@@ -240,6 +240,14 @@ int32_t gp_table_get_row(const GP_TableContext* ctx, int32_t idx, GP_TableRow* o
 int32_t gp_table_set_led_selected(GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, int32_t selected);
 int32_t gp_table_get_led_selected(const GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index);
 
+// Optional glow values per LED (0..1). When set, the renderer will perform an
+// additional glow pass around the LED using its on/off color and the supplied
+// normalized strength. Glow is applied only when rendering through a table
+// context with gp_table_render_rgba_with_state.
+int32_t gp_table_set_led_glow(GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, float glow01);
+int32_t gp_table_get_led_glow(const GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, float* out_glow01);
+int32_t gp_table_clear_led_glow(GP_TableContext* ctx);
+
 // Edge list API: LEDs are identified by the same packed 64-bit key used
 // by the selection APIs: (row<<32)|(col<<16)|led_index.
 int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b);
