@@ -495,6 +495,28 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     gp_table_set_rows(t, rows.data(), static_cast<int>(rows.size()));
     if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
     ctx->module_io_rows[module_idx] = row_meta;
+    // Annotate LED keys for created rows with explicit input/output hints
+    // so the table renderer's glow pass can recognize IO roles.
+    for (int ri = 0; ri < static_cast<int>(rows.size()); ++ri) {
+        bool is_input = row_meta[ri].is_input;
+        int col_idx = 1; // LED cell column
+        if (col_idx >= rows[ri].cell_count) continue;
+        const GP_TableCell &cell = rows[ri].cells[col_idx];
+        int led_count = 9;
+        if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
+            int c = std::max(0, std::min(32, static_cast<int>(cell.value)));
+            if (c == 0) c = static_cast<int>(cell.flags & 0xFFu);
+            if (c == 0) c = 12;
+            led_count = c;
+        } else if (cell.kind == GP_TABLE_CELL_LEDS_TABLE) {
+            led_count = 8;
+        }
+        for (int li = 0; li < led_count; ++li) {
+            uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(ri)) << 32) | (static_cast<uint64_t>(static_cast<uint32_t>(col_idx)) << 16) | static_cast<uint64_t>(static_cast<uint32_t>(li));
+            gp_table_set_key_type_hint(t, key, 0, is_input ? 1 : 0, is_input ? 0 : 1);
+        }
+    }
+    
     auto ensure_layout = [&](std::vector<MolexLayoutInfo> &arr) {
         if (module_idx >= static_cast<int>(arr.size())) arr.resize(module_idx + 1);
     };

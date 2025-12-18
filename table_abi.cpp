@@ -1510,7 +1510,7 @@ static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const f
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         auto &a = samples[i];
         auto &b = samples[i+1];
-        draw_segment_blend(a.first, a.second, b.first, b.second, eff_jacket, jacket_col);
+        draw_segment_blend(img, w, h, pitch, a.first, a.second, b.first, b.second, eff_jacket, jacket_col);
     }
 
     // draw core (thinner, translucent core_col)
@@ -1518,7 +1518,7 @@ static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const f
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         auto &a = samples[i];
         auto &b = samples[i+1];
-        draw_segment_blend(a.first, a.second, b.first, b.second, core_r, core_col);
+        draw_segment_blend(img, w, h, pitch, a.first, a.second, b.first, b.second, core_r, core_col);
     }
 }
 
