@@ -1,7 +1,0 @@
-C:/dev/Powershell/nodus/build/canvas_tables.dir/RelWithDebInfo/canvas_abi.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/RelWithDebInfo/table_abi.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/RelWithDebInfo/table_node_groups.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/RelWithDebInfo/menu_waveform.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/RelWithDebInfo/menu_waveform_abi.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/RelWithDebInfo/rope_sim.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/RelWithDebInfo/text_render_helper.obj

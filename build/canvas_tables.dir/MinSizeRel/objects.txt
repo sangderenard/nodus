@@ -1,7 +1,0 @@
-C:/dev/Powershell/nodus/build/canvas_tables.dir/MinSizeRel/canvas_abi.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/MinSizeRel/table_abi.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/MinSizeRel/table_node_groups.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/MinSizeRel/menu_waveform.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/MinSizeRel/menu_waveform_abi.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/MinSizeRel/rope_sim.obj
-C:/dev/Powershell/nodus/build/canvas_tables.dir/MinSizeRel/text_render_helper.obj
