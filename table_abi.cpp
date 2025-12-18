@@ -1442,6 +1442,66 @@ static void draw_rope_fiber_overlay(uint8_t* img, int w, int h, int pitch, const
     }
 }
 
+static float draw_rope_diffused_glow(
+    uint8_t* img,
+    int w,
+    int h,
+    int pitch,
+    const std::vector<std::pair<float,float>>& samples,
+    const std::vector<float>& depth_samples,
+    bool start_is_front,
+    float start_glow,
+    float depth_fade,
+    float gain,
+    Color glow_col,
+    float min_z,
+    float max_z,
+    int radius) {
+    if (samples.size() < 2) return 0.0f;
+    float clamped_glow = std::max(0.0f, start_glow);
+    if (clamped_glow <= 0.0f) return 0.0f;
+    float depth_span = std::max(1e-3f, max_z - min_z);
+
+    std::vector<float> prefix(samples.size(), 0.0f);
+    for (size_t i = 1; i < samples.size(); ++i) {
+        float dx = samples[i].first - samples[i-1].first;
+        float dy = samples[i].second - samples[i-1].second;
+        prefix[i] = prefix[i-1] + std::sqrt(dx*dx + dy*dy);
+    }
+    float total_len = prefix.back();
+    if (total_len <= 1e-5f) return 0.0f;
+
+    auto depth_scale_at = [&](size_t idx) {
+        if (depth_samples.size() != samples.size()) return 1.0f;
+        float norm = (depth_samples[idx] - min_z) / depth_span;
+        norm = std::clamp(norm, 0.0f, 1.0f);
+        return 1.0f - depth_fade * norm;
+    };
+    auto dist_from_start = [&](size_t idx) {
+        float d = prefix[idx];
+        return start_is_front ? d : (total_len - d);
+    };
+
+    // modest diffusion so the glow doesn't steal focus
+    const float decay = 1.35f;
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        float da = dist_from_start(i);
+        float db = dist_from_start(i + 1);
+        float dist_mid = 0.5f * (da + db);
+        float along = (total_len > 1e-4f) ? (dist_mid / total_len) : 0.0f;
+        float atten = std::exp(-decay * along);
+        float depth_scale = 0.5f * (depth_scale_at(i) + depth_scale_at(i + 1));
+        float alpha_scale = gain * clamped_glow * atten * depth_scale;
+        if (img && alpha_scale > 0.0f) {
+            draw_segment_blend(img, w, h, pitch, samples[i].first, samples[i].second, samples[i+1].first, samples[i+1].second, radius, glow_col, alpha_scale);
+        }
+    }
+
+    size_t dest_idx = start_is_front ? samples.size() - 1 : 0;
+    float transmitted = clamped_glow * std::exp(-decay) * depth_scale_at(dest_idx);
+    return transmitted;
+}
+
 // Draw a smooth blended rope/tube along given interleaved vertices using Catmull-Rom
 // verts: float array [x0,y0, x1,y1, ...], count = number of vertices
 static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, Color core_col, int samples_per_segment) {
@@ -1541,6 +1601,19 @@ static inline Color hsv_to_color(float h, float s, float v, uint8_t a=255) {
         case 5: r = v; g = p; b = q; break;
     }
     return Color{ static_cast<uint8_t>(std::lround(r * 255.0f)), static_cast<uint8_t>(std::lround(g * 255.0f)), static_cast<uint8_t>(std::lround(b * 255.0f)), a };
+}
+
+static inline Color lerp_color(Color a, Color b, float t) {
+    float tt = std::clamp(t, 0.0f, 1.0f);
+    auto mix = [&](uint8_t ca, uint8_t cb) -> uint8_t {
+        return static_cast<uint8_t>(std::lround(float(ca) * (1.0f - tt) + float(cb) * tt));
+    };
+    Color out;
+    out.r = mix(a.r, b.r);
+    out.g = mix(a.g, b.g);
+    out.b = mix(a.b, b.b);
+    out.a = mix(a.a, b.a);
+    return out;
 }
 
 // Colored variant: `hues` is an optional array of per-vertex hue values in [0..1]. If null, falls back to neutral drawing.
@@ -2589,6 +2662,71 @@ int32_t gp_table_render_rgba_with_state(
         }
     }
 
+    struct LedContactInfo {
+        int x = -1;
+        int y = -1;
+        bool on = false;
+        bool active = false;
+        bool is_input = false;
+        bool is_output = false;
+    };
+
+    auto fetch_led_contact = [&](uint64_t key, LedContactInfo& out) -> bool {
+        out = {};
+        out.is_input = ctx->key_is_input.count(key) != 0;
+        out.is_output = ctx->key_is_output.count(key) != 0;
+        uint32_t r_orig = static_cast<uint32_t>(key >> 32);
+        uint32_t c_idx = static_cast<uint32_t>((key >> 16) & 0xFFFFu);
+        uint32_t led = static_cast<uint32_t>(key & 0xFFFFu);
+        int vis_idx = find_visible_row(r_orig);
+        if (vis_idx < 0 || vis_idx >= static_cast<int>(vis_rows.size())) return false;
+        if (c_idx >= ctx->cols.size() || c_idx >= 8) return false;
+        const GP_TableRow &row = vis_rows[vis_idx];
+        if (c_idx >= static_cast<uint32_t>(row.cell_count)) return false;
+        const GP_TableCell &cell = row.cells[c_idx];
+        int x0 = col_x0[static_cast<int>(c_idx)];
+        int cw = col_w[static_cast<int>(c_idx)];
+        int y0 = vis_idx * ctx->st.row_h;
+        int led_count = 9;
+        uint32_t on_mask = cell.flags;
+        uint32_t active_mask = cell.flags;
+        if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
+            int count = std::max(0, std::min(32, static_cast<int>(cell.value)));
+            if (count == 0) count = (cell.flags & 0xFF);
+            if (count == 0) count = 12;
+            led_count = count;
+            on_mask = cell.flags;
+            active_mask = static_cast<uint32_t>(cell.reserved0);
+            if (active_mask == 0 && count > 0) active_mask = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+        } else if (cell.kind == GP_TABLE_CELL_LEDS_TABLE) {
+            led_count = 8;
+        }
+        int eff_w = std::max(1, cw - 4);
+        int radius = 4;
+        int led_spacing = std::max(radius * 2 + 2, eff_w / std::max(1, led_count + 1));
+        int cx0 = x0 + 2 + led_spacing;
+        if (led >= static_cast<uint32_t>(led_count)) return false;
+        out.x = cx0 + static_cast<int>(led) * led_spacing;
+        out.y = y0 + ctx->st.row_h / 2;
+        uint32_t bit = 1u << led;
+        out.on = (on_mask & bit) != 0;
+        out.active = (active_mask & bit) != 0;
+        return true;
+    };
+
+    auto compute_led_glow = [&](const LedContactInfo& info, uint64_t key) -> float {
+        float glow = 0.0f;
+        auto it = ctx->led_glow_strength.find(key);
+        if (it != ctx->led_glow_strength.end()) glow = std::max(glow, std::clamp(it->second, 0.0f, 1.0f));
+        if (glow <= 0.0f && info.is_output && info.on) {
+            glow = 0.35f;
+        }
+        if (!info.on) glow *= 0.3f;
+        if (info.is_input) glow *= 0.35f;
+        if (info.is_output && info.on) glow = std::min(1.0f, glow * 1.25f + 0.15f);
+        return glow;
+    };
+
 
     // Draw edges between LED centers
     // Prospective live-edge: if enabled and exactly one LED selected, we will
@@ -2612,40 +2750,11 @@ int32_t gp_table_render_rgba_with_state(
             if (render_state && render_state->mouse_x >= 0 && render_state->mouse_y >= 0) {
                 // compute selected node center
                 uint64_t sel_key = *ctx->selected_leds.begin();
-                int sx = -1, sy = -1;
-                {
-                    uint32_t r_orig = static_cast<uint32_t>(sel_key >> 32);
-                    uint32_t c_idx = static_cast<uint32_t>((sel_key >> 16) & 0xFFFFu);
-                    uint32_t led = static_cast<uint32_t>(sel_key & 0xFFFFu);
-                    int vis_idx = -1;
-                    for (size_t vi = 0; vi < map_vis_to_orig.size(); ++vi) if (map_vis_to_orig[vi] == static_cast<int>(r_orig)) { vis_idx = static_cast<int>(vi); break; }
-                    if (vis_idx >= 0) {
-                        const GP_TableRow &row = vis_rows[vis_idx];
-                        if (static_cast<int>(c_idx) >= 0 && static_cast<int>(c_idx) < row.cell_count) {
-                            const GP_TableCell &cell = row.cells[c_idx];
-                            int x0 = col_x0[static_cast<int>(c_idx)];
-                            int cw = col_w[static_cast<int>(c_idx)];
-                            int y0 = vis_idx * ctx->st.row_h;
-                            int led_count = 9;
-                            if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
-                                int count = std::max(0, std::min(32, static_cast<int>(cell.value)));
-                                if (count == 0) count = (cell.flags & 0xFF);
-                                if (count == 0) count = 12;
-                                led_count = count;
-                            } else if (cell.kind == GP_TABLE_CELL_LEDS_TABLE) {
-                                led_count = 8;
-                            }
-                            int eff_w = std::max(1, cw - 4);
-                            int radius = 4;
-                            int led_spacing = std::max(radius * 2 + 2, eff_w / std::max(1, led_count + 1));
-                            int cx0 = x0 + 2 + led_spacing;
-                            if (static_cast<int>(led) >= 0 && static_cast<int>(led) < led_count) {
-                                sx = cx0 + static_cast<int>(led) * led_spacing;
-                                sy = y0 + ctx->st.row_h / 2;
-                            }
-                        }
-                    }
-                }
+                LedContactInfo sel_info;
+                bool have_sel = fetch_led_contact(sel_key, sel_info);
+                int sx = have_sel ? sel_info.x : -1;
+                int sy = have_sel ? sel_info.y : -1;
+                float sel_glow = have_sel ? compute_led_glow(sel_info, sel_key) : 0.0f;
                 if (sx >= 0 && sy >= 0) {
                     // compute local image dims/pitch for drawing (use distinct names)
                     int p_w = local_geom.width_px;
@@ -2733,6 +2842,10 @@ int32_t gp_table_render_rgba_with_state(
                                 project_rope_vertices_ortho(verts3.data(), got, ctx->st.cable_tilt_x, ctx->st.cable_tilt_y, proj_xy, proj_z, min_z, max_z);
 
                                 Color pcol{180, 255, 180, 220};
+                                float tint = (sel_info.is_output ? sel_glow : 0.0f);
+                                if (tint > 0.0f) {
+                                    pcol = lerp_color(pcol, ctx->st.led_on, std::min(1.0f, tint));
+                                }
                                 int samples_per_segment = std::max(2, ctx->st.cable_segments / std::max(1, got - 1));
                                 draw_rope_curve_blend(out_rgba, p_w, p_h, p_pitch, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, pcol, samples_per_segment);
 
@@ -2744,6 +2857,12 @@ int32_t gp_table_render_rgba_with_state(
                                     Color fiber_col = ctx->st.led_on;
                                     fiber_col.a = static_cast<uint8_t>(std::lround(220.0f));
                                     draw_rope_fiber_overlay(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, fiber_r, fiber_col, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain, min_z, max_z);
+                                    if (sel_info.is_output && sel_glow > 0.0f) {
+                                        Color glow_col = ctx->st.led_on;
+                                        glow_col.a = static_cast<uint8_t>(std::lround(float(glow_col.a) * 0.7f));
+                                        int glow_r = fiber_r;
+                                        draw_rope_diffused_glow(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, true, sel_glow, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain * 0.5f, glow_col, min_z, max_z, glow_r);
+                                    }
                                 }
                             }
                         }
@@ -2758,6 +2877,10 @@ int32_t gp_table_render_rgba_with_state(
         int h_local = local_geom.height_px;
         int pitch_local = w_local * 4;
         Color edge_col{200, 200, 255, 200};
+        std::vector<LedContactInfo> edge_contact_a(ctx->edges.size());
+        std::vector<LedContactInfo> edge_contact_b(ctx->edges.size());
+        std::vector<float> edge_glow_a(ctx->edges.size(), 0.0f);
+        std::vector<float> edge_glow_b(ctx->edges.size(), 0.0f);
 
         // ensure rope simulator exists
         if (!ctx->rope_sim) {
@@ -2775,42 +2898,19 @@ int32_t gp_table_render_rgba_with_state(
             const auto &e = ctx->edges[ei];
             uint64_t ka = e.first;
             uint64_t kb = e.second;
-            int ax = -1, ay = -1, bx = -1, by = -1;
-            auto compute_center_vis = [&](uint64_t key, int &outx, int &outy) {
-                outx = -1; outy = -1;
-                uint32_t r_orig = static_cast<uint32_t>(key >> 32);
-                uint32_t c_idx = static_cast<uint32_t>((key >> 16) & 0xFFFFu);
-                uint32_t led = static_cast<uint32_t>(key & 0xFFFFu);
-                int vis_idx = -1;
-                for (size_t vi = 0; vi < map_vis_to_orig.size(); ++vi) if (map_vis_to_orig[vi] == static_cast<int>(r_orig)) { vis_idx = static_cast<int>(vi); break; }
-                if (vis_idx < 0) return;
-                const GP_TableRow &row = vis_rows[vis_idx];
-                if (static_cast<int>(c_idx) < 0 || static_cast<int>(c_idx) >= row.cell_count) return;
-                const GP_TableCell &cell = row.cells[c_idx];
-                int x0 = col_x0[static_cast<int>(c_idx)];
-                int cw = col_w[static_cast<int>(c_idx)];
-                int y0 = vis_idx * ctx->st.row_h;
-                int led_count = 9;
-                if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
-                    int count = std::max(0, std::min(32, static_cast<int>(cell.value)));
-                    if (count == 0) count = (cell.flags & 0xFF);
-                    if (count == 0) count = 12;
-                    led_count = count;
-                } else if (cell.kind == GP_TABLE_CELL_LEDS_TABLE) {
-                    led_count = 8;
-                }
-                int eff_w = std::max(1, cw - 4);
-                int radius = 4;
-                int led_spacing = std::max(radius * 2 + 2, eff_w / std::max(1, led_count + 1));
-                int cx0 = x0 + 2 + led_spacing;
-                if (static_cast<int>(led) >= 0 && static_cast<int>(led) < led_count) {
-                    outx = cx0 + static_cast<int>(led) * led_spacing;
-                    outy = y0 + ctx->st.row_h / 2;
-                }
-            };
-            compute_center_vis(ka, ax, ay);
-            compute_center_vis(kb, bx, by);
-            if (ax < 0 || ay < 0 || bx < 0 || by < 0) continue;
+            LedContactInfo info_a;
+            LedContactInfo info_b;
+            if (!fetch_led_contact(ka, info_a) || !fetch_led_contact(kb, info_b)) continue;
+            int ax = info_a.x;
+            int ay = info_a.y;
+            int bx = info_b.x;
+            int by = info_b.y;
+            float glow_a = compute_led_glow(info_a, ka);
+            float glow_b = compute_led_glow(info_b, kb);
+            edge_contact_a[ei] = info_a;
+            edge_contact_b[ei] = info_b;
+            edge_glow_a[ei] = glow_a;
+            edge_glow_b[ei] = glow_b;
 
             int rope_idx = ctx->rope_sim_idx[ei];
             if (rope_idx < 0) {
@@ -2835,10 +2935,23 @@ int32_t gp_table_render_rgba_with_state(
 
         // Now render ropes from simulator vertices
         for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
-            const auto &e = ctx->edges[ei];
+            const LedContactInfo &info_a = edge_contact_a[ei];
+            const LedContactInfo &info_b = edge_contact_b[ei];
+            if (info_a.x < 0 || info_b.x < 0) continue;
+            float glow_a = edge_glow_a[ei];
+            float glow_b = edge_glow_b[ei];
             float ev = 1.0f;
             if (ei < ctx->relax_value.size()) ev = ctx->relax_value[ei];
             Color col = edge_col;
+            float glow_a_eff = glow_a * ev;
+            float glow_b_eff = glow_b * ev;
+            float tint_glow = 0.0f;
+            if (info_a.is_output) tint_glow = std::max(tint_glow, glow_a_eff);
+            if (info_b.is_output) tint_glow = std::max(tint_glow, glow_b_eff);
+            if (tint_glow <= 0.0f) tint_glow = std::max(glow_a_eff, glow_b_eff) * 0.5f;
+            if (tint_glow > 0.0f) {
+                col = lerp_color(edge_col, ctx->st.led_on, std::min(1.0f, tint_glow));
+            }
             col.a = static_cast<uint8_t>(std::min<int>(255, static_cast<int>(col.a * ev)));
             int rope_idx = ctx->rope_sim_idx[ei];
             if (rope_idx < 0) continue;
@@ -2864,6 +2977,27 @@ int32_t gp_table_render_rgba_with_state(
                 Color fiber_col = ctx->st.led_on;
                 fiber_col.a = static_cast<uint8_t>(std::lround(float(fiber_col.a) * ev));
                 draw_rope_fiber_overlay(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, fiber_r, fiber_col, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain, min_z, max_z);
+                Color glow_col = ctx->st.led_on;
+                glow_col.a = static_cast<uint8_t>(std::lround(float(glow_col.a) * 0.7f));
+                float glow_gain = ctx->st.cable_fiber_gain * 0.55f;
+                if (info_a.is_output && glow_a_eff > 0.0f) {
+                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, true, glow_a_eff, ctx->st.cable_depth_fade, glow_gain, glow_col, min_z, max_z, fiber_r);
+                    if (info_b.is_input && transmitted > 0.0f) {
+                        Color input_col = ctx->st.led_on;
+                        float boost = std::min(1.0f, transmitted * 0.6f);
+                        input_col.a = static_cast<uint8_t>(std::lround(float(input_col.a) * (0.35f + 0.4f * boost)));
+                        draw_glow_blob(out_rgba, w_local, h_local, pitch_local, info_b.x, info_b.y, 4, boost, input_col);
+                    }
+                }
+                if (info_b.is_output && glow_b_eff > 0.0f) {
+                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, false, glow_b_eff, ctx->st.cable_depth_fade, glow_gain, glow_col, min_z, max_z, fiber_r);
+                    if (info_a.is_input && transmitted > 0.0f) {
+                        Color input_col = ctx->st.led_on;
+                        float boost = std::min(1.0f, transmitted * 0.6f);
+                        input_col.a = static_cast<uint8_t>(std::lround(float(input_col.a) * (0.35f + 0.4f * boost)));
+                        draw_glow_blob(out_rgba, w_local, h_local, pitch_local, info_a.x, info_a.y, 4, boost, input_col);
+                    }
+                }
             }
         }
     }
