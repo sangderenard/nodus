@@ -1,0 +1,71 @@
+# Ignore build artifacts and IDE files
+
+# CMake / build
+/build/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/install_manifest.txt
+/compile_commands.json
+
+# Visual Studio
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+.vs/
+
+# Build outputs
+*.obj
+*.o
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.pdb
+*.exp
+*.ilk
+
+# Generated project dirs
+build-*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env/
+venv/
+.env.*
+.pytest_cache/
+
+# Editors/IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Node
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs, temp
+*.log
+*.tmp
+*.bak
+*.cache
+
+# Images / generated assets
+*.png
+*.jpg
+*.jpeg
+
+# Misc
+*.user
+
+# End of .gitignore
