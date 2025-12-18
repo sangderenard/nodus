@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <chrono>
 #include <filesystem>
+#include <limits>
+#include <tuple>
 #include "text_render_helper.h"
 #include "table_node_groups.h"
 #include "rope_sim.h"
@@ -272,6 +274,12 @@ struct Style {
     int cable_jacket_border = 2;    // inner border thickness (core = jacket - border)
     float cable_core_alpha = 0.92f; // core translucency (0..1)
     float cable_sag = 0.10f;        // sag factor relative to distance (0..1)
+    float cable_plug_depth = 10.0f; // depth to sink plugs behind the UI plane
+    float cable_tilt_x = 0.06f;     // orthographic tilt factor in X for depth projection
+    float cable_tilt_y = -0.08f;    // orthographic tilt factor in Y for depth projection
+    float cable_depth_fade = 0.55f; // how much depth mutes fiber glow
+    float cable_fiber_gain = 0.85f; // multiplier for fiber optic overlay
+    float cable_fiber_radius_scale = 0.55f; // overlay radius relative to jacket
 };
 
 static Style load_style(const GP_TableStyle* s) {
@@ -1058,6 +1066,7 @@ struct GP_TableContext {
     float scroll_frac_x = 0.0f;
     // selected LED keys: packed (row<<32) | (col<<16) | led_index
     std::unordered_set<uint64_t> selected_leds;
+    std::unordered_map<uint64_t, float> led_glow_strength;
     std::vector<std::pair<uint64_t,uint64_t>> edges;
     // Relaxation state (per-edge values/velocities are maintained in parallel to edges)
     int32_t relax_mode = GP_TABLE_RELAX_OFF;
@@ -1231,6 +1240,21 @@ static void draw_blob_blend(uint8_t* img, int w, int h, int pitch, int cx, int c
     }
 }
 
+static void draw_glow_blob(uint8_t* img, int w, int h, int pitch, int cx, int cy, int radius, float strength01, Color c) {
+    if (!img) return;
+    float s = std::max(0.0f, std::min(1.0f, strength01));
+    if (s <= 0.0f) return;
+    // Slightly larger falloff radius than the LED core to create diffusion.
+    int glow_r = std::max(radius + 2, static_cast<int>(std::lround(float(radius) * (2.2f + 0.8f * s))));
+    Color halo = c;
+    halo.a = static_cast<uint8_t>(std::lround(float(c.a) * (0.55f + 0.45f * s)));
+    draw_blob_blend(img, w, h, pitch, cx, cy, glow_r, halo);
+    // Soft core to keep the center lively.
+    Color core = c;
+    core.a = static_cast<uint8_t>(std::lround(float(c.a) * std::min(1.0f, s * 1.4f)));
+    draw_blob_blend(img, w, h, pitch, cx, cy, std::max(radius, glow_r / 3), core);
+}
+
 // Draw a droopy blended cable between two points.
 static void draw_cable_blend(uint8_t* img, int w, int h, int pitch, int ax, int ay, int bx, int by, int jacket_px, int jacket_border, Color core_col, int segments, float sag_factor, float relax_v) {
     if (!img) return;
@@ -1278,6 +1302,144 @@ static void draw_cable_blend(uint8_t* img, int w, int h, int pitch, int ax, int 
     corecap.a = static_cast<uint8_t>(std::lround(corecap.a * 1.0f));
     draw_circle(img, w, h, pitch, ax, ay, std::max(1, jacket_px - jacket_border), corecap);
     draw_circle(img, w, h, pitch, bx, by, std::max(1, jacket_px - jacket_border), corecap);
+}
+
+// Helper: draw a blended thick segment with optional alpha scale.
+static void draw_segment_blend(uint8_t* img, int w, int h, int pitch, float x1, float y1, float x2, float y2, int radius, Color col, float alpha_scale = 1.0f) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float len2 = dx*dx + dy*dy;
+    float rplus = float(radius) + 1.0f; // allow soft edge
+    int minx = static_cast<int>(std::floor(std::min(x1,x2) - rplus));
+    int maxx = static_cast<int>(std::ceil(std::max(x1,x2) + rplus));
+    int miny = static_cast<int>(std::floor(std::min(y1,y2) - rplus));
+    int maxy = static_cast<int>(std::ceil(std::max(y1,y2) + rplus));
+    minx = std::max(minx, 0);
+    miny = std::max(miny, 0);
+    maxx = std::min(maxx, w - 1);
+    maxy = std::min(maxy, h - 1);
+    for (int py = miny; py <= maxy; ++py) {
+        for (int px = minx; px <= maxx; ++px) {
+            float cx = px + 0.5f;
+            float cy = py + 0.5f;
+            float t = 0.0f;
+            if (len2 > 1e-6f) {
+                t = ((cx - x1) * dx + (cy - y1) * dy) / len2;
+                if (t < 0.0f) t = 0.0f;
+                else if (t > 1.0f) t = 1.0f;
+            }
+            float closestX = x1 + dx * t;
+            float closestY = y1 + dy * t;
+            float ddx = cx - closestX;
+            float ddy = cy - closestY;
+            float dist = std::sqrt(ddx*ddx + ddy*ddy);
+            if (dist <= rplus) {
+                float coverage = 1.0f - (dist / rplus);
+                float a_scaled = float(col.a) * coverage * alpha_scale;
+                if (a_scaled <= 0.0f) continue;
+                Color cc = col;
+                cc.a = static_cast<uint8_t>(std::lround(std::min(255.0f, a_scaled)));
+                uint8_t* dstp = img + py * pitch + px * 4;
+                blend_pixel(dstp, cc.r, cc.g, cc.b, cc.a);
+            }
+        }
+    }
+}
+
+// Orthographic projection of 3D rope verts into 2D table space with a subtle tilt.
+static void project_rope_vertices_ortho(const float* verts3, int count, float tilt_x, float tilt_y, std::vector<float>& out_xy, std::vector<float>& out_z, float &out_min_z, float &out_max_z) {
+    out_xy.resize(static_cast<std::size_t>(count) * 2);
+    out_z.resize(static_cast<std::size_t>(count));
+    out_min_z = std::numeric_limits<float>::max();
+    out_max_z = std::numeric_limits<float>::lowest();
+    for (int i = 0; i < count; ++i) {
+        float x = verts3[3*i+0];
+        float y = verts3[3*i+1];
+        float z = verts3[3*i+2];
+        out_z[static_cast<std::size_t>(i)] = z;
+        out_xy[2*i+0] = x + tilt_x * z;
+        out_xy[2*i+1] = y + tilt_y * z;
+        out_min_z = std::min(out_min_z, z);
+        out_max_z = std::max(out_max_z, z);
+    }
+    if (out_min_z > out_max_z) {
+        out_min_z = out_max_z = 0.0f;
+    }
+}
+
+// Build Catmull-Rom samples for a rope and optionally depth samples aligned with them.
+static void build_rope_samples_with_depth(const float* verts2d, const float* depth_per_vert, int count, int jacket_px, std::vector<std::pair<float,float>>& samples, std::vector<float>* depth_samples) {
+    samples.clear();
+    if (depth_samples) depth_samples->clear();
+    if (!verts2d || count < 2) return;
+
+    auto get = [&](int idx) {
+        if (idx < 0) idx = 0;
+        if (idx >= count) idx = count - 1;
+        return std::pair<float,float>(verts2d[2*idx+0], verts2d[2*idx+1]);
+    };
+    auto get_depth = [&](int idx) {
+        if (!depth_per_vert) return 0.0f;
+        if (idx < 0) idx = 0;
+        if (idx >= count) idx = count - 1;
+        return depth_per_vert[idx];
+    };
+
+    auto catmull = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float x = 0.5f * ((2.0f * p1.first) + (-p0.first + p2.first) * t + (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t2 + (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t3);
+        float y = 0.5f * ((2.0f * p1.second) + (-p0.second + p2.second) * t + (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t2 + (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t3);
+        float dz = 0.0f;
+        if (depth_per_vert) {
+            float z0 = get_depth(i-1);
+            float z1 = get_depth(i+0);
+            float z2 = get_depth(i+1);
+            float z3 = get_depth(i+2);
+            dz = 0.5f * ((2.0f * z1) + (-z0 + z2) * t + (2.0f*z0 - 5.0f*z1 + 4.0f*z2 - z3) * t2 + (-z0 + 3.0f*z1 - 3.0f*z2 + z3) * t3);
+        }
+        return std::tuple<float,float,float>(x,y,dz);
+    };
+
+    samples.reserve(static_cast<std::size_t>((count - 1) * 8));
+    if (depth_samples) depth_samples->reserve(static_cast<std::size_t>((count - 1) * 8));
+    for (int i = 0; i < count - 1; ++i) {
+        auto p1 = get(i);
+        auto p2 = get(i+1);
+        float dx = p2.first - p1.first;
+        float dy = p2.second - p1.second;
+        float seglen = std::sqrt(dx*dx + dy*dy);
+        float preferred_spacing = std::max(1.0f, float(jacket_px) * 0.6f);
+        int n = std::max(2, static_cast<int>(std::ceil(seglen / preferred_spacing)));
+        for (int s = 0; s <= n; ++s) {
+            float t = float(s) / float(n);
+            auto [sx, sy, sz] = catmull(i, t);
+            samples.emplace_back(sx, sy);
+            if (depth_samples) depth_samples->push_back(sz);
+        }
+    }
+}
+
+static void draw_rope_fiber_overlay(uint8_t* img, int w, int h, int pitch, const std::vector<std::pair<float,float>>& samples, const std::vector<float>& depth_samples, int radius, Color glow_col, float depth_fade, float gain, float min_z, float max_z) {
+    if (!img || samples.size() < 2) return;
+    float depth_span = std::max(1e-3f, max_z - min_z);
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        auto &a = samples[i];
+        auto &b = samples[i+1];
+        float fade = 1.0f;
+        if (depth_samples.size() == samples.size()) {
+            float z_avg = 0.5f * (depth_samples[i] + depth_samples[i+1]);
+            float norm = (z_avg - min_z) / depth_span;
+            norm = std::clamp(norm, 0.0f, 1.0f);
+            fade = 1.0f - depth_fade * norm;
+        }
+        float alpha_scale = std::max(0.0f, gain * fade);
+        draw_segment_blend(img, w, h, pitch, a.first, a.second, b.first, b.second, radius, glow_col, alpha_scale);
+    }
 }
 
 // Draw a smooth blended rope/tube along given interleaved vertices using Catmull-Rom
@@ -1328,48 +1490,6 @@ static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const f
     }
 
     if (samples.empty()) return;
-
-    // helper: draw a blended thick segment by per-pixel distance to the segment
-    auto draw_segment_blend = [&](float x1, float y1, float x2, float y2, int radius, Color col) {
-        float dx = x2 - x1;
-        float dy = y2 - y1;
-        float len2 = dx*dx + dy*dy;
-        float rplus = float(radius) + 1.0f; // allow soft edge
-        int minx = static_cast<int>(std::floor(std::min(x1,x2) - rplus));
-        int maxx = static_cast<int>(std::ceil(std::max(x1,x2) + rplus));
-        int miny = static_cast<int>(std::floor(std::min(y1,y2) - rplus));
-        int maxy = static_cast<int>(std::ceil(std::max(y1,y2) + rplus));
-        minx = std::max(minx, 0);
-        miny = std::max(miny, 0);
-        maxx = std::min(maxx, w - 1);
-        maxy = std::min(maxy, h - 1);
-        for (int py = miny; py <= maxy; ++py) {
-            for (int px = minx; px <= maxx; ++px) {
-                float cx = px + 0.5f;
-                float cy = py + 0.5f;
-                float t = 0.0f;
-                if (len2 > 1e-6f) {
-                    t = ((cx - x1) * dx + (cy - y1) * dy) / len2;
-                    if (t < 0.0f) t = 0.0f;
-                    else if (t > 1.0f) t = 1.0f;
-                }
-                float closestX = x1 + dx * t;
-                float closestY = y1 + dy * t;
-                float ddx = cx - closestX;
-                float ddy = cy - closestY;
-                float dist = std::sqrt(ddx*ddx + ddy*ddy);
-                if (dist <= rplus) {
-                    float coverage = 1.0f - (dist / rplus);
-                    uint8_t a = static_cast<uint8_t>(std::lround(float(col.a) * coverage));
-                    if (a == 0) continue;
-                    Color cc = col;
-                    cc.a = a;
-                    uint8_t* dstp = img + py * pitch + px * 4;
-                    blend_pixel(dstp, cc.r, cc.g, cc.b, cc.a);
-                }
-            }
-        }
-    };
 
     // draw black backing rims then an inner core cap so rope drawn afterwards overwrites interior
     auto start = samples.front();
@@ -1755,7 +1875,8 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
         compute_center_local(b, bx, by);
         int segs = std::max(4, ctx->st.cable_segments);
         float slack = 0.0f;
-        int idx = rope_sim_add_rope(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), segs, slack);
+        float plug_z = -ctx->st.cable_plug_depth;
+        int idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
         ctx->rope_sim_idx.push_back(idx);
     } else {
         ctx->rope_sim_idx.push_back(-1);
@@ -2212,6 +2333,35 @@ int32_t gp_table_get_led_selected(const GP_TableContext* ctx, int32_t row_idx, i
     return ctx->selected_leds.find(key) != ctx->selected_leds.end() ? 1 : 0;
 }
 
+int32_t gp_table_set_led_glow(GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, float glow01) {
+    if (!ctx) return 0;
+    if (row_idx < 0 || row_idx >= static_cast<int>(ctx->rows.size())) return 0;
+    if (col_idx < 0 || col_idx >= static_cast<int>(ctx->cols.size())) return 0;
+    if (led_index < 0 || led_index > 65535) return 0;
+    float g = std::max(0.0f, std::min(1.0f, glow01));
+    uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) << 32) | (static_cast<uint64_t>(static_cast<uint32_t>(col_idx)) << 16) | static_cast<uint64_t>(static_cast<uint32_t>(led_index));
+    if (g <= 0.0f) ctx->led_glow_strength.erase(key);
+    else ctx->led_glow_strength[key] = g;
+    return 1;
+}
+
+int32_t gp_table_get_led_glow(const GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, float* out_glow01) {
+    if (!ctx || !out_glow01) return 0;
+    if (row_idx < 0 || row_idx >= static_cast<int>(ctx->rows.size())) return 0;
+    if (col_idx < 0 || col_idx >= static_cast<int>(ctx->cols.size())) return 0;
+    if (led_index < 0 || led_index > 65535) return 0;
+    uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) << 32) | (static_cast<uint64_t>(static_cast<uint32_t>(col_idx)) << 16) | static_cast<uint64_t>(static_cast<uint32_t>(led_index));
+    auto it = ctx->led_glow_strength.find(key);
+    *out_glow01 = (it != ctx->led_glow_strength.end()) ? it->second : 0.0f;
+    return 1;
+}
+
+int32_t gp_table_clear_led_glow(GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    ctx->led_glow_strength.clear();
+    return 1;
+}
+
 int32_t gp_table_render_rgba_with_hits(
     GP_TableContext* ctx,
     uint8_t* out_rgba,
@@ -2300,6 +2450,100 @@ int32_t gp_table_render_rgba_with_state(
     int col_x0[8] = {0};
     int col_w[8] = {0};
     compute_columns(ctx->cols.data(), static_cast<int>(ctx->cols.size()), ctx->st.w, ctx->st.name_w, col_x0, col_w);
+
+    auto find_visible_row = [&](uint32_t orig_idx) -> int {
+        for (size_t vi = 0; vi < map_vis_to_orig.size(); ++vi) {
+            if (map_vis_to_orig[vi] == static_cast<int>(orig_idx)) return static_cast<int>(vi);
+        }
+        return -1;
+    };
+
+    // Optional LED glow pass driven by per-key strengths and input/output hints.
+    if (out_rgba && (!ctx->led_glow_strength.empty() || !ctx->key_is_input.empty() || !ctx->key_is_output.empty())) {
+        int w_local = local_geom.width_px;
+        int h_local = local_geom.height_px;
+        int pitch_local = w_local * 4;
+
+        // Track processed keys so we do not double-apply when a key is both input and output.
+        std::unordered_set<uint64_t> seen_keys;
+        auto process_key = [&](uint64_t key, float strength){
+            if (seen_keys.count(key)) return;
+            seen_keys.insert(key);
+
+            uint32_t r_orig = static_cast<uint32_t>(key >> 32);
+            uint32_t c_idx = static_cast<uint32_t>((key >> 16) & 0xFFFFu);
+            uint32_t led = static_cast<uint32_t>(key & 0xFFFFu);
+            int vis_idx = find_visible_row(r_orig);
+            if (vis_idx < 0) return;
+            if (c_idx >= ctx->cols.size() || c_idx >= 8) return;
+            if (vis_idx >= static_cast<int>(vis_rows.size())) return;
+            const GP_TableRow &row = vis_rows[vis_idx];
+            if (c_idx >= static_cast<uint32_t>(row.cell_count)) return;
+            const GP_TableCell &cell = row.cells[c_idx];
+            if (cell.kind != GP_TABLE_CELL_LEDS && cell.kind != GP_TABLE_CELL_LEDS_ARG) return; // stacked strips omitted for now
+
+            int x0 = col_x0[static_cast<int>(c_idx)];
+            int cw = col_w[static_cast<int>(c_idx)];
+            int y0 = vis_idx * ctx->st.row_h;
+            int cy = y0 + ctx->st.row_h / 2;
+            int count = 9;
+            int radius = 4;
+            uint32_t on_mask = cell.flags;
+            uint32_t active_mask = cell.flags;
+            if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
+                count = std::max(0, std::min(32, static_cast<int>(cell.value)));
+                if (count == 0) count = (cell.flags & 0xFF);
+                if (count == 0) count = 12;
+                on_mask = cell.flags;
+                active_mask = static_cast<uint32_t>(cell.reserved0);
+                if (active_mask == 0 && count > 0) active_mask = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+            }
+            if (led >= static_cast<uint32_t>(count)) return;
+
+            int eff_w = std::max(1, cw - 4);
+            int led_spacing = std::max(radius * 2 + 2, eff_w / std::max(1, count + 1));
+            int cx0 = x0 + 2 + led_spacing;
+            int cx = cx0 + static_cast<int>(led) * led_spacing;
+
+            uint32_t bit = 1u << led;
+            bool on_b = (on_mask & bit) != 0;
+            bool active_but_off = !on_b && (active_mask & bit);
+            bool is_input = ctx->key_is_input.count(key) != 0;
+            bool is_output = ctx->key_is_output.count(key) != 0;
+
+            float glow = std::max(0.0f, std::min(1.0f, strength));
+            if (glow <= 0.0f && is_output && on_b) {
+                // Outputs light up even without an explicit glow value.
+                glow = 0.35f;
+            }
+            if (!on_b) glow *= 0.3f; // off LEDs only faintly glow unless explicitly boosted
+            if (is_input) glow *= 0.35f; // inputs read as dim glass bulbs
+            if (is_output && on_b) glow = std::min(1.0f, glow * 1.25f + 0.15f); // outputs pop when on
+
+            // Dead-glass tint for inputs that are off or inactive.
+            if (is_input && (!on_b || active_but_off)) {
+                Color tint = ctx->st.led_off;
+                tint.a = static_cast<uint8_t>(std::lround(180.0f));
+                draw_blob_blend(out_rgba, w_local, h_local, pitch_local, cx, cy, radius + 1, tint);
+            }
+
+            if (glow > 0.0f) {
+                Color glow_col = ctx->st.led_on;
+                glow_col.a = std::min<uint8_t>(255, static_cast<uint8_t>(std::lround(220.0f * glow)));
+                draw_glow_blob(out_rgba, w_local, h_local, pitch_local, cx, cy, radius, glow, glow_col);
+            }
+        };
+
+        for (const auto &kv : ctx->led_glow_strength) {
+            process_key(kv.first, kv.second);
+        }
+        for (uint64_t key : ctx->key_is_input) {
+            process_key(key, 0.0f);
+        }
+        for (uint64_t key : ctx->key_is_output) {
+            process_key(key, 0.0f);
+        }
+    }
 
     // Draw selection overlays for any selected LEDs kept in ctx.
     // Selected LEDs are stored as packed keys: (row<<32)|(col<<16)|led
@@ -2453,14 +2697,15 @@ int32_t gp_table_render_rgba_with_state(
                         ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
                         ctx->rope_sim_idx.clear();
                     }
+                    float plug_z = -ctx->st.cable_plug_depth;
                     // create a single persistent prospective rope if not present
                     if (ctx->prospective_rope_idx < 0) {
                         int segs = std::max(4, ctx->st.cable_segments);
                         float slack = ctx->prospective_rope_length > 0.0f ? ctx->prospective_rope_length : 0.0f;
-                        ctx->prospective_rope_idx = rope_sim_add_rope(ctx->rope_sim, static_cast<float>(sx), static_cast<float>(sy), static_cast<float>(ipx), static_cast<float>(ipy), segs, slack);
+                        ctx->prospective_rope_idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(sx), static_cast<float>(sy), plug_z, static_cast<float>(ipx), static_cast<float>(ipy), plug_z, segs, slack);
                     } else {
                         // move endpoints preserving previous positions so integrator receives velocity impulse
-                        rope_sim_move_endpoints(ctx->rope_sim, ctx->prospective_rope_idx, static_cast<float>(sx), static_cast<float>(sy), static_cast<float>(ipx), static_cast<float>(ipy));
+                        rope_sim_move_endpoints3(ctx->rope_sim, ctx->prospective_rope_idx, static_cast<float>(sx), static_cast<float>(sy), plug_z, static_cast<float>(ipx), static_cast<float>(ipy), plug_z);
                     }
                     // consume the newest queued target when close enough
                     float ddx = eff_tx - px;
@@ -2479,13 +2724,27 @@ int32_t gp_table_render_rgba_with_state(
                     if (ctx->prospective_rope_idx >= 0) {
                         int vc = rope_sim_get_vertex_count(ctx->rope_sim, ctx->prospective_rope_idx);
                         if (vc >= 2) {
-                            std::vector<float> verts(static_cast<size_t>(vc) * 2);
-                            int got = rope_sim_get_vertices(ctx->rope_sim, ctx->prospective_rope_idx, verts.data(), static_cast<int>(verts.size()));
+                            std::vector<float> verts3(static_cast<size_t>(vc) * 3);
+                            int got = rope_sim_get_vertices3(ctx->rope_sim, ctx->prospective_rope_idx, verts3.data(), static_cast<int>(verts3.size()));
                             if (got > 0) {
+                                std::vector<float> proj_xy;
+                                std::vector<float> proj_z;
+                                float min_z = 0.0f, max_z = 0.0f;
+                                project_rope_vertices_ortho(verts3.data(), got, ctx->st.cable_tilt_x, ctx->st.cable_tilt_y, proj_xy, proj_z, min_z, max_z);
+
                                 Color pcol{180, 255, 180, 220};
-                                // draw smooth curve along simulator vertices
                                 int samples_per_segment = std::max(2, ctx->st.cable_segments / std::max(1, got - 1));
-                                draw_rope_curve_blend(out_rgba, p_w, p_h, p_pitch, verts.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, pcol, samples_per_segment);
+                                draw_rope_curve_blend(out_rgba, p_w, p_h, p_pitch, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, pcol, samples_per_segment);
+
+                                std::vector<std::pair<float,float>> fiber_samples;
+                                std::vector<float> depth_samples;
+                                build_rope_samples_with_depth(proj_xy.data(), proj_z.data(), got, ctx->st.cable_jacket_px, fiber_samples, &depth_samples);
+                                if (!fiber_samples.empty()) {
+                                    int fiber_r = std::max(1, static_cast<int>(std::lround(float(ctx->st.cable_jacket_px) * ctx->st.cable_fiber_radius_scale)));
+                                    Color fiber_col = ctx->st.led_on;
+                                    fiber_col.a = static_cast<uint8_t>(std::lround(220.0f));
+                                    draw_rope_fiber_overlay(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, fiber_r, fiber_col, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain, min_z, max_z);
+                                }
                             }
                         }
                     }
@@ -2557,10 +2816,12 @@ int32_t gp_table_render_rgba_with_state(
             if (rope_idx < 0) {
                 int segs = std::max(4, ctx->st.cable_segments);
                 float slack = 0.0f;
-                int new_idx = rope_sim_add_rope(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), segs, slack);
+                float plug_z = -ctx->st.cable_plug_depth;
+                int new_idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
                 ctx->rope_sim_idx[ei] = new_idx;
             } else {
-                rope_sim_move_endpoints(ctx->rope_sim, rope_idx, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by));
+                float plug_z = -ctx->st.cable_plug_depth;
+                rope_sim_move_endpoints3(ctx->rope_sim, rope_idx, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z);
             }
         }
 
@@ -2583,12 +2844,27 @@ int32_t gp_table_render_rgba_with_state(
             if (rope_idx < 0) continue;
             int vc = rope_sim_get_vertex_count(ctx->rope_sim, rope_idx);
             if (vc < 2) continue;
-            std::vector<float> verts(static_cast<size_t>(vc) * 2);
-            int got = rope_sim_get_vertices(ctx->rope_sim, rope_idx, verts.data(), static_cast<int>(verts.size()));
+            std::vector<float> verts3(static_cast<size_t>(vc) * 3);
+            int got = rope_sim_get_vertices3(ctx->rope_sim, rope_idx, verts3.data(), static_cast<int>(verts3.size()));
             if (got <= 0) continue;
+            std::vector<float> proj_xy;
+            std::vector<float> proj_z;
+            float min_z = 0.0f, max_z = 0.0f;
+            project_rope_vertices_ortho(verts3.data(), got, ctx->st.cable_tilt_x, ctx->st.cable_tilt_y, proj_xy, proj_z, min_z, max_z);
             // draw smooth spline curve along simulator vertices
             int samples_per_segment = std::max(2, ctx->st.cable_segments / std::max(1, got - 1));
-            draw_rope_curve_blend(out_rgba, w_local, h_local, pitch_local, verts.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, col, samples_per_segment);
+            draw_rope_curve_blend(out_rgba, w_local, h_local, pitch_local, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, col, samples_per_segment);
+
+            // Fiber-optic overlay using LED on color as tint, masked by rope texture.
+            std::vector<std::pair<float,float>> fiber_samples;
+            std::vector<float> depth_samples;
+            build_rope_samples_with_depth(proj_xy.data(), proj_z.data(), got, ctx->st.cable_jacket_px, fiber_samples, &depth_samples);
+            if (!fiber_samples.empty()) {
+                int fiber_r = std::max(1, static_cast<int>(std::lround(float(ctx->st.cable_jacket_px) * ctx->st.cable_fiber_radius_scale)));
+                Color fiber_col = ctx->st.led_on;
+                fiber_col.a = static_cast<uint8_t>(std::lround(float(fiber_col.a) * ev));
+                draw_rope_fiber_overlay(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, fiber_r, fiber_col, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain, min_z, max_z);
+            }
         }
     }
     // Remap hitboxes' row indices from visible index -> original index
