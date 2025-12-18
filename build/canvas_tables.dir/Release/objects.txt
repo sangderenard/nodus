@@ -1,0 +1,7 @@
+C:/dev/Powershell/nodus/build/canvas_tables.dir/Release/canvas_abi.obj
+C:/dev/Powershell/nodus/build/canvas_tables.dir/Release/table_abi.obj
+C:/dev/Powershell/nodus/build/canvas_tables.dir/Release/table_node_groups.obj
+C:/dev/Powershell/nodus/build/canvas_tables.dir/Release/menu_waveform.obj
+C:/dev/Powershell/nodus/build/canvas_tables.dir/Release/menu_waveform_abi.obj
+C:/dev/Powershell/nodus/build/canvas_tables.dir/Release/rope_sim.obj
+C:/dev/Powershell/nodus/build/canvas_tables.dir/Release/text_render_helper.obj

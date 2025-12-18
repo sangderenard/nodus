@@ -1,0 +1,3 @@
+C:/dev/Powershell/nodus/build/CMakeFiles/canvas_tables.dir
+C:/dev/Powershell/nodus/build/CMakeFiles/ALL_BUILD.dir
+C:/dev/Powershell/nodus/build/CMakeFiles/ZERO_CHECK.dir

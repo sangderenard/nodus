@@ -1,0 +1,7 @@
+C:\dev\Powershell\nodus\canvas_abi.cpp;C:\dev\Powershell\nodus\build\canvas_tables.dir\Release\canvas_abi.obj
+C:\dev\Powershell\nodus\table_abi.cpp;C:\dev\Powershell\nodus\build\canvas_tables.dir\Release\table_abi.obj
+C:\dev\Powershell\nodus\table_node_groups.cpp;C:\dev\Powershell\nodus\build\canvas_tables.dir\Release\table_node_groups.obj
+C:\dev\Powershell\nodus\menu_waveform.cpp;C:\dev\Powershell\nodus\build\canvas_tables.dir\Release\menu_waveform.obj
+C:\dev\Powershell\nodus\menu_waveform_abi.cpp;C:\dev\Powershell\nodus\build\canvas_tables.dir\Release\menu_waveform_abi.obj
+C:\dev\Powershell\nodus\rope_sim.cpp;C:\dev\Powershell\nodus\build\canvas_tables.dir\Release\rope_sim.obj
+C:\dev\Powershell\nodus\text_render_helper.cpp;C:\dev\Powershell\nodus\build\canvas_tables.dir\Release\text_render_helper.obj
