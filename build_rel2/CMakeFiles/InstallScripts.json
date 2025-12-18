@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/dev/Powershell/nodus/build_rel2/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -10,6 +10,9 @@ extern "C" {
 typedef struct GP_CanvasContext GP_CanvasContext;
 typedef struct GP_TableContext GP_TableContext; // forward from table_abi
 
+// Module background rasterizer hook.
+typedef void(*GP_CanvasModuleBgFn)(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
+
 // Module descriptor
 typedef struct {
     int32_t x, y; // top-left
@@ -70,9 +73,9 @@ int gp_canvas_destroy_table(GP_CanvasContext* ctx, int module_idx);
 // Step the canvas' internal simulation by dt seconds. Returns 1 on success.
 int gp_canvas_step(GP_CanvasContext* ctx, float dt);
 
-// Return the internal RopeSim pointer for this canvas (or NULL if none).
-// Useful to attach table contexts to the canvas-owned simulator so tables defer
-// simulation to the canvas. The returned pointer is an opaque `RopeSim*`.
+// Return the RopeSim pointer used by the canvas' root/container table (or NULL if none).
+// Useful to attach table contexts to the shared simulator so tables defer
+// simulation to the root table. The returned pointer is an opaque `RopeSim*`.
 void* gp_canvas_get_rope_sim(GP_CanvasContext* ctx);
 
 // Attach a `GP_TableContext` to a canvas module so the canvas will render
@@ -84,6 +87,20 @@ int gp_canvas_attach_table(GP_CanvasContext* ctx, int module_idx, GP_TableContex
 // Detach any table from the given module. If the canvas owned the table,
 // it will destroy it. Returns 1 on success.
 int gp_canvas_detach_table(GP_CanvasContext* ctx, int module_idx);
+
+// Per-module background rasterizer hook. Returns 1 on success.
+int gp_canvas_set_module_bg_callback(GP_CanvasContext* ctx, int module_idx, GP_CanvasModuleBgFn cb, void* user);
+int gp_canvas_clear_module_bg_callback(GP_CanvasContext* ctx, int module_idx);
+// Background mode: 0=none (solid fill), 1=raytrace (input LED lights).
+int gp_canvas_set_module_bg_mode(GP_CanvasContext* ctx, int module_idx, int mode);
+int gp_canvas_get_module_bg_mode(GP_CanvasContext* ctx, int module_idx, int* out_mode);
+// Configure raytrace parameters for background mode.
+int gp_canvas_set_module_raytrace_params(GP_CanvasContext* ctx, int module_idx, int ray_count, int max_reflections, float blur_sigma);
+// Configure raytrace tuning: bounce decay, distance decay, and exposure scale.
+int gp_canvas_set_module_raytrace_tuning(GP_CanvasContext* ctx, int module_idx, float bounce_decay, float distance_decay, float exposure);
+// Set per-module table alpha (0..1). When raytrace mode is active, alpha is
+// clamped to `raytrace_alpha`.
+int gp_canvas_set_module_table_alpha(GP_CanvasContext* ctx, int module_idx, float alpha, float raytrace_alpha);
 
 // Register a host window pointer with the canvas so the canvas can retain
 // references to windows it will handle (opaque pointer). Returns 1 on success.
@@ -111,9 +128,9 @@ int gp_canvas_load_from_file(GP_CanvasContext* ctx, const char* path);
 int gp_canvas_set_templates_dir(const char* dir);
 int gp_canvas_get_templates_dir(char* out_buf, int out_len);
 
-// Optional containment: attach a GP_TableContext that will mirror the canvas'
-// scroll fractions (both axes) so table-based containers can host a canvas
-// viewport. Ownership is controlled by `take_ownership`.
+// Optional containment: attach a GP_TableContext that will act as the root table
+// for canvas actions and will mirror the canvas' scroll fractions (both axes).
+// Ownership is controlled by `take_ownership`.
 int gp_canvas_set_container_table(GP_CanvasContext* ctx, GP_TableContext* table, int take_ownership);
 GP_TableContext* gp_canvas_get_container_table(GP_CanvasContext* ctx);
 

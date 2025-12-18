@@ -54,6 +54,23 @@ typedef struct GP_TableHitBox {
     uint32_t flags;         // optional
 } GP_TableHitBox;
 
+// Action hooks for click dispatch. Use GP_TABLE_ACTION_ANY (-1) for wildcards.
+#define GP_TABLE_ACTION_ANY (-1)
+#define GP_TABLE_ACTION_EXPAND_TOGGLE (1000)
+#define GP_TABLE_ACTION_SCROLL_UP (1001)
+#define GP_TABLE_ACTION_SCROLL_DOWN (1002)
+#define GP_TABLE_ACTION_LED_TOGGLE (1003)
+
+typedef struct GP_TableAction {
+    int32_t row_idx;    // row index or GP_TABLE_ACTION_ANY
+    int32_t col_idx;    // column index or GP_TABLE_ACTION_ANY
+    int32_t part;       // GP_TableHitPart or GP_TABLE_ACTION_ANY
+    int32_t aux0;       // aux0 match or GP_TABLE_ACTION_ANY
+    int32_t action_id;  // caller-defined action id
+} GP_TableAction;
+
+typedef void(*GP_TableActionFn)(void* user, int32_t action_id, const GP_TableHitBox* hit);
+
 // Row kinds
 typedef enum GP_TableRowKind {
     GP_TABLE_ROW_HEADER = 0,
@@ -221,6 +238,16 @@ int32_t gp_table_render_rgba_with_state(
 // are the original indices) and returns 1. Returns 0 if nothing was hit.
 int32_t gp_table_on_click(GP_TableContext* ctx, int32_t x, int32_t y, GP_TableHitBox* out_hit);
 
+// Register a click-action table and callback. Actions are matched on row/col/part/aux0,
+// using GP_TABLE_ACTION_ANY (-1) as a wildcard. If a match is found, the callback
+// is invoked with the action_id and hitbox. Returns 1 on success.
+int32_t gp_table_set_actions(GP_TableContext* ctx, const GP_TableAction* actions, int32_t count);
+int32_t gp_table_set_action_callback(GP_TableContext* ctx, GP_TableActionFn cb, void* user);
+int32_t gp_table_clear_action_callback(GP_TableContext* ctx);
+// Dispatch a pre-resolved hit through the action registry (no hit-testing).
+// Returns 1 if any action matched, 0 otherwise.
+int32_t gp_table_dispatch_hit(GP_TableContext* ctx, const GP_TableHitBox* hit);
+
 // Set/get scroll position as a fraction 0..1 (0 -> top). Returns 1 on success.
 int32_t gp_table_set_scroll_fraction(GP_TableContext* ctx, float frac);
 int32_t gp_table_get_scroll_fraction(GP_TableContext* ctx, float* out_frac);
@@ -247,6 +274,12 @@ int32_t gp_table_get_led_selected(const GP_TableContext* ctx, int32_t row_idx, i
 int32_t gp_table_set_led_glow(GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, float glow01);
 int32_t gp_table_get_led_glow(const GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, float* out_glow01);
 int32_t gp_table_clear_led_glow(GP_TableContext* ctx);
+// Query LED state for a specific row/col/led index.
+int32_t gp_table_get_led_info(const GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index,
+    int32_t* out_on, int32_t* out_active, int32_t* out_is_input, int32_t* out_is_output);
+
+// Fetch the current raw style from the table context.
+int32_t gp_table_get_style(const GP_TableContext* ctx, GP_TableStyle* out_style);
 
 // Edge list API: LEDs are identified by the same packed 64-bit key used
 // by the selection APIs: (row<<32)|(col<<16)|led_index.
@@ -340,6 +373,22 @@ int32_t gp_table_get_side_reading_direction(GP_TableContext* ctx, int32_t side /
 // ratio when rendering LED-table blocks. These are hints only. Returns 1 on success.
 int32_t gp_table_set_led_grid_preference(GP_TableContext* ctx, int32_t pref_cols, int32_t pref_rows, float pref_aspect);
 int32_t gp_table_get_led_grid_preference(GP_TableContext* ctx, int32_t* out_pref_cols, int32_t* out_pref_rows, float* out_pref_aspect);
+
+// Table object definition (rows/columns/actions) for external modules to consume.
+typedef struct GP_TableObjectDef {
+    const GP_TableColumn* cols;
+    int32_t col_count;
+    const GP_TableRow* rows;
+    int32_t row_count;
+    const GP_TableAction* actions;
+    int32_t action_count;
+} GP_TableObjectDef;
+
+// Apply a table object definition onto an existing table context.
+int32_t gp_table_apply_object_def(GP_TableContext* ctx, const GP_TableObjectDef* def);
+
+// Return the RopeSim instance owned/used by this table (may be NULL).
+RopeSim* gp_table_get_rope_sim(GP_TableContext* ctx);
 
 // Table step callback and runtime invocation ---------------------------------
 // A table shim may provide a step function which consumes `in_count` input

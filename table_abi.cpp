@@ -278,7 +278,8 @@ struct Style {
     float cable_tilt_x = 0.06f;     // orthographic tilt factor in X for depth projection
     float cable_tilt_y = -0.08f;    // orthographic tilt factor in Y for depth projection
     float cable_depth_fade = 0.55f; // how much depth mutes fiber glow
-    float cable_fiber_gain = 0.85f; // multiplier for fiber optic overlay
+    // increase default fiber gain to make transferred glow/hue stronger
+    float cable_fiber_gain = 1.45f; // multiplier for fiber optic overlay
     float cable_fiber_radius_scale = 0.55f; // overlay radius relative to jacket
 };
 
@@ -1109,6 +1110,10 @@ struct GP_TableContext {
     // Optional step callback for node/table shims
     GP_TableStepFn step_callback = nullptr;
     void* step_user = nullptr;
+    // Optional click-action dispatch
+    std::vector<GP_TableAction> actions;
+    GP_TableActionFn action_callback = nullptr;
+    void* action_user = nullptr;
 };
 
 // Attach/detach an external RopeSim instance to the table context.
@@ -1129,6 +1134,11 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
     // reset indices so edges will create ropes in the new sim when next rendered
     ctx->rope_sim_idx.clear();
     return 1;
+}
+
+RopeSim* gp_table_get_rope_sim(GP_TableContext* ctx) {
+    if (!ctx) return nullptr;
+    return ctx->rope_sim;
 }
 
 int32_t gp_table_set_step_callback(GP_TableContext* ctx, GP_TableStepFn cb, void* user) {
@@ -1156,6 +1166,32 @@ int32_t gp_table_step(GP_TableContext* ctx, const float* inputs, int32_t in_coun
     } catch (...) {
         return 0;
     }
+}
+
+int32_t gp_table_set_actions(GP_TableContext* ctx, const GP_TableAction* actions, int32_t count) {
+    if (!ctx) return 0;
+    if (count < 0) return 0;
+    if (count > 0 && !actions) return 0;
+    if (count == 0) {
+        ctx->actions.clear();
+        return 1;
+    }
+    ctx->actions.assign(actions, actions + count);
+    return 1;
+}
+
+int32_t gp_table_set_action_callback(GP_TableContext* ctx, GP_TableActionFn cb, void* user) {
+    if (!ctx) return 0;
+    ctx->action_callback = cb;
+    ctx->action_user = user;
+    return 1;
+}
+
+int32_t gp_table_clear_action_callback(GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    ctx->action_callback = nullptr;
+    ctx->action_user = nullptr;
+    return 1;
 }
 
 static void recompute_geom(GP_TableContext* ctx) {
@@ -1240,6 +1276,361 @@ static void draw_blob_blend(uint8_t* img, int w, int h, int pitch, int cx, int c
     }
 }
 
+// Draw a smeared segment using the segment tangent as the cross-section normal.
+// This paints a continuous tube between (x1,y1) and (x2,y2) with radius and soft falloff.
+static void draw_segment_smear(uint8_t* img, int w, int h, int pitch, float x1, float y1, float x2, float y2, int radius, Color c, float alpha_scale = 1.0f) {
+    if (!img || radius <= 0) return;
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float len2 = dx*dx + dy*dy;
+    if (len2 <= 1e-6f) {
+        // fallback to blob
+        draw_blob_blend(img, w, h, pitch, int(std::lround(x1)), int(std::lround(y1)), radius, c);
+        return;
+    }
+    float len = std::sqrt(len2);
+    // normal pointing to the left of the segment (perpendicular)
+    float nx = -dy / len;
+    float ny = dx / len;
+    float r = float(radius);
+    float rplus = r + 1.0f;
+    int minx = static_cast<int>(std::floor(std::min(x1,x2) - rplus));
+    int maxx = static_cast<int>(std::ceil(std::max(x1,x2) + rplus));
+    int miny = static_cast<int>(std::floor(std::min(y1,y2) - rplus));
+    int maxy = static_cast<int>(std::ceil(std::max(y1,y2) + rplus));
+    minx = std::max(minx, 0);
+    miny = std::max(miny, 0);
+    maxx = std::min(maxx, w - 1);
+    maxy = std::min(maxy, h - 1);
+    for (int y = miny; y <= maxy; ++y) {
+        for (int x = minx; x <= maxx; ++x) {
+            // compute projection along segment
+            float vx = float(x) - x1;
+            float vy = float(y) - y1;
+            float proj = (vx * dx + vy * dy) / len2;
+            float t = std::clamp(proj, 0.0f, 1.0f);
+            float cxp = x1 + dx * t;
+            float cyp = y1 + dy * t;
+            // lateral distance to the segment centerline
+            float lx = float(x) - cxp;
+            float ly = float(y) - cyp;
+            float lateral = std::abs(lx * nx + ly * ny);
+            if (lateral > r) continue;
+            // simple linear falloff by lateral distance
+            float fall = 1.0f - (lateral / r);
+            uint8_t sa = static_cast<uint8_t>(std::lround(float(c.a) * fall * alpha_scale));
+            uint8_t* dst = img + y * pitch + x * 4;
+            blend_pixel(dst, c.r, c.g, c.b, sa);
+        }
+    }
+}
+
+// High-quality parametric SDF segment: uses endpoint tangents to interpolate a cross-section
+// and computes a smooth Gaussian falloff in cross-section distance.
+static void draw_segment_parametric_sdf(uint8_t* img, int w, int h, int pitch,
+    float x1, float y1, float x2, float y2,
+    float tx1, float ty1, float tx2, float ty2,
+    int radius, Color c, float alpha_scale = 1.0f, float tint_strength = 0.0f) {
+    if (!img || radius <= 0) return;
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float len2 = dx*dx + dy*dy;
+    if (len2 <= 1e-6f) {
+        draw_blob_blend(img, w, h, pitch, int(std::lround(x1)), int(std::lround(y1)), radius, c);
+        return;
+    }
+    float r = float(radius);
+    float rplus = r + 2.0f;
+    int minx = static_cast<int>(std::floor(std::min(x1,x2) - rplus));
+    int maxx = static_cast<int>(std::ceil(std::max(x1,x2) + rplus));
+    int miny = static_cast<int>(std::floor(std::min(y1,y2) - rplus));
+    int maxy = static_cast<int>(std::ceil(std::max(y1,y2) + rplus));
+    minx = std::max(minx, 0);
+    miny = std::max(miny, 0);
+    maxx = std::min(maxx, w - 1);
+    maxy = std::min(maxy, h - 1);
+
+    // pre-normalize endpoint tangents
+    float t1len = std::sqrt(tx1*tx1 + ty1*ty1);
+    float t2len = std::sqrt(tx2*tx2 + ty2*ty2);
+    if (t1len <= 1e-6f) { tx1 = dx; ty1 = dy; t1len = std::sqrt(dx*dx+dy*dy); }
+    if (t2len <= 1e-6f) { tx2 = dx; ty2 = dy; t2len = std::sqrt(dx*dx+dy*dy); }
+    tx1 /= t1len; ty1 /= t1len; tx2 /= t2len; ty2 /= t2len;
+
+    // Gaussian width parameter (so radius maps to ~3-sigma). Use smoother falloff.
+    float sigma = r / 2.0f;
+    float inv2sig2 = 1.0f / (2.0f * sigma * sigma);
+
+    for (int y = miny; y <= maxy; ++y) {
+        for (int x = minx; x <= maxx; ++x) {
+            // project point onto the segment (param t in [0,1])
+            float vx = float(x) - x1;
+            float vy = float(y) - y1;
+            float proj = (vx * dx + vy * dy) / len2;
+            float t = std::clamp(proj, 0.0f, 1.0f);
+            float cxp = x1 + dx * t;
+            float cyp = y1 + dy * t;
+
+            // interpolate tangent
+            float tx = (1.0f - t) * tx1 + t * tx2;
+            float ty = (1.0f - t) * ty1 + t * ty2;
+            float tlen = std::sqrt(tx*tx + ty*ty);
+            if (tlen <= 1e-6f) continue;
+            tx /= tlen; ty /= tlen;
+
+            // normal (perp)
+            float nx = -ty;
+            float ny = tx;
+
+            float lx = float(x) - cxp;
+            float ly = float(y) - cyp;
+            float lateral = std::abs(lx * nx + ly * ny);
+            if (lateral > r) continue;
+
+            // Gaussian falloff based on lateral distance
+            float gauss = std::exp(- (lateral * lateral) * inv2sig2);
+
+            // compute tint factor based on radial proximity (1 at center, 0 at radius)
+            float radial = std::clamp(1.0f - (lateral / r), 0.0f, 1.0f);
+            float tint_amt = std::clamp(tint_strength * radial, 0.0f, 1.0f);
+
+            // blend between neutral jacket (light grey) and provided color by tint_amt
+            float base_r = 200.0f;
+            float base_g = 200.0f;
+            float base_b = 200.0f;
+            float pr = base_r * (1.0f - tint_amt) + float(c.r) * tint_amt;
+            float pg = base_g * (1.0f - tint_amt) + float(c.g) * tint_amt;
+            float pb = base_b * (1.0f - tint_amt) + float(c.b) * tint_amt;
+
+            uint8_t sa = static_cast<uint8_t>(std::lround(float(c.a) * gauss * alpha_scale));
+            uint8_t* dst = img + y * pitch + x * 4;
+            blend_pixel(dst, static_cast<uint8_t>(std::lround(pr)), static_cast<uint8_t>(std::lround(pg)), static_cast<uint8_t>(std::lround(pb)), sa);
+        }
+    }
+}
+
+static void draw_rope_curve_blend_rgb(uint8_t* img, int w, int h, int pitch, const float* verts, int count,
+    int jacket_px, int jacket_border, Color col_a, Color col_b, float intensity) {
+    if (!img || !verts || count < 2) return;
+
+    auto get = [&](int idx) {
+        if (idx < 0) idx = 0;
+        if (idx >= count) idx = count - 1;
+        return std::pair<float,float>(verts[2*idx+0], verts[2*idx+1]);
+    };
+    auto catmull = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float x = 0.5f * ((2.0f * p1.first) + (-p0.first + p2.first) * t + (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t2 + (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t3);
+        float y = 0.5f * ((2.0f * p1.second) + (-p0.second + p2.second) * t + (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t2 + (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t3);
+        return std::pair<float,float>(x,y);
+    };
+    auto catmull_deriv = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float dx = 0.5f * ((-p0.first + p2.first) + 2.0f * (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t + 3.0f * (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t2);
+        float dy = 0.5f * ((-p0.second + p2.second) + 2.0f * (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t + 3.0f * (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t2);
+        return std::pair<float,float>(dx, dy);
+    };
+
+    std::vector<std::pair<float,float>> samples;
+    std::vector<std::pair<float,float>> tangents;
+    samples.reserve((count - 1) * 8);
+    tangents.reserve((count - 1) * 8);
+    for (int i = 0; i < count - 1; ++i) {
+        auto p1 = get(i);
+        auto p2 = get(i+1);
+        float dx = p2.first - p1.first;
+        float dy = p2.second - p1.second;
+        float seglen = std::sqrt(dx*dx + dy*dy);
+        float preferred_spacing = std::max(1.0f, float(jacket_px) * 0.6f);
+        int n = std::max(2, static_cast<int>(std::ceil(seglen / preferred_spacing)));
+        int s_start = (i == 0) ? 0 : 1; // avoid duplicate samples at segment boundaries
+        for (int s = s_start; s <= n; ++s) {
+            float t = float(s) / float(n);
+            auto p = catmull(i, t);
+            auto d = catmull_deriv(i, t);
+            samples.emplace_back(p.first, p.second);
+            tangents.emplace_back(d.first, d.second);
+        }
+    }
+    if (samples.empty()) return;
+
+    auto lerp_color = [&](const Color &a, const Color &b, float t) {
+        float tt = std::clamp(t, 0.0f, 1.0f);
+        Color out;
+        out.r = static_cast<uint8_t>(std::lround(float(a.r) * (1.0f - tt) + float(b.r) * tt));
+        out.g = static_cast<uint8_t>(std::lround(float(a.g) * (1.0f - tt) + float(b.g) * tt));
+        out.b = static_cast<uint8_t>(std::lround(float(a.b) * (1.0f - tt) + float(b.b) * tt));
+        out.a = static_cast<uint8_t>(std::lround(float(a.a) * (1.0f - tt) + float(b.a) * tt));
+        return out;
+    };
+
+    int eff_jacket = std::max(1, jacket_px - 1);
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        float u = float(i) / float(std::max<size_t>(1, samples.size() - 1));
+        Color jacket_col = lerp_color(col_a, col_b, u);
+        auto &a = samples[i];
+        auto &b = samples[i+1];
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, eff_jacket, jacket_col, 1.0f, intensity);
+    }
+
+    int core_r = std::max(1, jacket_px - jacket_border - 0);
+    uint8_t core_alpha = static_cast<uint8_t>(std::lround(255.0f * std::clamp(intensity, 0.0f, 1.0f) * 0.18f));
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        float u = float(i) / float(std::max<size_t>(1, samples.size() - 1));
+        Color core_col = lerp_color(col_a, col_b, u);
+        core_col.a = core_alpha;
+        auto &a = samples[i];
+        auto &b = samples[i+1];
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, core_r, core_col, 1.0f, intensity);
+    }
+}
+
+static void draw_rope_curve_blend_rgb_falloff(uint8_t* img, int w, int h, int pitch, const float* verts, int count,
+    int jacket_px, int jacket_border, Color col_a, Color col_b, float glow_a, float glow_b, float decay) {
+    if (!img || !verts || count < 2) return;
+
+    auto get = [&](int idx) {
+        if (idx < 0) idx = 0;
+        if (idx >= count) idx = count - 1;
+        return std::pair<float,float>(verts[2*idx+0], verts[2*idx+1]);
+    };
+    auto catmull = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float x = 0.5f * ((2.0f * p1.first) + (-p0.first + p2.first) * t + (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t2 + (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t3);
+        float y = 0.5f * ((2.0f * p1.second) + (-p0.second + p2.second) * t + (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t2 + (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t3);
+        return std::pair<float,float>(x,y);
+    };
+    auto catmull_deriv = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float dx = 0.5f * ((-p0.first + p2.first) + 2.0f * (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t + 3.0f * (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t2);
+        float dy = 0.5f * ((-p0.second + p2.second) + 2.0f * (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t + 3.0f * (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t2);
+        return std::pair<float,float>(dx, dy);
+    };
+
+    std::vector<std::pair<float,float>> samples;
+    std::vector<std::pair<float,float>> tangents;
+    samples.reserve((count - 1) * 8);
+    tangents.reserve((count - 1) * 8);
+    for (int i = 0; i < count - 1; ++i) {
+        auto p1 = get(i);
+        auto p2 = get(i+1);
+        float dx = p2.first - p1.first;
+        float dy = p2.second - p1.second;
+        float seglen = std::sqrt(dx*dx + dy*dy);
+        float preferred_spacing = std::max(1.0f, float(jacket_px) * 0.6f);
+        int n = std::max(2, static_cast<int>(std::ceil(seglen / preferred_spacing)));
+        int s_start = (i == 0) ? 0 : 1; // avoid duplicate samples at segment boundaries
+        for (int s = s_start; s <= n; ++s) {
+            float t = float(s) / float(n);
+            auto p = catmull(i, t);
+            auto d = catmull_deriv(i, t);
+            samples.emplace_back(p.first, p.second);
+            tangents.emplace_back(d.first, d.second);
+        }
+    }
+    if (samples.empty()) return;
+
+    auto mix = [&](const Color &a, const Color &b, float t) {
+        float tt = std::clamp(t, 0.0f, 1.0f);
+        Color out;
+        out.r = static_cast<uint8_t>(std::lround(float(a.r) * (1.0f - tt) + float(b.r) * tt));
+        out.g = static_cast<uint8_t>(std::lround(float(a.g) * (1.0f - tt) + float(b.g) * tt));
+        out.b = static_cast<uint8_t>(std::lround(float(a.b) * (1.0f - tt) + float(b.b) * tt));
+        out.a = static_cast<uint8_t>(std::lround(float(a.a) * (1.0f - tt) + float(b.a) * tt));
+        return out;
+    };
+
+    int eff_jacket = std::max(1, jacket_px - 1);
+    int core_r = std::max(1, jacket_px - jacket_border - 0);
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        float u = float(i) / float(std::max<size_t>(1, samples.size() - 1));
+        float ia = glow_a * std::exp(-decay * u);
+        float ib = glow_b * std::exp(-decay * (1.0f - u));
+        float total = (ia + ib) * 1.6f;
+        if (total <= 1e-4f) continue;
+        float t = (total > 0.0f) ? (ib / total) : 0.0f;
+        Color lit = mix(col_a, col_b, t);
+        float tint = std::clamp(total, 0.0f, 1.0f);
+
+        Color jacket_col = lit;
+        jacket_col.a = 26;
+        auto &a = samples[i];
+        auto &b = samples[i+1];
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, eff_jacket, jacket_col, tint, tint);
+
+        Color core_col = lit;
+        core_col.a = static_cast<uint8_t>(std::lround(255.0f * 0.35f * tint));
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, core_r, core_col, 1.0f, tint);
+    }
+}
+
+static void draw_segment_kernel_glow(uint8_t* img, int w, int h, int pitch,
+    float x1, float y1, float x2, float y2, float radius, Color c, float alpha_scale = 1.0f) {
+    if (!img || radius <= 0.0f) return;
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float len2 = dx * dx + dy * dy;
+    float r = radius;
+    float rplus = r + 2.0f;
+    int minx = static_cast<int>(std::floor(std::min(x1, x2) - rplus));
+    int maxx = static_cast<int>(std::ceil(std::max(x1, x2) + rplus));
+    int miny = static_cast<int>(std::floor(std::min(y1, y2) - rplus));
+    int maxy = static_cast<int>(std::ceil(std::max(y1, y2) + rplus));
+    minx = std::max(minx, 0);
+    miny = std::max(miny, 0);
+    maxx = std::min(maxx, w - 1);
+    maxy = std::min(maxy, h - 1);
+
+    float sigma = r * 0.5f;
+    float inv2sig2 = 1.0f / (2.0f * sigma * sigma);
+    for (int y = miny; y <= maxy; ++y) {
+        for (int x = minx; x <= maxx; ++x) {
+            float t = 0.0f;
+            if (len2 > 1e-6f) {
+                float vx = float(x) - x1;
+                float vy = float(y) - y1;
+                float proj = (vx * dx + vy * dy) / len2;
+                t = std::clamp(proj, 0.0f, 1.0f);
+            }
+            float cxp = x1 + dx * t;
+            float cyp = y1 + dy * t;
+            float lx = float(x) - cxp;
+            float ly = float(y) - cyp;
+            float dist2 = lx * lx + ly * ly;
+            if (dist2 > r * r) continue;
+            float gauss = std::exp(-dist2 * inv2sig2);
+            uint8_t sa = static_cast<uint8_t>(std::lround(float(c.a) * gauss * alpha_scale));
+            if (sa == 0) continue;
+            uint8_t* dst = img + y * pitch + x * 4;
+            blend_pixel(dst, c.r, c.g, c.b, sa);
+        }
+    }
+}
+
 static void draw_glow_blob(uint8_t* img, int w, int h, int pitch, int cx, int cy, int radius, float strength01, Color c) {
     if (!img) return;
     float s = std::max(0.0f, std::min(1.0f, strength01));
@@ -1269,9 +1660,9 @@ static void draw_cable_blend(uint8_t* img, int w, int h, int pitch, int ax, int 
     const float min_vis = 0.18f;
     float vis = std::max(min_vis, rv);
     core.a = static_cast<uint8_t>(std::lround(core.a * vis));
-    // jacket color (almost black)
-    Color jacket{10,10,10,220};
-    Color jacket_edge{40,40,40,160};
+    // jacket color: use faint neutral grey to avoid dark edges
+    Color jacket{200,200,200,13};
+    Color jacket_edge{200,200,200,20};
     // choose samples so blob spacing is <= ~0.6 * jacket_px to avoid visible gaps
     int min_seg_for_spacing = 1;
     if (jacket_px > 0) min_seg_for_spacing = static_cast<int>(std::ceil(dist / (std::max(1.0f, float(jacket_px) * 0.6f))));
@@ -1283,25 +1674,29 @@ static void draw_cable_blend(uint8_t* img, int w, int h, int pitch, int ax, int 
         float py = float(ay) + dy * t + sag * std::sin(3.14159265f * t);
         int ipx = static_cast<int>(std::lround(px));
         int ipy = static_cast<int>(std::lround(py));
-        // outer jacket blob (solid-ish)
-        draw_blob_blend(img, w, h, pitch, ipx, ipy, jacket_px, jacket);
-        // thin jacket edge to give depth
-        draw_blob_blend(img, w, h, pitch, ipx, ipy, std::max(1, jacket_px - 1), jacket_edge);
-        // core
-        int core_r = std::max(1, jacket_px - jacket_border);
-        Color corec = core;
-        // slightly boosted alpha near center
-        corec.a = static_cast<uint8_t>(std::lround(corec.a * 1.0f));
-        draw_blob_blend(img, w, h, pitch, ipx, ipy, core_r, corec);
+        // smear segment from previous sample to this sample (avoids per-sample caps)
+        if (si > 0) {
+            float px0 = float(ax) + dx * float(si - 1) / float(use_segments);
+            float py0 = float(ay) + dy * float(si - 1) / float(use_segments) + sag * std::sin(3.14159265f * (float(si - 1) / float(use_segments)));
+            // outer jacket smear
+            draw_segment_smear(img, w, h, pitch, px0, py0, px, py, jacket_px, jacket);
+            // thin jacket edge smear
+            draw_segment_smear(img, w, h, pitch, px0, py0, px, py, std::max(1, jacket_px - 1), jacket_edge);
+            // core smear
+            int core_r = std::max(1, jacket_px - jacket_border);
+            Color corec = core;
+            corec.a = static_cast<uint8_t>(std::lround(corec.a * 1.0f));
+            draw_segment_smear(img, w, h, pitch, px0, py0, px, py, core_r, corec);
+        }
     }
-    // end plugs: black outer circles
-    draw_circle(img, w, h, pitch, ax, ay, jacket_px, Color{0,0,0,255});
-    draw_circle(img, w, h, pitch, bx, by, jacket_px, Color{0,0,0,255});
-    // inner core caps
+    // end plugs: blended caps so endpoints remain joined to smears
+    draw_blob_blend(img, w, h, pitch, ax, ay, jacket_px, Color{200,200,200,13});
+    draw_blob_blend(img, w, h, pitch, bx, by, jacket_px, Color{200,200,200,13});
+    // inner core caps (blended)
     Color corecap = core_col;
-    corecap.a = static_cast<uint8_t>(std::lround(corecap.a * 1.0f));
-    draw_circle(img, w, h, pitch, ax, ay, std::max(1, jacket_px - jacket_border), corecap);
-    draw_circle(img, w, h, pitch, bx, by, std::max(1, jacket_px - jacket_border), corecap);
+    corecap.a = static_cast<uint8_t>(std::lround(corecap.a * 0.2f));
+    draw_blob_blend(img, w, h, pitch, ax, ay, std::max(1, jacket_px - jacket_border), corecap);
+    draw_blob_blend(img, w, h, pitch, bx, by, std::max(1, jacket_px - jacket_border), corecap);
 }
 
 // Helper: draw a blended thick segment with optional alpha scale.
@@ -1413,9 +1808,11 @@ static void build_rope_samples_with_depth(const float* verts2d, const float* dep
         float dx = p2.first - p1.first;
         float dy = p2.second - p1.second;
         float seglen = std::sqrt(dx*dx + dy*dy);
+        // sample spacing: ~0.6*jacket_px to avoid visible gaps while following spline
         float preferred_spacing = std::max(1.0f, float(jacket_px) * 0.6f);
         int n = std::max(2, static_cast<int>(std::ceil(seglen / preferred_spacing)));
-        for (int s = 0; s <= n; ++s) {
+        int s_start = (i == 0) ? 0 : 1; // avoid duplicate samples at segment boundaries
+        for (int s = s_start; s <= n; ++s) {
             float t = float(s) / float(n);
             auto [sx, sy, sz] = catmull(i, t);
             samples.emplace_back(sx, sy);
@@ -1482,8 +1879,8 @@ static float draw_rope_diffused_glow(
         return start_is_front ? d : (total_len - d);
     };
 
-    // modest diffusion so the glow doesn't steal focus
-    const float decay = 1.35f;
+    // modest diffusion: lower decay spreads glow more along cable
+    const float decay = 0.65f;
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         float da = dist_from_start(i);
         float db = dist_from_start(i + 1);
@@ -1493,7 +1890,7 @@ static float draw_rope_diffused_glow(
         float depth_scale = 0.5f * (depth_scale_at(i) + depth_scale_at(i + 1));
         float alpha_scale = gain * clamped_glow * atten * depth_scale;
         if (img && alpha_scale > 0.0f) {
-            draw_segment_blend(img, w, h, pitch, samples[i].first, samples[i].second, samples[i+1].first, samples[i+1].second, radius, glow_col, alpha_scale);
+            draw_segment_kernel_glow(img, w, h, pitch, samples[i].first, samples[i].second, samples[i+1].first, samples[i+1].second, float(radius), glow_col, alpha_scale);
         }
     }
 
@@ -1529,9 +1926,25 @@ static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const f
         return std::pair<float,float>(x,y);
     };
 
+    auto catmull_deriv = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float dx = 0.5f * ((-p0.first + p2.first) + 2.0f * (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t + 3.0f * (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t2);
+        float dy = 0.5f * ((-p0.second + p2.second) + 2.0f * (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t + 3.0f * (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t2);
+        return std::pair<float,float>(dx, dy);
+    };
+
+    // analytic Catmull-Rom derivative (tangent) for parametric cross-sections
+    
+
     // Build dense samples along the spline then rasterize as thick blended segments
     std::vector<std::pair<float,float>> samples;
+    std::vector<std::pair<float,float>> tangents;
     samples.reserve((count - 1) * 8);
+    tangents.reserve((count - 1) * 8);
     for (int i = 0; i < count - 1; ++i) {
         // estimate chord length for this segment (p1-p2)
         auto p1 = get(i);
@@ -1539,46 +1952,46 @@ static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const f
         float dx = p2.first - p1.first;
         float dy = p2.second - p1.second;
         float seglen = std::sqrt(dx*dx + dy*dy);
-        // sample spacing: ~0.6*jacket_px to ensure overlap
+        // sample spacing: ~0.6*jacket_px to avoid visible gaps while following spline
         float preferred_spacing = std::max(1.0f, float(jacket_px) * 0.6f);
         int n = std::max(2, static_cast<int>(std::ceil(seglen / preferred_spacing)));
-        for (int s = 0; s <= n; ++s) {
+        int s_start = (i == 0) ? 0 : 1; // avoid duplicate samples at segment boundaries
+        for (int s = s_start; s <= n; ++s) {
             float t = float(s) / float(n);
             auto p = catmull(i, t);
+            auto d = catmull_deriv(i, t);
             samples.emplace_back(p.first, p.second);
+            tangents.emplace_back(d.first, d.second);
         }
     }
 
     if (samples.empty()) return;
 
-    // draw black backing rims then an inner core cap so rope drawn afterwards overwrites interior
-    auto start = samples.front();
-    auto end = samples.back();
-    int rim_r = jacket_px + 2; // slightly larger rim
-    draw_blob_blend(img, w, h, pitch, static_cast<int>(std::lround(start.first)), static_cast<int>(std::lround(start.second)), rim_r, Color{0,0,0,255});
-    draw_blob_blend(img, w, h, pitch, static_cast<int>(std::lround(end.first)), static_cast<int>(std::lround(end.second)), rim_r, Color{0,0,0,255});
-    // inner core cap (rope color) to sit inside rim
-    int core_r_cap = std::max(1, jacket_px - jacket_border);
-    Color corecap = core_col;
-    corecap.a = static_cast<uint8_t>(std::lround(corecap.a));
-    draw_blob_blend(img, w, h, pitch, static_cast<int>(std::lround(start.first)), static_cast<int>(std::lround(start.second)), core_r_cap, corecap);
-    draw_blob_blend(img, w, h, pitch, static_cast<int>(std::lround(end.first)), static_cast<int>(std::lround(end.second)), core_r_cap, corecap);
+    // endpoint caps removed to avoid double-painted ends
 
-    // draw jacket (slightly slimmer to reduce chunkiness)
+    // draw jacket (slimmer and translucent so background shows through)
     int eff_jacket = std::max(1, jacket_px - 1);
-    Color jacket_col = Color{200,200,200, static_cast<uint8_t>(std::lround(180.0f))};
+    // use neutral grey jacket as requested
+    Color jacket_col = Color{200,200,200, static_cast<uint8_t>(13)};
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         auto &a = samples[i];
         auto &b = samples[i+1];
-        draw_segment_blend(img, w, h, pitch, a.first, a.second, b.first, b.second, eff_jacket, jacket_col);
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, eff_jacket, jacket_col, 1.0f);
     }
 
-    // draw core (thinner, translucent core_col)
+    // draw core (thinner, faint tinted core so cable looks clear)
     int core_r = std::max(1, jacket_px - jacket_border - 0);
+    Color corec = core_col;
+    // make inner core nearly clear so the tube appears transparent/tinted (≈5%)
+    corec.a = static_cast<uint8_t>(std::lround(float(corec.a) * 0.05f));
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         auto &a = samples[i];
         auto &b = samples[i+1];
-        draw_segment_blend(img, w, h, pitch, a.first, a.second, b.first, b.second, core_r, core_col);
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, core_r, corec, 1.0f);
     }
 }
 
@@ -1601,6 +2014,23 @@ static inline Color hsv_to_color(float h, float s, float v, uint8_t a=255) {
         case 5: r = v; g = p; b = q; break;
     }
     return Color{ static_cast<uint8_t>(std::lround(r * 255.0f)), static_cast<uint8_t>(std::lround(g * 255.0f)), static_cast<uint8_t>(std::lround(b * 255.0f)), a };
+}
+
+// Convert RGB Color to hue in [0..1]
+static inline float rgb_to_hue(const Color &c) {
+    float r = c.r / 255.0f;
+    float g = c.g / 255.0f;
+    float b = c.b / 255.0f;
+    float mx = std::max(r, std::max(g, b));
+    float mn = std::min(r, std::min(g, b));
+    float d = mx - mn;
+    if (d <= 1e-6f) return 0.0f;
+    float h = 0.0f;
+    if (mx == r) h = (g - b) / d + (g < b ? 6.0f : 0.0f);
+    else if (mx == g) h = (b - r) / d + 2.0f;
+    else h = (r - g) / d + 4.0f;
+    h /= 6.0f;
+    return h - std::floor(h);
 }
 
 static inline Color lerp_color(Color a, Color b, float t) {
@@ -1644,36 +2074,57 @@ static void draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch,
         return std::pair<float,float>(x,y);
     };
 
+    // analytic Catmull-Rom derivative (tension 0.5)
+    auto catmull_deriv = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float dx = 0.5f * ((-p0.first + p2.first) + 2.0f * (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t + 3.0f * (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t2);
+        float dy = 0.5f * ((-p0.second + p2.second) + 2.0f * (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t + 3.0f * (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t2);
+        return std::pair<float,float>(dx, dy);
+    };
+
     std::vector<std::pair<float,float>> samples;
+    std::vector<std::pair<float,float>> tangents;
     samples.reserve((count - 1) * 8);
+    tangents.reserve((count - 1) * 8);
     for (int i = 0; i < count - 1; ++i) {
         auto p1 = get(i);
         auto p2 = get(i+1);
         float dx = p2.first - p1.first;
         float dy = p2.second - p1.second;
         float seglen = std::sqrt(dx*dx + dy*dy);
+        // build hue samples spacing: ~0.6*jacket_px to align hue samples with visual samples
         float preferred_spacing = std::max(1.0f, float(jacket_px) * 0.6f);
         int n = std::max(2, static_cast<int>(std::ceil(seglen / preferred_spacing)));
         for (int s = 0; s <= n; ++s) {
             float t = float(s) / float(n);
             auto p = catmull(i, t);
+            auto d = catmull_deriv(i, t);
             samples.emplace_back(p.first, p.second);
+            tangents.emplace_back(d.first, d.second);
         }
     }
     if (samples.empty()) return;
 
-    // build hue samples aligned with `samples` by interpolating provided `hues` across verts
+    // build hue samples aligned with `samples` by interpolating provided `hues` across the rope
     std::vector<float> hue_samples;
     hue_samples.reserve(samples.size());
     for (size_t si = 0; si < samples.size(); ++si) {
         float u = float(si) / float(std::max<size_t>(1, samples.size() - 1));
-        float v = u * float(std::max(1, count - 1));
+        if (hue_count <= 1) {
+            hue_samples.push_back(hues[0]);
+            continue;
+        }
+        float v = u * float(hue_count - 1);
         int idx = static_cast<int>(std::floor(v));
+        idx = std::clamp(idx, 0, hue_count - 2);
         float ft = v - float(idx);
-        float h0 = hues[std::min(idx, hue_count-1) % hue_count];
-        float h1 = hues[std::min(idx+1, hue_count-1) % hue_count];
-        float hh = h0 * (1.0f - ft) + h1 * ft;
-        hue_samples.push_back(hh);
+        float h0 = hues[idx];
+        float h1 = hues[idx + 1];
+        hue_samples.push_back(h0 * (1.0f - ft) + h1 * ft);
     }
 
     // helper to draw segments (reuse draw_segment_blend lambda from earlier by reimplementing minimal inline)
@@ -1718,21 +2169,31 @@ static void draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch,
         }
     };
 
-    // Draw neutral jacket first
+    // Draw jacket first (grey base tinted by LED hue via tint_strength)
     int eff_jacket = std::max(1, jacket_px - 1);
-    Color jacket_col = Color{200,200,200, static_cast<uint8_t>(std::lround(180.0f))};
+    uint8_t jacket_alpha = static_cast<uint8_t>(13);
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        float hue_mid = 0.5f * (hue_samples[i] + hue_samples[i+1]);
+        Color jacket_hue = hsv_to_color(hue_mid, 1.0f, 1.0f, jacket_alpha);
         auto &a = samples[i];
         auto &b = samples[i+1];
-        draw_segment_blend_local(a.first, a.second, b.first, b.second, eff_jacket, jacket_col);
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, eff_jacket, jacket_hue, 1.0f, hue_intensity);
     }
 
-    // Draw colored core using hue_samples
+    // Draw colored core using hue_samples but keep core faint so cable looks clear
     int core_r = std::max(1, jacket_px - jacket_border - 0);
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
-        float hue = hue_samples[i];
-        Color hc = hsv_to_color(hue, 1.0f, 1.0f, static_cast<uint8_t>(std::lround(255.0f * std::clamp(hue_intensity, 0.0f, 1.0f))));
-        draw_segment_blend_local(samples[i].first, samples[i].second, samples[i+1].first, samples[i+1].second, core_r, hc);
+        float hue_mid = 0.5f * (hue_samples[i] + hue_samples[i+1]);
+        // keep colored core very faint so the rope interior remains mostly clear (≈5%)
+        uint8_t alpha = static_cast<uint8_t>(std::lround(255.0f * std::clamp(hue_intensity, 0.0f, 1.0f) * 0.18f));
+        Color hc = hsv_to_color(hue_mid, 1.0f, 1.0f, alpha);
+        auto &a = samples[i];
+        auto &b = samples[i+1];
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, core_r, hc, 1.0f, hue_intensity);
     }
     // note: endpoint rims already drawn by caller if desired
 }
@@ -1805,10 +2266,61 @@ int32_t gp_table_set_rows(GP_TableContext* ctx, const GP_TableRow* rows, int32_t
     return 1;
 }
 
+int32_t gp_table_apply_object_def(GP_TableContext* ctx, const GP_TableObjectDef* def) {
+    if (!ctx || !def) return 0;
+    if (!gp_table_set_columns(ctx, def->cols, def->col_count)) return 0;
+    if (!gp_table_set_rows(ctx, def->rows, def->row_count)) return 0;
+    if (!gp_table_set_actions(ctx, def->actions, def->action_count)) return 0;
+    return 1;
+}
+
 int32_t gp_table_get_geom(const GP_TableContext* ctx, GP_TableGeom* out_geom) {
     if (!ctx || !out_geom) return 0;
     *out_geom = ctx->geom;
     return 1;
+}
+
+static bool action_matches(const GP_TableAction& action, const GP_TableHitBox& hb) {
+    if (action.row_idx != GP_TABLE_ACTION_ANY && action.row_idx != hb.row_idx) return false;
+    if (action.col_idx != GP_TABLE_ACTION_ANY && action.col_idx != hb.col_idx) return false;
+    if (action.part != GP_TABLE_ACTION_ANY && action.part != hb.part) return false;
+    if (action.aux0 != GP_TABLE_ACTION_ANY && action.aux0 != hb.aux0) return false;
+    return true;
+}
+
+static bool dispatch_action_list(GP_TableContext* ctx, const GP_TableHitBox& hb, const GP_TableAction* actions, int count) {
+    if (!ctx || !ctx->action_callback || !actions || count <= 0) return false;
+    bool matched = false;
+    for (int i = 0; i < count; ++i) {
+        if (action_matches(actions[i], hb)) {
+            ctx->action_callback(ctx->action_user, actions[i].action_id, &hb);
+            matched = true;
+        }
+    }
+    return matched;
+}
+
+static void dispatch_actions(GP_TableContext* ctx, const GP_TableHitBox& hb) {
+    if (!ctx || !ctx->action_callback) return;
+    if (!ctx->actions.empty()) {
+        dispatch_action_list(ctx, hb, ctx->actions.data(), static_cast<int>(ctx->actions.size()));
+        return;
+    }
+    static const GP_TableAction kDefaultActions[] = {
+        { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_EXPAND, GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_EXPAND_TOGGLE },
+        { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_SCROLL_UP, GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_SCROLL_UP },
+        { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_SCROLL_DOWN, GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_SCROLL_DOWN },
+        { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED, GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_LED_TOGGLE },
+        { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_ARG, GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_LED_TOGGLE },
+        { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_TABLE, GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_LED_TOGGLE }
+    };
+    dispatch_action_list(ctx, hb, kDefaultActions, static_cast<int>(sizeof(kDefaultActions) / sizeof(kDefaultActions[0])));
+}
+
+int32_t gp_table_dispatch_hit(GP_TableContext* ctx, const GP_TableHitBox* hit) {
+    if (!ctx || !hit) return 0;
+    if (ctx->actions.empty()) return 0;
+    return dispatch_action_list(ctx, *hit, ctx->actions.data(), static_cast<int>(ctx->actions.size())) ? 1 : 0;
 }
 
 int32_t gp_table_on_click(GP_TableContext* ctx, int32_t x, int32_t y, GP_TableHitBox* out_hit) {
@@ -1832,6 +2344,7 @@ int32_t gp_table_on_click(GP_TableContext* ctx, int32_t x, int32_t y, GP_TableHi
         if (x >= hb.x0 && x < hb.x1 && y >= hb.y0 && y < hb.y1) {
             // process default actions
             if (out_hit) *out_hit = hb;
+            dispatch_actions(ctx, hb);
             // expand toggle
             if (hb.part == GP_TABLE_HIT_EXPAND && hb.row_idx >= 0 && hb.row_idx < static_cast<int>(ctx->rows.size())) {
                 ctx->rows[hb.row_idx].expanded = ctx->rows[hb.row_idx].expanded ? 0 : 1;
@@ -2435,6 +2948,51 @@ int32_t gp_table_clear_led_glow(GP_TableContext* ctx) {
     return 1;
 }
 
+int32_t gp_table_get_led_info(const GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index,
+    int32_t* out_on, int32_t* out_active, int32_t* out_is_input, int32_t* out_is_output) {
+    if (!ctx) return 0;
+    if (row_idx < 0 || row_idx >= static_cast<int32_t>(ctx->rows.size())) return 0;
+    const GP_TableRow &row = ctx->rows[static_cast<size_t>(row_idx)];
+    if (col_idx < 0 || col_idx >= row.cell_count) return 0;
+    const GP_TableCell &cell = row.cells[col_idx];
+    if (cell.kind != GP_TABLE_CELL_LEDS && cell.kind != GP_TABLE_CELL_LEDS_ARG && cell.kind != GP_TABLE_CELL_LEDS_TABLE) return 0;
+    int led_count = 9;
+    uint32_t on_mask = cell.flags;
+    uint32_t active_mask = cell.flags;
+    if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
+        int count = std::max(0, std::min(32, static_cast<int>(cell.value)));
+        if (count == 0) count = (cell.flags & 0xFF);
+        if (count == 0) count = 12;
+        led_count = count;
+        on_mask = cell.flags;
+        active_mask = static_cast<uint32_t>(cell.reserved0);
+        if (active_mask == 0 && count > 0) active_mask = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+    } else if (cell.kind == GP_TABLE_CELL_LEDS_TABLE) {
+        led_count = 8;
+    }
+    if (led_index < 0 || led_index >= led_count) return 0;
+
+    uint32_t bit = 1u << static_cast<uint32_t>(led_index);
+    if (out_on) *out_on = (on_mask & bit) != 0;
+    if (out_active) *out_active = (active_mask & bit) != 0;
+
+    if (out_is_input || out_is_output) {
+        uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) << 32)
+            | (static_cast<uint64_t>(static_cast<uint32_t>(col_idx)) << 16)
+            | static_cast<uint64_t>(static_cast<uint32_t>(led_index));
+        if (out_is_input) *out_is_input = ctx->key_is_input.count(key) != 0;
+        if (out_is_output) *out_is_output = ctx->key_is_output.count(key) != 0;
+    }
+
+    return 1;
+}
+
+int32_t gp_table_get_style(const GP_TableContext* ctx, GP_TableStyle* out_style) {
+    if (!ctx || !out_style) return 0;
+    *out_style = ctx->style_raw;
+    return 1;
+}
+
 int32_t gp_table_render_rgba_with_hits(
     GP_TableContext* ctx,
     uint8_t* out_rgba,
@@ -2715,15 +3273,16 @@ int32_t gp_table_render_rgba_with_state(
     };
 
     auto compute_led_glow = [&](const LedContactInfo& info, uint64_t key) -> float {
+        bool lit = info.on || info.active;
         float glow = 0.0f;
         auto it = ctx->led_glow_strength.find(key);
         if (it != ctx->led_glow_strength.end()) glow = std::max(glow, std::clamp(it->second, 0.0f, 1.0f));
-        if (glow <= 0.0f && info.is_output && info.on) {
+        if (glow <= 0.0f && info.is_output && lit) {
             glow = 0.35f;
         }
-        if (!info.on) glow *= 0.3f;
+        if (!lit) glow *= 0.3f;
         if (info.is_input) glow *= 0.35f;
-        if (info.is_output && info.on) glow = std::min(1.0f, glow * 1.25f + 0.15f);
+        if (info.is_output && lit) glow = std::min(1.0f, glow * 1.25f + 0.15f);
         return glow;
     };
 
@@ -2841,27 +3400,31 @@ int32_t gp_table_render_rgba_with_state(
                                 float min_z = 0.0f, max_z = 0.0f;
                                 project_rope_vertices_ortho(verts3.data(), got, ctx->st.cable_tilt_x, ctx->st.cable_tilt_y, proj_xy, proj_z, min_z, max_z);
 
-                                Color pcol{180, 255, 180, 220};
-                                float tint = (sel_info.is_output ? sel_glow : 0.0f);
-                                if (tint > 0.0f) {
-                                    pcol = lerp_color(pcol, ctx->st.led_on, std::min(1.0f, tint));
-                                }
+                                // choose colored or neutral rope draw depending on selected LED output
                                 int samples_per_segment = std::max(2, ctx->st.cable_segments / std::max(1, got - 1));
-                                draw_rope_curve_blend(out_rgba, p_w, p_h, p_pitch, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, pcol, samples_per_segment);
+                                if (sel_info.is_output && sel_glow > 0.0f) {
+                                    float hue = rgb_to_hue(ctx->st.led_on);
+                                    std::vector<float> hues_local = { hue };
+                                    draw_rope_curve_blend_colored(out_rgba, p_w, p_h, p_pitch, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, hues_local.data(), static_cast<int>(hues_local.size()), samples_per_segment, sel_glow);
+                                } else {
+                                    Color pcol{200,200,200, static_cast<uint8_t>(std::lround(180.0f))};
+                                    draw_rope_curve_blend(out_rgba, p_w, p_h, p_pitch, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, pcol, samples_per_segment);
+                                }
 
                                 std::vector<std::pair<float,float>> fiber_samples;
                                 std::vector<float> depth_samples;
                                 build_rope_samples_with_depth(proj_xy.data(), proj_z.data(), got, ctx->st.cable_jacket_px, fiber_samples, &depth_samples);
                                 if (!fiber_samples.empty()) {
                                     int fiber_r = std::max(1, static_cast<int>(std::lround(float(ctx->st.cable_jacket_px) * ctx->st.cable_fiber_radius_scale)));
-                                    Color fiber_col = ctx->st.led_on;
-                                    fiber_col.a = static_cast<uint8_t>(std::lround(220.0f));
-                                    draw_rope_fiber_overlay(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, fiber_r, fiber_col, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain, min_z, max_z);
+                                    // fiber pass removed: jacket/core will be tinted directly by SDF
+                                        // edge sliver drawing removed — rely on parametric SDF jacket/core and glow
                                     if (sel_info.is_output && sel_glow > 0.0f) {
                                         Color glow_col = ctx->st.led_on;
-                                        glow_col.a = static_cast<uint8_t>(std::lround(float(glow_col.a) * 0.7f));
+                                        // moderate glow source alpha so tube remains translucent
+                                        glow_col.a = static_cast<uint8_t>(std::lround(float(glow_col.a) * 0.85f));
                                         int glow_r = fiber_r;
-                                        draw_rope_diffused_glow(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, true, sel_glow, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain * 0.5f, glow_col, min_z, max_z, glow_r);
+                                        // increase multiplier so more of the source glow transmits
+                                        draw_rope_diffused_glow(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, true, sel_glow, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain * 0.8f, glow_col, min_z, max_z, glow_r);
                                     }
                                 }
                             }
@@ -2950,7 +3513,10 @@ int32_t gp_table_render_rgba_with_state(
             if (info_b.is_output) tint_glow = std::max(tint_glow, glow_b_eff);
             if (tint_glow <= 0.0f) tint_glow = std::max(glow_a_eff, glow_b_eff) * 0.5f;
             if (tint_glow > 0.0f) {
-                col = lerp_color(edge_col, ctx->st.led_on, std::min(1.0f, tint_glow));
+                // keep neutral color; increase alpha slightly for visibility when glow present
+                float boost = std::min(1.0f, tint_glow);
+                int extra = static_cast<int>(std::lround((255 - col.a) * boost * 0.45f));
+                col.a = static_cast<uint8_t>(std::min(255, static_cast<int>(col.a) + extra));
             }
             col.a = static_cast<uint8_t>(std::min<int>(255, static_cast<int>(col.a * ev)));
             int rope_idx = ctx->rope_sim_idx[ei];
@@ -2964,39 +3530,60 @@ int32_t gp_table_render_rgba_with_state(
             std::vector<float> proj_z;
             float min_z = 0.0f, max_z = 0.0f;
             project_rope_vertices_ortho(verts3.data(), got, ctx->st.cable_tilt_x, ctx->st.cable_tilt_y, proj_xy, proj_z, min_z, max_z);
-            // draw smooth spline curve along simulator vertices
+            // draw smooth spline curve along simulator vertices; overlay LED light falloff
             int samples_per_segment = std::max(2, ctx->st.cable_segments / std::max(1, got - 1));
+            float dominant_glow = std::max(glow_a_eff, glow_b_eff);
             draw_rope_curve_blend(out_rgba, w_local, h_local, pitch_local, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, col, samples_per_segment);
+            if (dominant_glow > 0.0f) {
+                bool lit_a = info_a.on || info_a.active;
+                bool lit_b = info_b.on || info_b.active;
+                Color led_a = lit_a ? ctx->st.led_on : ctx->st.led_off;
+                Color led_b = lit_b ? ctx->st.led_on : ctx->st.led_off;
+                float decay = 2.0f;
+                draw_rope_curve_blend_rgb_falloff(out_rgba, w_local, h_local, pitch_local, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, led_a, led_b, glow_a_eff, glow_b_eff, decay);
+            }
 
             // Fiber-optic overlay using LED on color as tint, masked by rope texture.
             std::vector<std::pair<float,float>> fiber_samples;
             std::vector<float> depth_samples;
             build_rope_samples_with_depth(proj_xy.data(), proj_z.data(), got, ctx->st.cable_jacket_px, fiber_samples, &depth_samples);
-            if (!fiber_samples.empty()) {
-                int fiber_r = std::max(1, static_cast<int>(std::lround(float(ctx->st.cable_jacket_px) * ctx->st.cable_fiber_radius_scale)));
-                Color fiber_col = ctx->st.led_on;
-                fiber_col.a = static_cast<uint8_t>(std::lround(float(fiber_col.a) * ev));
-                draw_rope_fiber_overlay(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, fiber_r, fiber_col, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain, min_z, max_z);
-                Color glow_col = ctx->st.led_on;
-                glow_col.a = static_cast<uint8_t>(std::lround(float(glow_col.a) * 0.7f));
-                float glow_gain = ctx->st.cable_fiber_gain * 0.55f;
+                if (!fiber_samples.empty()) {
+                int fiber_r = std::max(2, static_cast<int>(std::lround(float(ctx->st.cable_jacket_px) * ctx->st.cable_fiber_radius_scale * 1.35f)));
+                // fiber pass removed: jacket/core will be tinted directly by SDF; keep fiber_r for glow radius
+                bool lit_a = info_a.on || info_a.active;
+                bool lit_b = info_b.on || info_b.active;
+                Color glow_col_a = lit_a ? ctx->st.led_on : ctx->st.led_off;
+                Color glow_col_b = lit_b ? ctx->st.led_on : ctx->st.led_off;
+                glow_col_a.a = static_cast<uint8_t>(std::lround(float(glow_col_a.a) * 0.85f));
+                glow_col_b.a = static_cast<uint8_t>(std::lround(float(glow_col_b.a) * 0.85f));
+                // increase glow multiplier to transfer more hue along cable
+                float glow_gain = ctx->st.cable_fiber_gain * 1.25f;
                 if (info_a.is_output && glow_a_eff > 0.0f) {
-                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, true, glow_a_eff, ctx->st.cable_depth_fade, glow_gain, glow_col, min_z, max_z, fiber_r);
+                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, true, glow_a_eff, ctx->st.cable_depth_fade, glow_gain, glow_col_a, min_z, max_z, fiber_r);
                     if (info_b.is_input && transmitted > 0.0f) {
-                        Color input_col = ctx->st.led_on;
+                        Color input_col = glow_col_a;
                         float boost = std::min(1.0f, transmitted * 0.6f);
                         input_col.a = static_cast<uint8_t>(std::lround(float(input_col.a) * (0.35f + 0.4f * boost)));
-                        draw_glow_blob(out_rgba, w_local, h_local, pitch_local, info_b.x, info_b.y, 4, boost, input_col);
+                        float gx0 = static_cast<float>(info_b.x) - 0.5f;
+                        float gy0 = static_cast<float>(info_b.y);
+                        float gx1 = static_cast<float>(info_b.x) + 0.5f;
+                        float gy1 = static_cast<float>(info_b.y);
+                        draw_segment_kernel_glow(out_rgba, w_local, h_local, pitch_local, gx0, gy0, gx1, gy1, 5.0f, input_col, boost);
                     }
                 }
                 if (info_b.is_output && glow_b_eff > 0.0f) {
-                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, false, glow_b_eff, ctx->st.cable_depth_fade, glow_gain, glow_col, min_z, max_z, fiber_r);
+                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, false, glow_b_eff, ctx->st.cable_depth_fade, glow_gain, glow_col_b, min_z, max_z, fiber_r);
                     if (info_a.is_input && transmitted > 0.0f) {
-                        Color input_col = ctx->st.led_on;
+                        Color input_col = glow_col_b;
                         float boost = std::min(1.0f, transmitted * 0.6f);
                         input_col.a = static_cast<uint8_t>(std::lround(float(input_col.a) * (0.35f + 0.4f * boost)));
-                        draw_glow_blob(out_rgba, w_local, h_local, pitch_local, info_a.x, info_a.y, 4, boost, input_col);
+                        float gx0 = static_cast<float>(info_a.x) - 0.5f;
+                        float gy0 = static_cast<float>(info_a.y);
+                        float gx1 = static_cast<float>(info_a.x) + 0.5f;
+                        float gy1 = static_cast<float>(info_a.y);
+                        draw_segment_kernel_glow(out_rgba, w_local, h_local, pitch_local, gx0, gy0, gx1, gy1, 5.0f, input_col, boost);
                     }
+                        // edge sliver removed - parametric SDF and glow provide saturation
                 }
             }
         }
