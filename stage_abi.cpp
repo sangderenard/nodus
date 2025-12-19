@@ -11,77 +11,10 @@
 #include <limits>
 #include <vector>
 
-namespace {
-
-static inline uint32_t mix_u32(uint32_t x) {
-    x ^= x >> 16;
-    x *= 0x7FEB352Du;
-    x ^= x >> 15;
-    x *= 0x846CA68Bu;
-    x ^= x >> 16;
-    return x ? x : 1u;
-}
-
-static inline uint32_t lcg_next(uint32_t& s) {
-    s = s * 1664525u + 1013904223u;
-    return s;
-}
-
-static inline float rand01(uint32_t& s) {
-    return (lcg_next(s) >> 8) * (1.0f / 16777216.0f);
-}
-
 struct StageLayer {
     std::vector<float> temporal;
     uint8_t tint[4] = {255, 255, 255, 255};
 };
-
-static constexpr uint32_t kStageSampleStride = 18;
-
-static inline float pack_u32_as_float(uint32_t value) {
-    float storage = 0.0f;
-    std::memcpy(&storage, &value, sizeof(storage));
-    return storage;
-}
-
-static void stage_surface_hit_trampoline(void* user, const GP_SurfaceHit* hit) {
-    if (!user || !hit) return;
-    auto* s = reinterpret_cast<GP_StageContextImpl*>(user);
-    if (s->capture_samples) {
-        if (s->staged_capture_limit == 0 || s->staged_hits.size() < s->staged_capture_limit) {
-            s->staged_hits.push_back(*hit);
-        }
-    }
-    if (s->hit_cb) {
-        s->hit_cb(s->hit_user, hit);
-    }
-}
-
-static void fill_sample_payload(const GP_SurfaceHit& hit, float* dst, uint32_t stride) {
-    if (!dst || stride == 0) return;
-    std::fill(dst, dst + stride, 0.0f);
-    auto assign = [&](uint32_t idx, float value) {
-        if (idx < stride) dst[idx] = value;
-    };
-    assign(0, hit.px);
-    assign(1, hit.py);
-    assign(2, hit.pz);
-    assign(3, hit.nx);
-    assign(4, hit.ny);
-    assign(5, hit.nz);
-    assign(6, hit.dirx);
-    assign(7, hit.diry);
-    assign(8, hit.dirz);
-    assign(9, hit.wavelength);
-    assign(10, hit.phase);
-    assign(11, hit.time);
-    assign(12, pack_u32_as_float(hit.surface_id));
-    assign(13, pack_u32_as_float(hit.material_id));
-    assign(14, hit.radiance_r);
-    assign(15, hit.radiance_g);
-    assign(16, hit.radiance_b);
-    assign(17, hit.weight);
-}
 
 struct GP_StageContextImpl {
     int32_t w = 0;
@@ -148,6 +81,73 @@ struct GP_StageContextImpl {
     uint32_t pending_sample_count = 0;
     bool batch_committed = false;
 };
+
+namespace {
+
+static inline uint32_t mix_u32(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x ? x : 1u;
+}
+
+static inline uint32_t lcg_next(uint32_t& s) {
+    s = s * 1664525u + 1013904223u;
+    return s;
+}
+
+static inline float rand01(uint32_t& s) {
+    return (lcg_next(s) >> 8) * (1.0f / 16777216.0f);
+}
+
+static constexpr uint32_t kStageSampleStride = 18;
+
+static inline float pack_u32_as_float(uint32_t value) {
+    float storage = 0.0f;
+    std::memcpy(&storage, &value, sizeof(storage));
+    return storage;
+}
+
+static void stage_surface_hit_trampoline(void* user, const GP_SurfaceHit* hit) {
+    if (!user || !hit) return;
+    auto* s = reinterpret_cast<GP_StageContextImpl*>(user);
+    if (s->capture_samples) {
+        if (s->staged_capture_limit == 0 || s->staged_hits.size() < s->staged_capture_limit) {
+            s->staged_hits.push_back(*hit);
+        }
+    }
+    if (s->hit_cb) {
+        s->hit_cb(s->hit_user, hit);
+    }
+}
+
+static void fill_sample_payload(const GP_SurfaceHit& hit, float* dst, uint32_t stride) {
+    if (!dst || stride == 0) return;
+    std::fill(dst, dst + stride, 0.0f);
+    auto assign = [&](uint32_t idx, float value) {
+        if (idx < stride) dst[idx] = value;
+    };
+    assign(0, hit.px);
+    assign(1, hit.py);
+    assign(2, hit.pz);
+    assign(3, hit.nx);
+    assign(4, hit.ny);
+    assign(5, hit.nz);
+    assign(6, hit.dirx);
+    assign(7, hit.diry);
+    assign(8, hit.dirz);
+    assign(9, hit.wavelength);
+    assign(10, hit.phase);
+    assign(11, hit.time);
+    assign(12, pack_u32_as_float(hit.surface_id));
+    assign(13, pack_u32_as_float(hit.material_id));
+    assign(14, hit.radiance_r);
+    assign(15, hit.radiance_g);
+    assign(16, hit.radiance_b);
+    assign(17, hit.weight);
+}
 
 static void ensure_rt(GP_StageContextImpl* s) {
     if (!s) return;
@@ -988,6 +988,25 @@ int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx,
 
     uint32_t sample_limit = opts->sample_limit ? opts->sample_limit : static_cast<uint32_t>(s->staged_hits.size());
     sample_limit = static_cast<uint32_t>(std::min<size_t>(sample_limit, s->staged_hits.size()));
+
+    // Query tensor spec for debugging
+    GP_TableEdgeTensorSpec spec{};
+    (void)gp_table_edge_get_tensor_spec(table_ctx, edge_idx, &spec);
+
+    // If tensor stride doesn't match our payload stride, try to set it to match.
+    if ((spec.dim_count == 0 || spec.dims[0] != static_cast<int32_t>(stride))) {
+        GP_TableEdgeTensorSpec new_spec{};
+        new_spec.dim_count = 1;
+        new_spec.dims[0] = static_cast<int32_t>(stride);
+        // Choose a sensible slot count: prefer sample_limit if small, otherwise cap.
+        uint32_t desired_slots = sample_limit > 0 ? sample_limit : 64u;
+        const uint32_t kMaxSlots = 4096u;
+        new_spec.slots = static_cast<int32_t>(std::max<uint32_t>(16u, std::min<uint32_t>(desired_slots, kMaxSlots)));
+        new_spec.top_k = 0;
+        if (gp_table_edge_set_tensor_spec(table_ctx, edge_idx, &new_spec)) {
+            gp_table_edge_get_tensor_spec(table_ctx, edge_idx, &spec);
+        }
+    }
 
     std::vector<float> payload(stride);
     size_t pushed = 0;

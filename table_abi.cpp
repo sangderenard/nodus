@@ -2894,6 +2894,7 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
         ctx->rope_sim_idx.push_back(-1);
     }
     sync_edge_tensor_for_idx(ctx, ctx->edges.size() - 1);
+    int32_t edge_idx = static_cast<int32_t>(ctx->edges.size() - 1);
     return 1;
 }
 
@@ -2992,6 +2993,8 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     size_t wrote = 0;
     bool ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+    if (out_written) *out_written = static_cast<int32_t>(wrote);
+    if (!ok) return 0;
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     return ok ? 1 : 0;
 }

@@ -18,6 +18,11 @@
 #include <fstream>
 #include <sstream>
 #include <Eigen/Dense>
+#include <chrono>
+
+// C-linkage prototypes for spline drawer implemented in table_abi.cpp
+extern "C" void table_draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, const float* hues, int hue_count, int samples_per_segment, float hue_intensity);
+extern "C" void table_draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca, int samples_per_segment);
 
 // local minimal Color and draw helpers (self-contained)
 struct Color { uint8_t r=0,g=0,b=0,a=255; };
@@ -329,6 +334,8 @@ struct GP_CanvasContextImpl {
     std::vector<int> module_stage_owned; // 1 if canvas should destroy
     std::vector<int> module_is_stage;    // 1 if this module is a stage module
     std::vector<GP_TableImage> module_stage_images; // live image descriptors per stage module
+    std::vector<uint8_t> module_stage_integrator_mode; // integrator lock per stage module
+    std::vector<std::vector<float>> module_stage_integrator_accum; // per-stage integrator accumulators
     struct ModuleBg {
         GP_CanvasModuleBgFn cb = nullptr;
         void* user = nullptr;
@@ -1317,6 +1324,8 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_stage_owned.push_back(0);
     c->module_is_stage.push_back(0);
     c->module_stage_images.push_back(GP_TableImage{});
+    c->module_stage_integrator_mode.push_back(0);
+    c->module_stage_integrator_accum.emplace_back();
     c->module_bg.emplace_back();
     c->module_bg.back().mode = default_bg_mode;
     c->module_io_in_count.push_back(0);
@@ -2054,19 +2063,212 @@ static void canvas_setup_stage_defaults(GP_StageContext* st, int w_px, int h_px)
     gp_stage_set_emission_mask_sampling(st, /*samples_per_frame=*/12, /*z=*/0.5f * depth, /*radius=*/3.0f, /*intensity=*/0.10f, /*frequency=*/0.02f, /*phase0=*/0.0f);
 }
 
+static constexpr unsigned long long kStageInputLedKey = ((unsigned long long)0 << 32) | ((unsigned long long)1 << 16) | 0ull;
+static constexpr int kStageIntegratorSampleBudget = 256;
+static constexpr uint32_t kStageIntegratorDefaultStride = 18u;
+static constexpr float kIntegratorTemporalDecay = 0.995f;
+static constexpr float kIntegratorTemporalMax = 4.0f;
+static constexpr float kIntegratorExposure = 0.55f;
+
+static std::vector<float>& stage_get_integrator_buffer(GP_CanvasContextImpl* ctx, int module_idx, int width, int height) {
+    if (!ctx || module_idx < 0) {
+        static std::vector<float> empty_buffer;
+        empty_buffer.clear();
+        return empty_buffer;
+    }
+    if (module_idx >= static_cast<int>(ctx->module_stage_integrator_accum.size())) {
+        ctx->module_stage_integrator_accum.resize(module_idx + 1);
+    }
+    int stage_w = std::max(1, width);
+    int stage_h = std::max(1, height);
+    size_t need = static_cast<size_t>(stage_w) * static_cast<size_t>(stage_h) * 3u;
+    auto &buf = ctx->module_stage_integrator_accum[module_idx];
+    if (buf.size() != need) {
+        buf.assign(need, 0.0f);
+    }
+    return buf;
+}
+
+static uint32_t stage_integrator_stride(GP_TableContext* table, int edge_idx) {
+    if (!table || edge_idx < 0) return kStageIntegratorDefaultStride;
+    GP_TableEdgeTensorSpec spec{};
+    if (!gp_table_edge_get_tensor_spec(table, edge_idx, &spec)) return kStageIntegratorDefaultStride;
+    uint64_t stride = 1;
+    for (int32_t di = 0; di < spec.dim_count; ++di) {
+        stride *= static_cast<uint64_t>(std::max(1, spec.dims[di]));
+        if (stride > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            return std::numeric_limits<uint32_t>::max();
+        }
+    }
+    if (stride == 0) stride = kStageIntegratorDefaultStride;
+    stride = std::max<uint64_t>(stride, kStageIntegratorDefaultStride);
+    return static_cast<uint32_t>(std::min<uint64_t>(stride, static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
+}
+
+static void render_stage_integrator_image(GP_CanvasContextImpl* ctx, int module_idx, GP_TableContext* table, int stage_w, int stage_h, std::vector<uint8_t>& tmp) {
+    if (!ctx || module_idx < 0) return;
+    auto &accum = stage_get_integrator_buffer(ctx, module_idx, stage_w, stage_h);
+    float decay = std::clamp(kIntegratorTemporalDecay, 0.0f, 1.0f);
+    if (decay < 1.0f) {
+        for (float& v : accum) {
+            v *= decay;
+        }
+    }
+
+    if (table) {
+        int edge_idx = -1;
+        if (gp_table_edge_index_for_key(table, kStageInputLedKey, &edge_idx) && edge_idx >= 0) {
+            uint32_t stride = stage_integrator_stride(table, edge_idx);
+            std::vector<float> sample(stride);
+            int32_t unread = 0;
+            // Ensure integrator is subscribed as a reader so unread counts are tracked.
+            gp_table_edge_subscribe(table, edge_idx, kStageInputLedKey);
+            gp_table_edge_unread(table, edge_idx, kStageInputLedKey, &unread);
+            int to_read = std::min<int>(std::max(0, unread), kStageIntegratorSampleBudget);
+            for (int ri = 0; ri < to_read; ++ri) {
+                int32_t written = 0;
+                if (!gp_table_edge_consume(table, edge_idx, kStageInputLedKey, sample.data(), static_cast<int>(stride), &written) || written <= 0) {
+                    break;
+                }
+                size_t plen = static_cast<size_t>(written);
+                if (plen < 17) continue;
+                float px = sample[0];
+                float py = sample[1];
+                int ix = static_cast<int>(std::lround(px));
+                int iy = static_cast<int>(std::lround(py));
+                ix = std::clamp(ix, 0, stage_w - 1);
+                iy = std::clamp(iy, 0, stage_h - 1);
+                size_t acc_idx = (static_cast<size_t>(iy) * static_cast<size_t>(stage_w) + static_cast<size_t>(ix)) * 3u;
+                if (acc_idx + 2 >= accum.size()) continue;
+                float weight = (plen > 17) ? sample[17] : 1.0f;
+                float w = std::max(0.0f, weight);
+                if (plen > 14) accum[acc_idx + 0] += sample[14] * w;
+                if (plen > 15) accum[acc_idx + 1] += sample[15] * w;
+                if (plen > 16) accum[acc_idx + 2] += sample[16] * w;
+            }
+        }
+    }
+
+    float clamp_max = std::max(0.0f, kIntegratorTemporalMax);
+    float scale_max = (clamp_max > 0.0f) ? (1.0f / clamp_max) : 1.0f;
+    float exposure = std::max(0.0f, kIntegratorExposure);
+    size_t pixel_count = static_cast<size_t>(stage_w) * static_cast<size_t>(stage_h);
+    if (tmp.size() < pixel_count * 4u) tmp.resize(pixel_count * 4u);
+    for (size_t pi = 0; pi < pixel_count; ++pi) {
+        size_t acc_idx = pi * 3u;
+        size_t out_idx = pi * 4u;
+        float r = accum[acc_idx + 0];
+        float g = accum[acc_idx + 1];
+        float b = accum[acc_idx + 2];
+        if (clamp_max > 0.0f) {
+            r = std::min(r, clamp_max);
+            g = std::min(g, clamp_max);
+            b = std::min(b, clamp_max);
+        }
+        float rr = std::clamp(r * exposure * scale_max, 0.0f, 1.0f);
+        float gg = std::clamp(g * exposure * scale_max, 0.0f, 1.0f);
+        float bb = std::clamp(b * exposure * scale_max, 0.0f, 1.0f);
+        tmp[out_idx + 0] = static_cast<uint8_t>(std::lround(rr * 255.0f));
+        tmp[out_idx + 1] = static_cast<uint8_t>(std::lround(gg * 255.0f));
+        tmp[out_idx + 2] = static_cast<uint8_t>(std::lround(bb * 255.0f));
+        tmp[out_idx + 3] = 255;
+    }
+}
+
+static bool stage_module_has_input_connection(const GP_CanvasContextImpl* ctx, int module_idx, int in_count) {
+    if (!ctx) return false;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return false;
+    if (in_count <= 0) return false;
+    for (const auto &edge : ctx->edges) {
+        const auto &desc = edge.desc;
+        if (desc.b_module == module_idx && desc.b_contact_idx >= 0 && desc.b_contact_idx < in_count) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void configure_stage_scanner_mode(GP_StageContext* st) {
+    // Mirror defaults used during stage creation.
+    gp_stage_set_temporal(st, /*decay=*/0.93f, /*max_intensity=*/1.0f);
+    gp_stage_set_exposure(st, /*exposure=*/1.0f);
+}
+
+static void configure_stage_integrator_mode(GP_StageContext* st) {
+    gp_stage_set_temporal(st, /*decay=*/0.995f, /*max_intensity=*/4.0f);
+    gp_stage_set_exposure(st, /*exposure=*/0.55f);
+}
+
+static void apply_log_response(uint8_t* pix, size_t pixel_count) {
+    if (!pix) return;
+    constexpr float kLogScale = 18.0f;
+    const float denom = std::log1p(kLogScale);
+    for (size_t i = 0; i < pixel_count; ++i) {
+        uint8_t* base = pix + i * 4;
+        for (int ch = 0; ch < 3; ++ch) {
+            float norm = static_cast<float>(base[ch]) / 255.0f;
+            float mapped = std::log1p(norm * kLogScale) / denom;
+            mapped = std::clamp(mapped, 0.0f, 1.0f);
+            base[ch] = static_cast<uint8_t>(std::lround(mapped * 255.0f));
+        }
+        base[3] = 255;
+    }
+}
+
 static void stage_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch) {
     if (!user || !out_rgba || width <= 0 || height <= 0) return;
     auto* c = reinterpret_cast<GP_CanvasContextImpl*>(user);
     if (module_idx < 0 || module_idx >= static_cast<int>(c->module_stages.size())) return;
     GP_StageContext* st = c->module_stages[module_idx];
     if (!st) return;
-    // render full module height (no header band baked into the stage image)
     int stage_h = std::max(1, height);
+    int in_count = 0;
+    if (module_idx >= 0 && module_idx < static_cast<int>(c->module_io_in_count.size())) {
+        in_count = c->module_io_in_count[module_idx];
+    }
+    bool integrator_mode = stage_module_has_input_connection(c, module_idx, in_count);
+    if (module_idx >= static_cast<int>(c->module_stage_integrator_mode.size())) {
+        c->module_stage_integrator_mode.resize(module_idx + 1, 0);
+    }
+    bool was_integrator = (c->module_stage_integrator_mode[module_idx] != 0);
+    if (integrator_mode != was_integrator) {
+        if (integrator_mode) {
+            configure_stage_integrator_mode(st);
+            auto& accum = stage_get_integrator_buffer(c, module_idx, width, stage_h);
+            std::fill(accum.begin(), accum.end(), 0.0f);
+        } else {
+            configure_stage_scanner_mode(st);
+        }
+        c->module_stage_integrator_mode[module_idx] = integrator_mode ? 1 : 0;
+    }
+    // render full module height (no header band baked into the stage image)
     gp_stage_resize(st, width, stage_h);
-    gp_stage_render(st);
     std::vector<uint8_t> tmp;
     tmp.resize(static_cast<size_t>(width) * static_cast<size_t>(stage_h) * 4u);
-    gp_stage_copy_rgba(st, tmp.data(), static_cast<int32_t>(tmp.size()));
+    if (integrator_mode) {
+        // Prefer the canvas container/root table when present so tables
+        // defer their graphs to the root canvas graph. Fall back to the
+        // module's attached table if no container table is set.
+        GP_TableContext* table = c->container_table ? c->container_table : ((module_idx < static_cast<int>(c->module_tables.size())) ? c->module_tables[module_idx] : nullptr);
+        printf("render_stage_integrator_image: module=%d using table=%p container=%p\n", module_idx, (void*)table, (void*)c->container_table);
+        // Enable sample capture, render to populate staged hits, commit and stream
+        // them into the chosen table so the integrator can consume them.
+        gp_stage_enable_sample_capture(st, 1);
+        gp_stage_render(st);
+        uint64_t batch_id = static_cast<uint64_t>(std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count());
+        gp_stage_commit_staged_samples(st, batch_id);
+        GP_StageBatchOptions opts{};
+        opts.stride = kStageIntegratorDefaultStride;
+        opts.sample_limit = kStageIntegratorSampleBudget;
+        int32_t stream_ok = gp_stage_stream_samples(st, table, kStageInputLedKey, &opts);
+        // Optionally disable capture to avoid accumulating across frames
+        gp_stage_enable_sample_capture(st, 0);
+        // Now run integrator read from the table
+        render_stage_integrator_image(c, module_idx, table, width, stage_h, tmp);
+    } else {
+        gp_stage_render(st);
+        gp_stage_copy_rgba(st, tmp.data(), static_cast<int32_t>(tmp.size()));
+    }
     // If stage produced an all-zero frame (e.g., no emitters configured yet), paint a subtle fallback grid
     // so the module isn't rendered as a solid black box.
     bool all_zero = true;
@@ -2084,6 +2286,9 @@ static void stage_bg_callback(void* user, int module_idx, int width, int height,
                 tmp[idx + 3] = 255;
             }
         }
+    }
+    if (integrator_mode) {
+        apply_log_response(tmp.data(), static_cast<size_t>(stage_h) * static_cast<size_t>(width));
     }
     // copy stage image into out_rgba (no additional bands)
     for (int y = 0; y < height; ++y) {
@@ -2376,6 +2581,51 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
         ei.hues = c->hues;
         ei.hue_intensity = c->hue_intensity;
     }
+    // Ensure container/root table has corresponding edge keys so the
+    // root table (canonical graph) will host the data FIFOs for canvas
+    // edges. This makes tables defer their graphs to the root canvas graph.
+    GP_TableContext* root = canvas_ensure_root_table(c);
+    if (root) {
+        // determine required columns/rows to cover contact indices and modules
+        int max_module = std::max(desc->a_module, desc->b_module);
+        int max_contact = std::max(desc->a_contact_idx, desc->b_contact_idx);
+        int cols_needed = std::min(8, std::max(1, max_contact + 1));
+        int rows_needed = std::max(1, max_module + 1);
+        // setup simple LED columns if the table appears empty or too small
+        GP_TableGeom gtmp{};
+        int col_count_existing = 0;
+        if (gp_table_get_geom(root, &gtmp)) {
+            for (int ii = 0; ii < 8; ++ii) if (gtmp.col_w[ii] > 0) ++col_count_existing;
+        }
+        if (col_count_existing < cols_needed) {
+            GP_TableColumn cols[8];
+            for (int i = 0; i < cols_needed; ++i) { cols[i].kind = GP_TABLE_CELL_LEDS; cols[i].width_px = 80; cols[i].align = 0; }
+            gp_table_set_columns(root, cols, cols_needed);
+        }
+        // ensure rows exist
+        std::vector<GP_TableRow> rows;
+        rows.resize(rows_needed);
+        for (int ri = 0; ri < rows_needed; ++ri) {
+            std::memset(&rows[ri], 0, sizeof(GP_TableRow));
+            rows[ri].kind = GP_TABLE_ROW_DEVICE;
+            rows[ri].depth = 0;
+            rows[ri].expanded = 1;
+            rows[ri].cell_count = cols_needed;
+            for (int ci = 0; ci < cols_needed && ci < 8; ++ci) rows[ri].cells[ci].kind = GP_TABLE_CELL_LEDS;
+        }
+        gp_table_set_rows(root, rows.data(), static_cast<int>(rows.size()));
+
+        // compute keys for endpoints and add edge to root table so it creates FIFOs
+        uint64_t ka = (static_cast<uint64_t>(static_cast<uint32_t>(desc->a_module)) << 32) |
+                      (static_cast<uint64_t>(static_cast<uint32_t>(desc->a_contact_idx)) << 16) |
+                      static_cast<uint64_t>(0);
+        uint64_t kb = (static_cast<uint64_t>(static_cast<uint32_t>(desc->b_module)) << 32) |
+                      (static_cast<uint64_t>(static_cast<uint32_t>(desc->b_contact_idx)) << 16) |
+                      static_cast<uint64_t>(0);
+        printf("gp_canvas_add_edge_with_type: creating root edge ka=0x%016llx kb=0x%016llx root=%p\n", (unsigned long long)ka, (unsigned long long)kb, (void*)root);
+        gp_table_add_edge(root, ka, kb);
+    }
+
     c->edges.push_back(std::move(ei));
     int idx = static_cast<int>(c->edges.size() - 1);
     printf("gp_canvas_add_edge_with_type: added edge %d type=%d a=%d.%d b=%d.%d\n", idx, type_id, desc->a_module, desc->a_contact_idx, desc->b_module, desc->b_contact_idx);
@@ -2481,6 +2731,9 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     c->module_stages.clear();
     c->module_stage_owned.clear();
     c->module_is_stage.clear();
+    c->module_stage_images.clear();
+    c->module_stage_integrator_mode.clear();
+    c->module_stage_integrator_accum.clear();
     c->module_bg.clear();
     c->edges.clear();
     c->nodes.clear();
@@ -3230,9 +3483,6 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     }
 
     // render edges using the table spline drawer for exact Catmull-Rom appearance
-    extern void table_draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, const float* hues, int hue_count, int samples_per_segment, float hue_intensity);
-    // Non-colored spline drawer (core color provided as RGBA)
-    extern void table_draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca, int samples_per_segment);
     for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
         int ridx = ctx->edges[ei].rope_idx;
         if (ridx < 0) continue;
