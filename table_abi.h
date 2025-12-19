@@ -312,6 +312,14 @@ typedef struct GP_TableEdgeTensorSpec {
     int32_t top_k;      // if >0, keep this many of the newest samples when overwriting; 0 = hold until readers consume
 } GP_TableEdgeTensorSpec;
 
+typedef struct GP_TableEdgeBatchMetadata {
+    uint64_t batch_id;
+    double timestamp;
+    uint32_t sample_count;
+    uint32_t stride;
+    uint32_t schema_id;
+} GP_TableEdgeBatchMetadata;
+
 int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpec* spec);
 int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpec* out_spec);
 int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
@@ -325,6 +333,9 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
 int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written);
 // Query unread sample count for a subscriber on an edge.
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count);
+int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata);
+int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeBatchMetadata* out_metadata);
+int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx);
 
 // Stage port bindings --------------------------------------------------------
 // Bind a stage instance to a specific LED key so edges can auto-provision

@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 
+#include "surface_hit_abi.h"
+
 extern "C" {
 
 typedef struct Raytrace3D Raytrace3D;
@@ -39,6 +41,9 @@ int raytrace3d_set_seed(Raytrace3D* rt, uint32_t seed);
 
 // Configure wave parameters for phase accumulation (phase = phase0 + 2π*frequency*distance).
 int raytrace3d_set_wave(Raytrace3D* rt, float frequency, float phase0);
+
+int raytrace3d_set_surface_hit_callback(Raytrace3D* rt, GP_SurfaceHitFn cb, void* user);
+int raytrace3d_set_sample_wavelength(Raytrace3D* rt, float wavelength_nm);
 
 // Render into layered float output (layers * width * height).
 // `layer_centers_z` is an array of `layer_count` z values (world units) used to

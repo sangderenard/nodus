@@ -53,6 +53,10 @@ struct Raytrace3DImpl {
     std::vector<float> accum;
     std::vector<float> tmp;
     std::vector<float> blur;
+
+    GP_SurfaceHitFn hit_cb = nullptr;
+    void* hit_user = nullptr;
+    float sample_wavelength = 550.0f;
 };
 
 static void ensure_buffers(Raytrace3DImpl* rt, size_t count) {
@@ -102,6 +106,46 @@ static void gaussian_blur_2d(float* io, float* tmp, int w, int h, float sigma) {
             io[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)] = acc;
         }
     }
+}
+
+enum {
+    kSurfaceWallPosX = 1,
+    kSurfaceWallNegX = 2,
+    kSurfaceWallPosY = 3,
+    kSurfaceWallNegY = 4,
+    kSurfaceWallPosZ = 5,
+    kSurfaceWallNegZ = 6,
+    kSurfaceMeshBase = 1000,
+};
+
+static void emit_surface_hit(
+    Raytrace3DImpl* rt,
+    float px, float py, float pz,
+    float nx, float ny, float nz,
+    float dirx, float diry, float dirz,
+    float weight, float phase, float time,
+    uint32_t surface_id) {
+    if (!rt || !rt->hit_cb) return;
+    GP_SurfaceHit hit{};
+    hit.px = px;
+    hit.py = py;
+    hit.pz = pz;
+    hit.nx = nx;
+    hit.ny = ny;
+    hit.nz = nz;
+    hit.dirx = dirx;
+    hit.diry = diry;
+    hit.dirz = dirz;
+    hit.wavelength = rt->sample_wavelength;
+    hit.phase = phase;
+    hit.time = time;
+    hit.surface_id = surface_id;
+    hit.material_id = surface_id;
+    hit.radiance_r = weight;
+    hit.radiance_g = weight;
+    hit.radiance_b = weight;
+    hit.weight = weight;
+    rt->hit_cb(rt->hit_user, &hit);
 }
 
 static int quantize_layer(float z, int layer_count, const float* centers, float min_z, float max_z) {
@@ -389,6 +433,21 @@ int raytrace3d_set_wave(Raytrace3D* rt, float frequency, float phase0) {
     return 1;
 }
 
+int raytrace3d_set_surface_hit_callback(Raytrace3D* rt, GP_SurfaceHitFn cb, void* user) {
+    if (!rt) return 0;
+    auto* impl = reinterpret_cast<Raytrace3DImpl*>(rt);
+    impl->hit_cb = cb;
+    impl->hit_user = user;
+    return 1;
+}
+
+int raytrace3d_set_sample_wavelength(Raytrace3D* rt, float wavelength_nm) {
+    if (!rt) return 0;
+    auto* impl = reinterpret_cast<Raytrace3DImpl*>(rt);
+    impl->sample_wavelength = std::max(0.0f, wavelength_nm);
+    return 1;
+}
+
 int raytrace3d_render_layers_f32(
     Raytrace3D* rt,
     int layer_count,
@@ -566,15 +625,22 @@ int raytrace3d_render_field_f32(
             float t_hit = std::min({tx, ty, tz});
             float hit_nx = 0.0f, hit_ny = 0.0f, hit_nz = 0.0f;
             float hit_reflect = 1.0f;
+            size_t best_tri_idx = 0;
+            size_t tri_idx = 0;
             // Mesh intersection
             for (const auto& tri : impl->tris) {
-                float ttri = 0.0f, nx_hit=0.0f, ny_hit=0.0f, nz_hit=0.0f;
-                if (!tri_intersect(tri, x, y, z, dx, dy, dz, ttri, nx_hit, ny_hit, nz_hit)) continue;
+                float ttri = 0.0f, nx_hit = 0.0f, ny_hit = 0.0f, nz_hit = 0.0f;
+                if (!tri_intersect(tri, x, y, z, dx, dy, dz, ttri, nx_hit, ny_hit, nz_hit)) {
+                    ++tri_idx;
+                    continue;
+                }
                 if (ttri < t_hit) {
                     t_hit = ttri;
                     hit_nx = nx_hit; hit_ny = ny_hit; hit_nz = nz_hit;
                     hit_reflect = tri.reflectivity;
+                    best_tri_idx = tri_idx;
                 }
+                ++tri_idx;
             }
 
             if (!std::isfinite(t_hit) || t_hit <= 0.0f) break;
@@ -587,29 +653,86 @@ int raytrace3d_render_field_f32(
             float bounce_att = std::pow(impl->bounce_decay, static_cast<float>(bounce));
             float dist_att = std::exp(-impl->distance_decay * avg_len);
             float weight = std::max(0.0f, bounce_att * dist_att);
+            float sample_weight = weight;
             float phase = impl->wave_phase0 + k * avg_len;
+            float sample_time = total_len + seg_len;
 
             add_segment_field_quantized(impl, x, y, z, nx, ny, nz, dx, dy, dz, weight, phase, lc, layer_centers_z, out_field_f32);
 
+            float prev_dx = dx;
+            float prev_dy = dy;
+            float prev_dz = dz;
+            uint32_t surface_id = kSurfaceWallPosZ;
+            float normal_x = 0.0f;
+            float normal_y = 0.0f;
+            float normal_z = 1.0f;
+            float out_dx = prev_dx;
+            float out_dy = prev_dy;
+            float out_dz = prev_dz;
             bool hit_mesh = (hit_reflect < 1.1f) && (t_hit < std::min({tx, ty, tz}) - 1e-6f);
             if (hit_mesh) {
-                // Reflect or absorb
-                if (hit_reflect <= 0.0f) break;
-                float dot = dx*hit_nx + dy*hit_ny + dz*hit_nz;
-                dx = dx - 2.0f * dot * hit_nx;
-                dy = dy - 2.0f * dot * hit_ny;
-                dz = dz - 2.0f * dot * hit_nz;
-                float lenv = std::sqrt(dx*dx + dy*dy + dz*dz);
-                if (lenv > 1e-6f) { dx/=lenv; dy/=lenv; dz/=lenv; }
+                surface_id = kSurfaceMeshBase + static_cast<uint32_t>(best_tri_idx);
+                normal_x = hit_nx;
+                normal_y = hit_ny;
+                normal_z = hit_nz;
+                float dot = prev_dx * normal_x + prev_dy * normal_y + prev_dz * normal_z;
+                if (hit_reflect <= 0.0f) {
+                    emit_surface_hit(impl, nx, ny, nz, normal_x, normal_y, normal_z, prev_dx, prev_dy, prev_dz, sample_weight, phase, sample_time, surface_id);
+                    break;
+                }
+                dx = prev_dx - 2.0f * dot * normal_x;
+                dy = prev_dy - 2.0f * dot * normal_y;
+                dz = prev_dz - 2.0f * dot * normal_z;
+                float lenv = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (lenv > 1e-6f) {
+                    dx /= lenv;
+                    dy /= lenv;
+                    dz /= lenv;
+                }
+                out_dx = dx;
+                out_dy = dy;
+                out_dz = dz;
                 weight *= hit_reflect;
             } else {
                 bool hit_x = std::fabs(t_hit - tx) <= 1e-6f || tx < std::min(ty, tz);
                 bool hit_y = std::fabs(t_hit - ty) <= 1e-6f || ty < std::min(tx, tz);
                 bool hit_z = std::fabs(t_hit - tz) <= 1e-6f || tz < std::min(tx, ty);
+                surface_id = kSurfaceWallPosZ;
+                normal_x = 0.0f;
+                normal_y = 0.0f;
+                normal_z = 0.0f;
+                uint32_t axis_id = 0;
+                if (hit_x) {
+                    normal_x += (prev_dx > 0.0f) ? -1.0f : 1.0f;
+                    axis_id = axis_id ? axis_id : ((prev_dx > 0.0f) ? kSurfaceWallPosX : kSurfaceWallNegX);
+                }
+                if (hit_y) {
+                    normal_y += (prev_dy > 0.0f) ? -1.0f : 1.0f;
+                    axis_id = axis_id ? axis_id : ((prev_dy > 0.0f) ? kSurfaceWallPosY : kSurfaceWallNegY);
+                }
+                if (hit_z) {
+                    normal_z += (prev_dz > 0.0f) ? -1.0f : 1.0f;
+                    axis_id = axis_id ? axis_id : ((prev_dz > 0.0f) ? kSurfaceWallPosZ : kSurfaceWallNegZ);
+                }
+                if (!axis_id) axis_id = kSurfaceWallPosZ;
+                surface_id = axis_id;
+                float norm = std::sqrt(normal_x * normal_x + normal_y * normal_y + normal_z * normal_z);
+                if (norm > 1e-6f) {
+                    normal_x /= norm;
+                    normal_y /= norm;
+                    normal_z /= norm;
+                } else {
+                    normal_z = 1.0f;
+                    normal_x = normal_y = 0.0f;
+                }
                 if (hit_x) dx = -dx;
                 if (hit_y) dy = -dy;
                 if (hit_z) dz = -dz;
+                out_dx = dx;
+                out_dy = dy;
+                out_dz = dz;
             }
+            emit_surface_hit(impl, nx, ny, nz, normal_x, normal_y, normal_z, out_dx, out_dy, out_dz, sample_weight, phase, sample_time, surface_id);
 
             x = std::clamp(nx + dx * eps, min_x + eps, max_x - eps);
             y = std::clamp(ny + dy * eps, min_y + eps, max_y - eps);

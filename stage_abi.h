@@ -2,11 +2,15 @@
 
 #include <stdint.h>
 
+#include "surface_hit_abi.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct GP_StageContext GP_StageContext;
+
+struct GP_TableContext; // forward-declare table context for streaming helpers
 
 typedef struct GP_StageDims {
     int32_t width_px;
@@ -153,6 +157,19 @@ int32_t gp_stage_render(GP_StageContext* st);
 
 // Copy the rendered RGBA8 output into `out_rgba` (pitch is tightly packed).
 int32_t gp_stage_copy_rgba(const GP_StageContext* st, uint8_t* out_rgba, int32_t out_len_bytes);
+
+typedef struct GP_StageBatchOptions {
+    uint32_t stride;
+    uint32_t schema_id;
+    uint32_t sample_limit;
+    uint32_t reserved;
+} GP_StageBatchOptions;
+
+int32_t gp_stage_set_hit_callback(GP_StageContext* st, GP_SurfaceHitFn cb, void* user);
+int32_t gp_stage_enable_sample_capture(GP_StageContext* st, int32_t enable);
+int32_t gp_stage_commit_staged_samples(GP_StageContext* st, uint64_t batch_id);
+int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx, unsigned long long led_key, const GP_StageBatchOptions* opts);
+int32_t gp_stage_clear_staged_samples(GP_StageContext* st);
 
 #ifdef __cplusplus
 }

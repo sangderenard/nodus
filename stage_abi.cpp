@@ -2,10 +2,13 @@
 
 #include "raytrace_2d.h"
 #include "raytrace_3d.h"
+#include "table_abi.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -32,6 +35,53 @@ struct StageLayer {
     std::vector<float> temporal;
     uint8_t tint[4] = {255, 255, 255, 255};
 };
+
+static constexpr uint32_t kStageSampleStride = 18;
+
+static inline float pack_u32_as_float(uint32_t value) {
+    float storage = 0.0f;
+    std::memcpy(&storage, &value, sizeof(storage));
+    return storage;
+}
+
+static void stage_surface_hit_trampoline(void* user, const GP_SurfaceHit* hit) {
+    if (!user || !hit) return;
+    auto* s = reinterpret_cast<GP_StageContextImpl*>(user);
+    if (s->capture_samples) {
+        if (s->staged_capture_limit == 0 || s->staged_hits.size() < s->staged_capture_limit) {
+            s->staged_hits.push_back(*hit);
+        }
+    }
+    if (s->hit_cb) {
+        s->hit_cb(s->hit_user, hit);
+    }
+}
+
+static void fill_sample_payload(const GP_SurfaceHit& hit, float* dst, uint32_t stride) {
+    if (!dst || stride == 0) return;
+    std::fill(dst, dst + stride, 0.0f);
+    auto assign = [&](uint32_t idx, float value) {
+        if (idx < stride) dst[idx] = value;
+    };
+    assign(0, hit.px);
+    assign(1, hit.py);
+    assign(2, hit.pz);
+    assign(3, hit.nx);
+    assign(4, hit.ny);
+    assign(5, hit.nz);
+    assign(6, hit.dirx);
+    assign(7, hit.diry);
+    assign(8, hit.dirz);
+    assign(9, hit.wavelength);
+    assign(10, hit.phase);
+    assign(11, hit.time);
+    assign(12, pack_u32_as_float(hit.surface_id));
+    assign(13, pack_u32_as_float(hit.material_id));
+    assign(14, hit.radiance_r);
+    assign(15, hit.radiance_g);
+    assign(16, hit.radiance_b);
+    assign(17, hit.weight);
+}
 
 struct GP_StageContextImpl {
     int32_t w = 0;
@@ -87,6 +137,16 @@ struct GP_StageContextImpl {
     std::vector<uint8_t> occlusion_alpha_hi;
     std::vector<uint8_t> negative_damp_hi;
     std::vector<uint8_t> out_rgba;
+
+    GP_SurfaceHitFn hit_cb = nullptr;
+    void* hit_user = nullptr;
+    bool capture_samples = false;
+    std::vector<GP_SurfaceHit> staged_hits;
+    size_t staged_capture_limit = 0;
+    uint64_t pending_batch_id = 0;
+    double pending_batch_time = 0.0;
+    uint32_t pending_sample_count = 0;
+    bool batch_committed = false;
 };
 
 static void ensure_rt(GP_StageContextImpl* s) {
@@ -327,6 +387,11 @@ int32_t gp_stage_clear(GP_StageContext* st) {
     auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
     for (auto& l : s->layers) std::fill(l.temporal.begin(), l.temporal.end(), 0.0f);
     std::fill(s->out_rgba.begin(), s->out_rgba.end(), 0);
+    s->staged_hits.clear();
+    s->batch_committed = false;
+    s->pending_sample_count = 0;
+    s->pending_batch_time = 0.0;
+    s->pending_batch_id = 0;
     return 1;
 }
 
@@ -566,6 +631,11 @@ int32_t gp_stage_render(GP_StageContext* st) {
             raytrace3d_set_mesh(s->rt3, reinterpret_cast<const Raytrace3DMeshTriangle*>(s->mesh.data()), static_cast<int>(s->mesh.size()));
         } else {
             raytrace3d_set_mesh(s->rt3, nullptr, 0);
+        }
+        if (s->capture_samples || s->hit_cb) {
+            raytrace3d_set_surface_hit_callback(s->rt3, stage_surface_hit_trampoline, s);
+        } else {
+            raytrace3d_set_surface_hit_callback(s->rt3, nullptr, nullptr);
         }
     } else {
         raytrace2d_set_room(s->rt, 0.0f, 0.0f, static_cast<float>(s->w), static_cast<float>(s->h));
@@ -865,6 +935,95 @@ int32_t gp_stage_copy_rgba(const GP_StageContext* st, uint8_t* out_rgba, int32_t
     if (out_len_bytes < need) return 0;
     if (s->out_rgba.empty()) return 0;
     std::memcpy(out_rgba, s->out_rgba.data(), static_cast<size_t>(need));
+    return 1;
+}
+
+int32_t gp_stage_set_hit_callback(GP_StageContext* st, GP_SurfaceHitFn cb, void* user) {
+    if (!st) return 0;
+    auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
+    s->hit_cb = cb;
+    s->hit_user = user;
+    return 1;
+}
+
+int32_t gp_stage_enable_sample_capture(GP_StageContext* st, int32_t enable) {
+    if (!st) return 0;
+    auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
+    bool new_state = (enable != 0);
+    if (new_state && !s->capture_samples) {
+        s->staged_hits.clear();
+        s->batch_committed = false;
+        s->pending_sample_count = 0;
+        s->pending_batch_id = 0;
+        s->pending_batch_time = 0.0;
+    }
+    if (!new_state) {
+        s->staged_hits.clear();
+    }
+    s->capture_samples = new_state;
+    return 1;
+}
+
+int32_t gp_stage_commit_staged_samples(GP_StageContext* st, uint64_t batch_id) {
+    if (!st) return 0;
+    auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
+    s->pending_batch_id = batch_id;
+    s->pending_batch_time = std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    const size_t sample_count = s->staged_hits.size();
+    s->pending_sample_count = static_cast<uint32_t>(std::min<size_t>(sample_count, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    s->batch_committed = true;
+    return 1;
+}
+
+int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx, unsigned long long led_key, const GP_StageBatchOptions* opts) {
+    if (!st || !table_ctx || !opts) return 0;
+    auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
+    if (!s->batch_committed) return 0;
+    int32_t edge_idx = -1;
+    if (!gp_table_edge_index_for_key(table_ctx, led_key, &edge_idx) || edge_idx < 0) return 0;
+
+    uint32_t stride = opts->stride ? opts->stride : kStageSampleStride;
+    stride = std::max<uint32_t>(stride, kStageSampleStride);
+    if (stride > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) return 0;
+
+    uint32_t sample_limit = opts->sample_limit ? opts->sample_limit : static_cast<uint32_t>(s->staged_hits.size());
+    sample_limit = static_cast<uint32_t>(std::min<size_t>(sample_limit, s->staged_hits.size()));
+
+    std::vector<float> payload(stride);
+    size_t pushed = 0;
+    bool ok = true;
+    for (size_t i = 0; i < sample_limit; ++i) {
+        fill_sample_payload(s->staged_hits[i], payload.data(), stride);
+        int32_t dropped = 0;
+        if (!gp_table_edge_publish(table_ctx, edge_idx, led_key, payload.data(), static_cast<int32_t>(stride), &dropped)) {
+            ok = false;
+            break;
+        }
+        ++pushed;
+    }
+
+    GP_TableEdgeBatchMetadata meta{};
+    meta.batch_id = s->pending_batch_id;
+    meta.timestamp = s->pending_batch_time;
+    meta.sample_count = static_cast<uint32_t>(pushed);
+    meta.stride = stride;
+    meta.schema_id = opts->schema_id;
+    gp_table_edge_set_batch_metadata(table_ctx, edge_idx, &meta);
+
+    s->batch_committed = false;
+    s->staged_hits.clear();
+    s->pending_sample_count = 0;
+    return ok ? 1 : 0;
+}
+
+int32_t gp_stage_clear_staged_samples(GP_StageContext* st) {
+    if (!st) return 0;
+    auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
+    s->staged_hits.clear();
+    s->batch_committed = false;
+    s->pending_sample_count = 0;
+    s->pending_batch_time = 0.0;
+    s->pending_batch_id = 0;
     return 1;
 }
 

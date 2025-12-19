@@ -1423,6 +1423,7 @@ struct GP_TableContext {
     std::unordered_map<uint64_t, float> led_glow_strength;
     std::vector<std::pair<uint64_t,uint64_t>> edges;
     std::vector<EdgeTensorFifo> edge_fifos; // companion FIFO per rope edge
+    std::vector<GP_TableEdgeBatchMetadata> edge_batch_metadata;
     std::unordered_map<uint64_t, StagePortBinding> stage_ports; // LED key -> stage port binding
     // Relaxation state (per-edge values/velocities are maintained in parallel to edges)
     int32_t relax_mode = GP_TABLE_RELAX_OFF;
@@ -1571,6 +1572,12 @@ static void ensure_edge_fifos(GP_TableContext* ctx) {
     }
     if (ctx->edge_fifos.size() > ctx->edges.size()) {
         ctx->edge_fifos.resize(ctx->edges.size());
+    }
+    while (ctx->edge_batch_metadata.size() < ctx->edges.size()) {
+        ctx->edge_batch_metadata.emplace_back(GP_TableEdgeBatchMetadata{});
+    }
+    if (ctx->edge_batch_metadata.size() > ctx->edges.size()) {
+        ctx->edge_batch_metadata.resize(ctx->edges.size());
     }
 }
 
@@ -2996,6 +3003,35 @@ int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned lo
     size_t cnt = ctx->edge_fifos[static_cast<size_t>(edge_idx)].unread(subscriber_key);
     *out_count = static_cast<int32_t>(std::min<size_t>(cnt, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
     return 1;
+}
+
+int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata) {
+    if (!ctx || !metadata) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_batch_metadata.size())) return 0;
+    ctx->edge_batch_metadata[static_cast<size_t>(edge_idx)] = *metadata;
+    return 1;
+}
+
+int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeBatchMetadata* out_metadata) {
+    if (!ctx || !out_metadata) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_batch_metadata.size())) return 0;
+    *out_metadata = ctx->edge_batch_metadata[static_cast<size_t>(edge_idx)];
+    return 1;
+}
+
+int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx) {
+    if (!ctx || !out_edge_idx) return 0;
+    ensure_edge_fifos(ctx);
+    for (size_t i = 0; i < ctx->edges.size(); ++i) {
+        const auto& e = ctx->edges[i];
+        if (e.first == led_key || e.second == led_key) {
+            *out_edge_idx = static_cast<int32_t>(i);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int32_t gp_table_bind_stage_port(GP_TableContext* ctx, unsigned long long led_key, GP_StageContext* stage, int32_t is_output, int32_t channel) {
