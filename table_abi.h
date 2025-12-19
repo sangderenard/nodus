@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 typedef struct RopeSim RopeSim; // forward-declare rope sim type for attachment API
+struct GP_StageContext; // forward declare stage for port bindings
 
 struct GP_MenuWaveform; // from menu_waveform_abi.h
 
@@ -26,6 +27,7 @@ typedef enum GP_TableCellKind {
     GP_TABLE_CELL_LEDS_ARG = 6,    // signal arg LEDs (required vs linked)
     GP_TABLE_CELL_LEDS_TABLE = 7,  // stacked LED strips encoded inside one cell
     GP_TABLE_CELL_SCROLL = 8,      // vertical scrollbar (arrows + track + thumb)
+    GP_TABLE_CELL_IMAGE = 9,       // RGBA image content
 } GP_TableCellKind;
 
 // Hitbox parts for interactive regions.
@@ -96,8 +98,17 @@ typedef struct GP_TableCell {
     float hold_s;          // for TIMERS; AXIS: observed min
     float last_s;          // for TIMERS; AXIS: observed max
     const struct GP_MenuWaveform* wave; // for WAVE (nullable)
+    const struct GP_TableImage* image;  // for IMAGE (nullable)
     int32_t reserved0;
 } GP_TableCell;
+
+// External image descriptor used by GP_TABLE_CELL_IMAGE.
+typedef struct GP_TableImage {
+    const uint8_t* rgba;   // pointer to tightly-packed RGBA8 pixels
+    int32_t width_px;      // image width in pixels
+    int32_t height_px;     // image height in pixels
+    int32_t pitch_bytes;   // bytes per row (>= width_px*4)
+} GP_TableImage;
 
 // One row
 typedef struct GP_TableRow {
@@ -287,6 +298,40 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
 int32_t gp_table_clear_edges(GP_TableContext* ctx);
 int32_t gp_table_get_edge_count(const GP_TableContext* ctx);
 int32_t gp_table_get_edge(const GP_TableContext* ctx, int32_t idx, unsigned long long* out_a, unsigned long long* out_b);
+
+// Edge companion tensor FIFO -------------------------------------------------
+// Each rope edge owns a companion FIFO that stores an n-D tensor per sample.
+// A single writer appends samples; any number of subscribers can read through
+// their own circular heads. When the buffer is full, `top_k` controls whether
+// the oldest unread samples are advanced (drop old data, keep last top_k) or
+// writes are rejected (top_k == 0).
+typedef struct GP_TableEdgeTensorSpec {
+    int32_t dims[8];    // up to 8 dimensions; each <= INT32_MAX, clamped to >=1
+    int32_t dim_count;  // number of dims used in `dims`
+    int32_t slots;      // how many tensor samples to keep in the FIFO (capacity)
+    int32_t top_k;      // if >0, keep this many of the newest samples when overwriting; 0 = hold until readers consume
+} GP_TableEdgeTensorSpec;
+
+int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpec* spec);
+int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpec* out_spec);
+int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
+int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
+// Publish one tensor sample into the FIFO for an edge. Returns 1 on success.
+// If the buffer advanced slow readers to admit the write (top-k overwrite),
+// `out_dropped` is set to 1; otherwise 0. Returns 0 if no write occurred.
+int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped);
+// Consume the next available tensor sample for a subscriber. Returns 1 if a
+// sample was written to `out_sample` (length must match the tensor stride).
+int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written);
+// Query unread sample count for a subscriber on an edge.
+int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count);
+
+// Stage port bindings --------------------------------------------------------
+// Bind a stage instance to a specific LED key so edges can auto-provision
+// FIFO writers/readers between stage output/input ports.
+int32_t gp_table_bind_stage_port(GP_TableContext* ctx, unsigned long long led_key, GP_StageContext* stage, int32_t is_output, int32_t channel);
+int32_t gp_table_unbind_stage_port(GP_TableContext* ctx, unsigned long long led_key);
+int32_t gp_table_get_stage_port(GP_TableContext* ctx, unsigned long long led_key, GP_StageContext** out_stage, int32_t* out_is_output, int32_t* out_channel);
 
 // Selected LED query helpers
 int32_t gp_table_get_selected_count(const GP_TableContext* ctx);

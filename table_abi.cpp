@@ -514,6 +514,67 @@ static void draw_waveform(uint8_t* img, int w, int h, int pitch, int x0, int y0,
     }
 }
 
+// Simple nearest-neighbor image blit scaled into a cell rectangle.
+static void draw_image_cell(uint8_t* img, int w, int h, int pitch, int x0, int y0, int cw, int ch, const GP_TableImage* src) {
+    if (!img || !src || !src->rgba || cw <= 0 || ch <= 0 || src->width_px <= 0 || src->height_px <= 0) return;
+    int sw = src->width_px;
+    int sh = src->height_px;
+    int spitch = src->pitch_bytes;
+    // Many producers treat the buffer as opaque but leave alpha uninitialized/zero.
+    // Detect the common "alpha is all zero" case and treat it as fully opaque.
+    bool alpha_all_zero = true;
+    {
+        const int sx_samples[4] = {0, std::max(0, sw / 3), std::max(0, (2 * sw) / 3), std::max(0, sw - 1)};
+        const int sy_samples[4] = {0, std::max(0, sh / 3), std::max(0, (2 * sh) / 3), std::max(0, sh - 1)};
+        for (int syi = 0; syi < 4 && alpha_all_zero; ++syi) {
+            int sy = std::clamp(sy_samples[syi], 0, sh - 1);
+            const uint8_t* row = src->rgba + sy * spitch;
+            for (int sxi = 0; sxi < 4; ++sxi) {
+                int sx = std::clamp(sx_samples[sxi], 0, sw - 1);
+                const uint8_t a = row[sx * 4 + 3];
+                if (a != 0) { alpha_all_zero = false; break; }
+            }
+        }
+    }
+
+    // Preserve aspect ratio: fit source into destination rect and center.
+    float sx = float(cw) / float(std::max(1, sw));
+    float sy = float(ch) / float(std::max(1, sh));
+    float s = std::min(sx, sy);
+    int dw = std::max(1, int(std::lround(float(sw) * s)));
+    int dh = std::max(1, int(std::lround(float(sh) * s)));
+    dw = std::min(dw, cw);
+    dh = std::min(dh, ch);
+    int ox = x0 + (cw - dw) / 2;
+    int oy = y0 + (ch - dh) / 2;
+
+    for (int yy = 0; yy < dh; ++yy) {
+        int dy = oy + yy;
+        if (dy < 0 || dy >= h) continue;
+        float syf = (dh > 1) ? (float(yy) / float(dh - 1)) * float(sh - 1) : 0.0f;
+        int syi = std::clamp(int(std::round(syf)), 0, sh - 1);
+        const uint8_t* src_row = src->rgba + syi * spitch;
+        for (int xx = 0; xx < dw; ++xx) {
+            int dx = ox + xx;
+            if (dx < 0 || dx >= w) continue;
+            float sxf = (dw > 1) ? (float(xx) / float(dw - 1)) * float(sw - 1) : 0.0f;
+            int sxi = std::clamp(int(std::round(sxf)), 0, sw - 1);
+            const uint8_t* sp = src_row + sxi * 4;
+            uint8_t* dp = img + dy * pitch + dx * 4;
+            float sa = alpha_all_zero ? 1.0f : (sp[3] / 255.0f);
+            if (sa <= 0.0f) continue;
+            float inv = 1.0f - sa;
+            for (int c = 0; c < 3; ++c) {
+                float s0 = sp[c] / 255.0f;
+                float d0 = dp[c] / 255.0f;
+                dp[c] = static_cast<uint8_t>(std::lround((s0 * sa + d0 * inv) * 255.0f));
+            }
+            float da = dp[3] / 255.0f;
+            dp[3] = alpha_all_zero ? 255 : static_cast<uint8_t>(std::lround((sa + da * inv) * 255.0f));
+        }
+    }
+}
+
 static void draw_expand_box(uint8_t* img, int w, int h, int pitch, int x0, int y0, int size, bool expanded, Color c) {
     int s = std::max(6, size);
     int y_mid = y0 + s / 2;
@@ -633,6 +694,143 @@ static void compute_columns(const GP_TableColumn* cols, int col_count, int table
     }
 }
 
+static int row_base_height_px(const Style& st, const GP_TableRow& row) {
+    if (row.reserved0 > 0) return std::max(1, int(row.reserved0));
+    return std::max(1, st.row_h);
+}
+
+static bool row_find_image_cell(const GP_TableRow& row, const GP_TableCell** out_cell) {
+    if (out_cell) *out_cell = nullptr;
+    for (int c = 0; c < row.cell_count && c < 8; ++c) {
+        if (row.cells[c].kind == GP_TABLE_CELL_IMAGE) {
+            if (out_cell) *out_cell = &row.cells[c];
+            return true;
+        }
+    }
+    return false;
+}
+
+static int row_image_header_h(const Style& st, const GP_TableRow& row) {
+    (void)row;
+    return std::max(1, st.row_h);
+}
+
+static int row_desired_height_px(const Style& st, const GP_TableRow& row) {
+    // Fixed row height always wins.
+    if (row.reserved0 > 0) return std::max(1, int(row.reserved0));
+
+    const GP_TableCell* img_cell = nullptr;
+    if (!row_find_image_cell(row, &img_cell)) return std::max(1, st.row_h);
+
+    // Image rows: a header strip plus optional expanded image area.
+    int header_h = row_image_header_h(st, row);
+    if (!img_cell || row.expanded == 0) return header_h;
+    if (!img_cell->image || !img_cell->image->rgba || img_cell->image->width_px <= 0 || img_cell->image->height_px <= 0) return header_h;
+
+    const int max_img_h_default = 240;
+    int max_img_h = (img_cell->reserved0 > 0) ? std::max(1, img_cell->reserved0) : max_img_h_default;
+
+    // Default behavior: image content spans the full content width (excluding the label gutter).
+    int content_w = std::max(1, st.w - st.name_w - 4);
+    float aspect = float(img_cell->image->height_px) / float(std::max(1, img_cell->image->width_px));
+    
+    int desired_img_h = std::max(1, int(std::lround(float(content_w) * aspect)));
+    int img_h = std::clamp(desired_img_h, 0, max_img_h);
+    return header_h + img_h;
+}
+
+// Row layout policy:
+// - row.reserved0 > 0 => fixed height in pixels
+// - row.reserved0 == 0 => default height (style row height)
+// - row.reserved0 < 0 => flex row (eligible to absorb extra height)
+static void compute_row_layout(const GP_TableRow* rows, int row_count, const Style& st, int target_h,
+    std::vector<int>& out_y0, std::vector<int>& out_h) {
+    out_y0.assign(static_cast<size_t>(std::max(0, row_count)), 0);
+    out_h.assign(static_cast<size_t>(std::max(0, row_count)), 0);
+    if (!rows || row_count <= 0) return;
+
+    std::vector<int> h0(static_cast<size_t>(row_count), 0);
+    std::vector<int> hmin(static_cast<size_t>(row_count), 0);
+    std::vector<uint8_t> is_img_row(static_cast<size_t>(row_count), 0);
+    int sum = 0;
+    int flex_count = 0;
+    for (int i = 0; i < row_count; ++i) {
+        const GP_TableRow& r = rows[i];
+        const bool has_img = row_find_image_cell(r, nullptr);
+        is_img_row[static_cast<size_t>(i)] = has_img ? 1u : 0u;
+
+        int rh_min = row_base_height_px(st, r);
+        if (has_img && r.reserved0 <= 0) rh_min = row_image_header_h(st, r);
+        rh_min = std::max(1, rh_min);
+        hmin[static_cast<size_t>(i)] = rh_min;
+
+        int rh = has_img ? row_desired_height_px(st, r) : rh_min;
+        rh = std::max(rh_min, rh);
+        h0[static_cast<size_t>(i)] = rh;
+        sum += rh;
+        if (rows[i].reserved0 < 0) ++flex_count;
+    }
+
+    if (target_h > 0 && target_h != sum) {
+        if (target_h > sum) {
+            int extra = target_h - sum;
+            if (flex_count > 0) {
+                int per = extra / flex_count;
+                int rem = extra % flex_count;
+                for (int i = 0; i < row_count; ++i) {
+                    if (rows[i].reserved0 < 0) {
+                        h0[static_cast<size_t>(i)] += per;
+                        if (rem > 0) { h0[static_cast<size_t>(i)] += 1; --rem; }
+                    }
+                }
+            } else {
+                h0.back() += extra;
+            }
+        } else {
+            // Shrink to fit; prefer shrinking expanded image rows down to their header height first.
+            int over = sum - target_h;
+            for (int i = 0; i < row_count && over > 0; ++i) {
+                if (!is_img_row[static_cast<size_t>(i)]) continue;
+                int can = h0[static_cast<size_t>(i)] - hmin[static_cast<size_t>(i)];
+                if (can <= 0) continue;
+                int take = std::min(over, can);
+                h0[static_cast<size_t>(i)] -= take;
+                over -= take;
+            }
+
+            if (over > 0) {
+                // Scale down remaining overflow across all rows, bounded by hmin.
+                int cur_sum = 0;
+                for (int i = 0; i < row_count; ++i) cur_sum += h0[static_cast<size_t>(i)];
+                double scale = (cur_sum > 0) ? (double(target_h) / double(cur_sum)) : 1.0;
+                int new_sum = 0;
+                for (int i = 0; i < row_count; ++i) {
+                    int rh = int(std::floor(double(h0[static_cast<size_t>(i)]) * scale));
+                    rh = std::max(hmin[static_cast<size_t>(i)], std::max(1, rh));
+                    h0[static_cast<size_t>(i)] = rh;
+                    new_sum += rh;
+                }
+                int diff = target_h - new_sum;
+                if (diff > 0) {
+                    for (int i = 0; i < row_count && diff > 0; ++i) { h0[static_cast<size_t>(i)] += 1; --diff; }
+                } else if (diff < 0) {
+                    for (int i = row_count - 1; i >= 0 && diff < 0; --i) {
+                        int minv = std::max(1, hmin[static_cast<size_t>(i)]);
+                        if (h0[static_cast<size_t>(i)] > minv) { h0[static_cast<size_t>(i)] -= 1; ++diff; }
+                    }
+                }
+            }
+        }
+    }
+
+    int y = 0;
+    for (int i = 0; i < row_count; ++i) {
+        out_y0[static_cast<size_t>(i)] = y;
+        out_h[static_cast<size_t>(i)] = h0[static_cast<size_t>(i)];
+        y += h0[static_cast<size_t>(i)];
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -672,6 +870,8 @@ int32_t gp_table_raster_rgba_with_hits(
         w = out_geom->width_px;
         h = out_geom->height_px;
     }
+    // Ensure any content-driven sizing (e.g., image aspect) uses the actual target width.
+    st.w = std::max(1, w);
     const int need = w * h * 4;
     if (out_len_bytes < need) return 0;
 
@@ -702,13 +902,9 @@ int32_t gp_table_raster_rgba_with_hits(
     int col_x0[8] = {0};
     int col_w[8] = {0};
     compute_columns(cols, col_count, w, st.name_w, col_x0, col_w);
-    // If caller overrode the output geometry size, compute an effective
-    // per-row height so rows are laid out to match the target buffer
-    // height. This ensures hitbox coordinates line up with the rendered
-    // pixels when the renderer is asked to draw into a specific buffer
-    // (e.g. embedding a table into a larger module rect).
-    int row_h_eff = std::max(1, st.row_h);
-    if (row_count > 0) row_h_eff = std::max(1, h / row_count);
+    std::vector<int> row_y0;
+    std::vector<int> row_h;
+    compute_row_layout(rows, int(row_count), st, h, row_y0, row_h);
     if (out_geom) {
         out_geom->width_px = w;
         out_geom->height_px = h;
@@ -721,22 +917,39 @@ int32_t gp_table_raster_rgba_with_hits(
     const int led_count = 9;
     for (int i = 0; i < row_count; ++i) {
         const GP_TableRow& r = rows[i];
-        int y0 = i * row_h_eff;
+        const GP_TableCell* img_cell = nullptr;
+        const bool is_image_row = row_find_image_cell(r, &img_cell);
+        const int header_h = is_image_row ? row_image_header_h(st, r) : 0;
+        int y0 = row_y0[static_cast<size_t>(i)];
+        int rh = row_h[static_cast<size_t>(i)];
         Color bg = (r.kind == GP_TABLE_ROW_HEADER) ? st.hdr : (r.selected ? st.bg_sel : st.bg);
-        memset_rect(out_rgba, w, h, w * 4, 0, y0, w, row_h_eff, bg);
+        memset_rect(out_rgba, w, h, w * 4, 0, y0, w, rh, bg);
 
         // Expand box only on header/device rows to avoid clutter on leaf rows.
         int indent_px = st.indent * std::max(0, r.depth);
         if (r.kind == GP_TABLE_ROW_HEADER || r.kind == GP_TABLE_ROW_DEVICE) {
             int exp_x = 4 + indent_px;
-            int exp_y = y0 + (st.row_h - st.expand_w) / 2;
+            int band_h = is_image_row ? std::min(rh, header_h) : rh;
+            int exp_y = y0 + (band_h - st.expand_w) / 2;
             draw_expand_box(out_rgba, w, h, w * 4, exp_x, exp_y, st.expand_w, r.expanded != 0, st.text);
             push_hit(exp_x, exp_y, exp_x + st.expand_w, exp_y + st.expand_w, i, -1, GP_TABLE_CELL_TEXT, GP_TABLE_HIT_EXPAND, 0, 0, 0);
         }
         // Label gutter still reserves name_w; callers overlay text as needed.
 
         // Cells
-        int cy = y0 + row_h_eff / 2;
+        int cell_band_h = is_image_row ? std::min(rh, header_h) : rh;
+        int cy = y0 + cell_band_h / 2;
+
+        // Image rows: render image under the header band, spanning the full content width.
+        if (is_image_row && img_cell && img_cell->image && img_cell->image->rgba && r.expanded != 0 && rh > header_h) {
+            const int max_img_h_default = 240;
+            int max_img_h = (img_cell->reserved0 > 0) ? std::max(1, img_cell->reserved0) : max_img_h_default;
+            int img_x0 = st.name_w + 2;
+            int img_y0 = y0 + header_h;
+            int img_w = std::max(1, w - st.name_w - 4);
+            int img_h = std::max(0, std::min(rh - header_h, max_img_h));
+            draw_image_cell(out_rgba, w, h, w * 4, img_x0, img_y0, img_w, img_h, img_cell->image);
+        }
         for (int c = 0; c < r.cell_count && c < col_count && c < 8; ++c) {
             const GP_TableCell& cell = r.cells[c];
             int x0 = col_x0[c];
@@ -796,17 +1009,26 @@ int32_t gp_table_raster_rgba_with_hits(
                     int n = std::max(0, std::min<int>(pt.n, 3));
                     if (n <= 0) break;
                     int eff_w = std::max(1, cw - 4);
-                    int slot_h = std::max(6, row_h_eff / std::max(1, n + 1));
+                    int slot_h = std::max(6, rh / std::max(1, n + 1));
                     for (int si = 0; si < n; ++si) {
                         const PackedStrip& ps = pt.strips[si];
-                        int cy_slot = y0 + (row_h_eff * (si + 1)) / (n + 1);
+                        int cy_slot = y0 + (rh * (si + 1)) / (n + 1);
                         int led_spacing = std::max(3 * 2 + 2, eff_w / std::max(1, int(ps.count) + 1));
                         int cx0 = x0 + 2 + led_spacing;
                         for (int li = 0; li < ps.count; ++li) {
                             int cx = cx0 + li * led_spacing;
                             push_hit(cx - 5, cy_slot - 5, cx + 5, cy_slot + 5, i, c, GP_TABLE_CELL_LEDS_TABLE, GP_TABLE_HIT_LED_TABLE, si, li, 0);
                         }
-                        draw_led_strip(out_rgba, w, h, w * 4, x0 + 2, cy_slot, eff_w, std::max<int>(0, ps.count), ps.on_mask, ps.edge_mask, ps.active_mask, 3, st.led_on, st.led_off, st.led_edge, st.axis_tick);
+                    draw_led_strip(out_rgba, w, h, w * 4, x0 + 2, cy_slot, eff_w, std::max<int>(0, ps.count), ps.on_mask, ps.edge_mask, ps.active_mask, 3, st.led_on, st.led_off, st.led_edge, st.axis_tick);
+                    }
+                    break;
+                }
+                case GP_TABLE_CELL_IMAGE: {
+                    // Image rows are rendered as full-row content under the header band (above).
+                    if (!is_image_row) {
+                        int eff_w = std::max(1, cw - 4);
+                        int eff_h = std::max(1, rh - 2);
+                        draw_image_cell(out_rgba, w, h, w * 4, x0 + 2, y0 + 1, eff_w, eff_h, cell.image);
                     }
                     break;
                 }
@@ -817,13 +1039,13 @@ int32_t gp_table_raster_rgba_with_hits(
                     bool up_press = (cell.flags & 0x1u) != 0;
                     bool dn_press = (cell.flags & 0x2u) != 0;
                     int bar_w = std::max(1, cw - 2);
-                    int arrow_h = std::max(8, (row_h_eff - 2) / 6);
-                    draw_scrollbar(out_rgba, w, h, w * 4, x0 + 1, y0 + 1, bar_w, row_h_eff - 2, v, total, visible, up_press, dn_press, st.axis_bg, st.axis_val, st.text, st.text_hdr, st.bg_sel, st.bg);
+                    int arrow_h = std::max(8, (rh - 2) / 6);
+                    draw_scrollbar(out_rgba, w, h, w * 4, x0 + 1, y0 + 1, bar_w, rh - 2, v, total, visible, up_press, dn_press, st.axis_bg, st.axis_val, st.text, st.text_hdr, st.bg_sel, st.bg);
                     // Hitboxes: arrows + thumb
                     push_hit(x0 + 1, y0 + 1, x0 + 1 + bar_w, y0 + 1 + arrow_h, i, c, GP_TABLE_CELL_SCROLL, GP_TABLE_HIT_SCROLL_UP, 0, 0, 0);
-                    push_hit(x0 + 1, y0 + st.row_h - 1 - arrow_h, x0 + 1 + bar_w, y0 + st.row_h - 1, i, c, GP_TABLE_CELL_SCROLL, GP_TABLE_HIT_SCROLL_DOWN, 0, 0, 0);
+                    push_hit(x0 + 1, y0 + rh - 1 - arrow_h, x0 + 1 + bar_w, y0 + rh - 1, i, c, GP_TABLE_CELL_SCROLL, GP_TABLE_HIT_SCROLL_DOWN, 0, 0, 0);
                     int track_y0 = y0 + 1 + arrow_h;
-                    int track_h = (row_h_eff - 2) - 2 * arrow_h;
+                    int track_h = (rh - 2) - 2 * arrow_h;
                     if (track_h > 0) {
                         float vis_frac = std::clamp(float(visible) / float(std::max(visible, total)), 0.05f, 1.0f);
                         int thumb_h = std::max(6, int(vis_frac * track_h));
@@ -834,8 +1056,8 @@ int32_t gp_table_raster_rgba_with_hits(
                     break;
                 }
                 case GP_TABLE_CELL_AXIS: {
-                    int bar_h = std::max(6, row_h_eff / 3);
-                    int bar_y = y0 + (row_h_eff - bar_h) / 2;
+                    int bar_h = std::max(6, rh / 3);
+                    int bar_y = y0 + (rh - bar_h) / 2;
 
                     // Optional extras: hold_s/min, last_s/max, calib params encoded as text.
                     float v_min = cell.hold_s;
@@ -890,8 +1112,8 @@ int32_t gp_table_raster_rgba_with_hits(
                 case GP_TABLE_CELL_CALIB: {
                     bool inv_on = (cell.flags & 0x1u) != 0;
                     int mode = int((cell.flags >> 1) & 0x3u); // 0:none,1:trim,2:cap,3:ded
-                    int strip_h = std::max(6, row_h_eff / 3);
-                    int strip_y = y0 + (row_h_eff - strip_h) / 2;
+                    int strip_h = std::max(6, rh / 3);
+                    int strip_y = y0 + (rh - strip_h) / 2;
                     int eff_w = std::max(1, cw - 4);
                     draw_calib_strip(out_rgba, w, h, w * 4, x0 + 2, strip_y, eff_w, strip_h, inv_on, mode, st.axis_tick, st.timer, st.led_on);
                     // Slots: 0 INV, 1 TRIM, 2 CAP, 3 DED, 4 RST
@@ -907,14 +1129,14 @@ int32_t gp_table_raster_rgba_with_hits(
                     break;
                 }
                 case GP_TABLE_CELL_TIMERS: {
-                    int t_h = std::max(2, row_h_eff / 4);
-                    int t_y = y0 + (row_h_eff - t_h) / 2;
+                    int t_h = std::max(2, rh / 4);
+                    int t_y = y0 + (rh - t_h) / 2;
                     draw_timers(out_rgba, w, h, w * 4, x0 + 2, t_y, std::max(1, cw - 4), t_h, cell.hold_s, cell.last_s, st.timer);
                     break;
                 }
                 case GP_TABLE_CELL_WAVE: {
-                    int wh = std::min(row_h_eff - 4, cw);
-                    int wy = y0 + (row_h_eff - wh) / 2;
+                    int wh = std::min(rh - 4, cw);
+                    int wy = y0 + (rh - wh) / 2;
                     draw_waveform(out_rgba, w, h, w * 4, x0 + 2, wy, std::max(1, cw - 4), wh, cell.wave, st.wave_bg, st.wave_fg);
                     break;
                 }
@@ -925,7 +1147,7 @@ int32_t gp_table_raster_rgba_with_hits(
             }
             // Emit whole-cell hitbox after all per-part hitboxes so small parts (LEDs)
             // are found before the coarse whole-cell region by hit iteration order.
-            push_hit(x0, y0, x0 + cw, y0 + st.row_h, i, c, static_cast<GP_TableCellKind>(cell.kind), GP_TABLE_HIT_CELL, 0, 0, 0);
+            push_hit(x0, y0, x0 + cw, y0 + rh, i, c, static_cast<GP_TableCellKind>(cell.kind), GP_TABLE_HIT_CELL, 0, 0, 0);
         }
     }
 
@@ -1053,6 +1275,137 @@ int32_t gp_table_raster_rgba(
     return gp_table_raster_rgba_with_hits(rows, row_count, cols, col_count, style, /*render_state=*/nullptr, out_rgba, out_len_bytes, out_geom, nullptr, 0, nullptr);
 }
 
+struct StagePortBinding {
+    GP_StageContext* stage = nullptr;
+    int is_output = 0; // 1=output port, 0=input port
+    int channel = 0;   // optional stage-local channel index
+};
+
+struct EdgeTensorFifo {
+    struct Reader {
+        uint64_t id = 0;
+        size_t seq = 0; // next sequence to read
+    };
+
+    std::vector<int32_t> shape;
+    size_t stride = 1; // elements per tensor sample
+    size_t slots = 0;  // samples in ring
+    size_t top_k = 0;  // if >0, keep this many newest on overwrite
+    uint64_t writer = 0;
+    size_t write_seq = 0; // next sequence number to write
+    std::vector<float> storage;
+    std::vector<Reader> readers;
+
+    void configure_default() {
+        configure(std::vector<int32_t>{1}, 16, 0);
+    }
+
+    void configure(const std::vector<int32_t>& dims, size_t slot_count, size_t topk) {
+        shape = dims;
+        if (shape.empty()) shape.push_back(1);
+        stride = 1;
+        for (int32_t d : shape) {
+            stride *= static_cast<size_t>(std::max<int32_t>(1, d));
+        }
+        slots = std::max<size_t>(1, slot_count);
+        top_k = topk;
+        storage.assign(stride * slots, 0.0f);
+        write_seq = 0;
+        readers.clear();
+    }
+
+    size_t elem_count() const { return stride; }
+
+    Reader* find_reader(uint64_t id) {
+        for (auto &r : readers) {
+            if (r.id == id) return &r;
+        }
+        return nullptr;
+    }
+    const Reader* find_reader(uint64_t id) const {
+        for (auto &r : readers) {
+            if (r.id == id) return &r;
+        }
+        return nullptr;
+    }
+    Reader& ensure_reader(uint64_t id) {
+        if (Reader* r = find_reader(id)) return *r;
+        readers.push_back(Reader{id, write_seq});
+        return readers.back();
+    }
+    void remove_reader(uint64_t id) {
+        readers.erase(std::remove_if(readers.begin(), readers.end(), [&](const Reader& r){ return r.id == id; }), readers.end());
+    }
+
+    size_t min_read_seq() const {
+        if (readers.empty()) return write_seq;
+        size_t m = readers.front().seq;
+        for (const auto &r : readers) m = std::min(m, r.seq);
+        return m;
+    }
+
+    bool ensure_space_for_write(bool* out_dropped) {
+        if (out_dropped) *out_dropped = false;
+        if (slots == 0) return false;
+        size_t min_seq = min_read_seq();
+        size_t used = write_seq - min_seq;
+        if (used < slots) return true;
+        if (top_k == 0) return false;
+        size_t window = std::min(top_k, slots);
+        size_t target_min = (window > 0 && write_seq >= (window - 1)) ? (write_seq - (window - 1)) : 0;
+        if (target_min <= min_seq) return false;
+        for (auto &r : readers) {
+            if (r.seq < target_min) r.seq = target_min;
+        }
+        if (out_dropped) *out_dropped = true;
+        min_seq = min_read_seq();
+        used = write_seq - min_seq;
+        return used < slots;
+    }
+
+    bool push(uint64_t writer_id, const float* sample, size_t sample_len, bool* out_dropped) {
+        if (!sample) return false;
+        if (sample_len != stride) return false;
+        if (!ensure_space_for_write(out_dropped)) return false;
+        size_t slot = slots ? (write_seq % slots) : 0;
+        float* dst = storage.data() + slot * stride;
+        std::memcpy(dst, sample, stride * sizeof(float));
+        writer = writer_id;
+        ++write_seq;
+        return true;
+    }
+
+    bool pop(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written) {
+        out_written = 0;
+        Reader* r = find_reader(reader_id);
+        if (!r) return false;
+        if (r->seq >= write_seq) return false;
+        if (!out_sample || out_cap < stride) return false;
+        size_t slot = slots ? (r->seq % slots) : 0;
+        const float* src = storage.data() + slot * stride;
+        std::memcpy(out_sample, src, stride * sizeof(float));
+        ++(r->seq);
+        out_written = stride;
+        return true;
+    }
+
+    size_t unread(uint64_t reader_id) const {
+        const Reader* r = find_reader(reader_id);
+        if (!r) return 0;
+        if (write_seq < r->seq) return 0;
+        return write_seq - r->seq;
+    }
+
+    GP_TableEdgeTensorSpec to_spec() const {
+        GP_TableEdgeTensorSpec s{};
+        s.dim_count = static_cast<int32_t>(std::min<size_t>(shape.size(), sizeof(s.dims) / sizeof(s.dims[0])));
+        for (int32_t i = 0; i < s.dim_count; ++i) s.dims[i] = shape[static_cast<size_t>(i)];
+        s.slots = static_cast<int32_t>(slots);
+        s.top_k = static_cast<int32_t>(top_k);
+        return s;
+    }
+};
+
 // Stateful context ----------------------------------------------------------
 
 struct GP_TableContext {
@@ -1069,6 +1422,8 @@ struct GP_TableContext {
     std::unordered_set<uint64_t> selected_leds;
     std::unordered_map<uint64_t, float> led_glow_strength;
     std::vector<std::pair<uint64_t,uint64_t>> edges;
+    std::vector<EdgeTensorFifo> edge_fifos; // companion FIFO per rope edge
+    std::unordered_map<uint64_t, StagePortBinding> stage_ports; // LED key -> stage port binding
     // Relaxation state (per-edge values/velocities are maintained in parallel to edges)
     int32_t relax_mode = GP_TABLE_RELAX_OFF;
     float relax_stiffness = 10.0f;
@@ -1197,8 +1552,61 @@ int32_t gp_table_clear_action_callback(GP_TableContext* ctx) {
 static void recompute_geom(GP_TableContext* ctx) {
     if (!ctx) return;
     ctx->geom.width_px = ctx->st.w;
-    ctx->geom.height_px = std::max<int32_t>(1, static_cast<int32_t>(ctx->rows.size()) * ctx->st.row_h);
+    int h_sum = 0;
+    for (const auto& r : ctx->rows) {
+        int rh = row_desired_height_px(ctx->st, r);
+        h_sum += std::max(1, rh);
+    }
+    ctx->geom.height_px = std::max<int32_t>(1, static_cast<int32_t>(h_sum));
     compute_columns(ctx->cols.data(), static_cast<int>(ctx->cols.size()), ctx->st.w, ctx->st.name_w, ctx->geom.col_x0, ctx->geom.col_w);
+}
+
+// Ensure the edge FIFO list matches the edge list length.
+static void ensure_edge_fifos(GP_TableContext* ctx) {
+    if (!ctx) return;
+    while (ctx->edge_fifos.size() < ctx->edges.size()) {
+        EdgeTensorFifo fifo;
+        fifo.configure_default();
+        ctx->edge_fifos.push_back(std::move(fifo));
+    }
+    if (ctx->edge_fifos.size() > ctx->edges.size()) {
+        ctx->edge_fifos.resize(ctx->edges.size());
+    }
+}
+
+// Apply stage port bindings to an edge's FIFO: output keys claim writer, input keys subscribe.
+static void sync_edge_tensor_for_idx(GP_TableContext* ctx, size_t ei) {
+    if (!ctx) return;
+    ensure_edge_fifos(ctx);
+    if (ei >= ctx->edges.size() || ei >= ctx->edge_fifos.size()) return;
+    const auto &edge = ctx->edges[ei];
+    EdgeTensorFifo &fifo = ctx->edge_fifos[ei];
+    uint64_t prev_writer = fifo.writer;
+    auto bind_one = [&](uint64_t key) {
+        auto it = ctx->stage_ports.find(key);
+        if (it == ctx->stage_ports.end()) return;
+        const StagePortBinding &b = it->second;
+        if (b.is_output) {
+            if (prev_writer == 0 || prev_writer == key) {
+                fifo.writer = key;
+            }
+        } else {
+            fifo.ensure_reader(key);
+        }
+    };
+    bind_one(edge.first);
+    bind_one(edge.second);
+}
+
+static void sync_edge_tensors_for_key(GP_TableContext* ctx, uint64_t key) {
+    if (!ctx) return;
+    ensure_edge_fifos(ctx);
+    for (size_t i = 0; i < ctx->edges.size(); ++i) {
+        const auto &e = ctx->edges[i];
+        if (e.first == key || e.second == key) {
+            sync_edge_tensor_for_idx(ctx, i);
+        }
+    }
 }
 
 static void draw_circle_outline(uint8_t* img, int w, int h, int pitch, int cx, int cy, int r, int thickness, Color c) {
@@ -2414,17 +2822,25 @@ int32_t gp_table_set_scroll_fraction_xy(GP_TableContext* ctx, float frac_x, floa
 // Edge list helpers
 int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b) {
     if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
     ctx->edges.emplace_back(a, b);
     // ensure relax arrays stay in sync
     // start unrelaxed so the cable animates into place
     ctx->relax_value.push_back(0.0f);
     ctx->relax_vel.push_back(0.0f);
+    // companion tensor FIFO for this edge
+    EdgeTensorFifo fifo;
+    fifo.configure_default();
+    ctx->edge_fifos.push_back(std::move(fifo));
     // reset prospective state when a real edge is added
     ctx->prospective_initialized = false;
     // create a rope entry in the simulator (if available)
     if (ctx->rope_sim) {
         // compute approximate endpoints in table-local coords
         int ax = 0, ay = 0, bx = 0, by = 0;
+        std::vector<int> row_y0;
+        std::vector<int> row_h;
+        compute_row_layout(ctx->rows.data(), static_cast<int>(ctx->rows.size()), ctx->st, ctx->geom.height_px, row_y0, row_h);
         auto compute_center_local = [&](uint64_t key, int &outx, int &outy) {
             outx = -1; outy = -1;
             uint32_t r_orig = static_cast<uint32_t>(key >> 32);
@@ -2438,7 +2854,8 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
             const GP_TableCell &cell = row.cells[static_cast<int>(c_idx)];
             int x0 = col_x0[static_cast<int>(c_idx)];
             int cw = col_w[static_cast<int>(c_idx)];
-            int y0 = static_cast<int>(r_orig) * ctx->st.row_h;
+            int y0 = (r_orig < row_y0.size()) ? row_y0[static_cast<size_t>(r_orig)] : (static_cast<int>(r_orig) * ctx->st.row_h);
+            int rh = (r_orig < row_h.size()) ? row_h[static_cast<size_t>(r_orig)] : ctx->st.row_h;
             int led_count = 9;
             if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
                 int count = std::max(0, std::min(32, static_cast<int>(cell.value)));
@@ -2454,7 +2871,9 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
             int cx0 = x0 + 2 + led_spacing;
             if (static_cast<int>(led) >= 0 && static_cast<int>(led) < led_count) {
                 outx = cx0 + static_cast<int>(led) * led_spacing;
-                outy = y0 + ctx->st.row_h / 2;
+                const bool is_image_row = row_find_image_cell(row, nullptr);
+                int band_h = is_image_row ? std::min(rh, row_image_header_h(ctx->st, row)) : rh;
+                outy = y0 + band_h / 2;
             }
         };
         compute_center_local(a, ax, ay);
@@ -2467,6 +2886,7 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
     } else {
         ctx->rope_sim_idx.push_back(-1);
     }
+    sync_edge_tensor_for_idx(ctx, ctx->edges.size() - 1);
     return 1;
 }
 
@@ -2475,6 +2895,7 @@ int32_t gp_table_clear_edges(GP_TableContext* ctx) {
     ctx->edges.clear();
     ctx->relax_value.clear();
     ctx->relax_vel.clear();
+    ctx->edge_fifos.clear();
     // reset rope simulator indices and recreate sim to free resources
     ctx->rope_sim_idx.clear();
     if (ctx->rope_sim && ctx->rope_sim_owned) {
@@ -2498,6 +2919,116 @@ int32_t gp_table_get_edge(const GP_TableContext* ctx, int32_t idx, unsigned long
     if (idx < 0 || idx >= static_cast<int32_t>(ctx->edges.size())) return 0;
     *out_a = ctx->edges[static_cast<size_t>(idx)].first;
     *out_b = ctx->edges[static_cast<size_t>(idx)].second;
+    return 1;
+}
+
+int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpec* spec) {
+    if (!ctx || !spec) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    std::vector<int32_t> dims;
+    int dc = std::max(0, std::min(8, spec->dim_count));
+    dims.reserve(static_cast<size_t>(dc));
+    for (int i = 0; i < dc; ++i) {
+        int32_t d = spec->dims[i];
+        if (d < 1) d = 1;
+        dims.push_back(d);
+    }
+    size_t slots = spec->slots > 0 ? static_cast<size_t>(spec->slots) : size_t(1);
+    size_t topk = spec->top_k > 0 ? static_cast<size_t>(spec->top_k) : size_t(0);
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].configure(dims, slots, topk);
+    sync_edge_tensor_for_idx(ctx, static_cast<size_t>(edge_idx));
+    return 1;
+}
+
+int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpec* out_spec) {
+    if (!ctx || !out_spec) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    *out_spec = ctx->edge_fifos[static_cast<size_t>(edge_idx)].to_spec();
+    return 1;
+}
+
+int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].ensure_reader(subscriber_key);
+    return 1;
+}
+
+int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].remove_reader(subscriber_key);
+    return 1;
+}
+
+int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped) {
+    if (out_dropped) *out_dropped = 0;
+    if (!ctx || !sample || sample_len < 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    bool dropped = false;
+    bool ok = fifo.push(writer_key, sample, static_cast<size_t>(sample_len), &dropped);
+    if (out_dropped && dropped) *out_dropped = 1;
+    return ok ? 1 : 0;
+}
+
+int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written) {
+    if (out_written) *out_written = 0;
+    if (!ctx || !out_sample || out_len < 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    size_t wrote = 0;
+    bool ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+    if (out_written) *out_written = static_cast<int32_t>(wrote);
+    return ok ? 1 : 0;
+}
+
+int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count) {
+    if (!ctx || !out_count) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    size_t cnt = ctx->edge_fifos[static_cast<size_t>(edge_idx)].unread(subscriber_key);
+    *out_count = static_cast<int32_t>(std::min<size_t>(cnt, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
+    return 1;
+}
+
+int32_t gp_table_bind_stage_port(GP_TableContext* ctx, unsigned long long led_key, GP_StageContext* stage, int32_t is_output, int32_t channel) {
+    if (!ctx || !stage) return 0;
+    StagePortBinding b;
+    b.stage = stage;
+    b.is_output = is_output ? 1 : 0;
+    b.channel = channel;
+    ctx->stage_ports[led_key] = b;
+    sync_edge_tensors_for_key(ctx, led_key);
+    return 1;
+}
+
+int32_t gp_table_unbind_stage_port(GP_TableContext* ctx, unsigned long long led_key) {
+    if (!ctx) return 0;
+    ctx->stage_ports.erase(led_key);
+    ensure_edge_fifos(ctx);
+    for (size_t i = 0; i < ctx->edges.size() && i < ctx->edge_fifos.size(); ++i) {
+        auto &fifo = ctx->edge_fifos[i];
+        if (fifo.writer == led_key) fifo.writer = 0;
+        fifo.remove_reader(led_key);
+    }
+    sync_edge_tensors_for_key(ctx, led_key);
+    return 1;
+}
+
+int32_t gp_table_get_stage_port(GP_TableContext* ctx, unsigned long long led_key, GP_StageContext** out_stage, int32_t* out_is_output, int32_t* out_channel) {
+    if (!ctx) return 0;
+    auto it = ctx->stage_ports.find(led_key);
+    if (it == ctx->stage_ports.end()) return 0;
+    if (out_stage) *out_stage = it->second.stage;
+    if (out_is_output) *out_is_output = it->second.is_output;
+    if (out_channel) *out_channel = it->second.channel;
     return 1;
 }
 
@@ -2679,6 +3210,7 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
         // clear wave pointers inside cells to avoid serializing pointers
         for (int c = 0; c < row.cell_count && c < 8; ++c) {
             row.cells[c].wave = nullptr;
+            row.cells[c].image = nullptr;
         }
         memcpy(p, &row, sizeof(GP_TableRow)); p += sizeof(GP_TableRow);
     }
@@ -3026,28 +3558,28 @@ int32_t gp_table_render_rgba_with_state(
     int32_t* hitboxes_written) {
     if (!ctx) return 0;
 
-    // Build filtered visible rows according to expanded flags and create mapping
+    // Build filtered visible rows according to expanded flags and create mapping.
     std::vector<GP_TableRow> vis_rows;
     std::vector<int> map_vis_to_orig; // vis index -> original index
     vis_rows.reserve(ctx->rows.size());
     map_vis_to_orig.reserve(ctx->rows.size());
     const int max_depth = 64;
-    std::vector<bool> parent_expanded(max_depth, true);
+    std::vector<bool> expanded_at_depth(max_depth, true); // expanded_at_depth[d] controls visibility of depth d+1 children
     for (size_t i = 0; i < ctx->rows.size(); ++i) {
         const GP_TableRow &r = ctx->rows[i];
         int d = std::max(0, r.depth);
         if (d >= max_depth) d = max_depth - 1;
         bool visible = true;
-        for (int dd = 1; dd <= d; ++dd) {
-            if (!parent_expanded[dd]) { visible = false; break; }
+        for (int dd = 0; dd < d; ++dd) {
+            if (!expanded_at_depth[dd]) { visible = false; break; }
         }
         if (visible) {
             vis_rows.push_back(r);
             map_vis_to_orig.push_back(static_cast<int>(i));
         }
-        // set expanded flag for children
-        parent_expanded[d+1 < max_depth ? d+1 : d] = (r.expanded != 0);
-        // clear deeper flags if next row has smaller depth will happen on next iteration
+        // This row controls whether its children (depth d+1) are visible.
+        expanded_at_depth[d] = (r.expanded != 0);
+        for (int dd = d + 1; dd < max_depth; ++dd) expanded_at_depth[dd] = true;
     }
 
     // Prepare a local render state with translated highlight_row if present
@@ -3077,10 +3609,26 @@ int32_t gp_table_render_rgba_with_state(
 
     if (!ok) return 0;
 
-    // Prepare column geometry for overlay placement
+    // Translate hitboxes back to original row indices so clicks/actions operate on ctx->rows.
+    if (hitboxes_out && hitboxes_written && *hitboxes_written > 0) {
+        int n = *hitboxes_written;
+        for (int i = 0; i < n; ++i) {
+            int vr = hitboxes_out[i].row_idx;
+            if (vr >= 0 && vr < static_cast<int>(map_vis_to_orig.size())) hitboxes_out[i].row_idx = map_vis_to_orig[static_cast<size_t>(vr)];
+        }
+    }
+
+    // Prepare column geometry for overlay placement.
     int col_x0[8] = {0};
     int col_w[8] = {0};
-    compute_columns(ctx->cols.data(), static_cast<int>(ctx->cols.size()), ctx->st.w, ctx->st.name_w, col_x0, col_w);
+    compute_columns(ctx->cols.data(), static_cast<int>(ctx->cols.size()), local_geom.width_px, ctx->st.name_w, col_x0, col_w);
+
+    // Cache row layout for the visible row set (for post passes that compute LED centers).
+    Style st_local = load_style(&ctx->style_raw);
+    st_local.w = std::max(1, local_geom.width_px);
+    std::vector<int> vis_row_y0;
+    std::vector<int> vis_row_h;
+    compute_row_layout(vis_rows.data(), static_cast<int>(vis_rows.size()), st_local, local_geom.height_px, vis_row_y0, vis_row_h);
 
     auto find_visible_row = [&](uint32_t orig_idx) -> int {
         for (size_t vi = 0; vi < map_vis_to_orig.size(); ++vi) {
@@ -3115,8 +3663,11 @@ int32_t gp_table_render_rgba_with_state(
 
             int x0 = col_x0[static_cast<int>(c_idx)];
             int cw = col_w[static_cast<int>(c_idx)];
-            int y0 = vis_idx * ctx->st.row_h;
-            int cy = y0 + ctx->st.row_h / 2;
+            int y0 = (vis_idx >= 0 && vis_idx < static_cast<int>(vis_row_y0.size())) ? vis_row_y0[static_cast<size_t>(vis_idx)] : (vis_idx * ctx->st.row_h);
+            int rh = (vis_idx >= 0 && vis_idx < static_cast<int>(vis_row_h.size())) ? vis_row_h[static_cast<size_t>(vis_idx)] : ctx->st.row_h;
+            const bool is_image_row = row_find_image_cell(row, nullptr);
+            int band_h = is_image_row ? std::min(rh, row_image_header_h(st_local, row)) : rh;
+            int cy = y0 + band_h / 2;
             int count = 9;
             int radius = 4;
             uint32_t on_mask = cell.flags;
@@ -3197,7 +3748,10 @@ int32_t gp_table_render_rgba_with_state(
             const GP_TableCell &cell = row.cells[c_idx];
             int x0 = col_x0[static_cast<int>(c_idx)];
             int cw = col_w[static_cast<int>(c_idx)];
-            int y0 = vis_idx * ctx->st.row_h;
+            int y0 = (vis_idx >= 0 && vis_idx < static_cast<int>(vis_row_y0.size())) ? vis_row_y0[static_cast<size_t>(vis_idx)] : (vis_idx * ctx->st.row_h);
+            int rh = (vis_idx >= 0 && vis_idx < static_cast<int>(vis_row_h.size())) ? vis_row_h[static_cast<size_t>(vis_idx)] : ctx->st.row_h;
+            const bool is_image_row = row_find_image_cell(row, nullptr);
+            int band_h = is_image_row ? std::min(rh, row_image_header_h(st_local, row)) : rh;
             // approximate LED layout similar to raster
             int led_count = 9;
             if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
@@ -3214,7 +3768,7 @@ int32_t gp_table_render_rgba_with_state(
             int cx0 = x0 + 2 + led_spacing;
             if (static_cast<int>(led) >= 0 && static_cast<int>(led) < led_count) {
                 int cx = cx0 + static_cast<int>(led) * led_spacing;
-                int cy = y0 + ctx->st.row_h / 2;
+                int cy = y0 + band_h / 2;
                 draw_circle_outline(out_rgba, w_local, h_local, pitch_local, cx, cy, radius + 2, 2, sel_col);
             }
         }
@@ -3244,7 +3798,10 @@ int32_t gp_table_render_rgba_with_state(
         const GP_TableCell &cell = row.cells[c_idx];
         int x0 = col_x0[static_cast<int>(c_idx)];
         int cw = col_w[static_cast<int>(c_idx)];
-        int y0 = vis_idx * ctx->st.row_h;
+        int y0 = (vis_idx >= 0 && vis_idx < static_cast<int>(vis_row_y0.size())) ? vis_row_y0[static_cast<size_t>(vis_idx)] : (vis_idx * ctx->st.row_h);
+        int rh = (vis_idx >= 0 && vis_idx < static_cast<int>(vis_row_h.size())) ? vis_row_h[static_cast<size_t>(vis_idx)] : ctx->st.row_h;
+        const bool is_image_row = row_find_image_cell(row, nullptr);
+        int band_h = is_image_row ? std::min(rh, row_image_header_h(st_local, row)) : rh;
         int led_count = 9;
         uint32_t on_mask = cell.flags;
         uint32_t active_mask = cell.flags;
@@ -3265,7 +3822,7 @@ int32_t gp_table_render_rgba_with_state(
         int cx0 = x0 + 2 + led_spacing;
         if (led >= static_cast<uint32_t>(led_count)) return false;
         out.x = cx0 + static_cast<int>(led) * led_spacing;
-        out.y = y0 + ctx->st.row_h / 2;
+        out.y = y0 + band_h / 2;
         uint32_t bit = 1u << led;
         out.on = (on_mask & bit) != 0;
         out.active = (active_mask & bit) != 0;
@@ -3436,6 +3993,7 @@ int32_t gp_table_render_rgba_with_state(
     }
 
     if (out_rgba && !ctx->edges.empty()) {
+        ensure_edge_fifos(ctx);
         int w_local = local_geom.width_px;
         int h_local = local_geom.height_px;
         int pitch_local = w_local * 4;

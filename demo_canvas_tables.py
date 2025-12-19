@@ -343,8 +343,10 @@ HTML_TEMPLATE = """<!doctype html>
   </div>
   <div id="info">Dragging and clicking sends events to the backend. Frames auto-refresh.</div>
     <div style="margin-top:8px">
-        <button id="reload-btn">Reload native library</button>
-        <span id="reload-status" style="margin-left:8px;color:#aaa;font-size:13px"></span>
+          <button id="reload-btn">Reload native library</button>
+          <button id="unload-btn" style="margin-left:8px">Unload native library</button>
+          <button id="load-btn" style="margin-left:8px">Load native library</button>
+          <span id="reload-status" style="margin-left:8px;color:#aaa;font-size:13px"></span>
     </div>
   <script>
     const hit = document.getElementById('hit-layer');
@@ -398,7 +400,41 @@ HTML_TEMPLATE = """<!doctype html>
             }} catch (e) {{
                 status.textContent = 'error';
             }}
-        }});
+            }});
+
+            document.getElementById('unload-btn').addEventListener('click', async () => {{
+                const status = document.getElementById('reload-status');
+                status.textContent = 'unloading...';
+                try {{
+                    const r = await fetch('/unload', {{ method: 'POST' }});
+                    if (r.ok) {{
+                        status.textContent = 'unloaded';
+                        setTimeout(() => status.textContent = '', 3000);
+                    }} else {{
+                        const t = await r.text();
+                        status.textContent = 'error: ' + t;
+                    }}
+                }} catch (e) {{
+                    status.textContent = 'error';
+                }}
+            }});
+
+            document.getElementById('load-btn').addEventListener('click', async () => {{
+                const status = document.getElementById('reload-status');
+                status.textContent = 'loading...';
+                try {{
+                    const r = await fetch('/load', {{ method: 'POST' }});
+                    if (r.ok) {{
+                        status.textContent = 'loaded';
+                        setTimeout(() => status.textContent = '', 3000);
+                    }} else {{
+                        const t = await r.text();
+                        status.textContent = 'error: ' + t;
+                    }}
+                }} catch (e) {{
+                    status.textContent = 'error';
+                }}
+            }});
   </script>
 </body>
 </html>
@@ -424,17 +460,25 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_response(200, html.encode("utf-8"), "text/html; charset=utf-8")
             return
         if parsed.path == "/frame":
-            try:
-                with self.server.backend_lock:
+            with self.server.backend_lock:
+                if getattr(self.server, "backend", None) is None:
+                    body = json.dumps({"error": "native library unloaded"}).encode("utf-8")
+                    self._send_response(503, body, "application/json")
+                    return
+                try:
                     frame = self.server.backend.raster_png()  # type: ignore[attr-defined]
-            except Exception as exc:  # pragma: no cover - informational
-                body = json.dumps({"error": str(exc)}).encode("utf-8")
-                self._send_response(500, body, "application/json")
-                return
+                except Exception as exc:  # pragma: no cover - informational
+                    body = json.dumps({"error": str(exc)}).encode("utf-8")
+                    self._send_response(500, body, "application/json")
+                    return
             self._send_response(200, frame, "image/png")
             return
         if parsed.path == "/meta":
             with self.server.backend_lock:
+                if getattr(self.server, "backend", None) is None:
+                    body = json.dumps({"error": "native library unloaded"}).encode("utf-8")
+                    self._send_response(503, body, "application/json")
+                    return
                 data = {
                     "width": self.server.backend.width,  # type: ignore[attr-defined]
                     "height": self.server.backend.height,  # type: ignore[attr-defined]
@@ -446,6 +490,58 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/unload":
+            try:
+                with self.server.backend_lock:
+                    if getattr(self.server, "backend", None) is None:
+                        body = json.dumps({"error": "already unloaded"}).encode("utf-8")
+                        self._send_response(400, body, "application/json")
+                        return
+                    old = self.server.backend
+                    # remember size for reload
+                    try:
+                        self.server.last_backend_size = (old.width, old.height, old.step_dt)  # type: ignore[attr-defined]
+                    except Exception:
+                        self.server.last_backend_size = None
+                    old.shutdown()
+                    try:
+                        _free_cdll(old.lib)
+                    except Exception:
+                        pass
+                    self.server.backend = None
+                    # keep page dimensions stable
+                    w, h = (self.server.last_backend_size[0], self.server.last_backend_size[1]) if self.server.last_backend_size else (1000, 360)
+                    self.server.rendered_html = HTML_TEMPLATE.format(w=w, h=h)
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self._send_response(500, body, "application/json")
+                return
+            body = json.dumps({"unloaded": True}).encode("utf-8")
+            self._send_response(200, body, "application/json")
+            return
+
+        if parsed.path == "/load":
+            try:
+                with self.server.backend_lock:
+                    if getattr(self.server, "backend", None) is not None:
+                        body = json.dumps({"error": "already loaded"}).encode("utf-8")
+                        self._send_response(400, body, "application/json")
+                        return
+                    if getattr(self.server, "last_backend_size", None):
+                        w, h, step_dt = self.server.last_backend_size
+                    else:
+                        w, h, step_dt = 1000, 360, 1.0 / 60.0
+                    new = CanvasBackend(w, h, step_dt)
+                    self.server.backend = new
+                    self.server.rendered_html = HTML_TEMPLATE.format(w=w, h=h)
+            except Exception as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self._send_response(500, body, "application/json")
+                return
+            body = json.dumps({"loaded": True}).encode("utf-8")
+            self._send_response(200, body, "application/json")
+            return
+
         if parsed.path == "/reload":
             try:
                 with self.server.backend_lock:
@@ -478,6 +574,10 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
 
         handled = False
         with self.server.backend_lock:
+            if getattr(self.server, "backend", None) is None:
+                body = json.dumps({"error": "native library unloaded"}).encode("utf-8")
+                self._send_response(503, body, "application/json")
+                return
             if 0 <= x < self.server.backend.width and 0 <= y < self.server.backend.height:  # type: ignore[attr-defined]
                 handled = self.server.backend.handle_mouse(kind, x, y)  # type: ignore[attr-defined]
         body = json.dumps({"handled": handled}).encode("utf-8")
@@ -496,6 +596,11 @@ class CanvasHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.backend = backend
         self.backend_lock = threading.Lock()
         self.rendered_html = HTML_TEMPLATE.format(w=backend.width, h=backend.height)
+        # remember last known backend size so unload/load can preserve dimensions
+        try:
+            self.last_backend_size = (backend.width, backend.height, backend.step_dt)
+        except Exception:
+            self.last_backend_size = None
 
 
 def run_server(host: str, port: int, width: int, height: int, step_dt: float) -> int:
