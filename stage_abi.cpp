@@ -1046,4 +1046,31 @@ int32_t gp_stage_clear_staged_samples(GP_StageContext* st) {
     return 1;
 }
 
+int32_t gp_stage_perform_tick(GP_StageContext* st, GP_TableContext* table_ctx, uint64_t batch_id, const GP_StageBatchOptions* opts, uint8_t* out_rgba, int32_t out_pitch, int32_t width, int32_t height) {
+    if (!st) return 0;
+    // Ensure stage is sized appropriately for the requested output buffer.
+    if (width > 0 && height > 0) gp_stage_resize(st, width, height);
+
+    // Enable capture, render, commit and stream samples into the provided table.
+    gp_stage_enable_sample_capture(st, 1);
+    gp_stage_render(st);
+    if (batch_id == 0) batch_id = static_cast<uint64_t>(std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count());
+    gp_stage_commit_staged_samples(st, batch_id);
+    // If opts is null, stream with defaults.
+    GP_StageBatchOptions local_opts{};
+    if (!opts) {
+        local_opts.stride = 18;
+        local_opts.sample_limit = 256;
+        opts = &local_opts;
+    }
+    if (table_ctx) gp_stage_stream_samples(st, table_ctx, ((uint64_t)0 << 32) | ((uint64_t)1 << 16) | 0ull, opts);
+    gp_stage_enable_sample_capture(st, 0);
+
+    // Copy RGBA into out buffer if provided
+    if (out_rgba && out_pitch >= width * 4 && width > 0 && height > 0) {
+        gp_stage_copy_rgba(st, out_rgba, out_pitch * height);
+    }
+    return 1;
+}
+
 } // extern "C"

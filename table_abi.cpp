@@ -2,6 +2,7 @@
 #include "menu_waveform_abi.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <tuple>
 #include "text_render_helper.h"
+#include "thread_manager.h"
 #include "table_node_groups.h"
 #include "rope_sim.h"
 
@@ -1282,126 +1284,218 @@ struct StagePortBinding {
 };
 
 struct EdgeTensorFifo {
-    struct Reader {
-        uint64_t id = 0;
-        size_t seq = 0; // next sequence to read
+    static constexpr size_t kMaxReaders = 64;
+
+    struct ReaderEntry {
+        std::atomic<uint64_t> key{0};
+        std::atomic<uint64_t> seq{0}; // next sequence number to read
+    };
+
+    struct Impl {
+        std::atomic<uint64_t> write_seq{0}; // next sequence to write
+        std::atomic<uint64_t> writer{0};    // bound writer key (0 => unbound)
+        std::unique_ptr<std::atomic<uint64_t>[]> slot_seq; // published tag per slot (seq+1), 0 => empty
+        std::unique_ptr<float[]> storage;                  // slots * stride floats
+        std::unique_ptr<ReaderEntry[]> readers;
+        size_t stride = 1;
+        size_t slots = 1;
+        size_t top_k = 0;
+        bool configured = false;
+
+        Impl() : readers(new ReaderEntry[kMaxReaders]) {}
     };
 
     std::vector<int32_t> shape;
-    size_t stride = 1; // elements per tensor sample
-    size_t slots = 0;  // samples in ring
-    size_t top_k = 0;  // if >0, keep this many newest on overwrite
-    uint64_t writer = 0;
-    size_t write_seq = 0; // next sequence number to write
-    std::vector<float> storage;
-    std::vector<Reader> readers;
+    std::unique_ptr<Impl> impl;
 
-    void configure_default() {
-        configure(std::vector<int32_t>{1}, 16, 0);
-    }
+    EdgeTensorFifo() : impl(new Impl()) {}
+    EdgeTensorFifo(EdgeTensorFifo&&) noexcept = default;
+    EdgeTensorFifo& operator=(EdgeTensorFifo&&) noexcept = default;
+    EdgeTensorFifo(const EdgeTensorFifo&) = delete;
+    EdgeTensorFifo& operator=(const EdgeTensorFifo&) = delete;
+
+    void configure_default() { configure(std::vector<int32_t>{1}, 16, 0); }
 
     void configure(const std::vector<int32_t>& dims, size_t slot_count, size_t topk) {
+        if (!impl) impl.reset(new Impl());
         shape = dims;
         if (shape.empty()) shape.push_back(1);
-        stride = 1;
+        size_t stride_local = 1;
         for (int32_t d : shape) {
-            stride *= static_cast<size_t>(std::max<int32_t>(1, d));
+            stride_local *= static_cast<size_t>(std::max<int32_t>(1, d));
         }
-        slots = std::max<size_t>(1, slot_count);
-        top_k = topk;
-        storage.assign(stride * slots, 0.0f);
-        write_seq = 0;
-        readers.clear();
+        impl->stride = std::max<size_t>(1, stride_local);
+        impl->slots = std::max<size_t>(1, slot_count);
+        impl->top_k = topk;
+
+        impl->storage.reset(new float[impl->stride * impl->slots]);
+        impl->slot_seq.reset(new std::atomic<uint64_t>[impl->slots]);
+        for (size_t i = 0; i < impl->stride * impl->slots; ++i) impl->storage[i] = 0.0f;
+        for (size_t i = 0; i < impl->slots; ++i) impl->slot_seq[i].store(0, std::memory_order_relaxed);
+        impl->write_seq.store(0, std::memory_order_relaxed);
+        impl->writer.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            impl->readers[i].key.store(0, std::memory_order_relaxed);
+            impl->readers[i].seq.store(0, std::memory_order_relaxed);
+        }
+        impl->configured = true;
     }
 
-    size_t elem_count() const { return stride; }
+    size_t elem_count() const { return impl ? impl->stride : 0; }
 
-    Reader* find_reader(uint64_t id) {
-        for (auto &r : readers) {
-            if (r.id == id) return &r;
+    void maybe_claim_writer(uint64_t key) {
+        if (!impl) return;
+        uint64_t prev = impl->writer.load(std::memory_order_relaxed);
+        if (prev == 0 || prev == key) {
+            (void)impl->writer.compare_exchange_strong(prev, key, std::memory_order_relaxed);
+        }
+    }
+
+    ReaderEntry* find_reader(uint64_t key) {
+        if (!impl) return nullptr;
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            if (impl->readers[i].key.load(std::memory_order_relaxed) == key) return &impl->readers[i];
         }
         return nullptr;
     }
-    const Reader* find_reader(uint64_t id) const {
-        for (auto &r : readers) {
-            if (r.id == id) return &r;
+
+    bool subscribe(uint64_t key, bool start_at_head) {
+        if (!impl) return false;
+        if (key == 0) return false;
+        if (find_reader(key)) return true;
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            uint64_t expected = 0;
+            if (!impl->readers[i].key.compare_exchange_strong(expected, key, std::memory_order_acq_rel)) continue;
+            uint64_t head = impl->write_seq.load(std::memory_order_acquire);
+            uint64_t start = head;
+            if (!start_at_head) {
+                uint64_t cap = static_cast<uint64_t>(impl->slots);
+                start = (head > cap) ? (head - cap) : 0;
+            }
+            impl->readers[i].seq.store(start, std::memory_order_release);
+            return true;
         }
-        return nullptr;
-    }
-    Reader& ensure_reader(uint64_t id) {
-        if (Reader* r = find_reader(id)) return *r;
-        readers.push_back(Reader{id, write_seq});
-        return readers.back();
-    }
-    void remove_reader(uint64_t id) {
-        readers.erase(std::remove_if(readers.begin(), readers.end(), [&](const Reader& r){ return r.id == id; }), readers.end());
+        return false;
     }
 
-    size_t min_read_seq() const {
-        if (readers.empty()) return write_seq;
-        size_t m = readers.front().seq;
-        for (const auto &r : readers) m = std::min(m, r.seq);
-        return m;
+    void unsubscribe(uint64_t key) {
+        if (!impl || key == 0) return;
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            if (impl->readers[i].key.load(std::memory_order_relaxed) != key) continue;
+            impl->readers[i].key.store(0, std::memory_order_release);
+            return;
+        }
     }
 
-    bool ensure_space_for_write(bool* out_dropped) {
+    uint64_t min_reader_seq(uint64_t head) const {
+        if (!impl) return head;
+        uint64_t m = head;
+        bool any = false;
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            if (impl->readers[i].key.load(std::memory_order_relaxed) == 0) continue;
+            uint64_t s = impl->readers[i].seq.load(std::memory_order_relaxed);
+            m = std::min<uint64_t>(m, s);
+            any = true;
+        }
+        return any ? m : head;
+    }
+
+    bool ensure_space_for_write(uint64_t seq, bool* out_dropped, uint64_t edge_id = 0) {
+        if (!impl) return false;
         if (out_dropped) *out_dropped = false;
-        if (slots == 0) return false;
-        size_t min_seq = min_read_seq();
-        size_t used = write_seq - min_seq;
-        if (used < slots) return true;
-        if (top_k == 0) return false;
-        size_t window = std::min(top_k, slots);
-        size_t target_min = (window > 0 && write_seq >= (window - 1)) ? (write_seq - (window - 1)) : 0;
+        uint64_t head = impl->write_seq.load(std::memory_order_acquire);
+        uint64_t min_seq = min_reader_seq(head);
+        // If a ThreadManager is present and an edge id is supplied, consult
+        // its view of the minimum reader sequence for this edge. Fall back
+        // to the local reader table if the manager has no info.
+        if (edge_id != 0) {
+            ThreadManager* tm = ThreadManager::global();
+            if (tm) {
+                uint64_t mgr_min = tm->min_reader_seq_for_edge(edge_id);
+                if (mgr_min != UINT64_MAX) min_seq = mgr_min;
+            }
+        }
+        uint64_t used = (seq >= min_seq) ? (seq - min_seq) : 0;
+        if (used < static_cast<uint64_t>(impl->slots)) return true;
+        if (impl->top_k == 0) return false;
+        uint64_t window = std::min<uint64_t>(static_cast<uint64_t>(impl->top_k), static_cast<uint64_t>(impl->slots));
+        uint64_t target_min = (window > 0 && seq >= (window - 1)) ? (seq - (window - 1)) : 0;
         if (target_min <= min_seq) return false;
-        for (auto &r : readers) {
-            if (r.seq < target_min) r.seq = target_min;
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            if (impl->readers[i].key.load(std::memory_order_relaxed) == 0) continue;
+            uint64_t s = impl->readers[i].seq.load(std::memory_order_relaxed);
+            if (s < target_min) impl->readers[i].seq.store(target_min, std::memory_order_relaxed);
         }
         if (out_dropped) *out_dropped = true;
-        min_seq = min_read_seq();
-        used = write_seq - min_seq;
-        return used < slots;
+        min_seq = min_reader_seq(head);
+        used = (seq >= min_seq) ? (seq - min_seq) : 0;
+        return used < static_cast<uint64_t>(impl->slots);
     }
 
-    bool push(uint64_t writer_id, const float* sample, size_t sample_len, bool* out_dropped) {
+    bool push(uint64_t edge_id, uint64_t writer_id, const float* sample, size_t sample_len, bool* out_dropped) {
+        if (!impl || !impl->configured) return false;
         if (!sample) return false;
-        if (sample_len != stride) return false;
-        if (!ensure_space_for_write(out_dropped)) return false;
-        size_t slot = slots ? (write_seq % slots) : 0;
-        float* dst = storage.data() + slot * stride;
-        std::memcpy(dst, sample, stride * sizeof(float));
-        writer = writer_id;
-        ++write_seq;
+        if (sample_len != impl->stride) return false;
+        uint64_t bound = impl->writer.load(std::memory_order_relaxed);
+        if (bound == 0) {
+            (void)impl->writer.compare_exchange_strong(bound, writer_id, std::memory_order_relaxed);
+        }
+        bound = impl->writer.load(std::memory_order_relaxed);
+        if (bound != 0 && bound != writer_id) return false;
+
+        uint64_t seq = impl->write_seq.load(std::memory_order_relaxed);
+        bool dropped = false;
+        if (!ensure_space_for_write(seq, &dropped, edge_id)) {
+            if (out_dropped) *out_dropped = 1;
+            return false;
+        }
+
+        size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
+        float* dst = impl->storage.get() + slot * impl->stride;
+        std::memcpy(dst, sample, impl->stride * sizeof(float));
+        impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
+        impl->write_seq.store(seq + 1, std::memory_order_release);
+        if (out_dropped) *out_dropped = dropped ? 1 : 0;
         return true;
     }
 
     bool pop(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written) {
         out_written = 0;
-        Reader* r = find_reader(reader_id);
+        if (!impl || !impl->configured) return false;
+        ReaderEntry* r = find_reader(reader_id);
         if (!r) return false;
-        if (r->seq >= write_seq) return false;
-        if (!out_sample || out_cap < stride) return false;
-        size_t slot = slots ? (r->seq % slots) : 0;
-        const float* src = storage.data() + slot * stride;
-        std::memcpy(out_sample, src, stride * sizeof(float));
-        ++(r->seq);
-        out_written = stride;
+        if (!out_sample || out_cap < impl->stride) return false;
+
+        uint64_t rseq = r->seq.load(std::memory_order_relaxed);
+        size_t slot = static_cast<size_t>(rseq % static_cast<uint64_t>(impl->slots));
+        uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
+        if (observed != (rseq + 1)) return false;
+
+        const float* src = impl->storage.get() + slot * impl->stride;
+        std::memcpy(out_sample, src, impl->stride * sizeof(float));
+        r->seq.store(rseq + 1, std::memory_order_relaxed);
+        out_written = impl->stride;
         return true;
     }
 
-    size_t unread(uint64_t reader_id) const {
-        const Reader* r = find_reader(reader_id);
+    uint64_t unread(uint64_t reader_id) const {
+        if (!impl || !impl->configured) return 0;
+        const ReaderEntry* r = nullptr;
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            if (impl->readers[i].key.load(std::memory_order_relaxed) == reader_id) { r = &impl->readers[i]; break; }
+        }
         if (!r) return 0;
-        if (write_seq < r->seq) return 0;
-        return write_seq - r->seq;
+        uint64_t head = impl->write_seq.load(std::memory_order_acquire);
+        uint64_t tail = r->seq.load(std::memory_order_relaxed);
+        return (head >= tail) ? (head - tail) : 0;
     }
 
     GP_TableEdgeTensorSpec to_spec() const {
         GP_TableEdgeTensorSpec s{};
         s.dim_count = static_cast<int32_t>(std::min<size_t>(shape.size(), sizeof(s.dims) / sizeof(s.dims[0])));
         for (int32_t i = 0; i < s.dim_count; ++i) s.dims[i] = shape[static_cast<size_t>(i)];
-        s.slots = static_cast<int32_t>(slots);
-        s.top_k = static_cast<int32_t>(top_k);
+        s.slots = impl ? static_cast<int32_t>(impl->slots) : 0;
+        s.top_k = impl ? static_cast<int32_t>(impl->top_k) : 0;
         return s;
     }
 };
@@ -1424,6 +1518,11 @@ struct GP_TableContext {
     std::vector<std::pair<uint64_t,uint64_t>> edges;
     std::vector<EdgeTensorFifo> edge_fifos; // companion FIFO per rope edge
     std::vector<GP_TableEdgeBatchMetadata> edge_batch_metadata;
+    // per-edge persistent unique id used for ThreadManager registration
+    std::vector<uint64_t> edge_uids;
+    uint64_t next_edge_uid = 1;
+    // per-edge subscriber_key -> reader_slot registered with ThreadManager
+    std::vector<std::unordered_map<uint64_t,int>> edge_subscriber_slots;
     std::unordered_map<uint64_t, StagePortBinding> stage_ports; // LED key -> stage port binding
     // Relaxation state (per-edge values/velocities are maintained in parallel to edges)
     int32_t relax_mode = GP_TABLE_RELAX_OFF;
@@ -1579,6 +1678,9 @@ static void ensure_edge_fifos(GP_TableContext* ctx) {
     if (ctx->edge_batch_metadata.size() > ctx->edges.size()) {
         ctx->edge_batch_metadata.resize(ctx->edges.size());
     }
+    // keep subscriber slot maps in sync with edges
+    while (ctx->edge_subscriber_slots.size() < ctx->edges.size()) ctx->edge_subscriber_slots.emplace_back();
+    if (ctx->edge_subscriber_slots.size() > ctx->edges.size()) ctx->edge_subscriber_slots.resize(ctx->edges.size());
 }
 
 // Apply stage port bindings to an edge's FIFO: output keys claim writer, input keys subscribe.
@@ -1588,17 +1690,14 @@ static void sync_edge_tensor_for_idx(GP_TableContext* ctx, size_t ei) {
     if (ei >= ctx->edges.size() || ei >= ctx->edge_fifos.size()) return;
     const auto &edge = ctx->edges[ei];
     EdgeTensorFifo &fifo = ctx->edge_fifos[ei];
-    uint64_t prev_writer = fifo.writer;
     auto bind_one = [&](uint64_t key) {
         auto it = ctx->stage_ports.find(key);
         if (it == ctx->stage_ports.end()) return;
         const StagePortBinding &b = it->second;
         if (b.is_output) {
-            if (prev_writer == 0 || prev_writer == key) {
-                fifo.writer = key;
-            }
+            fifo.maybe_claim_writer(key);
         } else {
-            fifo.ensure_reader(key);
+            fifo.subscribe(key, /*start_at_head=*/true);
         }
     };
     bind_one(edge.first);
@@ -2831,6 +2930,10 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);
     ctx->edges.emplace_back(a, b);
+    // create and record a persistent unique id for this edge
+    uint64_t uid = ctx->next_edge_uid++;
+    if (uid == 0) uid = ctx->next_edge_uid++; // avoid zero
+    ctx->edge_uids.push_back(uid);
     // ensure relax arrays stay in sync
     // start unrelaxed so the cable animates into place
     ctx->relax_value.push_back(0.0f);
@@ -2901,6 +3004,8 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
 int32_t gp_table_clear_edges(GP_TableContext* ctx) {
     if (!ctx) return 0;
     ctx->edges.clear();
+    ctx->edge_uids.clear();
+    ctx->next_edge_uid = 1;
     ctx->relax_value.clear();
     ctx->relax_vel.clear();
     ctx->edge_fifos.clear();
@@ -2934,6 +3039,14 @@ int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, co
     if (!ctx || !spec) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    // Spec immutability: disallow reconfigure after any writes have occurred.
+    // (Caller may reconfigure only while the edge is quiescent.)
+    {
+        auto& fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+        if (fifo.impl && fifo.impl->write_seq.load(std::memory_order_relaxed) != 0) {
+            return 0;
+        }
+    }
     std::vector<int32_t> dims;
     int dc = std::max(0, std::min(8, spec->dim_count));
     dims.reserve(static_cast<size_t>(dc));
@@ -2946,6 +3059,23 @@ int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, co
     size_t topk = spec->top_k > 0 ? static_cast<size_t>(spec->top_k) : size_t(0);
     ctx->edge_fifos[static_cast<size_t>(edge_idx)].configure(dims, slots, topk);
     sync_edge_tensor_for_idx(ctx, static_cast<size_t>(edge_idx));
+    // If a ThreadManager is present, update registered reader slots with
+    // the freshly-initialized sequence (usually zero) so manager state
+    // remains consistent after reconfigure.
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        auto &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+        for (const auto &kv : m) {
+            uint64_t subscriber_key = kv.first;
+            int slot = kv.second;
+            if (slot <= 0) continue;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (!r) continue;
+            uint64_t seq = r->seq.load(std::memory_order_relaxed);
+            tm->update_reader_seq(slot, seq);
+        }
+    }
     return 1;
 }
 
@@ -2959,9 +3089,32 @@ int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP
 
 int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key) {
     if (!ctx) return 0;
+    return gp_table_edge_subscribe_ex(ctx, edge_idx, subscriber_key, /*start_at_head=*/1);
+}
+
+int32_t gp_table_edge_subscribe_ex(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t start_at_head) {
+    if (!ctx) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
-    ctx->edge_fifos[static_cast<size_t>(edge_idx)].ensure_reader(subscriber_key);
+    bool ok = ctx->edge_fifos[static_cast<size_t>(edge_idx)].subscribe(subscriber_key, start_at_head != 0);
+    if (!ok) return 0;
+    // Register reader slot with ThreadManager global (if available).
+    // Avoid re-registering if this subscriber already has a slot mapping.
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &map = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        if (map.find(subscriber_key) == map.end()) {
+            uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+            int slot = tm->register_reader_for_edge(edge_id);
+            if (slot > 0) map[subscriber_key] = slot;
+            // Notify manager of the starting sequence for this reader (if available).
+            auto *r = ctx->edge_fifos[static_cast<size_t>(edge_idx)].find_reader(subscriber_key);
+            if (r && slot > 0) {
+                uint64_t seq = r->seq.load(std::memory_order_relaxed);
+                tm->update_reader_seq(slot, seq);
+            }
+        }
+    }
     return 1;
 }
 
@@ -2969,7 +3122,17 @@ int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsign
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
-    ctx->edge_fifos[static_cast<size_t>(edge_idx)].remove_reader(subscriber_key);
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].unsubscribe(subscriber_key);
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        auto it = m.find(subscriber_key);
+        if (it != m.end()) {
+            int slot = it->second;
+            if (slot > 0) tm->unregister_reader_slot(slot);
+            m.erase(it);
+        }
+    }
     return 1;
 }
 
@@ -2980,8 +3143,25 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     bool dropped = false;
-    bool ok = fifo.push(writer_key, sample, static_cast<size_t>(sample_len), &dropped);
+    uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+    bool ok = fifo.push(edge_id, writer_key, sample, static_cast<size_t>(sample_len), &dropped);
     if (out_dropped && dropped) *out_dropped = 1;
+    // After a publish, the FIFO implementation may have advanced reader sequences
+    // (e.g., during top-k trimming). Ensure the ThreadManager has up-to-date
+    // per-slot sequences for all registered subscribers on this edge.
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        for (const auto &kv : m) {
+            uint64_t subscriber_key = kv.first;
+            int slot = kv.second;
+            if (slot <= 0) continue;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (!r) continue;
+            uint64_t seq = r->seq.load(std::memory_order_relaxed);
+            tm->update_reader_seq(slot, seq);
+        }
+    }
     return ok ? 1 : 0;
 }
 
@@ -2995,8 +3175,21 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     bool ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
-    if (out_written) *out_written = static_cast<int32_t>(wrote);
-    return ok ? 1 : 0;
+    // Notify ThreadManager of reader advancement, if registered.
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        auto it = m.find(subscriber_key);
+        if (it != m.end()) {
+            int slot = it->second;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (r && slot > 0) {
+                uint64_t seq = r->seq.load(std::memory_order_relaxed);
+                tm->update_reader_seq(slot, seq);
+            }
+        }
+    }
+    return 1;
 }
 
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count) {
@@ -3054,8 +3247,11 @@ int32_t gp_table_unbind_stage_port(GP_TableContext* ctx, unsigned long long led_
     ensure_edge_fifos(ctx);
     for (size_t i = 0; i < ctx->edges.size() && i < ctx->edge_fifos.size(); ++i) {
         auto &fifo = ctx->edge_fifos[i];
-        if (fifo.writer == led_key) fifo.writer = 0;
-        fifo.remove_reader(led_key);
+        if (fifo.impl) {
+            uint64_t cur = fifo.impl->writer.load(std::memory_order_relaxed);
+            if (cur == led_key) fifo.impl->writer.store(0, std::memory_order_relaxed);
+        }
+        fifo.unsubscribe(led_key);
     }
     sync_edge_tensors_for_key(ctx, led_key);
     return 1;

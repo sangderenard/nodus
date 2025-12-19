@@ -171,6 +171,13 @@ int32_t gp_stage_commit_staged_samples(GP_StageContext* st, uint64_t batch_id);
 int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx, unsigned long long led_key, const GP_StageBatchOptions* opts);
 int32_t gp_stage_clear_staged_samples(GP_StageContext* st);
 
+// Perform a full stage tick: render, commit staged samples, stream into the
+// provided table (if non-null) using the given options (nullable). If
+// `out_rgba` is non-null it will be filled with the stage's RGBA pixels with
+// the provided `out_pitch` (bytes per row) and `width`/`height` size. Returns
+// 1 on success, 0 on failure.
+int32_t gp_stage_perform_tick(GP_StageContext* st, GP_TableContext* table_ctx, uint64_t batch_id, const GP_StageBatchOptions* opts, uint8_t* out_rgba, int32_t out_pitch, int32_t width, int32_t height);
+
 #ifdef __cplusplus
 }
 #endif

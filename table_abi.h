@@ -323,6 +323,10 @@ typedef struct GP_TableEdgeBatchMetadata {
 int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpec* spec);
 int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpec* out_spec);
 int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
+// Subscribe with explicit start policy. If `start_at_head` is non-zero, the subscriber
+// begins at the current write head (new samples only). If zero, it begins at the
+// earliest sample still addressable within the ring capacity (best-effort).
+int32_t gp_table_edge_subscribe_ex(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t start_at_head);
 int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
 // Publish one tensor sample into the FIFO for an edge. Returns 1 on success.
 // If the buffer advanced slow readers to admit the write (top-k overwrite),

@@ -1,0 +1,293 @@
+#include "thread_manager.h"
+
+#include "table_abi.h"
+#include "stage_abi.h"
+#include <chrono>
+#include "stage_abi.h"
+
+#include <algorithm>
+#include <limits>
+
+// Scheduling helpers used inside run_scheduled_tick.
+namespace {
+
+// Kahn topo sort. Returns empty vector on cycle.
+static std::vector<int> topo_kahn(const std::vector<std::vector<int>>& succ) {
+    int N = (int)succ.size();
+    std::vector<int> indeg(N, 0);
+    for (int i = 0; i < N; ++i) for (int j : succ[i]) if (j >= 0 && j < N) ++indeg[j];
+    std::vector<int> q;
+    q.reserve(N);
+    for (int i = 0; i < N; ++i) if (indeg[i] == 0) q.push_back(i);
+    std::vector<int> order;
+    order.reserve(N);
+    for (size_t idx = 0; idx < q.size(); ++idx) {
+        int v = q[idx];
+        order.push_back(v);
+        for (int u : succ[v]) {
+            if (u < 0 || u >= N) continue;
+            --indeg[u];
+            if (indeg[u] == 0) q.push_back(u);
+        }
+    }
+    if ((int)order.size() != N) return {};
+    return order;
+}
+
+// Compute ASAP times using iterative relaxation (works for cyclic graphs bounded by N iterations).
+static std::vector<int> compute_asap_iter(int N, const std::vector<std::vector<int>>& succ) {
+    std::vector<int> asap(N, 0);
+    for (int iter = 0; iter < N; ++iter) {
+        bool changed = false;
+        for (int v = 0; v < N; ++v) {
+            for (int u : succ[v]) {
+                if (u < 0 || u >= N) continue;
+                int want = asap[v] + 1;
+                if (want > asap[u]) { asap[u] = want; changed = true; }
+            }
+        }
+        if (!changed) break;
+    }
+    return asap;
+}
+
+static std::vector<int> compute_alap_iter(int N, const std::vector<std::vector<int>>& succ, int makespan) {
+    std::vector<int> alap(N, makespan);
+    for (int iter = 0; iter < N; ++iter) {
+        bool changed = false;
+        for (int v = 0; v < N; ++v) {
+            for (int u : succ[v]) {
+                if (u < 0 || u >= N) continue;
+                int want = alap[u] - 1;
+                if (want < alap[v]) { alap[v] = want; changed = true; }
+            }
+        }
+        if (!changed) break;
+    }
+    return alap;
+}
+
+} // namespace
+
+
+ThreadManager::ThreadManager() = default;
+
+ThreadManager::~ThreadManager() {
+    stop();
+}
+
+void ThreadManager::start() {
+    bool expected = false;
+    if (!running_.compare_exchange_strong(expected, true)) return;
+    worker_ = std::thread([this]() { run_loop(); });
+}
+
+void ThreadManager::stop() {
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false)) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        queue_.clear();
+    }
+    cv_.notify_all();
+    cv_done_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
+
+void ThreadManager::set_mode(Mode mode) {
+    mode_.store(mode, std::memory_order_relaxed);
+}
+
+ThreadManager::Mode ThreadManager::mode() const {
+    return mode_.load(std::memory_order_relaxed);
+}
+
+void ThreadManager::submit_tick(TickRequest req, bool wait) {
+    if (req.tick_id == 0) {
+        std::lock_guard<std::mutex> lk(mu_);
+        req.tick_id = next_tick_id_++;
+    }
+    uint64_t wait_for = req.tick_id;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        queue_.push_back(std::move(req));
+        ++submitted_;
+    }
+    cv_.notify_one();
+    if (!wait) return;
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_done_.wait(lk, [&]() { return completed_ >= wait_for || !running_.load(std::memory_order_relaxed); });
+}
+
+uint64_t ThreadManager::ticks_submitted() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return submitted_;
+}
+
+uint64_t ThreadManager::ticks_completed() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return completed_;
+}
+
+void ThreadManager::run_loop() {
+    for (;;) {
+        TickRequest req;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&]() { return !queue_.empty() || !running_.load(std::memory_order_relaxed); });
+            if (!running_.load(std::memory_order_relaxed) && queue_.empty()) break;
+            req = std::move(queue_.front());
+            queue_.pop_front();
+        }
+
+        // For now both modes execute the same per-tick work; the mode flag is
+        // reserved for upcoming scheduling semantics (free-spinning vs imposed
+        // deterministic schedule).
+        run_scheduled_tick(req);
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            // Persist snapshot and derived indexing (edges grouped under their writer module).
+            last_modules_ = req.modules;
+            last_edges_ = req.edges;
+            edges_by_writer_module_.clear();
+            for (const auto& e : last_edges_) {
+                edges_by_writer_module_[e.a_module].push_back(e.edge_idx);
+            }
+            completed_ = std::max(completed_, req.tick_id);
+        }
+        cv_done_.notify_all();
+    }
+}
+
+// Reader-table bridge implementation
+int ThreadManager::register_reader_for_edge(uint64_t edge_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    int slot = ++next_reader_slot_;
+    reader_slot_to_edge_.emplace(slot, edge_id);
+    // Ensure entry exists
+    if (reader_min_seq_by_edge_.find(edge_id) == reader_min_seq_by_edge_.end()) {
+        reader_min_seq_by_edge_[edge_id] = 0ull;
+    }
+    return slot;
+}
+
+void ThreadManager::unregister_reader_slot(int slot) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = reader_slot_to_edge_.find(slot);
+    if (it == reader_slot_to_edge_.end()) return;
+    uint64_t edge_id = it->second;
+    reader_slot_to_edge_.erase(it);
+    // recompute min for this edge conservatively
+    uint64_t minv = UINT64_MAX;
+    for (const auto& kv : reader_slot_to_edge_) {
+        if (kv.second == edge_id) {
+            // unknown per-slot seq; leave as 0 for scaffold
+            minv = std::min(minv, reader_min_seq_by_edge_[edge_id]);
+        }
+    }
+    if (minv == UINT64_MAX) reader_min_seq_by_edge_.erase(edge_id);
+    else reader_min_seq_by_edge_[edge_id] = minv;
+}
+
+uint64_t ThreadManager::min_reader_seq_for_edge(uint64_t edge_id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = reader_min_seq_by_edge_.find(edge_id);
+    if (it == reader_min_seq_by_edge_.end()) return UINT64_MAX;
+    return it->second;
+}
+
+void ThreadManager::update_reader_seq(int slot, uint64_t seq) {
+    std::lock_guard<std::mutex> lk(mu_);
+    reader_slot_seq_[slot] = seq;
+    auto it = reader_slot_to_edge_.find(slot);
+    if (it == reader_slot_to_edge_.end()) return;
+    uint64_t edge_id = it->second;
+    uint64_t minv = UINT64_MAX;
+    for (const auto &kv : reader_slot_to_edge_) {
+        if (kv.second != edge_id) continue;
+        int s = kv.first;
+        auto sit = reader_slot_seq_.find(s);
+        uint64_t sv = (sit != reader_slot_seq_.end()) ? sit->second : 0ull;
+        minv = std::min(minv, sv);
+    }
+    if (minv == UINT64_MAX) reader_min_seq_by_edge_.erase(edge_id);
+    else reader_min_seq_by_edge_[edge_id] = minv;
+}
+
+// Global instance
+static ThreadManager* g_thread_manager_instance = nullptr;
+void ThreadManager::set_global(ThreadManager* mgr) { g_thread_manager_instance = mgr; }
+ThreadManager* ThreadManager::global() { return g_thread_manager_instance; }
+
+void ThreadManager::run_scheduled_tick(const TickRequest& req) {
+    // Build successor adjacency from edges (writer -> reader modules) using
+    // module vector indices as canonical ids.
+    int N = static_cast<int>(req.modules.size());
+    std::vector<std::vector<int>> succ(N);
+    for (const auto& e : req.edges) {
+        if (e.a_module >= 0 && e.a_module < N && e.b_module >= 0 && e.b_module < N) {
+            succ[e.a_module].push_back(e.b_module);
+        }
+    }
+
+    // Prefer topological order when acyclic, otherwise use ASAP/ALAP slack heuristic.
+    std::vector<int> order = topo_kahn(succ);
+    if (order.empty()) {
+        // cyclic: compute asap/alap and order by slack
+        auto asap = compute_asap_iter(N, succ);
+        int max_asap = 0; for (int v : asap) max_asap = std::max(max_asap, v);
+        int makespan = max_asap + N;
+        auto alap = compute_alap_iter(N, succ, makespan);
+        struct Node { int idx; int slack; int a; };
+        std::vector<Node> nodes; nodes.reserve(N);
+        for (int i = 0; i < N; ++i) nodes.push_back({i, alap[i] - asap[i], asap[i]});
+        std::sort(nodes.begin(), nodes.end(), [](const Node& A, const Node& B){
+            if (A.slack != B.slack) return A.slack < B.slack;
+            return A.a < B.a;
+        });
+        order.clear(); order.reserve(N);
+        for (auto &n : nodes) order.push_back(n.idx);
+    }
+
+    // Execute modules in chosen order.
+    // First, execute any stage tasks so their streamed samples arrive into
+    // tables before table steps run in this tick. Stage tasks may write
+    // into canvas-provided cache buffers (protected by optional mutex).
+    for (const auto &st : req.stages) {
+        if (!st.stage) continue;
+        uint64_t batch_id = static_cast<uint64_t>(std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count());
+        if (st.cache_mu) {
+            std::lock_guard<std::mutex> lk(*st.cache_mu);
+            gp_stage_perform_tick(reinterpret_cast<GP_StageContext*>(st.stage), st.table, batch_id, nullptr, st.out_rgba, st.out_pitch, st.width, st.height);
+        } else {
+            gp_stage_perform_tick(reinterpret_cast<GP_StageContext*>(st.stage), st.table, batch_id, nullptr, st.out_rgba, st.out_pitch, st.width, st.height);
+        }
+    }
+    for (int mod_idx : order) {
+        if (mod_idx < 0 || mod_idx >= (int)req.modules.size()) continue;
+        const auto& mod = req.modules[static_cast<size_t>(mod_idx)];
+        if (!mod.table) continue;
+        if (mod.in_count <= 0 && mod.out_count <= 0) continue;
+
+        std::vector<float> inputs(static_cast<size_t>(std::max(0, mod.in_count)));
+        std::vector<float> outputs(static_cast<size_t>(std::max(0, mod.out_count)));
+        std::fill(inputs.begin(), inputs.end(), 0.0f);
+        std::fill(outputs.begin(), outputs.end(), 0.0f);
+        gp_table_step(mod.table,
+            inputs.empty() ? nullptr : inputs.data(), mod.in_count,
+            outputs.empty() ? nullptr : outputs.data(), mod.out_count,
+            req.dt);
+
+        if (mod.module_idx >= 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (static_cast<size_t>(mod.module_idx) >= module_ledger_.size()) {
+                module_ledger_.resize(static_cast<size_t>(mod.module_idx) + 1);
+            }
+            auto& ledger = module_ledger_[static_cast<size_t>(mod.module_idx)];
+            ledger.ticks += 1;
+            ledger.last_tick_id = req.tick_id;
+            ledger.last_dt = req.dt;
+        }
+    }
+}

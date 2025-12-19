@@ -140,6 +140,12 @@ GP_TableContext* gp_canvas_get_container_table(GP_CanvasContext* ctx);
 int gp_canvas_set_autosave(GP_CanvasContext* ctx, const char* path, double interval_s);
 int gp_canvas_get_autosave(GP_CanvasContext* ctx, char* out_path, int out_len, double* out_interval_s);
 
+// Thread manager / scheduler mode (0 = free-spinning, 1 = scheduled).
+// Current behavior: gp_canvas_step always waits for scheduled ticks to finish
+// before returning, so raster/input can remain single-threaded and safe.
+int gp_canvas_set_thread_manager_mode(GP_CanvasContext* ctx, int mode);
+int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx, int* out_mode);
+
 #ifdef __cplusplus
 }
 #endif

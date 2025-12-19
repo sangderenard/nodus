@@ -4,6 +4,7 @@
 #include "raytrace_2d.h"
 #include "stage_abi.h"
 #include "text_render_helper.h"
+#include "thread_manager.h"
 
 #include <vector>
 #include <string>
@@ -334,6 +335,12 @@ struct GP_CanvasContextImpl {
     std::vector<int> module_stage_owned; // 1 if canvas should destroy
     std::vector<int> module_is_stage;    // 1 if this module is a stage module
     std::vector<GP_TableImage> module_stage_images; // live image descriptors per stage module
+    // per-module cached completed stage RGBA buffers (tight RGBA8 rows)
+    std::vector<std::vector<uint8_t>> module_stage_cache_rgba;
+    std::vector<int> module_stage_cache_w;
+    std::vector<int> module_stage_cache_h;
+    std::vector<int> module_stage_cache_pitch;
+    std::vector<std::unique_ptr<std::mutex>> module_stage_cache_mu;
     std::vector<uint8_t> module_stage_integrator_mode; // integrator lock per stage module
     std::vector<std::vector<float>> module_stage_integrator_accum; // per-stage integrator accumulators
     struct ModuleBg {
@@ -426,6 +433,7 @@ struct GP_CanvasContextImpl {
     std::string autosave_path;
     double autosave_interval_s = 0.0;
     double autosave_accum_s = 0.0;
+    std::unique_ptr<ThreadManager> thread_mgr;
     GP_CanvasContextImpl(int w, int h): width(w), height(h) {}
 };
 
@@ -1279,12 +1287,23 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
 extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     GP_CanvasContextImpl* c = new GP_CanvasContextImpl(width, height);
     canvas_ensure_root_table(c);
+    c->thread_mgr = std::make_unique<ThreadManager>();
+    c->thread_mgr->set_mode(ThreadManager::Mode::Scheduled);
+    c->thread_mgr->start();
+    // expose as global for table-layer integration
+    ThreadManager::set_global(c->thread_mgr.get());
     return reinterpret_cast<GP_CanvasContext*>(c);
 }
 
 extern "C" void gp_canvas_destroy(GP_CanvasContext* ctx) {
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
     if (!c) return;
+    if (c->thread_mgr) {
+        c->thread_mgr->stop();
+        // clear global reference before destroying
+        ThreadManager::set_global(nullptr);
+        c->thread_mgr.reset();
+    }
     // destroy any owned attached tables
     for (size_t i = 0; i < c->module_tables.size(); ++i) {
         if (c->module_tables[i] && c->module_table_owned[i]) {
@@ -1324,6 +1343,11 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_stage_owned.push_back(0);
     c->module_is_stage.push_back(0);
     c->module_stage_images.push_back(GP_TableImage{});
+    c->module_stage_cache_rgba.emplace_back();
+    c->module_stage_cache_w.push_back(0);
+    c->module_stage_cache_h.push_back(0);
+    c->module_stage_cache_pitch.push_back(0);
+    c->module_stage_cache_mu.emplace_back(std::make_unique<std::mutex>());
     c->module_stage_integrator_mode.push_back(0);
     c->module_stage_integrator_accum.emplace_back();
     c->module_bg.emplace_back();
@@ -1942,25 +1966,72 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     RopeSim* sim = canvas_root_sim(c);
-    if (!sim) return 0;
-    rope_sim_step(sim, dt, c->sim_maxforce, c->sim_iters, c->sim_damping);
-    // Drive per-module table step callbacks using the UI-specified in/out counts.
-    for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
-        GP_TableContext* t = nullptr;
-        if (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) t = c->module_tables[mi];
-        if (!t) continue;
-        int in_count = 0, out_count = 0;
-        if (mi < static_cast<int>(c->module_io_in_count.size())) in_count = c->module_io_in_count[mi];
-        if (mi < static_cast<int>(c->module_io_out_count.size())) out_count = c->module_io_out_count[mi];
-        if (in_count <= 0 && out_count <= 0) continue;
-        std::vector<float> inputs(static_cast<size_t>(std::max(0, in_count))); 
-        std::vector<float> outputs(static_cast<size_t>(std::max(0, out_count)));
-        // zero-init
-        for (auto &v : inputs) v = 0.0f;
-        for (auto &v : outputs) v = 0.0f;
-        // invoke the table's step callback (if installed)
-        gp_table_step(t, in_count ? inputs.data() : nullptr, in_count, out_count ? outputs.data() : nullptr, out_count, static_cast<double>(dt));
-        // (outputs are ignored here; host may later fetch state via other APIs)
+    if (sim) {
+        rope_sim_step(sim, dt, c->sim_maxforce, c->sim_iters, c->sim_damping);
+    }
+
+    if (c->thread_mgr) {
+        ThreadManager::TickRequest req;
+        req.dt = static_cast<double>(dt);
+        req.modules.reserve(c->modules.size());
+        for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
+            ThreadManager::ModuleContract mod{};
+            mod.module_idx = mi;
+            mod.table = (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) ? c->module_tables[mi] : nullptr;
+            mod.in_count = (mi >= 0 && mi < static_cast<int>(c->module_io_in_count.size())) ? c->module_io_in_count[mi] : 0;
+            mod.out_count = (mi >= 0 && mi < static_cast<int>(c->module_io_out_count.size())) ? c->module_io_out_count[mi] : 0;
+            req.modules.push_back(mod);
+        }
+        req.edges.reserve(c->edges.size());
+        for (size_t ei = 0; ei < c->edges.size(); ++ei) {
+            ThreadManager::EdgeContract e{};
+            e.edge_idx = static_cast<int32_t>(ei);
+            e.type_id = c->edges[ei].type_id;
+            e.a_module = c->edges[ei].desc.a_module;
+            e.a_contact_idx = c->edges[ei].desc.a_contact_idx;
+            e.b_module = c->edges[ei].desc.b_module;
+            e.b_contact_idx = c->edges[ei].desc.b_contact_idx;
+            req.edges.push_back(e);
+        }
+        // Populate stage tasks so ThreadManager can run stage work before table steps.
+        req.stages.reserve(c->module_stages.size());
+        for (int mi = 0; mi < static_cast<int>(c->module_stages.size()); ++mi) {
+            GP_StageContext* st = c->module_stages[mi];
+            if (!st) continue;
+            ThreadManager::StageContract sc{};
+            sc.module_idx = mi;
+            sc.stage = reinterpret_cast<void*>(st);
+            sc.table = (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) ? c->module_tables[mi] : nullptr;
+            // Ensure cache buffer is allocated to the stage size; UI rendering will read this.
+            int w = std::max(1, c->modules[mi].w);
+            int h = std::max(1, c->modules[mi].h);
+            int pitch = w * 4;
+            if (mi >= static_cast<int>(c->module_stage_cache_rgba.size())) {
+                // should not happen, but guard
+                c->module_stage_cache_rgba.resize(mi + 1);
+                c->module_stage_cache_w.resize(mi + 1);
+                c->module_stage_cache_h.resize(mi + 1);
+                c->module_stage_cache_pitch.resize(mi + 1);
+                c->module_stage_cache_mu.emplace_back(std::make_unique<std::mutex>());
+            }
+            {
+                std::lock_guard<std::mutex> lk(*c->module_stage_cache_mu[mi]);
+                if (c->module_stage_cache_w[mi] != w || c->module_stage_cache_h[mi] != h || c->module_stage_cache_pitch[mi] != pitch) {
+                    c->module_stage_cache_w[mi] = w;
+                    c->module_stage_cache_h[mi] = h;
+                    c->module_stage_cache_pitch[mi] = pitch;
+                    c->module_stage_cache_rgba[mi].assign(static_cast<size_t>(pitch) * static_cast<size_t>(h), 0u);
+                }
+            }
+            sc.out_rgba = c->module_stage_cache_rgba[mi].empty() ? nullptr : c->module_stage_cache_rgba[mi].data();
+            sc.out_pitch = c->module_stage_cache_pitch[mi];
+            sc.width = c->module_stage_cache_w[mi];
+            sc.height = c->module_stage_cache_h[mi];
+            sc.cache_mu = c->module_stage_cache_mu[mi].get();
+            req.stages.push_back(sc);
+        }
+        // Submit asynchronously so the UI thread is not blocked by stage/table work.
+        c->thread_mgr->submit_tick(std::move(req), /*wait=*/false);
     }
     // autosave: accumulate dt and write canvas file when interval reached
     if (!c->autosave_path.empty() && c->autosave_interval_s > 0.0) {
@@ -2245,29 +2316,65 @@ static void stage_bg_callback(void* user, int module_idx, int width, int height,
     gp_stage_resize(st, width, stage_h);
     std::vector<uint8_t> tmp;
     tmp.resize(static_cast<size_t>(width) * static_cast<size_t>(stage_h) * 4u);
+    // UI should not run stage work. Use cached completed RGBA if available.
     if (integrator_mode) {
-        // Prefer the canvas container/root table when present so tables
-        // defer their graphs to the root canvas graph. Fall back to the
-        // module's attached table if no container table is set.
         GP_TableContext* table = c->container_table ? c->container_table : ((module_idx < static_cast<int>(c->module_tables.size())) ? c->module_tables[module_idx] : nullptr);
-        printf("render_stage_integrator_image: module=%d using table=%p container=%p\n", module_idx, (void*)table, (void*)c->container_table);
-        // Enable sample capture, render to populate staged hits, commit and stream
-        // them into the chosen table so the integrator can consume them.
-        gp_stage_enable_sample_capture(st, 1);
-        gp_stage_render(st);
-        uint64_t batch_id = static_cast<uint64_t>(std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count());
-        gp_stage_commit_staged_samples(st, batch_id);
-        GP_StageBatchOptions opts{};
-        opts.stride = kStageIntegratorDefaultStride;
-        opts.sample_limit = kStageIntegratorSampleBudget;
-        int32_t stream_ok = gp_stage_stream_samples(st, table, kStageInputLedKey, &opts);
-        // Optionally disable capture to avoid accumulating across frames
-        gp_stage_enable_sample_capture(st, 0);
-        // Now run integrator read from the table
-        render_stage_integrator_image(c, module_idx, table, width, stage_h, tmp);
+        // If cached texture exists and matches size, blit it; otherwise fall back
+        // to rendering a subtle grid so UI shows something.
+        bool blitted = false;
+        if (module_idx >= 0 && module_idx < static_cast<int>(c->module_stage_cache_rgba.size())) {
+            int cw = c->module_stage_cache_w[module_idx];
+            int ch = c->module_stage_cache_h[module_idx];
+            int cp = c->module_stage_cache_pitch[module_idx];
+            if (cw == width && ch == stage_h && cp >= width * 4) {
+                std::lock_guard<std::mutex> lk(*c->module_stage_cache_mu[module_idx]);
+                const uint8_t* src = c->module_stage_cache_rgba[module_idx].data();
+                if (src && !c->module_stage_cache_rgba[module_idx].empty()) {
+                    for (int y = 0; y < height; ++y) {
+                        uint8_t* row = out_rgba + y * out_pitch;
+                        if (y < ch) {
+                            const uint8_t* srow = src + static_cast<size_t>(y) * static_cast<size_t>(cp);
+                            std::memcpy(row, srow, static_cast<size_t>(width) * 4);
+                        } else {
+                            std::memset(row, 0, static_cast<size_t>(width) * 4);
+                        }
+                    }
+                    blitted = true;
+                }
+            }
+        }
+        if (!blitted) {
+            gp_stage_render(st);
+            render_stage_integrator_image(c, module_idx, table, width, stage_h, tmp);
+        }
     } else {
-        gp_stage_render(st);
-        gp_stage_copy_rgba(st, tmp.data(), static_cast<int32_t>(tmp.size()));
+        // Non-integrator mode: prefer cached texture, else copy latest stage image
+        bool blitted = false;
+        if (module_idx >= 0 && module_idx < static_cast<int>(c->module_stage_cache_rgba.size())) {
+            int cw = c->module_stage_cache_w[module_idx];
+            int ch = c->module_stage_cache_h[module_idx];
+            int cp = c->module_stage_cache_pitch[module_idx];
+            if (cw == width && ch == stage_h && cp >= width * 4) {
+                std::lock_guard<std::mutex> lk(*c->module_stage_cache_mu[module_idx]);
+                const uint8_t* src = c->module_stage_cache_rgba[module_idx].data();
+                if (src && !c->module_stage_cache_rgba[module_idx].empty()) {
+                    for (int y = 0; y < height; ++y) {
+                        uint8_t* row = out_rgba + y * out_pitch;
+                        if (y < ch) {
+                            const uint8_t* srow = src + static_cast<size_t>(y) * static_cast<size_t>(cp);
+                            std::memcpy(row, srow, static_cast<size_t>(width) * 4);
+                        } else {
+                            std::memset(row, 0, static_cast<size_t>(width) * 4);
+                        }
+                    }
+                    blitted = true;
+                }
+            }
+        }
+        if (!blitted) {
+            gp_stage_render(st);
+            gp_stage_copy_rgba(st, tmp.data(), static_cast<int32_t>(tmp.size()));
+        }
     }
     // If stage produced an all-zero frame (e.g., no emitters configured yet), paint a subtle fallback grid
     // so the module isn't rendered as a solid black box.
@@ -2454,6 +2561,23 @@ extern "C" int gp_canvas_get_autosave(GP_CanvasContext* ctx_, char* out_path, in
         if (to_write > 0) memcpy(out_path, c->autosave_path.data(), static_cast<size_t>(to_write));
     }
     if (out_interval_s) *out_interval_s = c->autosave_interval_s;
+    return 1;
+}
+
+extern "C" int gp_canvas_set_thread_manager_mode(GP_CanvasContext* ctx_, int mode) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->thread_mgr) return 0;
+    ThreadManager::Mode m = (mode == 0) ? ThreadManager::Mode::FreeSpinning : ThreadManager::Mode::Scheduled;
+    c->thread_mgr->set_mode(m);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx_, int* out_mode) {
+    if (!ctx_ || !out_mode) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->thread_mgr) return 0;
+    *out_mode = (c->thread_mgr->mode() == ThreadManager::Mode::FreeSpinning) ? 0 : 1;
     return 1;
 }
 
