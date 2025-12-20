@@ -715,7 +715,6 @@ enum CanvasActionId {
     CANVAS_ACT_IO_CONSUMER_ADD = 2032,
     CANVAS_ACT_IO_PRODUCER_ADD = 2033,
     CANVAS_ACT_MODULE_LED = 2040,
-    CANVAS_ACT_MENU_KEY_RECORDER = 2100,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
     CANVAS_ACT_MENU_TOOL_SUB = 2102,
     CANVAS_ACT_MENU_TOOL_MUL = 2103,
@@ -977,7 +976,6 @@ struct ToolMenuItem {
 };
 
 static const ToolMenuItem kToolMenuItems[] = {
-    { CANVAS_ACT_MENU_KEY_RECORDER, LABEL_MENU_KEY_RECORDER, ModuleToolKind::None },
     { CANVAS_ACT_MENU_TOOL_ADD, LABEL_TOOL_ADD, ModuleToolKind::Add },
     { CANVAS_ACT_MENU_TOOL_SUB, LABEL_TOOL_SUB, ModuleToolKind::Subtract },
     { CANVAS_ACT_MENU_TOOL_MUL, LABEL_TOOL_MUL, ModuleToolKind::Multiply },
@@ -1046,7 +1044,6 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_COUNT_INC, CANVAS_ACT_IO_COUNT_INC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_CONSUMER_ADD, CANVAS_ACT_IO_CONSUMER_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_PRODUCER_ADD, CANVAS_ACT_IO_PRODUCER_ADD },
-    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_KEY_RECORDER, CANVAS_ACT_MENU_KEY_RECORDER },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
@@ -1293,14 +1290,6 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 if (c->dispatch_module_idx >= 0) {
                     canvas_handle_module_led_hit(c, c->dispatch_module_idx, *hit);
                 }
-                break;
-            case CANVAS_ACT_MENU_KEY_RECORDER:
-                if (c->focused_module >= 0) {
-                    gp_canvas_destroy_table(reinterpret_cast<GP_CanvasContext*>(c), c->focused_module);
-                    canvas_install_key_recorder_table(c, c->focused_module);
-                }
-                c->tool_menu_open = false;
-                c->selected_tool_table = 0;
                 break;
             case CANVAS_ACT_MENU_TOOL_ADD:
                 canvas_push_tool_to_focused(c, ModuleToolKind::Add);
@@ -2591,100 +2580,10 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
             }
         }
     }
-    // Consume any root-table FIFO samples targeted at module tables and
-    // append them as rows to the module's attached table. This lets a
-    // recorder publish key codes and a receiver module display them.
-    GP_TableContext* root = canvas_ensure_root_table(c);
-    if (root) {
-        for (size_t mi = 0; mi < c->modules.size(); ++mi) {
-            int in_count = 1;
-            if (mi < c->module_io_in_count.size()) in_count = std::max(1, c->module_io_in_count[mi]);
-            for (int ci = 0; ci < in_count; ++ci) {
-                // subscriber key convention: (module_idx << 32) | (contact_idx << 16) | 0
-                uint64_t sub_key = (static_cast<uint64_t>(static_cast<uint32_t>(mi)) << 32) |
-                                   (static_cast<uint64_t>(static_cast<uint32_t>(ci)) << 16) |
-                                   static_cast<uint64_t>(0);
-                int edge_idx = -1;
-                if (!gp_table_edge_index_for_key(root, sub_key, &edge_idx) || edge_idx < 0) {
-                    // no root edge for this contact, skip
-                    //printf("canvas_consume: module=%zu contact=%d sub_key=%llu no root edge found\n", mi, ci, (unsigned long long)sub_key);
-                    continue;
-                }
-                // Ensure subscription is registered synchronously so we can immediately
-                // check unread counts. The table API's enqueue path is asynchronous
-                // and the pending op may not have been applied when we query unread.
-                // Also, subscription keys of zero are rejected by the FIFO; map a
-                // zero module key to a non-zero reader key with the top-bit set.
-                uint64_t reader_key = sub_key;
-                if (reader_key == 0) reader_key = (sub_key | 0x8000000000000000ull);
-                gp_table_edge_subscribe_ex(root, edge_idx, reader_key, /*start_at_head=*/1);
-                int32_t unread = 0;
-                gp_table_edge_unread(root, edge_idx, reader_key, &unread);
-                printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu reader_key=%llu unread=%d\n", mi, ci, edge_idx, (unsigned long long)sub_key, (unsigned long long)reader_key, unread);
-                if (unread <= 0) continue;
-                // consume available samples (assume stride 1 float representing keycode)
-                for (int ri = 0; ri < unread; ++ri) {
-                    float sample[1]; int32_t written = 0;
-                    if (!gp_table_edge_consume(root, edge_idx, reader_key, sample, 1, &written) || written <= 0) {
-                        printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu consume_failed or no_written\n", mi, ci, edge_idx, (unsigned long long)sub_key);
-                        break;
-                    }
-                    int key = static_cast<int>(std::lround(sample[0]));
-                    printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu reader_key=%llu consumed_sample=%f written=%d key=%d\n", mi, ci, edge_idx, (unsigned long long)sub_key, (unsigned long long)reader_key, sample[0], written, key);
-
-                    // append to module's attached table if present
-                    bool had_table = (mi < c->module_tables.size() && c->module_tables[mi]);
-                    if (had_table) {
-                        GP_TableContext* mt = c->module_tables[mi];
-                        int32_t n = gp_table_get_row_count(mt);
-                        std::vector<GP_TableRow> rows;
-                        rows.resize(static_cast<size_t>(n + 1));
-                        for (int32_t i = 0; i < n; ++i) {
-                            GP_TableRow tmp; memset(&tmp, 0, sizeof(tmp));
-                            if (gp_table_get_row(mt, i, &tmp)) rows[static_cast<size_t>(i)] = tmp;
-                        }
-                        GP_TableRow nr; memset(&nr, 0, sizeof(nr));
-                        nr.kind = GP_TABLE_ROW_DEVICE; nr.depth = 0; nr.expanded = 1; nr.selected = 0; nr.cell_count = 1;
-                        nr.cells[0].kind = GP_TABLE_CELL_TEXT;
-                        char txt[64];
-                        if (key >= 32 && key < 127) std::snprintf(txt, sizeof(txt), "recv: '%c' (%d)", static_cast<char>(key), key);
-                        else std::snprintf(txt, sizeof(txt), "recv: %d", key);
-                        std::snprintf(nr.cells[0].text, sizeof(nr.cells[0].text), "%s", txt);
-                        rows[static_cast<size_t>(n)] = nr;
-                        gp_table_set_rows(mt, rows.data(), static_cast<int32_t>(rows.size()));
-
-                    }
-                    // Update per-module chat visual state: append char to chat buffer
-                    if (mi < c->module_chat_text.size()) {
-                        std::string &buf = c->module_chat_text[mi];
-                        if (key >= 32 && key < 127) {
-                            if (buf.size() >= 128) buf.erase(0, buf.size() - 127);
-                            buf.push_back(static_cast<char>(key));
-                        } else {
-                            char tmp[32]; std::snprintf(tmp, sizeof(tmp), "[%d]", key);
-                            buf.append(tmp);
-                            if (buf.size() > 128) buf = buf.substr(buf.size() - 128);
-                        }
-                        // color highlight per-module (stable-ish)
-                        c->module_chat_color[mi].r = static_cast<uint8_t>(80 + (mi * 37) % 160);
-                        c->module_chat_color[mi].g = static_cast<uint8_t>(80 + (mi * 61) % 160);
-                        c->module_chat_color[mi].b = static_cast<uint8_t>(80 + (mi * 97) % 160);
-                        c->module_chat_color[mi].a = 255;
-                        c->module_chat_ttl[mi] = 240; // show for ~240 frames (~4s at 60fps)
-                        if (mi < static_cast<int>(c->module_bg.size()) && !c->module_bg[mi].cb) {
-                            c->module_bg[mi].cb = chat_bg_callback;
-                            c->module_bg[mi].user = c;
-                            c->module_bg[mi].table_alpha = 200;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     if (c->thread_mgr) {
         ThreadManager::TickRequest req;
         req.dt = static_cast<double>(dt);
+        req.root_table = canvas_ensure_root_table(c);
         req.modules.reserve(c->modules.size());
         for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
             ThreadManager::ModuleContract mod{};

@@ -271,6 +271,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         for (const auto& m : req.modules) {
             if (m.table) gp_table_apply_pending_ops(reinterpret_cast<GP_TableContext*>(m.table));
         }
+        if (req.root_table) {
+            gp_table_apply_pending_ops(req.root_table);
+        }
 
         // Build successor adjacency from edges (writer -> reader modules) using
     // module vector indices as canonical ids.
@@ -361,6 +364,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             stack.pop_back();
             return v;
         };
+        GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
         for (int row = 0; row < row_count; ++row) {
             ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None, 0};
             if (meta.kind == ModuleRowKind::Input) {
@@ -372,6 +376,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     // Find the edge index for this input (mod_idx is the consumer)
                     int edge_idx = -1;
                     uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
+                    if (reader_key == 0) reader_key = 0x8000000000000000ull;
                     // Find the edge in req.edges where b_module == mod_idx and b_contact_idx == contact_idx
                     for (const auto& e : req.edges) {
                         if (e.b_module == mod_idx && e.b_contact_idx == contact_idx) {
@@ -379,13 +384,14 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             break;
                         }
                     }
-                    if (edge_idx >= 0) {
+                    if (edge_idx >= 0 && fifo_table) {
                         int32_t unread = 0;
-                        gp_table_edge_unread(mod.table, edge_idx, reader_key, &unread);
+                        gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
+                        gp_table_edge_unread(fifo_table, edge_idx, reader_key, &unread);
                         if (unread > 0) {
                             float sample[1] = {0.0f};
                             int32_t written = 0;
-                            if (gp_table_edge_consume(mod.table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
+                            if (gp_table_edge_consume(fifo_table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
                                 val = sample[0];
                             }
                         }
@@ -476,10 +482,10 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             break;
                         }
                     }
-                    if (edge_idx >= 0) {
+                    if (edge_idx >= 0 && fifo_table) {
                         int dropped = 0;
                         float payload[1] = {val};
-                        gp_table_edge_publish(mod.table, edge_idx, writer_key, payload, 1, &dropped);
+                        gp_table_edge_publish(fifo_table, edge_idx, writer_key, payload, 1, &dropped);
                     }
                 }
             }

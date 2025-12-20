@@ -110,7 +110,8 @@ public:
         double dt = 0.0;
         std::vector<ModuleContract> modules;
         std::vector<EdgeContract> edges;
-            std::vector<StageContract> stages;
+        std::vector<StageContract> stages;
+        GP_TableContext* root_table = nullptr;
     };
 
     ThreadManager();
