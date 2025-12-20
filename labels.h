@@ -19,6 +19,19 @@
 #define LABEL_TABLE_TOOL_SHORT_EDIT "e"
 #define LABEL_TABLE_TOOL_SHORT_MORE "m"
 
+// Edge tool labels
+#define LABEL_EDGE_TOOL_CREATE "Edge Create"
+#define LABEL_EDGE_TOOL_DESTROY "Edge Destroy"
+#define LABEL_EDGE_TOOL_ON_CHANGE "Edge On-Change"
+#define LABEL_EDGE_TOOL_CONTINUOUS "Edge Continuous"
+
+#define LABEL_EDGE_TOOL_SHORT_CREATE "C"
+#define LABEL_EDGE_TOOL_SHORT_DESTROY "X"
+#define LABEL_EDGE_TOOL_SHORT_ON_CHANGE "O"
+#define LABEL_EDGE_TOOL_SHORT_CONTINUOUS "N"
+
+#define LABEL_EDGE_ORDER_TOOL "Order"
+
 // Rope bar labels
 #define LABEL_ROPE_SEGS_DEC "Seg -"
 #define LABEL_ROPE_SEGS_INC "Seg +"
