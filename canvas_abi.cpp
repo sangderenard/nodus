@@ -450,6 +450,14 @@ struct GP_CanvasContextImpl {
 
 // (global drag map removed; each canvas has its own DragState member)
 
+static GP_CanvasContextImpl* g_canvas_context_singleton = nullptr;
+
+const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx) {
+    if (!g_canvas_context_singleton) return nullptr;
+    if (module_idx < 0 || module_idx >= static_cast<int>(g_canvas_context_singleton->module_io_rows.size())) return nullptr;
+    return &g_canvas_context_singleton->module_io_rows[module_idx];
+}
+
 
 // NOTE: legacy per-side contact geometry removed. Contact hit/position
 // information is authoritative from attached `GP_TableContext` hitboxes.
@@ -1579,6 +1587,7 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
 }
 extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     GP_CanvasContextImpl* c = new GP_CanvasContextImpl(width, height);
+    if (!g_canvas_context_singleton) g_canvas_context_singleton = c;
     canvas_ensure_root_table(c);
     c->thread_mgr = std::make_unique<ThreadManager>();
     c->thread_mgr->set_mode(ThreadManager::Mode::Scheduled);
@@ -1619,6 +1628,7 @@ extern "C" void gp_canvas_destroy(GP_CanvasContext* ctx) {
         gp_table_destroy(c->container_table);
     }
     delete c;
+    if (g_canvas_context_singleton == c) g_canvas_context_singleton = nullptr;
 }
 
 extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModuleDesc* desc) {
@@ -2365,6 +2375,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                     }
                     int key = static_cast<int>(std::lround(sample[0]));
                     printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu reader_key=%llu consumed_sample=%f written=%d key=%d\n", mi, ci, edge_idx, (unsigned long long)sub_key, (unsigned long long)reader_key, sample[0], written, key);
+                }
                 // append to module's attached table if present
                 bool had_table = (mi < c->module_tables.size() && c->module_tables[mi]);
                 if (had_table) {

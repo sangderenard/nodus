@@ -318,9 +318,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         if (!mod.table) continue;
         std::vector<ModuleIORow> io_rows;
         {
-            extern GP_CanvasContextImpl* g_canvas_context_singleton;
-            if (g_canvas_context_singleton && mod_idx < (int)g_canvas_context_singleton->module_io_rows.size()) {
-                io_rows = g_canvas_context_singleton->module_io_rows[mod_idx];
+            extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
+            if (const auto* rows = canvas_get_module_io_rows(mod_idx)) {
+                io_rows = *rows;
             } else {
                 int row_count = gp_table_get_row_count(mod.table);
                 io_rows.resize(row_count);
