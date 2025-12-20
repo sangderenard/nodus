@@ -1562,6 +1562,124 @@ static int canvas_pick_edge_by_rope(GP_CanvasContextImpl* ctx, int world_x, int 
             }
         }
     }
+}
+
+static uint64_t canvas_root_key_for_contact(int module_idx, int contact_idx) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) |
+           (static_cast<uint64_t>(static_cast<uint32_t>(contact_idx)) << 16) |
+           static_cast<uint64_t>(0);
+}
+
+static void canvas_collect_edges_for_contact(const GP_CanvasContextImpl* ctx, int module_idx, int contact_idx, std::vector<int> &out_indices) {
+    out_indices.clear();
+    if (!ctx) return;
+    for (size_t i = 0; i < ctx->edges.size(); ++i) {
+        const auto &e = ctx->edges[i].desc;
+        if ((e.a_module == module_idx && e.a_contact_idx == contact_idx) ||
+            (e.b_module == module_idx && e.b_contact_idx == contact_idx)) {
+            out_indices.push_back(static_cast<int>(i));
+        }
+    }
+}
+
+static void canvas_set_delta_mode_for_edge(GP_CanvasContextImpl* ctx, const GP_CanvasEdgeDesc &desc, bool delta_mode) {
+    if (!ctx) return;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (!root) return;
+    uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+    uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+    int edge_idx = -1;
+    if (gp_table_edge_index_for_pair(root, ka, kb, &edge_idx)) {
+        gp_table_edge_set_delta_mode(root, edge_idx, delta_mode ? 1 : 0);
+    } else if (gp_table_edge_index_for_pair(root, kb, ka, &edge_idx)) {
+        gp_table_edge_set_delta_mode(root, edge_idx, delta_mode ? 1 : 0);
+    }
+}
+
+static void canvas_set_order_mode_for_edge(GP_CanvasContextImpl* ctx, const GP_CanvasEdgeDesc &desc, int order_mode) {
+    if (!ctx) return;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (!root) return;
+    uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+    uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+    int edge_idx = -1;
+    if (gp_table_edge_index_for_pair(root, ka, kb, &edge_idx)) {
+        gp_table_edge_set_order_mode(root, edge_idx, order_mode);
+    } else if (gp_table_edge_index_for_pair(root, kb, ka, &edge_idx)) {
+        gp_table_edge_set_order_mode(root, edge_idx, order_mode);
+    }
+}
+
+static void canvas_remove_edge_at(GP_CanvasContextImpl* ctx, int edge_idx) {
+    if (!ctx || edge_idx < 0 || edge_idx >= static_cast<int>(ctx->edges.size())) return;
+    const auto desc = ctx->edges[static_cast<size_t>(edge_idx)].desc;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (root) {
+        uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+        uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+        gp_table_remove_edge_pair(root, ka, kb);
+    }
+    ctx->edges.erase(ctx->edges.begin() + edge_idx);
+}
+
+static float point_segment_distance_sq(float px, float py, float ax, float ay, float bx, float by) {
+    float vx = bx - ax;
+    float vy = by - ay;
+    float wx = px - ax;
+    float wy = py - ay;
+    float c1 = vx * wx + vy * wy;
+    if (c1 <= 0.0f) {
+        float dx = px - ax;
+        float dy = py - ay;
+        return dx * dx + dy * dy;
+    }
+    float c2 = vx * vx + vy * vy;
+    if (c2 <= c1) {
+        float dx = px - bx;
+        float dy = py - by;
+        return dx * dx + dy * dy;
+    }
+    float t = c1 / c2;
+    float projx = ax + t * vx;
+    float projy = ay + t * vy;
+    float dx = px - projx;
+    float dy = py - projy;
+    return dx * dx + dy * dy;
+}
+
+static int canvas_pick_edge_by_rope(GP_CanvasContextImpl* ctx, int world_x, int world_y, float max_dist) {
+    if (!ctx) return -1;
+    RopeSim* sim = canvas_root_sim(ctx);
+    if (!sim) return -1;
+    float max_dist_sq = max_dist * max_dist;
+    int best_edge = -1;
+    float best_dist = max_dist_sq;
+    for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+        int ridx = ctx->edges[ei].rope_idx;
+        if (ridx < 0) continue;
+        int vc = rope_sim_get_vertex_count(sim, ridx);
+        if (vc < 2) continue;
+        std::vector<float> verts(static_cast<size_t>(vc) * 2u);
+        int got = rope_sim_get_vertices(sim, ridx, verts.data(), static_cast<int>(verts.size()));
+        if (got < 2) continue;
+        float dx0 = verts[0] - static_cast<float>(world_x);
+        float dy0 = verts[1] - static_cast<float>(world_y);
+        float dx1 = verts[(got - 1) * 2] - static_cast<float>(world_x);
+        float dy1 = verts[(got - 1) * 2 + 1] - static_cast<float>(world_y);
+        if ((dx0 * dx0 + dy0 * dy0) <= max_dist_sq) continue;
+        if ((dx1 * dx1 + dy1 * dy1) <= max_dist_sq) continue;
+        for (int vi = 0; vi < got - 1; ++vi) {
+            float ax = verts[vi * 2];
+            float ay = verts[vi * 2 + 1];
+            float bx = verts[(vi + 1) * 2];
+            float by = verts[(vi + 1) * 2 + 1];
+            float dist_sq = point_segment_distance_sq(static_cast<float>(world_x), static_cast<float>(world_y), ax, ay, bx, by);
+            if (dist_sq <= best_dist) {
+                best_dist = dist_sq;
+                best_edge = static_cast<int>(ei);
+            }
+        }
+    }
     return best_edge;
 }
     sync_module_table_io_layout(ctx, module_idx);
