@@ -2375,6 +2375,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                     }
                     int key = static_cast<int>(std::lround(sample[0]));
                     printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu reader_key=%llu consumed_sample=%f written=%d key=%d\n", mi, ci, edge_idx, (unsigned long long)sub_key, (unsigned long long)reader_key, sample[0], written, key);
+
                     // append to module's attached table if present
                     bool had_table = (mi < c->module_tables.size() && c->module_tables[mi]);
                     if (had_table) {
@@ -2395,6 +2396,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                         std::snprintf(nr.cells[0].text, sizeof(nr.cells[0].text), "%s", txt);
                         rows[static_cast<size_t>(n)] = nr;
                         gp_table_set_rows(mt, rows.data(), static_cast<int32_t>(rows.size()));
+
                     }
                     // Update per-module chat visual state: append char to chat buffer
                     if (mi < c->module_chat_text.size()) {
