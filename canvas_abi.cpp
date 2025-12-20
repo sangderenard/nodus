@@ -540,6 +540,11 @@ static void ensure_module_row_order(GP_CanvasContextImpl* ctx, int module_idx) {
     }
 }
 
+static void canvas_setup_stage_table(GP_TableContext* t, int w_px);
+static void canvas_setup_stage_defaults(GP_StageContext* st, int w_px, int h_px);
+static void stage_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
+static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_idx);
+
 static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, const std::vector<ModuleIORow>& rows) {
     if (!ctx) return;
     if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
