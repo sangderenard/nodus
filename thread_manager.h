@@ -28,6 +28,7 @@ enum class ModuleToolKind : int8_t {
     Modulo = 5,
     KeyboardListener = 6,
     MouseListener = 7,
+    StackDisplay = 8,
 };
 
 struct ModuleIORow {
@@ -45,6 +46,30 @@ struct ModuleInputState {
     int32_t key = 0;
     int32_t key_event = 0;
 };
+
+struct ToolStackSpec {
+    int consumes = 0;
+    int produces = 0;
+};
+
+inline ToolStackSpec module_tool_stack_spec(ModuleToolKind tool) {
+    switch (tool) {
+        case ModuleToolKind::Add:
+        case ModuleToolKind::Subtract:
+        case ModuleToolKind::Multiply:
+        case ModuleToolKind::Divide:
+        case ModuleToolKind::Modulo:
+            return {2, 1};
+        case ModuleToolKind::KeyboardListener:
+            return {0, 1};
+        case ModuleToolKind::MouseListener:
+            return {0, 4};
+        case ModuleToolKind::StackDisplay:
+        case ModuleToolKind::None:
+        default:
+            return {0, 0};
+    }
+}
 
 class ThreadManager {
 public:
