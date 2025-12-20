@@ -27,6 +27,8 @@
 extern "C" void table_draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, const float* hues, int hue_count, int samples_per_segment, float hue_intensity);
 extern "C" void table_draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca, int samples_per_segment);
 
+static const char* kCanvasDefaultWorkspacePath = "canvas_workspace.txt";
+
 // local minimal Color and draw helpers (self-contained)
 struct Color { uint8_t r=0,g=0,b=0,a=255; };
 
@@ -35,6 +37,8 @@ struct ContactLight {
     float intensity = 0.0f;
     bool valid = false;
 };
+
+struct KeyRecorderState;
 
 static inline void blend_pixel(uint8_t* dst, uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa) {
     if (!dst) return;
@@ -536,6 +540,145 @@ static void ensure_module_row_order(GP_CanvasContextImpl* ctx, int module_idx) {
     }
 }
 
+static void canvas_setup_stage_table(GP_TableContext* t, int w_px);
+static void canvas_setup_stage_defaults(GP_StageContext* st, int w_px, int h_px);
+static void stage_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
+static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_idx);
+
+static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, const std::vector<ModuleIORow>& rows) {
+    if (!ctx) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
+    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
+    if (module_idx >= static_cast<int>(ctx->module_io_input_rows.size())) ctx->module_io_input_rows.resize(module_idx + 1);
+    if (module_idx >= static_cast<int>(ctx->module_io_output_rows.size())) ctx->module_io_output_rows.resize(module_idx + 1);
+    if (module_idx >= static_cast<int>(ctx->module_tool_stack.size())) ctx->module_tool_stack.resize(module_idx + 1);
+
+    ctx->module_io_rows[module_idx].clear();
+    ctx->module_io_input_rows[module_idx].clear();
+    ctx->module_io_output_rows[module_idx].clear();
+    ctx->module_tool_stack[module_idx].clear();
+
+    int in_total = 0;
+    for (const auto &row : rows) {
+        if (row.kind == ModuleRowKind::Input) {
+            in_total += std::clamp(row.attachment_count, 1, 32);
+        }
+    }
+    int in_offset = 0;
+    int out_offset = 0;
+    for (const auto &row : rows) {
+        if (row.kind == ModuleRowKind::Tool) {
+            ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Tool, -1, row.tool, 0});
+            ctx->module_tool_stack[module_idx].push_back(row.tool);
+            continue;
+        }
+        int count = std::clamp(row.attachment_count, 1, 32);
+        if (row.kind == ModuleRowKind::Input) {
+            ctx->module_io_input_rows[module_idx].push_back(count);
+            ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Input, in_offset, ModuleToolKind::None, count});
+            in_offset += count;
+        } else if (row.kind == ModuleRowKind::Output) {
+            ctx->module_io_output_rows[module_idx].push_back(count);
+            ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, in_total + out_offset, ModuleToolKind::None, count});
+            out_offset += count;
+        }
+    }
+    if (module_idx >= static_cast<int>(ctx->module_io_in_count.size())) ctx->module_io_in_count.resize(module_idx + 1, 0);
+    if (module_idx >= static_cast<int>(ctx->module_io_out_count.size())) ctx->module_io_out_count.resize(module_idx + 1, 0);
+    ctx->module_io_in_count[module_idx] = in_offset;
+    ctx->module_io_out_count[module_idx] = out_offset;
+    ensure_module_row_order(ctx, module_idx);
+}
+
+static void canvas_configure_stage_module(GP_CanvasContextImpl* ctx, int module_idx, int w_px, int h_px) {
+    if (!ctx) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
+    if (module_idx < static_cast<int>(ctx->module_is_stage.size())) ctx->module_is_stage[module_idx] = 1;
+    if (module_idx < static_cast<int>(ctx->module_stages.size())) {
+        GP_StageContext* st = gp_stage_create(w_px, h_px, 2);
+        ctx->module_stages[module_idx] = st;
+        if (module_idx < static_cast<int>(ctx->module_stage_owned.size())) ctx->module_stage_owned[module_idx] = 1;
+        canvas_setup_stage_defaults(st, w_px, h_px);
+    }
+    if (module_idx < static_cast<int>(ctx->module_io_in_count.size())) ctx->module_io_in_count[module_idx] = 1;
+    if (module_idx < static_cast<int>(ctx->module_io_out_count.size())) ctx->module_io_out_count[module_idx] = 1;
+    if (module_idx < static_cast<int>(ctx->module_bg.size())) {
+        ctx->module_bg[module_idx].cb = stage_bg_callback;
+        ctx->module_bg[module_idx].user = ctx;
+        ctx->module_bg[module_idx].table_alpha = 192;
+        ctx->module_bg[module_idx].table_alpha_ray = 192;
+        ctx->module_bg[module_idx].header_margin_px = 0;
+    }
+    if (module_idx < static_cast<int>(ctx->module_tables.size()) && ctx->module_tables[module_idx]) {
+        canvas_setup_stage_table(ctx->module_tables[module_idx], w_px);
+        sync_module_table_io_layout(ctx, module_idx);
+    }
+}
+
+static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
+    if (!ctx) return;
+    for (size_t i = 0; i < ctx->module_tables.size(); ++i) {
+        if (ctx->module_tables[i] && i < ctx->module_table_owned.size() && ctx->module_table_owned[i]) {
+            gp_table_destroy(ctx->module_tables[i]);
+        }
+        if (i < ctx->module_key_recorder_state.size()) {
+            void* s = ctx->module_key_recorder_state[i];
+            if (s) delete reinterpret_cast<KeyRecorderState*>(s);
+        }
+    }
+    for (size_t i = 0; i < ctx->module_stages.size(); ++i) {
+        if (ctx->module_stages[i] && i < ctx->module_stage_owned.size() && ctx->module_stage_owned[i]) {
+            gp_stage_destroy(ctx->module_stages[i]);
+        }
+    }
+    if (ctx->container_table) {
+        gp_table_clear_edges(ctx->container_table);
+    }
+    ctx->modules.clear();
+    ctx->module_tables.clear();
+    ctx->module_table_owned.clear();
+    ctx->module_stages.clear();
+    ctx->module_stage_owned.clear();
+    ctx->module_is_stage.clear();
+    ctx->module_stage_images.clear();
+    ctx->module_stage_cache_rgba.clear();
+    ctx->module_stage_cache_w.clear();
+    ctx->module_stage_cache_h.clear();
+    ctx->module_stage_cache_pitch.clear();
+    ctx->module_stage_cache_mu.clear();
+    ctx->module_stage_integrator_mode.clear();
+    ctx->module_stage_integrator_accum.clear();
+    ctx->module_bg.clear();
+    ctx->module_io_in_count.clear();
+    ctx->module_io_out_count.clear();
+    ctx->module_io_input_rows.clear();
+    ctx->module_io_output_rows.clear();
+    ctx->module_input_layout.clear();
+    ctx->module_output_layout.clear();
+    ctx->module_io_rows.clear();
+    ctx->module_table_rows.clear();
+    ctx->module_stack_snapshots.clear();
+    ctx->module_tool_stack.clear();
+    ctx->module_key_recorder_state.clear();
+    ctx->module_input_state.clear();
+    ctx->module_chat_text.clear();
+    ctx->module_chat_color.clear();
+    ctx->module_chat_ttl.clear();
+    ctx->edges.clear();
+    ctx->nodes.clear();
+    ctx->module_node_id.clear();
+    ctx->selected = {};
+    ctx->dispatch_module_idx = -1;
+    ctx->focused_module = -1;
+    ctx->prospective_rope_idx = -1;
+    ctx->tool_menu_open = false;
+    int max_window_node = 0;
+    for (const auto &entry : ctx->window_node_ids) {
+        max_window_node = std::max(max_window_node, entry.second);
+    }
+    ctx->next_node_id = std::max(1, max_window_node + 1);
+}
+
 static void canvas_record_key_input(GP_CanvasContextImpl* ctx, int key, int action) {
     if (!ctx || action == 0) return;
     for (int mi = 0; mi < static_cast<int>(ctx->module_input_state.size()); ++mi) {
@@ -707,6 +850,8 @@ enum CanvasActionId {
     CANVAS_ACT_SIM_SEGS_INC = 2001,
     CANVAS_ACT_SIM_SLACK_DEC = 2002,
     CANVAS_ACT_SIM_SLACK_INC = 2003,
+    CANVAS_ACT_SAVE = 2004,
+    CANVAS_ACT_CLEAR = 2005,
     CANVAS_ACT_TOOL_CANVAS_0 = 2010,
     CANVAS_ACT_TOOL_CANVAS_1 = 2011,
     CANVAS_ACT_TOOL_CANVAS_2 = 2012,
@@ -1044,6 +1189,8 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SIM_SEGS_INC, CANVAS_ACT_SIM_SEGS_INC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SIM_SLACK_DEC, CANVAS_ACT_SIM_SLACK_DEC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SIM_SLACK_INC, CANVAS_ACT_SIM_SLACK_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SAVE, CANVAS_ACT_SAVE },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_CLEAR, CANVAS_ACT_CLEAR },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_CANVAS_0, CANVAS_ACT_TOOL_CANVAS_0 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_CANVAS_1, CANVAS_ACT_TOOL_CANVAS_1 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_CANVAS_2, CANVAS_ACT_TOOL_CANVAS_2 },
@@ -1257,6 +1404,17 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
             case CANVAS_ACT_SIM_SLACK_INC:
                 c->sim_slack = std::min(8.0f, c->sim_slack + 0.1f);
                 printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack);
+                break;
+            case CANVAS_ACT_SAVE:
+                if (!c->autosave_path.empty()) {
+                    gp_canvas_save_to_file(reinterpret_cast<GP_CanvasContext*>(c), c->autosave_path.c_str());
+                } else {
+                    gp_canvas_save_to_file(reinterpret_cast<GP_CanvasContext*>(c), kCanvasDefaultWorkspacePath);
+                }
+                break;
+            case CANVAS_ACT_CLEAR:
+                canvas_clear_workspace(c);
+                update_canvas_scroll_state(c, /*pull_from_container=*/false);
                 break;
             case CANVAS_ACT_TOOL_CANVAS_0:
             case CANVAS_ACT_TOOL_CANVAS_1:
@@ -2039,6 +2197,13 @@ extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     c->thread_mgr->start();
     // expose as global for table-layer integration
     ThreadManager::set_global(c->thread_mgr.get());
+    c->autosave_path = kCanvasDefaultWorkspacePath;
+    c->autosave_interval_s = 2.0;
+    c->autosave_accum_s = 0.0;
+    std::ifstream ifs(kCanvasDefaultWorkspacePath);
+    if (ifs.good()) {
+        gp_canvas_load_from_file(reinterpret_cast<GP_CanvasContext*>(c), kCanvasDefaultWorkspacePath);
+    }
     return reinterpret_cast<GP_CanvasContext*>(c);
 }
 
@@ -2178,6 +2343,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     if (view_y >= c->rope_bar_h && view_y < c->rope_bar_h + c->control_bar_h) {
         const int canvas_btn_count = 4;
         const int edge_btn_count = 4;
+        const int save_btn_count = 2;
         const int table_btn_count = 3;
         const int spacing = 8;
         int by = c->rope_bar_h + 4;
@@ -2201,9 +2367,18 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 if (canvas_dispatch_root_action(c, action_id)) return 1;
             }
         }
-        // right table group
         int group_width = table_btn_count * (bw + spacing) - spacing;
         int bx_r = std::max(8, c->width - 8 - group_width);
+        int save_group_w = save_btn_count * (bw + spacing) - spacing;
+        int bx_save = bx_r - save_group_w - spacing * 2;
+        for (int bi = 0; bi < save_btn_count; ++bi) {
+            int bx_i = bx_save + bi * (bw + spacing);
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
+                int action_id = (bi == 0) ? CANVAS_ACT_SAVE : CANVAS_ACT_CLEAR;
+                if (canvas_dispatch_root_action(c, action_id)) return 1;
+            }
+        }
+        // right table group
         for (int bi = 0; bi < table_btn_count; ++bi) {
             int bx_i = bx_r + bi * (bw + spacing);
             if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
@@ -2212,7 +2387,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             }
         }
         // IO controls to the left of table buttons: compute positions matching raster
-        int io_base_x = bx_r;
+        int io_base_x = bx_save - spacing * 2;
         int nbw = bw;
         int num_w = std::max(24, nbw * 2);
         int gap = 10;
@@ -2412,31 +2587,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int new_idx = gp_canvas_add_module(ctx_, &d);
         if (new_idx >= 0) {
             // Mark as stage module and set up stage + frame table.
-            if (new_idx < static_cast<int>(c->module_is_stage.size())) c->module_is_stage[new_idx] = 1;
-            if (new_idx < static_cast<int>(c->module_stages.size())) {
-                GP_StageContext* st = gp_stage_create(d.w, d.h, 2);
-                c->module_stages[new_idx] = st;
-                if (new_idx < static_cast<int>(c->module_stage_owned.size())) c->module_stage_owned[new_idx] = 1;
-                canvas_setup_stage_defaults(st, d.w, d.h);
-            }
-            // Stage modules always expose one input and one output port.
-            if (new_idx < static_cast<int>(c->module_io_in_count.size())) c->module_io_in_count[new_idx] = 1;
-            if (new_idx < static_cast<int>(c->module_io_out_count.size())) c->module_io_out_count[new_idx] = 1;
-            // Use module background callback for stage raster.
-            if (new_idx < static_cast<int>(c->module_bg.size())) {
-                c->module_bg[new_idx].cb = stage_bg_callback;
-                c->module_bg[new_idx].user = c;
-                // allow stage imagery to remain visible behind the table
-                c->module_bg[new_idx].table_alpha = 192;
-                c->module_bg[new_idx].table_alpha_ray = 192;
-                c->module_bg[new_idx].header_margin_px = 0;   // content rendered inside table cells; no header gap needed
-            }
-            // Reconfigure the auto-created table as a minimal header strip.
-            if (new_idx < static_cast<int>(c->module_tables.size()) && c->module_tables[new_idx]) {
-                canvas_setup_stage_table(c->module_tables[new_idx], d.w);
-                // Install stage IO LEDs immediately.
-                sync_module_table_io_layout(c, new_idx);
-            }
+            canvas_configure_stage_module(c, new_idx, d.w, d.h);
             printf("gp_canvas_on_click: spawned new stage at %d,%d module=%d\n", nx, ny, new_idx);
             c->focused_module = new_idx;
         }
@@ -3662,10 +3813,12 @@ extern "C" int gp_canvas_get_module_node_id(GP_CanvasContext* ctx_, int module_i
 
 // Persist canvas state to a simple line-based file format. This is intentionally
 // lightweight and human readable so it's easy to edit by hand during development.
-// Format (V1):
-// CANVAS V1
+// Format (V2):
+// CANVAS V2
 // WIDTH HEIGHT CONTROL_BAR_H
-// MODULE x y w h label
+// OFFSET offx offy
+// MODULE x y w h in_count out_count is_stage bg_mode label
+// ROWS module_idx row_count [kind tool attachment_count]...
 // EDGE a_module a_contact_idx b_module b_contact_idx type_id
 // NODE node_id module_idx input_count [inputs...] output_count [outputs...]
 // Lines may appear in any order; loader will reconstruct internal vectors.
@@ -3674,14 +3827,19 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     std::ofstream ofs(path);
     if (!ofs.good()) return 0;
-    ofs << "CANVAS V1\n";
+    ofs << "CANVAS V2\n";
     ofs << c->width << " " << c->height << " " << c->control_bar_h << "\n";
     ofs << "OFFSET " << c->offset_x << " " << c->offset_y << "\n";
     // modules
     for (size_t i = 0; i < c->modules.size(); ++i) {
         const auto &m = c->modules[i];
+        int in_count = (i < c->module_io_in_count.size()) ? c->module_io_in_count[i] : 0;
+        int out_count = (i < c->module_io_out_count.size()) ? c->module_io_out_count[i] : 0;
+        int is_stage = (i < c->module_is_stage.size() && c->module_is_stage[i]) ? 1 : 0;
+        int bg_mode = (i < c->module_bg.size()) ? c->module_bg[i].mode : 0;
         // label may contain spaces; write as remainder of line
-        ofs << "MODULE " << m.x << " " << m.y << " " << m.w << " " << m.h << " ";
+        ofs << "MODULE " << m.x << " " << m.y << " " << m.w << " " << m.h << " "
+            << in_count << " " << out_count << " " << is_stage << " " << bg_mode << " ";
         // write label as-is but escape newlines and backslashes
         std::string lbl(m.label, m.label + sizeof(m.label));
         // trim at first null
@@ -3690,6 +3848,16 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
             if (ch == '\\') ofs << "\\\\";
             else if (ch == '\n') ofs << "\\n";
             else ofs << ch;
+        }
+        ofs << "\n";
+    }
+    // module IO row layout
+    for (size_t i = 0; i < c->module_io_rows.size(); ++i) {
+        const auto &rows = c->module_io_rows[i];
+        if (rows.empty()) continue;
+        ofs << "ROWS " << i << " " << rows.size();
+        for (const auto &row : rows) {
+            ofs << " " << static_cast<int>(row.kind) << " " << static_cast<int>(row.tool) << " " << row.attachment_count;
         }
         ofs << "\n";
     }
@@ -3719,50 +3887,53 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     std::ifstream ifs(path);
     if (!ifs.good()) return 0;
-    // clear existing modules/edges/nodes (destroy owned tables/stages)
-    for (size_t i = 0; i < c->module_tables.size(); ++i) {
-        if (c->module_tables[i] && c->module_table_owned[i]) gp_table_destroy(c->module_tables[i]);
-    }
-    for (size_t i = 0; i < c->module_stages.size(); ++i) {
-        if (c->module_stages[i] && i < c->module_stage_owned.size() && c->module_stage_owned[i]) gp_stage_destroy(c->module_stages[i]);
-    }
-    c->modules.clear();
-    c->module_tables.clear();
-    c->module_table_owned.clear();
-    c->module_stages.clear();
-    c->module_stage_owned.clear();
-    c->module_is_stage.clear();
-    c->module_stage_images.clear();
-    c->module_stage_integrator_mode.clear();
-    c->module_stage_integrator_accum.clear();
-    c->module_bg.clear();
-    c->module_io_in_count.clear();
-    c->module_io_out_count.clear();
-    c->module_io_input_rows.clear();
-    c->module_io_output_rows.clear();
-    c->module_input_layout.clear();
-    c->module_output_layout.clear();
-    c->module_io_rows.clear();
-    c->module_table_rows.clear();
-    c->module_stack_snapshots.clear();
-    c->module_input_state.clear();
-    c->edges.clear();
-    c->nodes.clear();
-    c->module_node_id.clear();
-    c->module_tool_stack.clear();
+    struct ModuleSnapshot {
+        GP_CanvasModuleDesc desc{};
+        int in_count = 0;
+        int out_count = 0;
+        int is_stage = 0;
+        int bg_mode = 0;
+    };
+    struct EdgeSnapshot {
+        GP_CanvasEdgeDesc desc{};
+        int type_id = 0;
+    };
+    struct RowSnapshot {
+        int module_idx = -1;
+        std::vector<ModuleIORow> rows;
+    };
+
+    int version = 1;
+    int file_w = c->width;
+    int file_h = c->height;
+    int file_cbh = c->control_bar_h;
+    int file_offx = 0;
+    int file_offy = 0;
+    std::vector<ModuleSnapshot> modules;
+    std::vector<EdgeSnapshot> edges;
+    std::vector<RowSnapshot> row_sets;
+    std::vector<GP_CanvasContextImpl::NodeContract> nodes;
 
     std::string line;
-    // optionally read header
-    if (!std::getline(ifs, line)) return 0;
-    if (line.rfind("CANVAS", 0) == 0) {
-        // read dims
-        if (!std::getline(ifs, line)) return 0;
-        std::istringstream sh(line);
-        int w,h,cbh; sh >> w >> h >> cbh;
-        c->width = w; c->height = h; c->control_bar_h = cbh;
-    } else {
-        // no header; reset stream to beginning
-        ifs.clear(); ifs.seekg(0);
+    bool has_header = false;
+    if (std::getline(ifs, line)) {
+        if (line.rfind("CANVAS", 0) == 0) {
+            has_header = true;
+            std::istringstream header(line);
+            std::string canvas_token;
+            std::string version_token;
+            header >> canvas_token >> version_token;
+            if (version_token == "V2") version = 2;
+            if (!std::getline(ifs, line)) return 0;
+            std::istringstream sh(line);
+            sh >> file_w >> file_h >> file_cbh;
+        } else {
+            ifs.clear();
+            ifs.seekg(0);
+        }
+    }
+    if (!has_header) {
+        version = 1;
     }
 
     while (std::getline(ifs, line)) {
@@ -3770,14 +3941,14 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         std::istringstream ss(line);
         std::string tag; ss >> tag;
         if (tag == "MODULE") {
-                GP_CanvasModuleDesc m{};
-                ss >> m.x >> m.y >> m.w >> m.h;
-            // remainder of line is label (may be empty)
+            ModuleSnapshot snap{};
+            ss >> snap.desc.x >> snap.desc.y >> snap.desc.w >> snap.desc.h;
+            if (version >= 2) {
+                ss >> snap.in_count >> snap.out_count >> snap.is_stage >> snap.bg_mode;
+            }
             std::string rest;
             std::getline(ss, rest);
-            // trim leading spaces
             if (!rest.empty() && rest[0] == ' ') rest.erase(0,1);
-            // unescape backslashes and \n
             std::string lbl; lbl.reserve(rest.size());
             for (size_t i = 0; i < rest.size(); ++i) {
                 char ch = rest[i];
@@ -3787,51 +3958,113 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                     else { lbl.push_back(nx); ++i; }
                 } else lbl.push_back(ch);
             }
-            // copy into fixed label buffer
-            std::memset(m.label, 0, sizeof(m.label));
-            std::memcpy(m.label, lbl.c_str(), std::min<size_t>(lbl.size(), sizeof(m.label)-1));
-            // append module
-            c->modules.push_back(m);
-            c->module_tables.push_back(nullptr);
-            c->module_table_owned.push_back(0);
-            c->module_bg.emplace_back();
-            c->module_tool_stack.emplace_back();
-            c->module_io_in_count.push_back(0);
-            c->module_io_out_count.push_back(0);
-            c->module_io_input_rows.emplace_back();
-            c->module_io_output_rows.emplace_back();
-            c->module_input_layout.emplace_back();
-            c->module_output_layout.emplace_back();
-            c->module_io_rows.emplace_back();
-            c->module_table_rows.emplace_back();
-            c->module_stack_snapshots.emplace_back();
-            c->module_input_state.emplace_back();
-            // assign node id for this module
-            int nid = c->next_node_id++;
-            c->module_node_id.push_back(nid);
-            GP_CanvasContextImpl::NodeContract nc; nc.node_id = nid; nc.module_idx = static_cast<int>(c->modules.size() - 1);
-            c->nodes.push_back(std::move(nc));
+            std::memset(snap.desc.label, 0, sizeof(snap.desc.label));
+            std::memcpy(snap.desc.label, lbl.c_str(), std::min<size_t>(lbl.size(), sizeof(snap.desc.label)-1));
+            modules.push_back(std::move(snap));
+        } else if (tag == "ROWS") {
+            RowSnapshot rs{};
+            int row_count = 0;
+            ss >> rs.module_idx >> row_count;
+            for (int i = 0; i < row_count; ++i) {
+                int kind_int = 0;
+                int tool_int = 0;
+                int attachment_count = 0;
+                ss >> kind_int >> tool_int >> attachment_count;
+                ModuleIORow row{};
+                row.kind = static_cast<ModuleRowKind>(kind_int);
+                row.tool = static_cast<ModuleToolKind>(tool_int);
+                row.contact_idx = 0;
+                row.attachment_count = attachment_count;
+                rs.rows.push_back(row);
+            }
+            row_sets.push_back(std::move(rs));
         } else if (tag == "EDGE") {
-            GP_CanvasEdgeDesc e{}; int type_id = 0;
-            ss >> e.a_module >> e.a_contact_idx >> e.b_module >> e.b_contact_idx >> type_id;
-            GP_CanvasContextImpl::EdgeInfo ei; ei.desc = e; ei.type_id = type_id;
-            if (!c->hues.empty()) { ei.hues = c->hues; ei.hue_intensity = c->hue_intensity; }
-            c->edges.push_back(std::move(ei));
+            EdgeSnapshot es{};
+            ss >> es.desc.a_module >> es.desc.a_contact_idx >> es.desc.b_module >> es.desc.b_contact_idx >> es.type_id;
+            edges.push_back(std::move(es));
         } else if (tag == "NODE") {
-            int nid = -1; int midx = -1; ss >> nid >> midx;
-            GP_CanvasContextImpl::NodeContract *found = nullptr;
-            for (auto &n : c->nodes) if (n.node_id == nid) { found = &n; break; }
-            if (!found) { GP_CanvasContextImpl::NodeContract nc; nc.node_id = nid; nc.module_idx = midx; c->nodes.push_back(std::move(nc)); found = &c->nodes.back(); }
+            GP_CanvasContextImpl::NodeContract nc{};
+            ss >> nc.node_id >> nc.module_idx;
             int in_count = 0; ss >> in_count;
-            for (int i = 0; i < in_count; ++i) { int t; ss >> t; found->input_types.push_back(t); }
+            for (int i = 0; i < in_count; ++i) { int t; ss >> t; nc.input_types.push_back(t); }
             int out_count = 0; ss >> out_count;
-            for (int i = 0; i < out_count; ++i) { int t; ss >> t; found->output_types.push_back(t); }
+            for (int i = 0; i < out_count; ++i) { int t; ss >> t; nc.output_types.push_back(t); }
+            nodes.push_back(std::move(nc));
         } else if (tag == "OFFSET") {
-            ss >> c->offset_x >> c->offset_y;
+            ss >> file_offx >> file_offy;
         }
     }
+
+    canvas_clear_workspace(c);
+    c->width = file_w;
+    c->height = file_h;
+    c->control_bar_h = file_cbh;
+    c->offset_x = file_offx;
+    c->offset_y = file_offy;
+
+    std::unordered_map<int, std::vector<ModuleIORow>> row_map;
+    for (const auto &rs : row_sets) {
+        row_map[rs.module_idx] = rs.rows;
+    }
+
+    for (size_t i = 0; i < modules.size(); ++i) {
+        const auto &snap = modules[i];
+        int new_idx = gp_canvas_add_module(ctx_, &snap.desc);
+        if (new_idx < 0) continue;
+        if (snap.is_stage) {
+            canvas_configure_stage_module(c, new_idx, snap.desc.w, snap.desc.h);
+        } else {
+            if (new_idx < static_cast<int>(c->module_bg.size())) {
+                c->module_bg[new_idx].mode = snap.bg_mode;
+            }
+            if (new_idx < static_cast<int>(c->module_io_in_count.size())) c->module_io_in_count[new_idx] = std::max(0, snap.in_count);
+            if (new_idx < static_cast<int>(c->module_io_out_count.size())) c->module_io_out_count[new_idx] = std::max(0, snap.out_count);
+            auto it = row_map.find(static_cast<int>(i));
+            if (it != row_map.end()) {
+                canvas_apply_io_rows(c, new_idx, it->second);
+            } else {
+                std::vector<ModuleIORow> default_rows;
+                if (snap.in_count > 0) default_rows.push_back({ModuleRowKind::Input, 0, ModuleToolKind::None, std::clamp(snap.in_count, 1, 32)});
+                if (snap.out_count > 0) default_rows.push_back({ModuleRowKind::Output, 0, ModuleToolKind::None, std::clamp(snap.out_count, 1, 32)});
+                if (!default_rows.empty()) {
+                    canvas_apply_io_rows(c, new_idx, default_rows);
+                } else {
+                    ensure_module_row_order(c, new_idx);
+                }
+            }
+        }
+    }
+
+    c->nodes.clear();
+    c->module_node_id.assign(c->modules.size(), -1);
+    int max_node_id = 0;
+    for (auto &nc : nodes) {
+        if (nc.module_idx >= 0 && nc.module_idx < static_cast<int>(c->modules.size())) {
+            c->module_node_id[nc.module_idx] = nc.node_id;
+            max_node_id = std::max(max_node_id, nc.node_id);
+            c->nodes.push_back(std::move(nc));
+        }
+    }
+    for (size_t i = 0; i < c->modules.size(); ++i) {
+        if (c->module_node_id[i] >= 0) continue;
+        int nid = ++max_node_id;
+        c->module_node_id[i] = nid;
+        GP_CanvasContextImpl::NodeContract nc{};
+        nc.node_id = nid;
+        nc.module_idx = static_cast<int>(i);
+        c->nodes.push_back(std::move(nc));
+    }
+    int max_window_node = 0;
+    for (const auto &entry : c->window_node_ids) {
+        max_window_node = std::max(max_window_node, entry.second);
+    }
+    c->next_node_id = std::max(max_node_id + 1, max_window_node + 1);
+
+    for (const auto &es : edges) {
+        gp_canvas_add_edge_with_type(ctx_, &es.desc, es.type_id);
+    }
+
     update_canvas_scroll_state(c, /*pull_from_container=*/false);
-    // done
     return 1;
 }
 
@@ -3975,6 +4208,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         // two tool groups: canvas (left) and table (right)
         const int canvas_btn_count = 4;
         const int edge_btn_count = 4;
+        const int save_btn_count = 2;
         const int table_btn_count = 3;
         const int spacing = 8;
         int bh = std::max(4, cbh - 8);
@@ -4115,9 +4349,64 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
             }
         }
-        // right (table) group
         int group_width = table_btn_count * (bw + spacing) - spacing;
         int bx_r = std::max(8, w - 8 - group_width);
+        int save_group_w = save_btn_count * (bw + spacing) - spacing;
+        int bx_save = bx_r - save_group_w - spacing * 2;
+        for (int bi = 0; bi < save_btn_count; ++bi) {
+            int bx_i = bx_save + bi * (bw + spacing);
+            Color fill = Color{50,62,54,255};
+            memset_rect(out_rgba, w, h, pitch, bx_i, by, bw, bh, fill);
+            for (int oy = 0; oy < bh; ++oy) {
+                int y = by + oy; if (y < 0 || y >= h) continue;
+                int left_x = bx_i; int right_x = bx_i + bw - 1;
+                uint8_t* pleft = out_rgba + y * pitch + left_x * 4;
+                uint8_t* pright = out_rgba + y * pitch + right_x * 4;
+                pleft[0]=36; pleft[1]=36; pleft[2]=40; pleft[3]=255;
+                pright[0]=36; pright[1]=36; pright[2]=40; pright[3]=255;
+            }
+            const char* save_labels[2] = { LABEL_CANVAS_SAVE, LABEL_CANVAS_CLEAR };
+            const char* save_short[2] = { LABEL_CANVAS_SAVE_SHORT, LABEL_CANVAS_CLEAR_SHORT };
+            auto lbm = render_text_to_rgba(save_labels[bi], 0.85f, {225,235,228,255});
+            if (!lbm.pixels.empty()) {
+                int tx = bx_i + (bw - lbm.width) / 2;
+                int ty = by + (bh - lbm.height) / 2;
+                for (int yy = 0; yy < lbm.height; ++yy) {
+                    int dst_y = ty + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < lbm.width; ++xx) {
+                        int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &lbm.pixels[(yy * lbm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+            auto small = render_text_to_rgba(save_short[bi], 1.0f, {225,235,228,255});
+            if (!small.pixels.empty()) {
+                int txs = bx_i + (bw - small.width) / 2;
+                int tys = by + (bh - small.height) / 2;
+                for (int yy = 0; yy < small.height; ++yy) {
+                    int dst_y = tys + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < small.width; ++xx) {
+                        int dst_x = txs + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &small.pixels[(yy * small.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        // right (table) group
         for (int bi = 0; bi < table_btn_count; ++bi) {
             int bx_i = bx_r + bi * (bw + spacing);
             Color fill = (ctx->selected_tool_table == bi) ? Color{90,70,90,255} : Color{60,50,60,255};
@@ -4341,7 +4630,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             }
         };
         // compute left of table buttons start for groups placement
-        int io_base_x = bx_r; // place IO groups to the left of the table buttons
+        int io_base_x = bx_save - spacing * 2; // place IO groups to the left of save/clear buttons
         int io_by = by;
         int counter_value = std::max(1, ctx->io_attachment_count);
         int nbw = bw;
