@@ -150,6 +150,13 @@ typedef struct GP_TableStyle {
 
     uint32_t led_mask[9];
     uint32_t led_edge_mask;
+    // Cable FIFO lighting mode: when enabled, rope glow can be driven by
+    // FIFO read/write head movement.
+    int32_t cable_fifo_light_mode;
+    float cable_fifo_friction_half_life; // seconds; <=0 uses internal default
+    float cable_fifo_friction_gain;      // scalar gain for friction glow
+    int32_t cable_fifo_friction_regions; // quantization regions for head movement
+    float cable_fifo_friction_tint;      // hue shift intensity from head angle (0..1)
 } GP_TableStyle;
 
 // Geometry returned to the caller.
@@ -342,9 +349,15 @@ int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsign
 // If the buffer advanced slow readers to admit the write (top-k overwrite),
 // `out_dropped` is set to 1; otherwise 0. Returns 0 if no write occurred.
 int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped);
+// Blocking publish with optional timeout (ms). timeout_ms < 0 waits forever.
+// Returns 1 on success, 0 on failure/timeout.
+int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms);
 // Consume the next available tensor sample for a subscriber. Returns 1 if a
 // sample was written to `out_sample` (length must match the tensor stride).
 int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written);
+// Blocking consume with optional timeout (ms). timeout_ms < 0 waits forever.
+// Returns 1 on success, 0 on failure/timeout.
+int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written, int32_t timeout_ms);
 // Query unread sample count for a subscriber on an edge.
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count);
 int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata);
