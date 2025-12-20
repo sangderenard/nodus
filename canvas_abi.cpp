@@ -2375,27 +2375,29 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                     }
                     int key = static_cast<int>(std::lround(sample[0]));
                     printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu reader_key=%llu consumed_sample=%f written=%d key=%d\n", mi, ci, edge_idx, (unsigned long long)sub_key, (unsigned long long)reader_key, sample[0], written, key);
-                }
-                // append to module's attached table if present
-                bool had_table = (mi < c->module_tables.size() && c->module_tables[mi]);
-                if (had_table) {
-                    GP_TableContext* mt = c->module_tables[mi];
-                    int32_t n = gp_table_get_row_count(mt);
-                    std::vector<GP_TableRow> rows;
-                    rows.resize(static_cast<size_t>(n + 1));
-                    for (int32_t i = 0; i < n; ++i) {
-                        GP_TableRow tmp; memset(&tmp, 0, sizeof(tmp));
-                        if (gp_table_get_row(mt, i, &tmp)) rows[static_cast<size_t>(i)] = tmp;
+
+                    // append to module's attached table if present
+                    bool had_table = (mi < c->module_tables.size() && c->module_tables[mi]);
+                    if (had_table) {
+                        GP_TableContext* mt = c->module_tables[mi];
+                        int32_t n = gp_table_get_row_count(mt);
+                        std::vector<GP_TableRow> rows;
+                        rows.resize(static_cast<size_t>(n + 1));
+                        for (int32_t i = 0; i < n; ++i) {
+                            GP_TableRow tmp; memset(&tmp, 0, sizeof(tmp));
+                            if (gp_table_get_row(mt, i, &tmp)) rows[static_cast<size_t>(i)] = tmp;
+                        }
+                        GP_TableRow nr; memset(&nr, 0, sizeof(nr));
+                        nr.kind = GP_TABLE_ROW_DEVICE; nr.depth = 0; nr.expanded = 1; nr.selected = 0; nr.cell_count = 1;
+                        nr.cells[0].kind = GP_TABLE_CELL_TEXT;
+                        char txt[64];
+                        if (key >= 32 && key < 127) std::snprintf(txt, sizeof(txt), "recv: '%c' (%d)", static_cast<char>(key), key);
+                        else std::snprintf(txt, sizeof(txt), "recv: %d", key);
+                        std::snprintf(nr.cells[0].text, sizeof(nr.cells[0].text), "%s", txt);
+                        rows[static_cast<size_t>(n)] = nr;
+                        gp_table_set_rows(mt, rows.data(), static_cast<int32_t>(rows.size()));
+
                     }
-                    GP_TableRow nr; memset(&nr, 0, sizeof(nr));
-                    nr.kind = GP_TABLE_ROW_DEVICE; nr.depth = 0; nr.expanded = 1; nr.selected = 0; nr.cell_count = 1;
-                    nr.cells[0].kind = GP_TABLE_CELL_TEXT;
-                    char txt[64];
-                    if (key >= 32 && key < 127) std::snprintf(txt, sizeof(txt), "recv: '%c' (%d)", static_cast<char>(key), key);
-                    else std::snprintf(txt, sizeof(txt), "recv: %d", key);
-                    std::snprintf(nr.cells[0].text, sizeof(nr.cells[0].text), "%s", txt);
-                    rows[static_cast<size_t>(n)] = nr;
-                    gp_table_set_rows(mt, rows.data(), static_cast<int32_t>(rows.size()));
                     // Update per-module chat visual state: append char to chat buffer
                     if (mi < c->module_chat_text.size()) {
                         std::string &buf = c->module_chat_text[mi];
@@ -2413,31 +2415,6 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                         c->module_chat_color[mi].b = static_cast<uint8_t>(80 + (mi * 97) % 160);
                         c->module_chat_color[mi].a = 255;
                         c->module_chat_ttl[mi] = 240; // show for ~240 frames (~4s at 60fps)
-                        if (mi < static_cast<int>(c->module_bg.size()) && !c->module_bg[mi].cb) {
-                            c->module_bg[mi].cb = chat_bg_callback;
-                            c->module_bg[mi].user = c;
-                            c->module_bg[mi].table_alpha = 200;
-                        }
-                    }
-                }
-                // If the module has no attached table, still update the visual chat
-                // state so background callback can render received text.
-                if (!had_table) {
-                    if (mi < c->module_chat_text.size()) {
-                        std::string &buf = c->module_chat_text[mi];
-                        if (key >= 32 && key < 127) {
-                            if (buf.size() >= 128) buf.erase(0, buf.size() - 127);
-                            buf.push_back(static_cast<char>(key));
-                        } else {
-                            char tmp[32]; std::snprintf(tmp, sizeof(tmp), "[%d]", key);
-                            buf.append(tmp);
-                            if (buf.size() > 128) buf = buf.substr(buf.size() - 128);
-                        }
-                        c->module_chat_color[mi].r = static_cast<uint8_t>(80 + (mi * 37) % 160);
-                        c->module_chat_color[mi].g = static_cast<uint8_t>(80 + (mi * 61) % 160);
-                        c->module_chat_color[mi].b = static_cast<uint8_t>(80 + (mi * 97) % 160);
-                        c->module_chat_color[mi].a = 255;
-                        c->module_chat_ttl[mi] = 240;
                         if (mi < static_cast<int>(c->module_bg.size()) && !c->module_bg[mi].cb) {
                             c->module_bg[mi].cb = chat_bg_callback;
                             c->module_bg[mi].user = c;
