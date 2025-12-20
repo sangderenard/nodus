@@ -163,6 +163,13 @@ def load_canvas_lib():
     lib.gp_canvas_get_scroll_flags.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
     lib.gp_canvas_step.restype = ctypes.c_int
     lib.gp_canvas_step.argtypes = (ctypes.c_void_p, ctypes.c_float)
+    # keyboard forwarding for interactive demos
+    try:
+        lib.gp_canvas_on_key.restype = ctypes.c_int
+        lib.gp_canvas_on_key.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)
+    except AttributeError:
+        # older builds may not export on_key
+        pass
     lib.gp_canvas_attach_table.restype = ctypes.c_int
     lib.gp_canvas_attach_table.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
     lib.gp_canvas_create_table.restype = ctypes.c_int
@@ -656,8 +663,24 @@ def run_pygame_demo(width: int, height: int) -> int:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
-            elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_ESCAPE, pygame.K_q):
-                running = False
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+                else:
+                    sc = getattr(ev, "scancode", 0)
+                    mods = pygame.key.get_mods()
+                    try:
+                        lib.gp_canvas_on_key(cctx, int(ev.key), int(sc), 1, int(mods))
+                    except Exception:
+                        # ignore if symbol not present or call fails
+                        pass
+            elif ev.type == pygame.KEYUP:
+                sc = getattr(ev, "scancode", 0)
+                mods = pygame.key.get_mods()
+                try:
+                    lib.gp_canvas_on_key(cctx, int(ev.key), int(sc), 0, int(mods))
+                except Exception:
+                    pass
             elif ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
                 mx, my = ev.pos
                 if my >= table_h and my < table_h + canvas_h:

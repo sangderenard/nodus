@@ -262,6 +262,12 @@ struct DragState {
 struct GP_CanvasContextImpl;
 extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_CanvasEdgeDesc* desc, int type_id);
 
+// Lightweight chat color struct used by canvas chat visuals
+struct ChatCol { uint8_t r=40, g=40, b=40, a=255; };
+
+// Forward-declare chat bg callback so it can be assigned earlier in the file
+static void chat_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
+
 struct MolexLayoutInfo {
     int rows = 0;
     int cols = 0;
@@ -373,6 +379,12 @@ struct GP_CanvasContextImpl {
     std::vector<MolexLayoutInfo> module_input_layout;
     std::vector<MolexLayoutInfo> module_output_layout;
     std::vector<std::vector<ModuleIORow>> module_io_rows;
+    // optional per-module key-recorder state pointer
+    std::vector<void*> module_key_recorder_state;
+    // per-module lightweight chat state (used to visually confirm rope traffic)
+    std::vector<std::string> module_chat_text;
+    std::vector<ChatCol> module_chat_color;
+    std::vector<int> module_chat_ttl; // frames remaining to show chat highlight
     // cable style/hues
     int jacket_px = 4;
     int jacket_border = 2;
@@ -817,6 +829,154 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
 static void canvas_setup_stage_table(GP_TableContext* t, int w_px);
 static void canvas_setup_stage_defaults(GP_StageContext* st, int w_px, int h_px);
 static void stage_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
+static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx);
+
+// Per-module recorder state stored by the canvas so it can be freed on table destroy.
+struct KeyRecorderState {
+    GP_CanvasContextImpl* canvas;
+    int module_idx;
+    uint64_t writer_key;
+    int root_edge_idx;
+};
+
+// Create a simple table that records key presses. Attaches a key callback
+// that appends a text row for each key press.
+static void canvas_install_key_recorder_table(GP_CanvasContextImpl* ctx, int module_idx) {
+    if (!ctx) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
+    // create table
+    GP_TableContext* t = gp_table_create(nullptr);
+    if (!t) return;
+    // style
+    GP_TableStyle st{};
+    st.width_px = std::max(1, ctx->modules[module_idx].w);
+    st.row_h_px = 20;
+    st.name_w_px = 140;
+    gp_table_set_style(t, &st);
+    // one text column
+    GP_TableColumn col{};
+    col.kind = GP_TABLE_CELL_TEXT;
+    col.width_px = std::max(64, st.width_px - st.name_w_px);
+    col.align = 0;
+    gp_table_set_columns(t, &col, 1);
+    // initial header row
+    GP_TableRow r{};
+    memset(&r, 0, sizeof(r));
+    r.kind = GP_TABLE_ROW_HEADER;
+    r.depth = 0;
+    r.expanded = 1;
+    r.selected = 0;
+    r.cell_count = 1;
+    r.cells[0].kind = GP_TABLE_CELL_TEXT;
+    std::snprintf(r.cells[0].text, sizeof(r.cells[0].text), "Key Recorder");
+    gp_table_set_rows(t, &r, 1);
+
+    // We'll attach a key callback that both records the key locally and
+    // publishes the key value onto a root-table edge (if present).
+    // Create a small state object and store it per-module.
+    KeyRecorderState* ks = new KeyRecorderState();
+    ks->canvas = ctx; ks->module_idx = module_idx; ks->writer_key = 0; ks->root_edge_idx = -1;
+
+    gp_table_set_key_callback(t, +[](void* user, int key, int scancode, int action, int mods) {
+        KeyRecorderState* ks = reinterpret_cast<KeyRecorderState*>(user);
+        if (!ks) return;
+        printf("key-recorder callback: module=%d key=%d sc=%d action=%d mods=%d writer_key=%llu root_edge_idx=%d\n", ks->module_idx, key, scancode, action, mods, (unsigned long long)ks->writer_key, ks->root_edge_idx);
+        GP_TableContext* tt = nullptr;
+        // find the attached table for this module via canvas
+        GP_CanvasContextImpl* c = ks->canvas;
+        if (!c) return;
+        int mi = ks->module_idx;
+        if (mi < 0 || mi >= static_cast<int>(c->module_tables.size())) return;
+        tt = c->module_tables[mi];
+        if (!tt) return;
+        // Only act on non-zero actions
+        if (action == 0) return;
+        // append local row
+        int32_t n = gp_table_get_row_count(tt);
+        std::vector<GP_TableRow> rows;
+        rows.resize(static_cast<size_t>(n + 1));
+        for (int32_t i = 0; i < n; ++i) {
+            GP_TableRow tmp; memset(&tmp, 0, sizeof(tmp));
+            if (gp_table_get_row(tt, i, &tmp)) rows[static_cast<size_t>(i)] = tmp;
+        }
+        GP_TableRow nr; memset(&nr, 0, sizeof(nr));
+        nr.kind = GP_TABLE_ROW_DEVICE; nr.depth = 0; nr.expanded = 1; nr.selected = 0; nr.cell_count = 1;
+        nr.cells[0].kind = GP_TABLE_CELL_TEXT;
+        std::snprintf(nr.cells[0].text, sizeof(nr.cells[0].text), "K=%d S=%d A=%d M=%d", key, scancode, action, mods);
+        rows[static_cast<size_t>(n)] = nr;
+        gp_table_set_rows(tt, rows.data(), static_cast<int32_t>(rows.size()));
+
+        // publish to root edge(s) if available. Use module's output count
+        // to determine how many contact channels to publish to. This lets a
+        // single recorder emit to multiple writer keys (contact_idx 0..N-1).
+        GP_TableContext* root = canvas_ensure_root_table(c);
+        if (!root) return;
+        int out_count = 1;
+        if (mi >= 0 && mi < static_cast<int>(c->module_io_out_count.size())) out_count = std::max(1, c->module_io_out_count[mi]);
+        for (int ci = 0; ci < out_count; ++ci) {
+            uint64_t writer_key = (static_cast<uint64_t>(static_cast<uint32_t>(mi)) << 32) |
+                                  (static_cast<uint64_t>(static_cast<uint32_t>(ci)) << 16) |
+                                  static_cast<uint64_t>(0);
+            int edge_idx = -1;
+            if (!gp_table_edge_index_for_key(root, writer_key, &edge_idx) || edge_idx < 0) {
+                // no edge for this contact, skip
+                //printf("key-recorder: no root edge for module=%d contact=%d key=%llu\n", ks->module_idx, ci, (unsigned long long)writer_key);
+                continue;
+            }
+            float payload[1]; payload[0] = static_cast<float>(key);
+            int dropped = 0;
+            int ok = gp_table_edge_publish(root, edge_idx, writer_key, payload, 1, &dropped);
+            printf("key-recorder publish: module=%d contact=%d edge=%d writer_key=%llu ok=%d dropped=%d payload=%f\n", ks->module_idx, ci, edge_idx, (unsigned long long)writer_key, ok, dropped, payload[0]);
+            if (!ok) {
+                printf("key-recorder publish FAILED: module=%d contact=%d edge=%d writer_key=%llu\n", ks->module_idx, ci, edge_idx, (unsigned long long)writer_key);
+            }
+        }
+    }, ks);
+
+    // store state so we can free it on table destroy
+    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_key_recorder_state.size())) ctx->module_key_recorder_state[module_idx] = reinterpret_cast<void*>(ks);
+    printf("canvas_install_key_recorder_table: installed recorder for module=%d writer_key=%llu\n", module_idx, (unsigned long long)ks->writer_key);
+
+    // attach to module and let canvas own it
+    gp_canvas_attach_table(reinterpret_cast<GP_CanvasContext*>(ctx), module_idx, t, 1);
+    ctx->focused_module = module_idx;
+    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
+    ctx->module_io_rows[module_idx].clear();
+    // If there's another module available, create a canvas/root edge from this module to the next module
+    if (ctx->modules.size() > 1) {
+        int target = (module_idx + 1) % static_cast<int>(ctx->modules.size());
+        if (target != module_idx) {
+            GP_CanvasEdgeDesc ed{};
+            ed.a_module = module_idx; ed.a_contact_idx = 0;
+            ed.b_module = target; ed.b_contact_idx = 0;
+            // create a canvas-level edge which will ensure root-table FIFOs
+            gp_canvas_add_edge_with_type(reinterpret_cast<GP_CanvasContext*>(ctx), &ed, /*type_id=*/0);
+            // Try to synchronously create the corresponding root edge for immediate publishes
+            GP_TableContext* root = canvas_ensure_root_table(ctx);
+                if (root) {
+                    uint64_t ka = (static_cast<uint64_t>(static_cast<uint32_t>(ed.a_module)) << 32) |
+                                  (static_cast<uint64_t>(static_cast<uint32_t>(ed.a_contact_idx)) << 16) |
+                                  static_cast<uint64_t>(0);
+                    uint64_t kb = (static_cast<uint64_t>(static_cast<uint32_t>(ed.b_module)) << 32) |
+                                  (static_cast<uint64_t>(static_cast<uint32_t>(ed.b_contact_idx)) << 16) |
+                                  static_cast<uint64_t>(0);
+                    gp_table_add_edge(root, ka, kb);
+                    // update cached edge index and writer_key if state exists
+                    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_key_recorder_state.size())) {
+                        void* s = ctx->module_key_recorder_state[module_idx];
+                        if (s) {
+                            KeyRecorderState* ks2 = reinterpret_cast<KeyRecorderState*>(s);
+                            // if writer_key wasn't set (==0), use the canonical 'ka' we just created
+                            if (ks2->writer_key == 0) ks2->writer_key = ka;
+                            int idx = -1;
+                            if (gp_table_edge_index_for_key(root, ks2->writer_key, &idx) && idx >= 0) ks2->root_edge_idx = idx;
+                        }
+                    }
+                    (void)0;
+                }
+        }
+    }
+}
 
 static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableContext* table) {
     if (!ctx || !table) return;
@@ -850,9 +1010,12 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 printf("gp_canvas_on_click: canvas tool %d toggled -> selected_tool_canvas=%d\n", tool, c->selected_tool_canvas);
                 break;
             }
+            
             case CANVAS_ACT_TOOL_TABLE_0:
             case CANVAS_ACT_TOOL_TABLE_1:
             case CANVAS_ACT_TOOL_TABLE_2: {
+                // debug: table-tool button clicked (before state change)
+                printf("gp_canvas_on_click: table-tool button clicked action_id=%d selected_tool_table(before)=%d\n", action_id, c->selected_tool_table);
                 int tool = static_cast<int>(action_id - CANVAS_ACT_TOOL_TABLE_0);
                 if (c->selected_tool_table == tool) c->selected_tool_table = 0; else c->selected_tool_table = tool;
                 printf("gp_canvas_on_click: table tool %d toggled -> selected_tool_table=%d\n", tool, c->selected_tool_table);
@@ -1060,7 +1223,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
                 (static_cast<uint64_t>(static_cast<uint32_t>(led_col_idx)) << 16) | // LED column index
                 static_cast<uint64_t>(0); // single LED
             gp_table_set_key_type_hint(t, key, /*type_id=*/0, is_output ? 0 : 1, is_output ? 1 : 0);
-            if (st) gp_table_bind_stage_port(t, key, st, is_output ? 1 : 0, channel);
+            if (st) gp_table_enqueue_bind_stage_port(t, key, st, is_output ? 1 : 0, channel);
         };
         bind_port(0, /*led_col_idx=*/1, /*is_output=*/false, /*channel=*/0);
         bind_port(1, /*led_col_idx=*/2, /*is_output=*/true,  /*channel=*/0);
@@ -1109,17 +1272,9 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     // a canvas-owned table so the user sees the LED cells immediately.
     if (!t && (in_count > 0 || (module_idx < static_cast<int>(ctx->module_io_out_count.size()) && ctx->module_io_out_count[module_idx] > 0))) {
         GP_TableContext* nt = gp_table_create(nullptr);
-        if (nt) {
-            ctx->module_tables[module_idx] = nt;
-            if (module_idx >= static_cast<int>(ctx->module_table_owned.size())) ctx->module_table_owned.resize(module_idx + 1, 0);
-            ctx->module_table_owned[module_idx] = 1;
-            // attach to root table rope sim
-            RopeSim* sim = canvas_require_root_sim(ctx);
-            if (sim) gp_table_attach_rope_sim(nt, sim, 0);
-            gp_table_set_prospective_mode(nt, 1);
-            gp_table_prospective_set_params(nt, 8, 4.0f, 0.0f);
-            t = nt;
-        }
+        gp_table_set_prospective_mode(nt, 1);
+        gp_table_prospective_set_params(nt, 8, 4.0f, 0.0f);
+        t = nt;
     }
     if (!t) return;
 
@@ -1357,6 +1512,10 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_input_layout.emplace_back();
     c->module_output_layout.emplace_back();
     c->module_io_rows.emplace_back();
+    c->module_key_recorder_state.push_back(nullptr);
+    c->module_chat_text.push_back(std::string());
+    c->module_chat_color.push_back(ChatCol{});
+    c->module_chat_ttl.push_back(0);
     int new_idx = static_cast<int>(c->modules.size() - 1);
     // Ensure newly-added modules get a canvas-owned table so table-driven
     // hitboxes and dynamic LED cells work immediately instead of falling
@@ -1646,6 +1805,19 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         if (world_x >= m.x && world_x < m.x + m.w && world_y >= m.y && world_y < m.y + m.h) {
             // focus this module when clicked
             c->focused_module = mi;
+            // debug: report focus and current table-tool selection before any action
+            printf("gp_canvas_on_click: focus set -> module=%d selected_tool_table=%d selected_tool_canvas=%d\n", mi, c->selected_tool_table, c->selected_tool_canvas);
+            // Table-tool: if table-edit tool selected, install key-recorder table
+            if (c->selected_tool_table == 1) {
+                // debug: log intention to install recorder
+                printf("gp_canvas_on_click: installing key-recorder for module=%d (selected_tool_table=%d)\n", mi, c->selected_tool_table);
+                // destroy existing table (if any) and install recorder
+                int destroy_ok = gp_canvas_destroy_table(reinterpret_cast<GP_CanvasContext*>(c), mi);
+                printf("gp_canvas_on_click: gp_canvas_destroy_table returned %d for module=%d\n", destroy_ok, mi);
+                canvas_install_key_recorder_table(c, mi);
+                update_canvas_scroll_state(c, /*pull_from_container=*/false);
+                return 1;
+            }
             if (mi < static_cast<int>(c->module_tables.size()) && c->module_tables[mi] && c->selected_tool_canvas == 0) {
                 // local coords; only forward clicks into attached tables when
                 // canvas is in select/interaction mode (tool 0). In edge-mode
@@ -1765,6 +1937,20 @@ extern "C" int gp_canvas_on_mouse_up(GP_CanvasContext* ctx_, int x, int y) {
     c->drag.module = -1;
     update_canvas_scroll_state(c, /*pull_from_container=*/false);
     return 1;
+}
+
+extern "C" int gp_canvas_on_key(GP_CanvasContext* ctx_, int key, int scancode, int action, int mods) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    printf("gp_canvas_on_key: canvas=%p key=%d scancode=%d action=%d mods=%d focused=%d\n", (void*)c, key, scancode, action, mods, c->focused_module);
+    int mi = c->focused_module;
+    if (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) {
+        GP_TableContext* t = c->module_tables[mi];
+        if (t) {
+            return gp_table_on_key(t, key, scancode, action, mods);
+        }
+    }
+    return 0;
 }
 
 extern "C" int gp_canvas_set_offset(GP_CanvasContext* ctx_, int offx, int offy) {
@@ -1951,6 +2137,14 @@ extern "C" int gp_canvas_destroy_table(GP_CanvasContext* ctx_, int module_idx) {
     c->module_tables[module_idx] = nullptr;
     c->module_table_owned[module_idx] = 0;
     if (t && owned) gp_table_destroy(t);
+    // free any module key-recorder state
+    if (module_idx >= 0 && module_idx < static_cast<int>(c->module_key_recorder_state.size())) {
+        void* s = c->module_key_recorder_state[module_idx];
+        if (s) {
+            delete reinterpret_cast<KeyRecorderState*>(s);
+            c->module_key_recorder_state[module_idx] = nullptr;
+        }
+    }
     // detach node mapping for this module
     if (module_idx >= 0 && module_idx < static_cast<int>(c->module_node_id.size())) {
         int nid = c->module_node_id[module_idx];
@@ -1968,6 +2162,133 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
     RopeSim* sim = canvas_root_sim(c);
     if (sim) {
         rope_sim_step(sim, dt, c->sim_maxforce, c->sim_iters, c->sim_damping);
+    }
+    // decay chat highlight TTLs and clear chat bg callback when expired
+    for (size_t mi = 0; mi < c->modules.size(); ++mi) {
+        if (mi < c->module_chat_ttl.size() && c->module_chat_ttl[mi] > 0) {
+            c->module_chat_ttl[mi] -= 1;
+            if (c->module_chat_ttl[mi] <= 0) {
+                if (mi < static_cast<size_t>(c->module_bg.size())) {
+                    if (c->module_bg[mi].cb == chat_bg_callback) {
+                        c->module_bg[mi].cb = nullptr;
+                        c->module_bg[mi].user = nullptr;
+                        c->module_bg[mi].table_alpha = 255;
+                    }
+                }
+            }
+        }
+    }
+    // Consume any root-table FIFO samples targeted at module tables and
+    // append them as rows to the module's attached table. This lets a
+    // recorder publish key codes and a receiver module display them.
+    GP_TableContext* root = canvas_ensure_root_table(c);
+    if (root) {
+        for (size_t mi = 0; mi < c->modules.size(); ++mi) {
+            int in_count = 1;
+            if (mi < c->module_io_in_count.size()) in_count = std::max(1, c->module_io_in_count[mi]);
+            for (int ci = 0; ci < in_count; ++ci) {
+                // subscriber key convention: (module_idx << 32) | (contact_idx << 16) | 0
+                uint64_t sub_key = (static_cast<uint64_t>(static_cast<uint32_t>(mi)) << 32) |
+                                   (static_cast<uint64_t>(static_cast<uint32_t>(ci)) << 16) |
+                                   static_cast<uint64_t>(0);
+                int edge_idx = -1;
+                if (!gp_table_edge_index_for_key(root, sub_key, &edge_idx) || edge_idx < 0) {
+                    // no root edge for this contact, skip
+                    //printf("canvas_consume: module=%zu contact=%d sub_key=%llu no root edge found\n", mi, ci, (unsigned long long)sub_key);
+                    continue;
+                }
+                // Ensure subscription is registered synchronously so we can immediately
+                // check unread counts. The table API's enqueue path is asynchronous
+                // and the pending op may not have been applied when we query unread.
+                // Also, subscription keys of zero are rejected by the FIFO; map a
+                // zero module key to a non-zero reader key with the top-bit set.
+                uint64_t reader_key = sub_key;
+                if (reader_key == 0) reader_key = (sub_key | 0x8000000000000000ull);
+                gp_table_edge_subscribe_ex(root, edge_idx, reader_key, /*start_at_head=*/1);
+                int32_t unread = 0;
+                gp_table_edge_unread(root, edge_idx, reader_key, &unread);
+                printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu reader_key=%llu unread=%d\n", mi, ci, edge_idx, (unsigned long long)sub_key, (unsigned long long)reader_key, unread);
+                if (unread <= 0) continue;
+                // consume available samples (assume stride 1 float representing keycode)
+                for (int ri = 0; ri < unread; ++ri) {
+                    float sample[1]; int32_t written = 0;
+                    if (!gp_table_edge_consume(root, edge_idx, reader_key, sample, 1, &written) || written <= 0) {
+                        printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu consume_failed or no_written\n", mi, ci, edge_idx, (unsigned long long)sub_key);
+                        break;
+                    }
+                    int key = static_cast<int>(std::lround(sample[0]));
+                    printf("canvas_consume: module=%zu contact=%d edge_idx=%d sub_key=%llu reader_key=%llu consumed_sample=%f written=%d key=%d\n", mi, ci, edge_idx, (unsigned long long)sub_key, (unsigned long long)reader_key, sample[0], written, key);
+                // append to module's attached table if present
+                bool had_table = (mi < c->module_tables.size() && c->module_tables[mi]);
+                if (had_table) {
+                    GP_TableContext* mt = c->module_tables[mi];
+                    int32_t n = gp_table_get_row_count(mt);
+                    std::vector<GP_TableRow> rows;
+                    rows.resize(static_cast<size_t>(n + 1));
+                    for (int32_t i = 0; i < n; ++i) {
+                        GP_TableRow tmp; memset(&tmp, 0, sizeof(tmp));
+                        if (gp_table_get_row(mt, i, &tmp)) rows[static_cast<size_t>(i)] = tmp;
+                    }
+                    GP_TableRow nr; memset(&nr, 0, sizeof(nr));
+                    nr.kind = GP_TABLE_ROW_DEVICE; nr.depth = 0; nr.expanded = 1; nr.selected = 0; nr.cell_count = 1;
+                    nr.cells[0].kind = GP_TABLE_CELL_TEXT;
+                    char txt[64];
+                    if (key >= 32 && key < 127) std::snprintf(txt, sizeof(txt), "recv: '%c' (%d)", static_cast<char>(key), key);
+                    else std::snprintf(txt, sizeof(txt), "recv: %d", key);
+                    std::snprintf(nr.cells[0].text, sizeof(nr.cells[0].text), "%s", txt);
+                    rows[static_cast<size_t>(n)] = nr;
+                    gp_table_set_rows(mt, rows.data(), static_cast<int32_t>(rows.size()));
+                    // Update per-module chat visual state: append char to chat buffer
+                    if (mi < c->module_chat_text.size()) {
+                        std::string &buf = c->module_chat_text[mi];
+                        if (key >= 32 && key < 127) {
+                            if (buf.size() >= 128) buf.erase(0, buf.size() - 127);
+                            buf.push_back(static_cast<char>(key));
+                        } else {
+                            char tmp[32]; std::snprintf(tmp, sizeof(tmp), "[%d]", key);
+                            buf.append(tmp);
+                            if (buf.size() > 128) buf = buf.substr(buf.size() - 128);
+                        }
+                        // color highlight per-module (stable-ish)
+                        c->module_chat_color[mi].r = static_cast<uint8_t>(80 + (mi * 37) % 160);
+                        c->module_chat_color[mi].g = static_cast<uint8_t>(80 + (mi * 61) % 160);
+                        c->module_chat_color[mi].b = static_cast<uint8_t>(80 + (mi * 97) % 160);
+                        c->module_chat_color[mi].a = 255;
+                        c->module_chat_ttl[mi] = 240; // show for ~240 frames (~4s at 60fps)
+                        if (mi < static_cast<int>(c->module_bg.size()) && !c->module_bg[mi].cb) {
+                            c->module_bg[mi].cb = chat_bg_callback;
+                            c->module_bg[mi].user = c;
+                            c->module_bg[mi].table_alpha = 200;
+                        }
+                    }
+                }
+                // If the module has no attached table, still update the visual chat
+                // state so background callback can render received text.
+                if (!had_table) {
+                    if (mi < c->module_chat_text.size()) {
+                        std::string &buf = c->module_chat_text[mi];
+                        if (key >= 32 && key < 127) {
+                            if (buf.size() >= 128) buf.erase(0, buf.size() - 127);
+                            buf.push_back(static_cast<char>(key));
+                        } else {
+                            char tmp[32]; std::snprintf(tmp, sizeof(tmp), "[%d]", key);
+                            buf.append(tmp);
+                            if (buf.size() > 128) buf = buf.substr(buf.size() - 128);
+                        }
+                        c->module_chat_color[mi].r = static_cast<uint8_t>(80 + (mi * 37) % 160);
+                        c->module_chat_color[mi].g = static_cast<uint8_t>(80 + (mi * 61) % 160);
+                        c->module_chat_color[mi].b = static_cast<uint8_t>(80 + (mi * 97) % 160);
+                        c->module_chat_color[mi].a = 255;
+                        c->module_chat_ttl[mi] = 240;
+                        if (mi < static_cast<int>(c->module_bg.size()) && !c->module_bg[mi].cb) {
+                            c->module_bg[mi].cb = chat_bg_callback;
+                            c->module_bg[mi].user = c;
+                            c->module_bg[mi].table_alpha = 200;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (c->thread_mgr) {
@@ -2192,8 +2513,9 @@ static void render_stage_integrator_image(GP_CanvasContextImpl* ctx, int module_
             uint32_t stride = stage_integrator_stride(table, edge_idx);
             std::vector<float> sample(stride);
             int32_t unread = 0;
-            // Ensure integrator is subscribed as a reader so unread counts are tracked.
-            gp_table_edge_subscribe(table, edge_idx, kStageInputLedKey);
+            // Ensure integrator is subscribed as a reader; enqueue the subscription
+            // so the manager applies it on the table's thread.
+            gp_table_enqueue_edge_subscribe_ex(table, edge_idx, kStageInputLedKey, /*start_at_head=*/1);
             gp_table_edge_unread(table, edge_idx, kStageInputLedKey, &unread);
             int to_read = std::min<int>(std::max(0, unread), kStageIntegratorSampleBudget);
             for (int ri = 0; ri < to_read; ++ri) {
@@ -2405,6 +2727,35 @@ static void stage_bg_callback(void* user, int module_idx, int width, int height,
             std::memcpy(row, src, static_cast<size_t>(width) * 4);
         } else {
             std::memset(row, 0, static_cast<size_t>(width) * 4);
+        }
+    }
+}
+
+// Simple chat background callback: fill module background with chat color
+// and render the latest chat text (if present) using `text_render_helper`.
+static void chat_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch) {
+    if (!user || !out_rgba || width <= 0 || height <= 0) return;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(user);
+    if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return;
+    // pick color from chat state
+    if (module_idx >= static_cast<int>(c->module_chat_color.size())) return;
+    auto col = c->module_chat_color[module_idx];
+    // fill background
+    Color bc{col.r, col.g, col.b, col.a};
+    memset_rect(out_rgba, width, height, out_pitch, 0, 0, width, height, bc);
+
+    // render text bitmap and blit it with alpha
+    if (module_idx < static_cast<int>(c->module_chat_text.size())) {
+        const std::string &txt = c->module_chat_text[module_idx];
+        if (!txt.empty()) {
+            TextBitmap tb = render_text_to_rgba(txt, 1.0f, {255,255,255,255});
+            if (tb.width > 0 && tb.height > 0 && !tb.pixels.empty()) {
+                // convert pixels to uint8_t vector and blit at small inset
+                std::vector<uint8_t> v(tb.pixels.begin(), tb.pixels.end());
+                int px = 8;
+                int py = 8;
+                blit_module_buffer_srcalpha(out_rgba, width, height, out_pitch, px, py, tb.width, tb.height, v);
+            }
         }
     }
 }
@@ -2747,7 +3098,8 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
                       (static_cast<uint64_t>(static_cast<uint32_t>(desc->b_contact_idx)) << 16) |
                       static_cast<uint64_t>(0);
         printf("gp_canvas_add_edge_with_type: creating root edge ka=0x%016llx kb=0x%016llx root=%p\n", (unsigned long long)ka, (unsigned long long)kb, (void*)root);
-        gp_table_add_edge(root, ka, kb);
+        // Enqueue edge addition to be applied by the manager thread.
+        gp_table_enqueue_add_edge(root, ka, kb);
     }
 
     c->edges.push_back(std::move(ei));
@@ -3095,9 +3447,10 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
                 pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
             }
-            // render canvas tool labels
+            // render canvas tool labels (full text) and a short letter inside the button
             const char* canvas_labels[4] = { "Select", "New Table", "Edge Mode", "New Stage" };
             auto lbm = render_text_to_rgba(canvas_labels[bi], 0.95f, {240,240,240,255});
+            const char canvas_short[4] = { 'S', 'T', 'E', 'G' };
             if (!lbm.pixels.empty()) {
                 int tx = bx_i + (bw - lbm.width) / 2;
                 int ty = by + (bh - lbm.height) / 2;
@@ -3107,6 +3460,26 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                         int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
                         uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
                         const unsigned char* src = &lbm.pixels[(yy * lbm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+            // small centered letter inside the square button for quick ID
+            auto small = render_text_to_rgba(std::string(1, canvas_short[bi]), 1.1f, {240,240,240,255});
+            if (!small.pixels.empty()) {
+                int txs = bx_i + (bw - small.width) / 2;
+                int tys = by + (bh - small.height) / 2;
+                for (int yy = 0; yy < small.height; ++yy) {
+                    int dst_y = tys + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < small.width; ++xx) {
+                        int dst_x = txs + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &small.pixels[(yy * small.width + xx) * 4];
                         float sa = src[3] / 255.0f;
                         if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
                         else if (sa > 0.001f) {
@@ -3132,9 +3505,10 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
                 pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
             }
-            // render table tool labels
+            // render table tool labels (full text) and a short letter inside the button
             const char* table_labels[3] = { "Tbl Select", "Tbl Edit", "Tbl More" };
             auto lbm2 = render_text_to_rgba(table_labels[bi], 0.85f, {230,220,240,255});
+            const char table_short[3] = { 's', 'e', 'm' };
             if (!lbm2.pixels.empty()) {
                 int tx = bx_i + (bw - lbm2.width) / 2;
                 int ty = by + (bh - lbm2.height) / 2;
@@ -3152,6 +3526,26 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                         }
                     }
                 }
+                    // small centered letter inside the square button for quick ID
+                    auto small2 = render_text_to_rgba(std::string(1, table_short[bi]), 1.0f, {230,220,240,255});
+                    if (!small2.pixels.empty()) {
+                        int txs = bx_i + (bw - small2.width) / 2;
+                        int tys = by + (bh - small2.height) / 2;
+                        for (int yy = 0; yy < small2.height; ++yy) {
+                            int dst_y = tys + yy; if (dst_y < 0 || dst_y >= h) continue;
+                            for (int xx = 0; xx < small2.width; ++xx) {
+                                int dst_x = txs + xx; if (dst_x < 0 || dst_x >= w) continue;
+                                uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                                const unsigned char* src = &small2.pixels[(yy * small2.width + xx) * 4];
+                                float sa = src[3] / 255.0f;
+                                if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                                else if (sa > 0.001f) {
+                                    for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                                    dst[3] = 255;
+                                }
+                            }
+                        }
+                    }
             }
         }
         // IO counts (inputs / outputs) shown to the left of the table buttons
@@ -3561,9 +3955,11 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     }
                 }
             } else if (bg.mode == 1) {
-                render_module_raytrace_bg(bg, m.w, m.h, inputs);
-                blit_module_buffer(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bg.scratch);
-                bg_done = true;
+                if (!is_stage) {
+                    render_module_raytrace_bg(bg, m.w, m.h, inputs);
+                    blit_module_buffer(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bg.scratch);
+                    bg_done = true;
+                }
             }
         }
         if (!bg_done) {
@@ -3606,33 +4002,67 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
     }
 
-    // render edges using the table spline drawer for exact Catmull-Rom appearance
-    for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
-        int ridx = ctx->edges[ei].rope_idx;
-        if (ridx < 0) continue;
-        int vc = sim ? rope_sim_get_vertex_count(sim, ridx) : 0;
-        if (vc < 2) continue;
-        std::vector<float> verts(static_cast<size_t>(vc) * 2);
-        int got = sim ? rope_sim_get_vertices(sim, ridx, verts.data(), static_cast<int>(verts.size())) : 0;
-        if (got <= 0) continue;
-        std::vector<float> verts_view(static_cast<size_t>(got) * 2);
-        for (int vi = 0; vi < got; ++vi) {
-            verts_view[vi * 2 + 0] = verts[vi * 2 + 0] - static_cast<float>(ctx->offset_x);
-            verts_view[vi * 2 + 1] = verts[vi * 2 + 1] - static_cast<float>(ctx->offset_y);
+    // Prefer manager-supplied immutable network snapshot for rendering the connection graph.
+    // The snapshot contains only endpoint keys and edges (no UI data). Map endpoint keys
+    // to module centers for visual placement (canvas module positions are UI-owned).
+    GP_TableContext* root_table = canvas_ensure_root_table(ctx);
+    std::shared_ptr<ThreadManager::NetworkSnapshot> snap;
+    ThreadManager* tm = ThreadManager::global();
+    if (tm && root_table) snap = tm->get_table_snapshot(root_table);
+    if (snap && !snap->edges.empty()) {
+        // Draw simple straight lines between module centers derived from endpoint keys.
+        for (size_t ei = 0; ei < snap->edges.size(); ++ei) {
+            const auto &se = snap->edges[ei];
+            // Resolve endpoints using the canonical indices from the snapshot.
+            if (se.a_idx >= snap->nodes.size() || se.b_idx >= snap->nodes.size()) continue;
+            uint64_t a_key = snap->nodes[se.a_idx];
+            uint64_t b_key = snap->nodes[se.b_idx];
+            int a_module = static_cast<int>((a_key >> 32) & 0xFFFFFFFFu);
+            int b_module = static_cast<int>((b_key >> 32) & 0xFFFFFFFFu);
+            if (a_module < 0 || a_module >= static_cast<int>(ctx->modules.size())) continue;
+            if (b_module < 0 || b_module >= static_cast<int>(ctx->modules.size())) continue;
+            int ax = ctx->modules[static_cast<size_t>(a_module)].x + ctx->modules[static_cast<size_t>(a_module)].w / 2 - ctx->offset_x;
+            int ay = ctx->modules[static_cast<size_t>(a_module)].y + ctx->modules[static_cast<size_t>(a_module)].h / 2 - ctx->offset_y;
+            int bx = ctx->modules[static_cast<size_t>(b_module)].x + ctx->modules[static_cast<size_t>(b_module)].w / 2 - ctx->offset_x;
+            int by = ctx->modules[static_cast<size_t>(b_module)].y + ctx->modules[static_cast<size_t>(b_module)].h / 2 - ctx->offset_y;
+            // draw a simple line (Bresenham-ish) with light gray color
+            Color col{200,200,200,180};
+            int dx = std::abs(bx - ax), sx = ax < bx ? 1 : -1;
+            int dy = -std::abs(by - ay), sy = ay < by ? 1 : -1;
+            int err = dx + dy;
+            int x0 = ax, y0 = ay;
+            while (true) {
+                if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
+                    uint8_t* px = out_rgba + (y0 * pitch) + (x0 * 4);
+                    blend_pixel(px, col.r, col.g, col.b, col.a);
+                }
+                if (x0 == bx && y0 == by) break;
+                int e2 = 2 * err;
+                if (e2 >= dy) { err += dy; x0 += sx; }
+                if (e2 <= dx) { err += dx; y0 += sy; }
+            }
         }
-        // use configured jacket/core sizing and per-edge hue array if present
-        int jacket_px = ctx->jacket_px;
-        int jacket_border = ctx->jacket_border;
-        const float* hues_ptr = ctx->edges[ei].hues.empty() ? nullptr : ctx->edges[ei].hues.data();
-        int hue_count = static_cast<int>(ctx->edges[ei].hues.size());
-        float hue_intensity = ctx->edges[ei].hue_intensity;
-        int samples_per_segment = 3;
-        (void)hues_ptr;
-        (void)hue_count;
-        (void)hue_intensity;
-        table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, samples_per_segment);
-        int glow_r = std::max(2, jacket_px * 2);
-        draw_rope_light_falloff(out_rgba, w, h, pitch, verts_view.data(), got, edge_light_a[ei], edge_light_b[ei], rope_decay, glow_r);
+    } else {
+        // Fallback: legacy per-edge rope rendering using canvas-local rope sim/indices
+        for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+            int ridx = ctx->edges[ei].rope_idx;
+            if (ridx < 0) continue;
+            int vc = sim ? rope_sim_get_vertex_count(sim, ridx) : 0;
+            if (vc < 2) continue;
+            std::vector<float> verts(static_cast<size_t>(vc) * 2);
+            int got = sim ? rope_sim_get_vertices(sim, ridx, verts.data(), static_cast<int>(verts.size())) : 0;
+            if (got <= 0) continue;
+            std::vector<float> verts_view(static_cast<size_t>(got) * 2);
+            for (int vi = 0; vi < got; ++vi) {
+                verts_view[vi * 2 + 0] = verts[vi * 2 + 0] - static_cast<float>(ctx->offset_x);
+                verts_view[vi * 2 + 1] = verts[vi * 2 + 1] - static_cast<float>(ctx->offset_y);
+            }
+            int jacket_px = ctx->jacket_px;
+            int jacket_border = ctx->jacket_border;
+            table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, 3);
+            int glow_r = std::max(2, jacket_px * 2);
+            draw_rope_light_falloff(out_rgba, w, h, pitch, verts_view.data(), got, edge_light_a[ei], edge_light_b[ei], rope_decay, glow_r);
+        }
     }
 
     // render provisional prospective rope (follows mouse) if present

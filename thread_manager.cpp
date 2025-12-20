@@ -76,6 +76,23 @@ ThreadManager::~ThreadManager() {
     stop();
 }
 
+std::shared_ptr<ThreadManager::NetworkSnapshot> ThreadManager::get_table_snapshot(GP_TableContext* table) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = table_snapshots_.find(table);
+    if (it == table_snapshots_.end()) return nullptr;
+    return it->second;
+}
+
+int32_t ThreadManager::find_node_index(GP_TableContext* table, uint64_t key) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = table_snapshots_.find(table);
+    if (it == table_snapshots_.end()) return -1;
+    const auto &snap = it->second;
+    auto nit = snap->node_index_map.find(key);
+    if (nit == snap->node_index_map.end()) return -1;
+    return static_cast<int32_t>(nit->second);
+}
+
 void ThreadManager::start() {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) return;
@@ -156,6 +173,27 @@ void ThreadManager::run_loop() {
             }
             completed_ = std::max(completed_, req.tick_id);
         }
+        // Build and publish per-table network snapshots (manager thread only).
+        for (const auto& mod : req.modules) {
+            GP_TableContext* t = mod.table;
+            if (!t) continue;
+            int32_t node_count = 0, edge_count = 0; uint64_t stamp = 0;
+            if (!gp_table_snapshot_network_size(t, &node_count, &edge_count, &stamp)) continue;
+            auto snap = std::make_shared<ThreadManager::NetworkSnapshot>();
+            snap->nodes.resize(static_cast<size_t>(node_count));
+            snap->edges.resize(static_cast<size_t>(edge_count));
+            if (!gp_table_snapshot_network_fill(t, snap->nodes.data(), node_count, snap->edges.data(), edge_count, stamp)) continue;
+            snap->stamp = stamp;
+            // Build quick lookup map from node key -> index for UI consumers.
+            snap->node_index_map.clear();
+            for (uint32_t ni = 0; ni < snap->nodes.size(); ++ni) {
+                snap->node_index_map.emplace(snap->nodes[ni], ni);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                table_snapshots_[t] = snap;
+            }
+        }
         cv_done_.notify_all();
     }
 }
@@ -221,7 +259,14 @@ void ThreadManager::set_global(ThreadManager* mgr) { g_thread_manager_instance =
 ThreadManager* ThreadManager::global() { return g_thread_manager_instance; }
 
 void ThreadManager::run_scheduled_tick(const TickRequest& req) {
-    // Build successor adjacency from edges (writer -> reader modules) using
+        // Apply any queued UI ops on each module's table before building the successor
+        // adjacency. This ensures UI-side edits are applied on the manager thread
+        // and will be visible to scheduling logic in this tick.
+        for (const auto& m : req.modules) {
+            if (m.table) gp_table_apply_pending_ops(reinterpret_cast<GP_TableContext*>(m.table));
+        }
+
+        // Build successor adjacency from edges (writer -> reader modules) using
     // module vector indices as canonical ids.
     int N = static_cast<int>(req.modules.size());
     std::vector<std::vector<int>> succ(N);

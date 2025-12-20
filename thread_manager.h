@@ -8,6 +8,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <memory>
+#include "table_abi.h"
 
 struct GP_TableContext;
 
@@ -86,6 +88,16 @@ public:
     // Global accessor: set/get the process-global ThreadManager instance.
     static void set_global(ThreadManager* mgr);
     static ThreadManager* global();
+    // Per-table immutable network snapshots published by the manager thread.
+    struct NetworkSnapshot {
+        std::vector<uint64_t> nodes;
+        std::vector<GP_TableEdgeSnapshot> edges;
+        uint64_t stamp = 0;
+        std::unordered_map<uint64_t, uint32_t> node_index_map;
+    };
+
+    // Retrieve the most recent immutable network snapshot for a table (may return nullptr).
+    std::shared_ptr<NetworkSnapshot> get_table_snapshot(GP_TableContext* table) const;
 
 private:
     struct ModuleLedger {
@@ -114,6 +126,12 @@ private:
     std::vector<ModuleContract> last_modules_;
     std::vector<EdgeContract> last_edges_;
     std::unordered_map<int32_t, std::vector<int32_t>> edges_by_writer_module_;
+    
+    std::unordered_map<GP_TableContext*, std::shared_ptr<NetworkSnapshot>> table_snapshots_;
+
+    // Helper: find the node index for a given endpoint key in a table snapshot.
+    // Returns -1 if not found.
+    int32_t find_node_index(GP_TableContext* table, uint64_t key) const;
 
     // "Time cards": per-module tick ledger.
     std::vector<ModuleLedger> module_ledger_;

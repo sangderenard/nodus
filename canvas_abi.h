@@ -56,6 +56,8 @@ int gp_canvas_on_click(GP_CanvasContext* ctx, int x, int y);
 int gp_canvas_on_mouse_down(GP_CanvasContext* ctx, int x, int y);
 int gp_canvas_on_mouse_move(GP_CanvasContext* ctx, int x, int y);
 int gp_canvas_on_mouse_up(GP_CanvasContext* ctx, int x, int y);
+// Deliver a keyboard event to the canvas host. Returns 1 if handled.
+int gp_canvas_on_key(GP_CanvasContext* ctx, int key, int scancode, int action, int mods);
 // Set/get the canvas viewport offset (world origin mapped to local (0,0)).
 // Offsets are expressed in canvas-space pixels and can be updated by user
 // panning or by a containing table.

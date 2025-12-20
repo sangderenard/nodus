@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <tuple>
 #include "text_render_helper.h"
 #include "thread_manager.h"
@@ -1569,6 +1570,32 @@ struct GP_TableContext {
     std::vector<GP_TableAction> actions;
     GP_TableActionFn action_callback = nullptr;
     void* action_user = nullptr;
+    // Optional keyboard callback
+    GP_TableKeyFn key_callback = nullptr;
+    void* key_user = nullptr;
+    // Pending operations enqueued by UI threads to be applied by the manager.
+    enum PendingOpType {
+        PENDING_OP_ADD_EDGE = 1,
+        PENDING_OP_CLEAR_EDGES = 2,
+        PENDING_OP_SUBSCRIBE_EDGE = 3,
+        PENDING_OP_UNSUBSCRIBE_EDGE = 4,
+        PENDING_OP_BIND_STAGE = 5,
+        PENDING_OP_UNBIND_STAGE = 6,
+    };
+    struct PendingOp {
+        PendingOpType type;
+        // fields used by various ops
+        uint64_t a_key = 0;
+        uint64_t b_key = 0;
+        int32_t edge_idx = -1;
+        uint64_t sub_key = 0;
+        int32_t start_at_head = 1;
+        GP_StageContext* stage = nullptr;
+        int32_t is_output = 0;
+        int32_t channel = 0;
+    };
+    std::vector<PendingOp> pending_ops;
+    std::mutex pending_ops_mu;
 };
 
 // Attach/detach an external RopeSim instance to the table context.
@@ -1588,6 +1615,166 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
     ctx->rope_sim_owned = (sim != nullptr) ? (take_ownership ? 1 : 0) : 0;
     // reset indices so edges will create ropes in the new sim when next rendered
     ctx->rope_sim_idx.clear();
+    return 1;
+}
+
+// Enqueue operations -------------------------------------------------------
+int32_t gp_table_enqueue_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b) {
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+    GP_TableContext::PendingOp op;
+    op.type = GP_TableContext::PENDING_OP_ADD_EDGE;
+    op.a_key = a;
+    op.b_key = b;
+    ctx->pending_ops.push_back(op);
+    return 1;
+}
+
+int32_t gp_table_enqueue_clear_edges(GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+    GP_TableContext::PendingOp op;
+    op.type = GP_TableContext::PENDING_OP_CLEAR_EDGES;
+    ctx->pending_ops.push_back(op);
+    return 1;
+}
+
+int32_t gp_table_enqueue_edge_subscribe_ex(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t start_at_head) {
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+    GP_TableContext::PendingOp op;
+    op.type = GP_TableContext::PENDING_OP_SUBSCRIBE_EDGE;
+    op.edge_idx = edge_idx;
+    op.sub_key = subscriber_key;
+    op.start_at_head = start_at_head;
+    ctx->pending_ops.push_back(op);
+    return 1;
+}
+
+int32_t gp_table_enqueue_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key) {
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+    GP_TableContext::PendingOp op;
+    op.type = GP_TableContext::PENDING_OP_UNSUBSCRIBE_EDGE;
+    op.edge_idx = edge_idx;
+    op.sub_key = subscriber_key;
+    ctx->pending_ops.push_back(op);
+    return 1;
+}
+
+int32_t gp_table_enqueue_bind_stage_port(GP_TableContext* ctx, unsigned long long led_key, GP_StageContext* stage, int32_t is_output, int32_t channel) {
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+    GP_TableContext::PendingOp op;
+    op.type = GP_TableContext::PENDING_OP_BIND_STAGE;
+    op.a_key = led_key;
+    op.stage = stage;
+    op.is_output = is_output;
+    op.channel = channel;
+    ctx->pending_ops.push_back(op);
+    return 1;
+}
+
+int32_t gp_table_enqueue_unbind_stage_port(GP_TableContext* ctx, unsigned long long led_key) {
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+    GP_TableContext::PendingOp op;
+    op.type = GP_TableContext::PENDING_OP_UNBIND_STAGE;
+    op.a_key = led_key;
+    ctx->pending_ops.push_back(op);
+    return 1;
+}
+
+// Apply pending ops (manager thread should call this before scheduling)
+int32_t gp_table_apply_pending_ops(GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    std::vector<GP_TableContext::PendingOp> ops;
+    {
+        std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+        if (ctx->pending_ops.empty()) return 1;
+        ops.swap(ctx->pending_ops);
+    }
+    for (const auto &op : ops) {
+        switch (op.type) {
+        case GP_TableContext::PENDING_OP_ADD_EDGE:
+            gp_table_add_edge(ctx, op.a_key, op.b_key);
+            break;
+        case GP_TableContext::PENDING_OP_CLEAR_EDGES:
+            gp_table_clear_edges(ctx);
+            break;
+        case GP_TableContext::PENDING_OP_SUBSCRIBE_EDGE:
+            gp_table_edge_subscribe_ex(ctx, op.edge_idx, op.sub_key, op.start_at_head);
+            break;
+        case GP_TableContext::PENDING_OP_UNSUBSCRIBE_EDGE:
+            gp_table_edge_unsubscribe(ctx, op.edge_idx, op.sub_key);
+            break;
+        case GP_TableContext::PENDING_OP_BIND_STAGE:
+            gp_table_bind_stage_port(ctx, op.a_key, op.stage, op.is_output, op.channel);
+            break;
+        case GP_TableContext::PENDING_OP_UNBIND_STAGE:
+            gp_table_unbind_stage_port(ctx, op.a_key);
+            break;
+        default:
+            break;
+        }
+    }
+    return 1;
+}
+
+// Network-only snapshot implementation (no locking; caller must be manager thread)
+int32_t gp_table_snapshot_network_size(GP_TableContext* ctx, int32_t* out_node_count, int32_t* out_edge_count, uint64_t* out_stamp) {
+    if (!ctx || !out_node_count || !out_edge_count || !out_stamp) return 0;
+    // Count unique endpoint keys
+    std::unordered_set<uint64_t> keys;
+    keys.reserve(ctx->edges.size() * 2 + 1);
+    for (const auto &e : ctx->edges) {
+        keys.insert(e.first);
+        keys.insert(e.second);
+    }
+    *out_node_count = static_cast<int32_t>(keys.size());
+    *out_edge_count = static_cast<int32_t>(ctx->edges.size());
+    // Stamp: simple generation combining edge count and next_edge_uid to detect changes
+    uint64_t stamp = (static_cast<uint64_t>(ctx->edges.size()) << 32) ^ (ctx->next_edge_uid & 0xffffffffull);
+    *out_stamp = stamp;
+    return 1;
+}
+
+int32_t gp_table_snapshot_network_fill(GP_TableContext* ctx, uint64_t* node_buf, int32_t node_buf_len, GP_TableEdgeSnapshot* edge_buf, int32_t edge_buf_len, uint64_t expected_stamp) {
+    if (!ctx || !node_buf || !edge_buf) return 0;
+    // Recompute stamp
+    uint64_t stamp = (static_cast<uint64_t>(ctx->edges.size()) << 32) ^ (ctx->next_edge_uid & 0xffffffffull);
+    if (expected_stamp != stamp) return 0; // caller should retry size/fill
+
+    // Build a node index map in caller-visible order: insert as discovered while scanning edges
+    std::unordered_map<uint64_t,uint32_t> idx;
+    idx.reserve(ctx->edges.size() * 2 + 1);
+    uint32_t next_idx = 0;
+    for (const auto &e : ctx->edges) {
+        if (idx.find(e.first) == idx.end()) {
+            if (next_idx >= static_cast<uint32_t>(node_buf_len)) return 0;
+            idx[e.first] = next_idx;
+            node_buf[next_idx] = e.first;
+            ++next_idx;
+        }
+        if (idx.find(e.second) == idx.end()) {
+            if (next_idx >= static_cast<uint32_t>(node_buf_len)) return 0;
+            idx[e.second] = next_idx;
+            node_buf[next_idx] = e.second;
+            ++next_idx;
+        }
+    }
+    if (next_idx > static_cast<uint32_t>(node_buf_len)) return 0;
+    // Fill edges
+    if (static_cast<int32_t>(ctx->edges.size()) > edge_buf_len) return 0;
+    for (size_t i = 0; i < ctx->edges.size(); ++i) {
+        const auto &e = ctx->edges[i];
+        auto it_a = idx.find(e.first);
+        auto it_b = idx.find(e.second);
+        if (it_a == idx.end() || it_b == idx.end()) return 0; // should not happen
+        edge_buf[i].a_idx = it_a->second;
+        edge_buf[i].b_idx = it_b->second;
+        edge_buf[i].edge_uid = (i < ctx->edge_uids.size()) ? ctx->edge_uids[i] : 0ull;
+    }
     return 1;
 }
 
@@ -1647,6 +1834,31 @@ int32_t gp_table_clear_action_callback(GP_TableContext* ctx) {
     ctx->action_callback = nullptr;
     ctx->action_user = nullptr;
     return 1;
+}
+
+int32_t gp_table_set_key_callback(GP_TableContext* ctx, GP_TableKeyFn cb, void* user) {
+    if (!ctx) return 0;
+    ctx->key_callback = cb;
+    ctx->key_user = user;
+    return 1;
+}
+
+int32_t gp_table_clear_key_callback(GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    ctx->key_callback = nullptr;
+    ctx->key_user = nullptr;
+    return 1;
+}
+
+int32_t gp_table_on_key(GP_TableContext* ctx, int32_t key, int32_t scancode, int32_t action, int32_t mods) {
+    if (!ctx) return 0;
+    if (!ctx->key_callback) return 0;
+    try {
+        ctx->key_callback(ctx->key_user, key, scancode, action, mods);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
 }
 
 static void recompute_geom(GP_TableContext* ctx) {
@@ -3152,7 +3364,12 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     ThreadManager* tm = ThreadManager::global();
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
-        for (const auto &kv : m) {
+        // Snapshot subscriber map to avoid iterator invalidation if
+        // concurrent subscribe/unsubscribe mutates the map.
+        std::vector<std::pair<uint64_t,int>> subs;
+        subs.reserve(m.size());
+        for (const auto &kv : m) subs.emplace_back(kv.first, kv.second);
+        for (const auto &kv : subs) {
             uint64_t subscriber_key = kv.first;
             int slot = kv.second;
             if (slot <= 0) continue;

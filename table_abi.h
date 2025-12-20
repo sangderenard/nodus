@@ -73,6 +73,9 @@ typedef struct GP_TableAction {
 
 typedef void(*GP_TableActionFn)(void* user, int32_t action_id, const GP_TableHitBox* hit);
 
+// Keyboard callback signature (mirrors common window callbacks: key, scancode, action, mods)
+typedef void(*GP_TableKeyFn)(void* user, int32_t key, int32_t scancode, int32_t action, int32_t mods);
+
 // Row kinds
 typedef enum GP_TableRowKind {
     GP_TABLE_ROW_HEADER = 0,
@@ -259,6 +262,13 @@ int32_t gp_table_clear_action_callback(GP_TableContext* ctx);
 // Returns 1 if any action matched, 0 otherwise.
 int32_t gp_table_dispatch_hit(GP_TableContext* ctx, const GP_TableHitBox* hit);
 
+// Keyboard event delivery to a table context. Returns 1 if delivered, 0 otherwise.
+int32_t gp_table_on_key(GP_TableContext* ctx, int32_t key, int32_t scancode, int32_t action, int32_t mods);
+
+// Register / clear a keyboard callback for a table context. Returns 1 on success.
+int32_t gp_table_set_key_callback(GP_TableContext* ctx, GP_TableKeyFn cb, void* user);
+int32_t gp_table_clear_key_callback(GP_TableContext* ctx);
+
 // Set/get scroll position as a fraction 0..1 (0 -> top). Returns 1 on success.
 int32_t gp_table_set_scroll_fraction(GP_TableContext* ctx, float frac);
 int32_t gp_table_get_scroll_fraction(GP_TableContext* ctx, float* out_frac);
@@ -340,6 +350,33 @@ int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned lo
 int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata);
 int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeBatchMetadata* out_metadata);
 int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx);
+
+// Queued UI operations: enqueue structural edits from UI threads to be applied
+// by the manager thread. These mirror immediate APIs but defer application.
+int32_t gp_table_enqueue_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b);
+int32_t gp_table_enqueue_clear_edges(GP_TableContext* ctx);
+int32_t gp_table_enqueue_edge_subscribe_ex(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t start_at_head);
+int32_t gp_table_enqueue_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
+int32_t gp_table_enqueue_bind_stage_port(GP_TableContext* ctx, unsigned long long led_key, GP_StageContext* stage, int32_t is_output, int32_t channel);
+int32_t gp_table_enqueue_unbind_stage_port(GP_TableContext* ctx, unsigned long long led_key);
+
+// Apply any pending queued ops on the current thread (manager should call this).
+int32_t gp_table_apply_pending_ops(GP_TableContext* ctx);
+
+// Network-only immutable snapshot (NO UI data). Two-call pattern:
+// 1) gp_table_snapshot_network_size -> returns node and edge counts + stamp
+// 2) gp_table_snapshot_network_fill -> caller supplies buffers sized from step (1)
+// The snapshot contains only endpoint keys and edges (node indices + edge_uid).
+// These functions perform no locking and assume the caller is the manager
+// thread responsible for touching the table context.
+typedef struct GP_TableEdgeSnapshot {
+    uint32_t a_idx;
+    uint32_t b_idx;
+    uint64_t edge_uid;
+} GP_TableEdgeSnapshot;
+
+int32_t gp_table_snapshot_network_size(GP_TableContext* ctx, int32_t* out_node_count, int32_t* out_edge_count, uint64_t* out_stamp);
+int32_t gp_table_snapshot_network_fill(GP_TableContext* ctx, uint64_t* node_buf, int32_t node_buf_len, GP_TableEdgeSnapshot* edge_buf, int32_t edge_buf_len, uint64_t expected_stamp);
 
 // Stage port bindings --------------------------------------------------------
 // Bind a stage instance to a specific LED key so edges can auto-provision
