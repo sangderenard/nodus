@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <condition_variable>
 #include <tuple>
 #include "text_render_helper.h"
 #include "thread_manager.h"
@@ -29,6 +30,8 @@ namespace {
 struct Color {
     uint8_t r = 0, g = 0, b = 0, a = 255;
 };
+
+constexpr float kPi = 3.14159265358979323846f;
 
 // Global template library directory (can be set by gp_table_set_library_dir).
 static std::string g_template_library_dir;
@@ -284,6 +287,11 @@ struct Style {
     // increase default fiber gain to make transferred glow/hue stronger
     float cable_fiber_gain = 1.45f; // multiplier for fiber optic overlay
     float cable_fiber_radius_scale = 0.55f; // overlay radius relative to jacket
+    int cable_fifo_light_mode = 0;
+    float cable_fifo_friction_half_life = 0.35f;
+    float cable_fifo_friction_gain = 0.85f;
+    int cable_fifo_friction_regions = 8;
+    float cable_fifo_friction_tint = 0.12f;
 };
 
 static Style load_style(const GP_TableStyle* s) {
@@ -310,6 +318,11 @@ static Style load_style(const GP_TableStyle* s) {
     out.wave_fg = to_color(s->wave_fg_rgba);
     for (int i = 0; i < 9; ++i) out.led_mask[i] = s->led_mask[i];
     out.led_edge_mask = s->led_edge_mask;
+    out.cable_fifo_light_mode = s->cable_fifo_light_mode != 0;
+    if (s->cable_fifo_friction_half_life > 0.0f) out.cable_fifo_friction_half_life = s->cable_fifo_friction_half_life;
+    if (s->cable_fifo_friction_gain > 0.0f) out.cable_fifo_friction_gain = s->cable_fifo_friction_gain;
+    if (s->cable_fifo_friction_regions > 0) out.cable_fifo_friction_regions = s->cable_fifo_friction_regions;
+    if (s->cable_fifo_friction_tint > 0.0f) out.cable_fifo_friction_tint = s->cable_fifo_friction_tint;
     return out;
 }
 
@@ -338,6 +351,11 @@ static GP_TableStyle make_default_style() {
     uint32_t default_bits[9] = {1u << 0, 1u << 1, 1u << 2, 1u << 3, 1u << 4, 1u << 5, 1u << 6, 1u << 7, 1u << 8};
     for (int i = 0; i < 9; ++i) s.led_mask[i] = default_bits[i];
     s.led_edge_mask = (1u << 1) | (1u << 2) | (1u << 4) | (1u << 7) | (1u << 8);
+    s.cable_fifo_light_mode = 0;
+    s.cable_fifo_friction_half_life = 0.35f;
+    s.cable_fifo_friction_gain = 0.85f;
+    s.cable_fifo_friction_regions = 8;
+    s.cable_fifo_friction_tint = 0.12f;
     return s;
 }
 
@@ -1351,6 +1369,17 @@ struct EdgeTensorFifo {
         size_t stride = 1;
         size_t slots = 1;
         size_t top_k = 0;
+        std::atomic<float> write_friction{0.0f};
+        std::atomic<float> read_friction{0.0f};
+        std::atomic<uint64_t> last_write_seq{0};
+        std::atomic<uint64_t> last_read_seq{0};
+        std::atomic<int32_t> last_write_region{-1};
+        std::atomic<int32_t> last_read_region{-1};
+        std::atomic<float> write_phase{0.0f};
+        std::atomic<float> read_phase{0.0f};
+        std::atomic<int32_t> friction_regions{8};
+        std::mutex cv_mu;
+        std::condition_variable cv;
         bool configured = false;
 
         Impl() : readers(new ReaderEntry[kMaxReaders]) {}
@@ -1385,6 +1414,14 @@ struct EdgeTensorFifo {
         for (size_t i = 0; i < impl->slots; ++i) impl->slot_seq[i].store(0, std::memory_order_relaxed);
         impl->write_seq.store(0, std::memory_order_relaxed);
         impl->writer.store(0, std::memory_order_relaxed);
+        impl->write_friction.store(0.0f, std::memory_order_relaxed);
+        impl->read_friction.store(0.0f, std::memory_order_relaxed);
+        impl->last_write_seq.store(0, std::memory_order_relaxed);
+        impl->last_read_seq.store(0, std::memory_order_relaxed);
+        impl->last_write_region.store(-1, std::memory_order_relaxed);
+        impl->last_read_region.store(-1, std::memory_order_relaxed);
+        impl->write_phase.store(0.0f, std::memory_order_relaxed);
+        impl->read_phase.store(0.0f, std::memory_order_relaxed);
         for (size_t i = 0; i < kMaxReaders; ++i) {
             impl->readers[i].key.store(0, std::memory_order_relaxed);
             impl->readers[i].seq.store(0, std::memory_order_relaxed);
@@ -1410,6 +1447,12 @@ struct EdgeTensorFifo {
         return nullptr;
     }
 
+    void set_friction_regions(int32_t regions) {
+        if (!impl) return;
+        int32_t clamped = std::max(1, regions);
+        impl->friction_regions.store(clamped, std::memory_order_relaxed);
+    }
+
     bool subscribe(uint64_t key, bool start_at_head) {
         if (!impl) return false;
         if (key == 0) return false;
@@ -1424,6 +1467,15 @@ struct EdgeTensorFifo {
                 start = (head > cap) ? (head - cap) : 0;
             }
             impl->readers[i].seq.store(start, std::memory_order_release);
+            uint64_t prev = impl->last_read_seq.load(std::memory_order_relaxed);
+            if (prev == 0) {
+                impl->last_read_seq.store(start, std::memory_order_relaxed);
+                if (impl->slots > 0) {
+                    float phase = static_cast<float>(start % static_cast<uint64_t>(impl->slots)) / static_cast<float>(impl->slots);
+                    impl->read_phase.store(phase, std::memory_order_relaxed);
+                }
+            }
+            impl->cv.notify_all();
             return true;
         }
         return false;
@@ -1434,6 +1486,7 @@ struct EdgeTensorFifo {
         for (size_t i = 0; i < kMaxReaders; ++i) {
             if (impl->readers[i].key.load(std::memory_order_relaxed) != key) continue;
             impl->readers[i].key.store(0, std::memory_order_release);
+            impl->cv.notify_all();
             return;
         }
     }
@@ -1449,6 +1502,79 @@ struct EdgeTensorFifo {
             any = true;
         }
         return any ? m : head;
+    }
+
+    static float atomic_add(std::atomic<float>& v, float delta) {
+        float cur = v.load(std::memory_order_relaxed);
+        while (!v.compare_exchange_weak(cur, cur + delta, std::memory_order_relaxed)) {}
+        return cur + delta;
+    }
+
+    static void atomic_scale(std::atomic<float>& v, float factor) {
+        float cur = v.load(std::memory_order_relaxed);
+        while (!v.compare_exchange_weak(cur, cur * factor, std::memory_order_relaxed)) {}
+    }
+
+    void note_activity(uint64_t seq,
+                       std::atomic<uint64_t>& last_seq,
+                       std::atomic<int32_t>& last_region,
+                       std::atomic<float>& friction,
+                       std::atomic<float>& phase) {
+        if (!impl || impl->slots == 0) return;
+        uint64_t prev = last_seq.exchange(seq, std::memory_order_relaxed);
+        if (seq <= prev) return;
+        uint64_t delta = seq - prev;
+        float inc = static_cast<float>(delta) / static_cast<float>(impl->slots);
+        uint64_t slot = seq % static_cast<uint64_t>(impl->slots);
+        int32_t regions = impl->friction_regions.load(std::memory_order_relaxed);
+        if (regions > 0) {
+            int32_t region = static_cast<int32_t>((slot * static_cast<uint64_t>(regions)) / static_cast<uint64_t>(impl->slots));
+            int32_t prev_region = last_region.exchange(region, std::memory_order_relaxed);
+            if (prev_region >= 0 && prev_region != region) {
+                int32_t diff = std::abs(region - prev_region);
+                if (diff > regions / 2) diff = regions - diff;
+                inc += 2.0f * static_cast<float>(std::max(1, diff));
+            }
+        }
+        float phase_val = static_cast<float>(slot) / static_cast<float>(impl->slots);
+        phase.store(phase_val, std::memory_order_relaxed);
+        atomic_add(friction, inc);
+    }
+
+    void tick_friction(float dt, float half_life) {
+        if (!impl) return;
+        if (half_life <= 0.0f || dt <= 0.0f) return;
+        float factor = std::pow(0.5f, dt / half_life);
+        atomic_scale(impl->write_friction, factor);
+        atomic_scale(impl->read_friction, factor);
+    }
+
+    float write_friction() const { return impl ? impl->write_friction.load(std::memory_order_relaxed) : 0.0f; }
+    float read_friction() const { return impl ? impl->read_friction.load(std::memory_order_relaxed) : 0.0f; }
+
+    float phase_delta() const {
+        if (!impl) return 0.0f;
+        float w = impl->write_phase.load(std::memory_order_relaxed);
+        float r = impl->read_phase.load(std::memory_order_relaxed);
+        float delta = w - r;
+        if (delta > 0.5f) delta -= 1.0f;
+        if (delta < -0.5f) delta += 1.0f;
+        return delta;
+    }
+
+    bool is_full(uint64_t seq, uint64_t edge_id = 0) const {
+        if (!impl) return false;
+        uint64_t head = impl->write_seq.load(std::memory_order_acquire);
+        uint64_t min_seq = min_reader_seq(head);
+        if (edge_id != 0) {
+            ThreadManager* tm = ThreadManager::global();
+            if (tm) {
+                uint64_t mgr_min = tm->min_reader_seq_for_edge(edge_id);
+                if (mgr_min != UINT64_MAX) min_seq = mgr_min;
+            }
+        }
+        uint64_t used = (seq >= min_seq) ? (seq - min_seq) : 0;
+        return used >= static_cast<uint64_t>(impl->slots);
     }
 
     bool ensure_space_for_write(uint64_t seq, bool* out_dropped, uint64_t edge_id = 0) {
@@ -1506,6 +1632,8 @@ struct EdgeTensorFifo {
         std::memcpy(dst, sample, impl->stride * sizeof(float));
         impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
         impl->write_seq.store(seq + 1, std::memory_order_release);
+        note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
+        impl->cv.notify_all();
         if (out_dropped) *out_dropped = dropped ? 1 : 0;
         return true;
     }
@@ -1525,8 +1653,55 @@ struct EdgeTensorFifo {
         const float* src = impl->storage.get() + slot * impl->stride;
         std::memcpy(out_sample, src, impl->stride * sizeof(float));
         r->seq.store(rseq + 1, std::memory_order_relaxed);
+        note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
+        impl->cv.notify_all();
         out_written = impl->stride;
         return true;
+    }
+
+    bool push_blocking(uint64_t edge_id, uint64_t writer_id, const float* sample, size_t sample_len, bool* out_dropped, int timeout_ms) {
+        if (!impl || !impl->configured) return false;
+        if (!sample || sample_len != impl->stride) return false;
+        uint64_t bound = impl->writer.load(std::memory_order_relaxed);
+        if (bound != 0 && bound != writer_id) return false;
+        if (timeout_ms == 0) return push(edge_id, writer_id, sample, sample_len, out_dropped);
+        using clock = std::chrono::steady_clock;
+        auto deadline = (timeout_ms < 0) ? clock::time_point::max() : (clock::now() + std::chrono::milliseconds(timeout_ms));
+        std::unique_lock<std::mutex> lk(impl->cv_mu);
+        while (true) {
+            lk.unlock();
+            bool ok = push(edge_id, writer_id, sample, sample_len, out_dropped);
+            lk.lock();
+            if (ok) return true;
+            uint64_t seq = impl->write_seq.load(std::memory_order_relaxed);
+            if (!is_full(seq, edge_id)) return false;
+            if (timeout_ms < 0) {
+                impl->cv.wait(lk);
+            } else {
+                if (impl->cv.wait_until(lk, deadline) == std::cv_status::timeout) return false;
+            }
+        }
+    }
+
+    bool pop_blocking(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written, int timeout_ms) {
+        if (!impl || !impl->configured) return false;
+        if (!find_reader(reader_id)) return false;
+        if (!out_sample || out_cap < impl->stride) return false;
+        if (timeout_ms == 0) return pop(reader_id, out_sample, out_cap, out_written);
+        using clock = std::chrono::steady_clock;
+        auto deadline = (timeout_ms < 0) ? clock::time_point::max() : (clock::now() + std::chrono::milliseconds(timeout_ms));
+        std::unique_lock<std::mutex> lk(impl->cv_mu);
+        while (true) {
+            lk.unlock();
+            bool ok = pop(reader_id, out_sample, out_cap, out_written);
+            lk.lock();
+            if (ok) return true;
+            if (timeout_ms < 0) {
+                impl->cv.wait(lk);
+            } else {
+                if (impl->cv.wait_until(lk, deadline) == std::cv_status::timeout) return false;
+            }
+        }
     }
 
     uint64_t unread(uint64_t reader_id) const {
@@ -1929,10 +2104,14 @@ static void ensure_edge_fifos(GP_TableContext* ctx) {
     while (ctx->edge_fifos.size() < ctx->edges.size()) {
         EdgeTensorFifo fifo;
         fifo.configure_default();
+        fifo.set_friction_regions(ctx->st.cable_fifo_friction_regions);
         ctx->edge_fifos.push_back(std::move(fifo));
     }
     if (ctx->edge_fifos.size() > ctx->edges.size()) {
         ctx->edge_fifos.resize(ctx->edges.size());
+    }
+    for (auto &fifo : ctx->edge_fifos) {
+        fifo.set_friction_regions(ctx->st.cable_fifo_friction_regions);
     }
     while (ctx->edge_batch_metadata.size() < ctx->edges.size()) {
         ctx->edge_batch_metadata.emplace_back(GP_TableEdgeBatchMetadata{});
@@ -2822,6 +3001,12 @@ static inline Color lerp_color(Color a, Color b, float t) {
     return out;
 }
 
+static inline Color tint_color_hue(Color base, float hue_shift, float tint_strength) {
+    float hue = rgb_to_hue(base);
+    Color shifted = hsv_to_color(hue + hue_shift, 1.0f, 1.0f, base.a);
+    return lerp_color(base, shifted, tint_strength);
+}
+
 // Colored variant: `hues` is an optional array of per-vertex hue values in [0..1]. If null, falls back to neutral drawing.
 static void draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, const float* hues, int hue_count, int samples_per_segment, float hue_intensity) {
     if (!hues || hue_count <= 0) {
@@ -3013,6 +3198,9 @@ int32_t gp_table_set_style(GP_TableContext* ctx, const GP_TableStyle* style) {
     }
     ctx->st = load_style(&ctx->style_raw);
     recompute_geom(ctx);
+    for (auto &fifo : ctx->edge_fifos) {
+        fifo.set_friction_regions(ctx->st.cable_fifo_friction_regions);
+    }
     return 1;
 }
 
@@ -3432,6 +3620,36 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     return ok ? 1 : 0;
 }
 
+int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms) {
+    if (out_dropped) *out_dropped = 0;
+    if (!ctx || !sample || sample_len < 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    bool dropped = false;
+    uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+    bool ok = fifo.push_blocking(edge_id, writer_key, sample, static_cast<size_t>(sample_len), &dropped, timeout_ms);
+    if (out_dropped && dropped) *out_dropped = 1;
+    if (!ok) return 0;
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        std::vector<std::pair<uint64_t,int>> subs;
+        subs.reserve(m.size());
+        for (const auto &kv : m) subs.emplace_back(kv.first, kv.second);
+        for (const auto &kv : subs) {
+            uint64_t subscriber_key = kv.first;
+            int slot = kv.second;
+            if (slot <= 0) continue;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (!r) continue;
+            uint64_t seq = r->seq.load(std::memory_order_relaxed);
+            tm->update_reader_seq(slot, seq);
+        }
+    }
+    return 1;
+}
+
 int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written) {
     if (out_written) *out_written = 0;
     if (!ctx || !out_sample || out_len < 0) return 0;
@@ -3443,6 +3661,32 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
     // Notify ThreadManager of reader advancement, if registered.
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        auto it = m.find(subscriber_key);
+        if (it != m.end()) {
+            int slot = it->second;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (r && slot > 0) {
+                uint64_t seq = r->seq.load(std::memory_order_relaxed);
+                tm->update_reader_seq(slot, seq);
+            }
+        }
+    }
+    return 1;
+}
+
+int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written, int32_t timeout_ms) {
+    if (out_written) *out_written = 0;
+    if (!ctx || !out_sample || out_len < 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    size_t wrote = 0;
+    bool ok = fifo.pop_blocking(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote, timeout_ms);
+    if (out_written) *out_written = static_cast<int32_t>(wrote);
+    if (!ok) return 0;
     ThreadManager* tm = ThreadManager::global();
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
@@ -4568,6 +4812,36 @@ int32_t gp_table_render_rgba_with_state(
             Color col = edge_col;
             float glow_a_eff = glow_a * ev;
             float glow_b_eff = glow_b * ev;
+            float fifo_write_glow = 0.0f;
+            float fifo_read_glow = 0.0f;
+            float fifo_tint = 0.0f;
+            float fifo_phase_delta = 0.0f;
+            if (ctx->st.cable_fifo_light_mode && ei < ctx->edge_fifos.size()) {
+                auto &fifo = ctx->edge_fifos[ei];
+                fifo.tick_friction(sim_dt, ctx->st.cable_fifo_friction_half_life);
+                float wf = fifo.write_friction();
+                float rf = fifo.read_friction();
+                float gain = ctx->st.cable_fifo_friction_gain;
+                float mag = std::sqrt(wf * wf + rf * rf);
+                fifo_write_glow = std::min(1.0f, wf * gain);
+                fifo_read_glow = std::min(1.0f, rf * gain);
+                float fifo_mag = std::min(1.0f, mag * gain);
+                fifo_phase_delta = fifo.phase_delta();
+                float theta = std::abs(fifo_phase_delta) * 2.0f * kPi;
+                fifo_tint = std::clamp(theta / kPi, 0.0f, 1.0f) * ctx->st.cable_fifo_friction_tint;
+                if (fifo_mag > 0.0f) {
+                    if (info_a.is_output && info_b.is_input) {
+                        glow_a_eff = std::max(glow_a_eff, fifo_write_glow);
+                        glow_b_eff = std::max(glow_b_eff, fifo_read_glow);
+                    } else if (info_b.is_output && info_a.is_input) {
+                        glow_b_eff = std::max(glow_b_eff, fifo_write_glow);
+                        glow_a_eff = std::max(glow_a_eff, fifo_read_glow);
+                    } else {
+                        glow_a_eff = std::max(glow_a_eff, fifo_mag);
+                        glow_b_eff = std::max(glow_b_eff, fifo_mag);
+                    }
+                }
+            }
             float tint_glow = 0.0f;
             if (info_a.is_output) tint_glow = std::max(tint_glow, glow_a_eff);
             if (info_b.is_output) tint_glow = std::max(tint_glow, glow_b_eff);
@@ -4599,6 +4873,11 @@ int32_t gp_table_render_rgba_with_state(
                 bool lit_b = info_b.on || info_b.active;
                 Color led_a = lit_a ? ctx->st.led_on : ctx->st.led_off;
                 Color led_b = lit_b ? ctx->st.led_on : ctx->st.led_off;
+                if (ctx->st.cable_fifo_light_mode && fifo_tint > 0.0f) {
+                    float hue_shift = (fifo_phase_delta >= 0.0f) ? fifo_tint : -fifo_tint;
+                    led_a = tint_color_hue(led_a, hue_shift, fifo_tint);
+                    led_b = tint_color_hue(led_b, hue_shift, fifo_tint);
+                }
                 float decay = 2.0f;
                 draw_rope_curve_blend_rgb_falloff(out_rgba, w_local, h_local, pitch_local, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, led_a, led_b, glow_a_eff, glow_b_eff, decay);
             }
