@@ -287,10 +287,10 @@ struct Style {
     // increase default fiber gain to make transferred glow/hue stronger
     float cable_fiber_gain = 1.45f; // multiplier for fiber optic overlay
     float cable_fiber_radius_scale = 0.55f; // overlay radius relative to jacket
-    int cable_fifo_light_mode = 0;
+    int cable_fifo_light_mode = 1;
     float cable_fifo_friction_half_life = 0.35f;
     float cable_fifo_friction_gain = 0.85f;
-    int cable_fifo_friction_regions = 8;
+    int cable_fifo_friction_regions = 0;
     float cable_fifo_friction_tint = 0.12f;
 };
 
@@ -323,6 +323,7 @@ static Style load_style(const GP_TableStyle* s) {
     if (s->cable_fifo_friction_gain > 0.0f) out.cable_fifo_friction_gain = s->cable_fifo_friction_gain;
     if (s->cable_fifo_friction_regions > 0) out.cable_fifo_friction_regions = s->cable_fifo_friction_regions;
     if (s->cable_fifo_friction_tint > 0.0f) out.cable_fifo_friction_tint = s->cable_fifo_friction_tint;
+    if (out.cable_fifo_friction_regions <= 0) out.cable_fifo_friction_regions = std::max(1, out.cable_segments);
     return out;
 }
 
@@ -351,10 +352,10 @@ static GP_TableStyle make_default_style() {
     uint32_t default_bits[9] = {1u << 0, 1u << 1, 1u << 2, 1u << 3, 1u << 4, 1u << 5, 1u << 6, 1u << 7, 1u << 8};
     for (int i = 0; i < 9; ++i) s.led_mask[i] = default_bits[i];
     s.led_edge_mask = (1u << 1) | (1u << 2) | (1u << 4) | (1u << 7) | (1u << 8);
-    s.cable_fifo_light_mode = 0;
+    s.cable_fifo_light_mode = 1;
     s.cable_fifo_friction_half_life = 0.35f;
     s.cable_fifo_friction_gain = 0.85f;
-    s.cable_fifo_friction_regions = 8;
+    s.cable_fifo_friction_regions = 0;
     s.cable_fifo_friction_tint = 0.12f;
     return s;
 }
@@ -1551,6 +1552,8 @@ struct EdgeTensorFifo {
 
     float write_friction() const { return impl ? impl->write_friction.load(std::memory_order_relaxed) : 0.0f; }
     float read_friction() const { return impl ? impl->read_friction.load(std::memory_order_relaxed) : 0.0f; }
+    float write_phase() const { return impl ? impl->write_phase.load(std::memory_order_relaxed) : 0.0f; }
+    float read_phase() const { return impl ? impl->read_phase.load(std::memory_order_relaxed) : 0.0f; }
 
     float phase_delta() const {
         if (!impl) return 0.0f;
@@ -1560,6 +1563,28 @@ struct EdgeTensorFifo {
         if (delta > 0.5f) delta -= 1.0f;
         if (delta < -0.5f) delta += 1.0f;
         return delta;
+    }
+
+    bool fill_state(uint64_t edge_id, float& out_fill, float& out_head_phase, float& out_tail_phase) const {
+        out_fill = 0.0f;
+        out_head_phase = 0.0f;
+        out_tail_phase = 0.0f;
+        if (!impl || impl->slots == 0) return false;
+        uint64_t head = impl->write_seq.load(std::memory_order_acquire);
+        uint64_t min_seq = min_reader_seq(head);
+        if (edge_id != 0) {
+            ThreadManager* tm = ThreadManager::global();
+            if (tm) {
+                uint64_t mgr_min = tm->min_reader_seq_for_edge(edge_id);
+                if (mgr_min != UINT64_MAX) min_seq = mgr_min;
+            }
+        }
+        uint64_t used = (head >= min_seq) ? (head - min_seq) : 0;
+        float fill = static_cast<float>(used) / static_cast<float>(impl->slots);
+        out_fill = std::clamp(fill, 0.0f, 1.0f);
+        out_head_phase = static_cast<float>(head % static_cast<uint64_t>(impl->slots)) / static_cast<float>(impl->slots);
+        out_tail_phase = static_cast<float>(min_seq % static_cast<uint64_t>(impl->slots)) / static_cast<float>(impl->slots);
+        return true;
     }
 
     bool is_full(uint64_t seq, uint64_t edge_id = 0) const {
@@ -2939,14 +2964,86 @@ static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const f
     // draw core (thinner, faint tinted core so cable looks clear)
     int core_r = std::max(1, jacket_px - jacket_border - 0);
     Color corec = core_col;
-    // make inner core nearly clear so the tube appears transparent/tinted (≈5%)
-    corec.a = static_cast<uint8_t>(std::lround(float(corec.a) * 0.05f));
+    // keep inner core at requested alpha so producer color remains visible
+    corec.a = static_cast<uint8_t>(std::clamp<int>(corec.a, 0, 255));
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         auto &a = samples[i];
         auto &b = samples[i+1];
         auto &ta = tangents[i];
         auto &tb = tangents[i+1];
         draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, core_r, corec, 1.0f);
+    }
+}
+
+static void build_rope_samples_with_tangents(const float* verts, int count, int jacket_px, std::vector<std::pair<float,float>>& samples, std::vector<std::pair<float,float>>& tangents) {
+    samples.clear();
+    tangents.clear();
+    if (!verts || count < 2) return;
+    auto get = [&](int idx) {
+        if (idx < 0) idx = 0;
+        if (idx >= count) idx = count - 1;
+        return std::pair<float,float>(verts[2*idx+0], verts[2*idx+1]);
+    };
+    auto catmull = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float x = 0.5f * ((2.0f * p1.first) + (-p0.first + p2.first) * t + (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t2 + (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t3);
+        float y = 0.5f * ((2.0f * p1.second) + (-p0.second + p2.second) * t + (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t2 + (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t3);
+        return std::pair<float,float>(x,y);
+    };
+    auto catmull_deriv = [&](int i, float t) {
+        auto p0 = get(i-1);
+        auto p1 = get(i+0);
+        auto p2 = get(i+1);
+        auto p3 = get(i+2);
+        float t2 = t * t;
+        float dx = 0.5f * ((-p0.first + p2.first) + 2.0f * (2.0f*p0.first - 5.0f*p1.first + 4.0f*p2.first - p3.first) * t + 3.0f * (-p0.first + 3.0f*p1.first - 3.0f*p2.first + p3.first) * t2);
+        float dy = 0.5f * ((-p0.second + p2.second) + 2.0f * (2.0f*p0.second - 5.0f*p1.second + 4.0f*p2.second - p3.second) * t + 3.0f * (-p0.second + 3.0f*p1.second - 3.0f*p2.second + p3.second) * t2);
+        return std::pair<float,float>(dx, dy);
+    };
+    samples.reserve((count - 1) * 8);
+    tangents.reserve((count - 1) * 8);
+    for (int i = 0; i < count - 1; ++i) {
+        auto p1 = get(i);
+        auto p2 = get(i+1);
+        float dx = p2.first - p1.first;
+        float dy = p2.second - p1.second;
+        float seglen = std::sqrt(dx*dx + dy*dy);
+        float preferred_spacing = std::max(1.0f, float(jacket_px) * 0.6f);
+        int n = std::max(2, static_cast<int>(std::ceil(seglen / preferred_spacing)));
+        int s_start = (i == 0) ? 0 : 1;
+        for (int s = s_start; s <= n; ++s) {
+            float t = float(s) / float(n);
+            auto p = catmull(i, t);
+            auto d = catmull_deriv(i, t);
+            samples.emplace_back(p.first, p.second);
+            tangents.emplace_back(d.first, d.second);
+        }
+    }
+}
+
+static void draw_rope_jacket_overlay(uint8_t* img, int w, int h, int pitch,
+                                     const std::vector<std::pair<float,float>>& samples,
+                                     const std::vector<std::pair<float,float>>& tangents,
+                                     int jacket_px,
+                                     const std::vector<Color>& jacket_colors) {
+    if (!img || samples.size() < 2 || samples.size() != tangents.size() || jacket_colors.empty()) return;
+    int eff_jacket = std::max(1, jacket_px - 1);
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        float u = (samples.size() > 1) ? (static_cast<float>(i) + 0.5f) / static_cast<float>(samples.size() - 1) : 0.0f;
+        int seg_idx = static_cast<int>(std::floor(u * static_cast<float>(jacket_colors.size())));
+        seg_idx = std::clamp(seg_idx, 0, static_cast<int>(jacket_colors.size()) - 1);
+        Color col = jacket_colors[static_cast<size_t>(seg_idx)];
+        if (col.a == 0) continue;
+        auto &a = samples[i];
+        auto &b = samples[i+1];
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, eff_jacket, col, 1.0f);
     }
 }
 
@@ -4743,7 +4840,6 @@ int32_t gp_table_render_rgba_with_state(
         int w_local = local_geom.width_px;
         int h_local = local_geom.height_px;
         int pitch_local = w_local * 4;
-        Color edge_col{200, 200, 255, 200};
         std::vector<LedContactInfo> edge_contact_a(ctx->edges.size());
         std::vector<LedContactInfo> edge_contact_b(ctx->edges.size());
         std::vector<float> edge_glow_a(ctx->edges.size(), 0.0f);
@@ -4809,13 +4905,19 @@ int32_t gp_table_render_rgba_with_state(
             float glow_b = edge_glow_b[ei];
             float ev = 1.0f;
             if (ei < ctx->relax_value.size()) ev = ctx->relax_value[ei];
-            Color col = edge_col;
+            Color producer_col = ctx->st.led_on;
             float glow_a_eff = glow_a * ev;
             float glow_b_eff = glow_b * ev;
             float fifo_write_glow = 0.0f;
             float fifo_read_glow = 0.0f;
             float fifo_tint = 0.0f;
             float fifo_phase_delta = 0.0f;
+            float fifo_fill = 0.0f;
+            float fifo_head_phase = 0.0f;
+            float fifo_tail_phase = 0.0f;
+            float fifo_write_phase = 0.0f;
+            float fifo_read_phase = 0.0f;
+            bool fifo_has_state = false;
             if (ctx->st.cable_fifo_light_mode && ei < ctx->edge_fifos.size()) {
                 auto &fifo = ctx->edge_fifos[ei];
                 fifo.tick_friction(sim_dt, ctx->st.cable_fifo_friction_half_life);
@@ -4829,6 +4931,10 @@ int32_t gp_table_render_rgba_with_state(
                 fifo_phase_delta = fifo.phase_delta();
                 float theta = std::abs(fifo_phase_delta) * 2.0f * kPi;
                 fifo_tint = std::clamp(theta / kPi, 0.0f, 1.0f) * ctx->st.cable_fifo_friction_tint;
+                fifo_write_phase = fifo.write_phase();
+                fifo_read_phase = fifo.read_phase();
+                uint64_t edge_id = (ei < ctx->edge_uids.size()) ? ctx->edge_uids[ei] : 0ull;
+                fifo_has_state = fifo.fill_state(edge_id, fifo_fill, fifo_head_phase, fifo_tail_phase);
                 if (fifo_mag > 0.0f) {
                     if (info_a.is_output && info_b.is_input) {
                         glow_a_eff = std::max(glow_a_eff, fifo_write_glow);
@@ -4842,17 +4948,9 @@ int32_t gp_table_render_rgba_with_state(
                     }
                 }
             }
-            float tint_glow = 0.0f;
-            if (info_a.is_output) tint_glow = std::max(tint_glow, glow_a_eff);
-            if (info_b.is_output) tint_glow = std::max(tint_glow, glow_b_eff);
-            if (tint_glow <= 0.0f) tint_glow = std::max(glow_a_eff, glow_b_eff) * 0.5f;
-            if (tint_glow > 0.0f) {
-                // keep neutral color; increase alpha slightly for visibility when glow present
-                float boost = std::min(1.0f, tint_glow);
-                int extra = static_cast<int>(std::lround((255 - col.a) * boost * 0.45f));
-                col.a = static_cast<uint8_t>(std::min(255, static_cast<int>(col.a) + extra));
-            }
-            col.a = static_cast<uint8_t>(std::min<int>(255, static_cast<int>(col.a * ev)));
+            bool reverse_phases = info_b.is_output && !info_a.is_output;
+            Color core_col = producer_col;
+            core_col.a = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(float(core_col.a) * ctx->st.cable_core_alpha * ev)), 0, 255));
             int rope_idx = ctx->rope_sim_idx[ei];
             if (rope_idx < 0) continue;
             int vc = rope_sim_get_vertex_count(ctx->rope_sim, rope_idx);
@@ -4867,7 +4965,80 @@ int32_t gp_table_render_rgba_with_state(
             // draw smooth spline curve along simulator vertices; overlay LED light falloff
             int samples_per_segment = std::max(2, ctx->st.cable_segments / std::max(1, got - 1));
             float dominant_glow = std::max(glow_a_eff, glow_b_eff);
-            draw_rope_curve_blend(out_rgba, w_local, h_local, pitch_local, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, col, samples_per_segment);
+            draw_rope_curve_blend(out_rgba, w_local, h_local, pitch_local, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, core_col, samples_per_segment);
+            if (ctx->st.cable_fifo_light_mode && fifo_has_state) {
+                int fifo_segments = std::max(1, got - 1);
+                std::vector<Color> jacket_colors(static_cast<size_t>(fifo_segments), Color{0, 0, 0, 0});
+                auto normalize_phase = [&](float p) {
+                    float v = p - std::floor(p);
+                    if (v < 0.0f) v += 1.0f;
+                    return v;
+                };
+                auto orient_phase = [&](float p) {
+                    float v = normalize_phase(p);
+                    if (reverse_phases) {
+                        v = 1.0f - v;
+                        if (v >= 1.0f) v = 0.0f;
+                    }
+                    return v;
+                };
+                auto phase_in_arc = [&](float phase, float tail, float head) {
+                    if (head == tail) return false;
+                    if (head > tail) return (phase >= tail && phase < head);
+                    return (phase >= tail || phase < head);
+                };
+                auto ring_dist = [&](int a, int b, int n) {
+                    int d = std::abs(a - b);
+                    return std::min(d, n - d);
+                };
+                float fill_strength = std::clamp(fifo_fill * ev, 0.0f, 1.0f);
+                float write_strength = std::clamp(fifo_write_glow * ev, 0.0f, 1.0f);
+                float read_strength = std::clamp(fifo_read_glow * ev, 0.0f, 1.0f);
+                float head_phase = orient_phase(fifo_head_phase);
+                float tail_phase = orient_phase(fifo_tail_phase);
+                float write_phase = orient_phase(fifo_write_phase);
+                float read_phase = orient_phase(fifo_read_phase);
+                int write_idx = std::clamp(static_cast<int>(std::floor(write_phase * fifo_segments)), 0, fifo_segments - 1);
+                int read_idx = std::clamp(static_cast<int>(std::floor(read_phase * fifo_segments)), 0, fifo_segments - 1);
+                Color led_col = producer_col;
+                led_col.a = 255;
+                Color write_col = tint_color_hue(led_col, ctx->st.cable_fifo_friction_tint, 1.0f);
+                Color read_col = tint_color_hue(led_col, -ctx->st.cable_fifo_friction_tint, 1.0f);
+                for (int si = 0; si < fifo_segments; ++si) {
+                    float seg_phase = (static_cast<float>(si) + 0.5f) / static_cast<float>(fifo_segments);
+                    float fill_local = (fill_strength > 0.0f && phase_in_arc(seg_phase, tail_phase, head_phase)) ? fill_strength : 0.0f;
+                    float write_local = 0.0f;
+                    float read_local = 0.0f;
+                    if (write_strength > 0.0f) {
+                        int dist = ring_dist(si, write_idx, fifo_segments);
+                        write_local = write_strength * std::exp(-0.9f * static_cast<float>(dist));
+                    }
+                    if (read_strength > 0.0f) {
+                        int dist = ring_dist(si, read_idx, fifo_segments);
+                        read_local = read_strength * std::exp(-0.9f * static_cast<float>(dist));
+                    }
+                    Color out{0, 0, 0, 0};
+                    auto apply_tint = [&](Color tint, float strength, uint8_t alpha_max) {
+                        if (strength <= 0.0f) return;
+                        Color t = tint;
+                        t.a = static_cast<uint8_t>(std::lround(alpha_max * std::clamp(strength, 0.0f, 1.0f)));
+                        if (out.a == 0) {
+                            out = t;
+                            return;
+                        }
+                        out = lerp_color(out, t, strength);
+                        out.a = std::max(out.a, t.a);
+                    };
+                    apply_tint(led_col, fill_local, 170);
+                    apply_tint(write_col, write_local, 200);
+                    apply_tint(read_col, read_local, 200);
+                    jacket_colors[static_cast<size_t>(si)] = out;
+                }
+                std::vector<std::pair<float,float>> jacket_samples;
+                std::vector<std::pair<float,float>> jacket_tangents;
+                build_rope_samples_with_tangents(proj_xy.data(), got, ctx->st.cable_jacket_px, jacket_samples, jacket_tangents);
+                draw_rope_jacket_overlay(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, jacket_colors);
+            }
             if (dominant_glow > 0.0f) {
                 bool lit_a = info_a.on || info_a.active;
                 bool lit_b = info_b.on || info_b.active;
