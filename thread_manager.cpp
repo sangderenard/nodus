@@ -6,6 +6,7 @@
 #include "stage_abi.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 // Scheduling helpers used inside run_scheduled_tick.
@@ -317,21 +318,36 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         if (!mod.table) continue;
         std::vector<ModuleIORow> io_rows;
         {
-            extern GP_CanvasContextImpl* g_canvas_context_singleton;
-            if (g_canvas_context_singleton && mod_idx < (int)g_canvas_context_singleton->module_io_rows.size()) {
-                io_rows = g_canvas_context_singleton->module_io_rows[mod_idx];
+            extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
+            if (const auto* rows = canvas_get_module_io_rows(mod_idx)) {
+                io_rows = *rows;
             } else {
                 int row_count = gp_table_get_row_count(mod.table);
                 io_rows.resize(row_count);
-                for (int i = 0; i < row_count; ++i) io_rows[i] = ModuleIORow{false, i};
+                for (int i = 0; i < row_count; ++i) {
+                    ModuleRowKind kind = ModuleRowKind::Tool;
+                    if (i < mod.in_count) {
+                        kind = ModuleRowKind::Input;
+                    } else if (i >= row_count - mod.out_count) {
+                        kind = ModuleRowKind::Output;
+                    }
+                    int contact_idx = (kind == ModuleRowKind::Output) ? (i - (row_count - mod.out_count)) : i;
+                    io_rows[i] = ModuleIORow{kind, contact_idx, ModuleToolKind::None};
+                }
             }
         }
         int row_count = gp_table_get_row_count(mod.table);
         std::vector<float> stack;
         stack.reserve(32);
+        auto pop_value = [&stack]() -> float {
+            if (stack.empty()) return 0.0f;
+            float v = stack.back();
+            stack.pop_back();
+            return v;
+        };
         for (int row = 0; row < row_count; ++row) {
-            ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{false, row};
-            if (meta.is_input) {
+            ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None};
+            if (meta.kind == ModuleRowKind::Input) {
                 // Consume from FIFO for this input contact
                 float val = 0.0f;
                 // Find the edge index for this input (mod_idx is the consumer)
@@ -358,10 +374,38 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                 stack.push_back(val);
             }
             // Tool row: pass stack through (no-op for now)
-            if (!meta.is_input && (row < row_count - mod.out_count)) {
-                // No-op (tool row placeholder)
+            if (meta.kind == ModuleRowKind::Tool) {
+                size_t before = stack.size();
+                float b = pop_value();
+                float a = pop_value();
+                switch (meta.tool) {
+                    case ModuleToolKind::Add:
+                        stack.push_back(a + b);
+                        break;
+                    case ModuleToolKind::Subtract:
+                        stack.push_back(a - b);
+                        break;
+                    case ModuleToolKind::Multiply:
+                        stack.push_back(a * b);
+                        break;
+                    case ModuleToolKind::Divide:
+                        stack.push_back((b == 0.0f) ? 0.0f : (a / b));
+                        break;
+                    case ModuleToolKind::Modulo:
+                        stack.push_back((b == 0.0f) ? 0.0f : std::fmod(a, b));
+                        break;
+                    case ModuleToolKind::None:
+                    default:
+                        if (before >= 2) {
+                            stack.push_back(a);
+                            stack.push_back(b);
+                        } else if (before == 1) {
+                            stack.push_back(a);
+                        }
+                        break;
+                }
             }
-            if (!meta.is_input && (row >= row_count - mod.out_count)) {
+            if (meta.kind == ModuleRowKind::Output) {
                 // Output row: publish from stack to FIFO
                 float val = stack.empty() ? 0.0f : stack.back();
                 int edge_idx = -1;
