@@ -716,9 +716,11 @@ static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
 static int resolve_contact_index(const GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& hb) {
     if (!ctx) return table_hit_contact_index(hb);
     const std::vector<ModuleIORow>* rows_ptr = nullptr;
+    bool using_table_rows = false;
     if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_table_rows.size()) &&
         !ctx->module_table_rows[module_idx].empty()) {
         rows_ptr = &ctx->module_table_rows[module_idx];
+        using_table_rows = true;
     } else if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
         rows_ptr = &ctx->module_io_rows[module_idx];
     }
@@ -727,6 +729,13 @@ static int resolve_contact_index(const GP_CanvasContextImpl* ctx, int module_idx
         if (hb.row_idx >= 0 && hb.row_idx < static_cast<int>(rows.size())) {
             const ModuleIORow &meta = rows[hb.row_idx];
             if (meta.kind == ModuleRowKind::Tool) return -1;
+            if (using_table_rows) {
+                bool is_left = (hb.col_idx == kModuleColLeftLed);
+                bool is_right = (hb.col_idx == kModuleColRightLed);
+                if (meta.kind == ModuleRowKind::Input && !is_left) return -1;
+                if (meta.kind == ModuleRowKind::Output && !is_right) return -1;
+                if (!is_left && !is_right) return -1;
+            }
             int attachment_count = std::max(1, meta.attachment_count);
             int led_idx = 0;
             if (hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG) {
@@ -755,6 +764,36 @@ struct CanvasBounds {
     int max_y = 0;
     bool has_any = false;
 };
+
+constexpr int kModuleDefaultWidth = 420;
+constexpr int kModuleDefaultHeight = 620;
+constexpr int kModulePreviewMinTableHeight = 120;
+constexpr int kModuleLedPerSide = 2;
+constexpr int kModuleColLeftLed = 0;
+constexpr int kModuleColText = 1;
+constexpr int kModuleColRightLed = 2;
+constexpr int kModuleColScroll = 3;
+constexpr int kModuleColCount = 4;
+
+struct ModuleLayout {
+    int table_clip_h = 0;
+    int preview_h = 0;
+    int preview_y = 0;
+};
+
+static ModuleLayout module_layout_for(const GP_CanvasModuleDesc& m) {
+    ModuleLayout layout{};
+    if (m.w <= 0 || m.h <= 0) return layout;
+    int preview_h = std::min(m.w, m.h);
+    if ((m.h - preview_h) < kModulePreviewMinTableHeight) {
+        preview_h = std::max(0, m.h - kModulePreviewMinTableHeight);
+        preview_h = std::min(preview_h, m.w);
+    }
+    layout.preview_h = std::max(0, preview_h);
+    layout.preview_y = std::max(0, m.h - layout.preview_h);
+    layout.table_clip_h = std::max(1, layout.preview_y);
+    return layout;
+}
 
 static CanvasBounds compute_canvas_bounds(const GP_CanvasContextImpl* ctx) {
     CanvasBounds b;
@@ -1868,24 +1907,39 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     }
     if (!t) return;
 
-    // Create columns: label, LED grid.
-    GP_TableColumn cols[2];
-    cols[0].kind = GP_TABLE_CELL_TEXT; cols[0].width_px = 80; cols[0].align = 0;
-    cols[1].kind = GP_TABLE_CELL_LEDS_ARG; cols[1].width_px = 120; cols[1].align = 0;
-    gp_table_set_columns(t, cols, 2);
-
     GP_TableStyle st{};
     gp_table_get_style(t, &st);
-    int base_row_h = st.row_h_px > 0 ? st.row_h_px : 20;
-    int stack_value_row_h = std::max(12, base_row_h - 6);
+    const auto &mod = ctx->modules[module_idx];
+    st.width_px = std::max(1, mod.w);
+    st.name_w_px = 0;
+    if (st.row_h_px <= 0) st.row_h_px = 22;
+    gp_table_set_style(t, &st);
+
+    int content_w = std::max(1, st.width_px);
+    int scroll_w = 18;
+    int led_w = std::max(30, std::min(52, (content_w - scroll_w) / 4));
+    int text_w = std::max(1, content_w - scroll_w - 2 * led_w);
+    GP_TableColumn cols[kModuleColCount];
+    cols[kModuleColLeftLed] = { GP_TABLE_CELL_LEDS_ARG, led_w, 0 };
+    cols[kModuleColText] = { GP_TABLE_CELL_TEXT, text_w, 0 };
+    cols[kModuleColRightLed] = { GP_TABLE_CELL_LEDS_ARG, led_w, 0 };
+    cols[kModuleColScroll] = { GP_TABLE_CELL_SCROLL, scroll_w, 0 };
+    gp_table_set_columns(t, cols, kModuleColCount);
+
+    int base_row_h = st.row_h_px > 0 ? st.row_h_px : 22;
+    int tool_row_h = std::max(14, base_row_h - 6);
+    int stack_value_row_h = std::max(12, base_row_h - 8);
 
     int total_rows = static_cast<int>(ordered_rows.size());
     if (total_rows <= 0) {
         GP_TableRow prow{}; memset(&prow, 0, sizeof(prow));
         prow.kind = GP_TABLE_ROW_HEADER; prow.depth = 0; prow.expanded = 1; prow.selected = 0;
-        prow.cell_count = 2;
-        prow.cells[0].kind = GP_TABLE_CELL_TEXT;
-        prow.cells[1].kind = GP_TABLE_CELL_TEXT;
+        prow.cell_count = kModuleColCount;
+        prow.reserved0 = tool_row_h;
+        prow.cells[kModuleColLeftLed].kind = GP_TABLE_CELL_LEDS_ARG;
+        prow.cells[kModuleColText].kind = GP_TABLE_CELL_TEXT;
+        prow.cells[kModuleColRightLed].kind = GP_TABLE_CELL_LEDS_ARG;
+        prow.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
         gp_table_set_rows(t, &prow, 1);
         if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
         ctx->module_table_rows[module_idx].clear();
@@ -1899,13 +1953,12 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         cell.text[len] = '\0';
     };
 
-    auto fill_led_cell = [](GP_TableCell &cell, int count) {
+    auto fill_led_cell = [](GP_TableCell &cell, int count, uint32_t on_mask, uint32_t active_mask) {
         cell.kind = GP_TABLE_CELL_LEDS_ARG;
         int clamped = std::clamp(count, 1, 32);
         cell.value = static_cast<float>(clamped);
-        uint32_t mask = (clamped >= 32) ? 0xFFFFFFFFu : ((1u << clamped) - 1u);
-        cell.flags = mask;
-        cell.reserved0 = static_cast<int32_t>(mask);
+        cell.flags = on_mask;
+        cell.reserved0 = static_cast<int32_t>(active_mask);
     };
 
     std::vector<GP_TableRow> rows;
@@ -1913,18 +1966,22 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     std::vector<ModuleIORow> row_meta;
     row_meta.reserve(static_cast<size_t>(total_rows));
 
-    auto append_row = [&](const char* label, ModuleRowKind kind, int contact_idx, int attachment_count, ModuleToolKind tool_kind) {
+    auto append_row = [&](const char* label, ModuleRowKind kind, int contact_idx, int attachment_count, ModuleToolKind tool_kind, int row_h, bool left_active, bool right_active) {
         GP_TableRow r{};
         memset(&r, 0, sizeof(r));
-        r.kind = GP_TABLE_ROW_DEVICE;
+        r.kind = (kind == ModuleRowKind::Tool) ? GP_TABLE_ROW_HEADER : GP_TABLE_ROW_DEVICE;
         r.depth = 0;
         r.expanded = 1;
         r.selected = 0;
-        r.cell_count = (kind == ModuleRowKind::Tool) ? 1 : 2;
-        fill_text_cell(r.cells[0], label);
-        if (kind != ModuleRowKind::Tool) {
-            fill_led_cell(r.cells[1], attachment_count);
-        }
+        r.cell_count = kModuleColCount;
+        r.reserved0 = row_h;
+        uint32_t mask = (attachment_count >= 32) ? 0xFFFFFFFFu : ((1u << std::max(1, attachment_count)) - 1u);
+        uint32_t left_mask = left_active ? mask : 0u;
+        uint32_t right_mask = right_active ? mask : 0u;
+        fill_led_cell(r.cells[kModuleColLeftLed], std::max(1, left_active ? attachment_count : kModuleLedPerSide), left_mask, left_mask);
+        fill_text_cell(r.cells[kModuleColText], label);
+        fill_led_cell(r.cells[kModuleColRightLed], std::max(1, right_active ? attachment_count : kModuleLedPerSide), right_mask, right_mask);
+        r.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
         rows.push_back(r);
         row_meta.push_back({kind, contact_idx, tool_kind, attachment_count});
     };
@@ -1936,8 +1993,12 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         header.depth = 0;
         header.expanded = 1;
         header.selected = 0;
-        header.cell_count = 1;
-        fill_text_cell(header.cells[0], LABEL_TOOL_STACK);
+        header.cell_count = kModuleColCount;
+        header.reserved0 = tool_row_h;
+        fill_led_cell(header.cells[kModuleColLeftLed], kModuleLedPerSide, 0u, 0u);
+        fill_text_cell(header.cells[kModuleColText], LABEL_TOOL_STACK);
+        fill_led_cell(header.cells[kModuleColRightLed], kModuleLedPerSide, 0u, 0u);
+        header.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
         rows.push_back(header);
         row_meta.push_back({ModuleRowKind::Tool, -1, ModuleToolKind::StackDisplay, 0});
 
@@ -1957,11 +2018,14 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             vr.depth = 0;
             vr.expanded = 1;
             vr.selected = 0;
-            vr.cell_count = 1;
+            vr.cell_count = kModuleColCount;
             vr.reserved0 = stack_value_row_h;
             char buf[96];
             std::snprintf(buf, sizeof(buf), "%d: %.6g", display_idx, *it);
-            fill_text_cell(vr.cells[0], buf);
+            fill_led_cell(vr.cells[kModuleColLeftLed], kModuleLedPerSide, 0u, 0u);
+            fill_text_cell(vr.cells[kModuleColText], buf);
+            fill_led_cell(vr.cells[kModuleColRightLed], kModuleLedPerSide, 0u, 0u);
+            vr.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
             rows.push_back(vr);
             row_meta.push_back({ModuleRowKind::Tool, -1, ModuleToolKind::StackDisplay, 0});
         }
@@ -1971,43 +2035,67 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     int output_contact = 0;
     for (size_t row_idx = 0; row_idx < ordered_rows.size(); ++row_idx) {
         const auto &row = ordered_rows[row_idx];
-        if (row.kind == ModuleRowKind::Input) {
-            int attachments = std::clamp(row.attachment_count, 1, 32);
-            append_row(LABEL_IO_INPUT, ModuleRowKind::Input, input_contact, attachments, ModuleToolKind::None);
-            input_contact += attachments;
-        } else if (row.kind == ModuleRowKind::Output) {
-            int attachments = std::clamp(row.attachment_count, 1, 32);
-            append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, in_count + output_contact, attachments, ModuleToolKind::None);
-            output_contact += attachments;
+        if (row.kind != ModuleRowKind::Tool) continue;
+        if (row.tool == ModuleToolKind::StackDisplay) {
+            append_stack_display_rows(static_cast<int>(row_idx));
         } else {
-            if (row.tool == ModuleToolKind::StackDisplay) {
-                append_stack_display_rows(static_cast<int>(row_idx));
-            } else {
-                append_row(tool_label(row.tool), ModuleRowKind::Tool, -1, 0, row.tool);
+            append_row(tool_label(row.tool), ModuleRowKind::Tool, -1, kModuleLedPerSide, row.tool, tool_row_h, false, false);
+        }
+    }
+
+    for (size_t row_idx = 0; row_idx < ordered_rows.size(); ++row_idx) {
+        const auto &row = ordered_rows[row_idx];
+        if (row.kind == ModuleRowKind::Input) {
+            int remaining = std::clamp(row.attachment_count, 1, 32);
+            while (remaining > 0) {
+                int attachments = std::min(kModuleLedPerSide, remaining);
+                append_row(LABEL_IO_INPUT, ModuleRowKind::Input, input_contact, attachments, ModuleToolKind::None, base_row_h, true, false);
+                input_contact += attachments;
+                remaining -= attachments;
+            }
+        } else if (row.kind == ModuleRowKind::Output) {
+            int remaining = std::clamp(row.attachment_count, 1, 32);
+            while (remaining > 0) {
+                int attachments = std::min(kModuleLedPerSide, remaining);
+                append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, in_count + output_contact, attachments, ModuleToolKind::None, base_row_h, false, true);
+                output_contact += attachments;
+                remaining -= attachments;
             }
         }
+    }
+
+    float scroll_frac = 0.0f;
+    gp_table_get_scroll_fraction(t, &scroll_frac);
+    ModuleLayout layout = module_layout_for(mod);
+    int visible_rows = std::max(1, layout.table_clip_h / std::max(1, base_row_h));
+    int total_rows_render = std::max(1, static_cast<int>(rows.size()));
+    for (auto &r : rows) {
+        if (r.cell_count <= kModuleColScroll) continue;
+        GP_TableCell &cell = r.cells[kModuleColScroll];
+        cell.kind = GP_TABLE_CELL_SCROLL;
+        cell.value = scroll_frac;
+        cell.hold_s = static_cast<float>(total_rows_render);
+        cell.last_s = static_cast<float>(visible_rows);
     }
 
     gp_table_set_rows(t, rows.data(), static_cast<int>(rows.size()));
     if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
     ctx->module_table_rows[module_idx] = row_meta;
-        // Annotate LED keys for created rows with explicit input/output hints
-        // so the table renderer's glow pass can recognize IO roles.
-        for (int ri = 0; ri < static_cast<int>(rows.size()); ++ri) {
-            ModuleRowKind kind = row_meta[ri].kind;
-            if (kind == ModuleRowKind::Tool) continue;
-            bool is_input = (kind == ModuleRowKind::Input);
-            int col_idx = 1; // LED cell column
+    // Annotate LED keys for created rows with explicit input/output hints
+    // so the table renderer's glow pass can recognize IO roles.
+    for (int ri = 0; ri < static_cast<int>(rows.size()); ++ri) {
+        ModuleRowKind kind = row_meta[ri].kind;
+        if (kind == ModuleRowKind::Tool) continue;
+        bool is_input = (kind == ModuleRowKind::Input);
+        int col_idx = is_input ? kModuleColLeftLed : kModuleColRightLed;
         if (col_idx >= rows[ri].cell_count) continue;
         const GP_TableCell &cell = rows[ri].cells[col_idx];
-        int led_count = 9;
+        int led_count = std::max(1, row_meta[ri].attachment_count);
         if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
             int c = std::max(0, std::min(32, static_cast<int>(cell.value)));
             if (c == 0) c = static_cast<int>(cell.flags & 0xFFu);
             if (c == 0) c = 12;
-            led_count = c;
-        } else if (cell.kind == GP_TABLE_CELL_LEDS_TABLE) {
-            led_count = 8;
+            led_count = std::min(led_count, c);
         }
         for (int li = 0; li < led_count; ++li) {
             uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(ri)) << 32) | (static_cast<uint64_t>(static_cast<uint32_t>(col_idx)) << 16) | static_cast<uint64_t>(static_cast<uint32_t>(li));
@@ -2468,11 +2556,16 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 int lx = world_x - m.x;
                 int ly = world_y - m.y;
                 int tw = std::max(1, m.w);
-                int th = std::max(1, m.h);
-                std::vector<uint8_t> tmp(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
+                ModuleLayout layout = module_layout_for(m);
+                int table_clip_h = std::max(1, layout.table_clip_h);
+                if (ly >= table_clip_h) continue;
                 GP_TableGeom geom{};
                 gp_table_get_geom(t, &geom);
-                geom.width_px = tw; geom.height_px = th;
+                geom.width_px = tw;
+                int table_render_h = std::max(1, geom.height_px);
+                int th = std::max(1, table_render_h);
+                std::vector<uint8_t> tmp(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
+                geom.height_px = th;
                 const int hitcap = 1024;
                 std::vector<GP_TableHitBox> hits(hitcap);
                 int hits_written = 0;
@@ -2488,6 +2581,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     GP_TableHitBox found{}; bool found_any = false;
                     for (int hi = 0; hi < hits_written; ++hi) {
                         const GP_TableHitBox &hb = hits[hi];
+                        if (hb.y0 >= table_clip_h) continue;
                         if (lx >= hb.x0 && lx < hb.x1 && ly >= hb.y0 && ly < hb.y1) { found = hb; found_any = true; break; }
                     }
                     if (!found_any) {
@@ -2563,7 +2657,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         GP_CanvasModuleDesc d{};
         int nx = world_x - 20;
         int ny = world_y - 16;
-        d.x = nx; d.y = ny; d.w = 320; d.h = 240;
+        d.x = nx; d.y = ny; d.w = kModuleDefaultWidth; d.h = kModuleDefaultHeight;
         std::memset(d.label, 0, sizeof(d.label));
         std::memcpy(d.label, LABEL_MODULE_TABLE, std::min<size_t>(std::strlen(LABEL_MODULE_TABLE), sizeof(d.label) - 1));
         int new_idx = gp_canvas_add_module(ctx_, &d);
@@ -2581,7 +2675,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         GP_CanvasModuleDesc d{};
         int nx = world_x - 20;
         int ny = world_y - 16;
-        d.x = nx; d.y = ny; d.w = 320; d.h = 240;
+        d.x = nx; d.y = ny; d.w = kModuleDefaultWidth; d.h = kModuleDefaultHeight;
         std::memset(d.label, 0, sizeof(d.label));
         std::memcpy(d.label, LABEL_MODULE_STAGE, std::min<size_t>(std::strlen(LABEL_MODULE_STAGE), sizeof(d.label) - 1));
         int new_idx = gp_canvas_add_module(ctx_, &d);
@@ -2609,6 +2703,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 // letting the table change its own selection state here.
                 int lx = world_x - m.x;
                 int ly = world_y - m.y;
+                ModuleLayout layout = module_layout_for(m);
+                if (ly >= layout.table_clip_h) break;
                 GP_TableHitBox hb{};
                 int ok = gp_table_on_click(c->module_tables[mi], lx, ly, &hb);
                 if (ok) return 1;
@@ -4667,72 +4763,68 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         bool is_stage = (mi >= 0 && mi < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[mi]);
         int tw = std::max(1, m.w);
         int th = std::max(1, m.h);
-        module_tables[mi].resize(static_cast<size_t>(tw) * th * 4);
-        // Initialize the full module-sized buffer so blitting doesn't punch transparent holes
-        // when the table's computed height is smaller than the module height.
-        if (mi < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[mi]) {
-            std::fill(module_tables[mi].begin(), module_tables[mi].end(), 0);
-        } else {
-            for (size_t i = 0; i + 3 < module_tables[mi].size(); i += 4) {
-                module_tables[mi][i + 0] = 40;
-                module_tables[mi][i + 1] = 40;
-                module_tables[mi][i + 2] = 50;
-                module_tables[mi][i + 3] = 255;
-            }
-        }
+        ModuleLayout layout = module_layout_for(m);
+        int table_clip_h = std::max(1, layout.table_clip_h);
         GP_TableGeom geom{};
-        // Provide the module-sized target geometry so the table raster
-        // can compute row layout (image rows rely on the target height).
+        gp_table_get_geom(t, &geom);
         geom.width_px = tw;
-        geom.height_px = th;
+        int table_render_h = std::max(1, geom.height_px);
+        module_tables[mi].assign(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4u, 0);
         const int hitcap = 4096;
         std::vector<GP_TableHitBox> hits(hitcap);
         int hits_written = 0;
-        // For stage modules we want the stage image to act as the full
-        // module background. Render the table into a temporary buffer and
-        // composite only its non-transparent pixels over the stage base so
-        // transparent gutters preserve the stage imagery.
-        if (mi < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[mi] && !ctx->module_stage_images[mi].rgba) {
-            // no stage image available: fallback to regular render
-            gp_table_render_rgba_with_state(t, nullptr, module_tables[mi].data(), static_cast<int32_t>(module_tables[mi].size()), &geom, hits.data(), hitcap, &hits_written);
-        } else if (mi < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[mi]) {
-            // Prefill module buffer with stage pixels if available.
+        if (mi < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[mi]) {
+            // For stage modules we want the stage image to act as the full module background.
+            geom.height_px = th;
             if (!ctx->module_stage_images[mi].rgba) {
-                std::fill(module_tables[mi].begin(), module_tables[mi].end(), 0);
+                gp_table_render_rgba_with_state(t, nullptr, module_tables[mi].data(), static_cast<int32_t>(module_tables[mi].size()), &geom, hits.data(), hitcap, &hits_written);
             } else {
                 const uint8_t* src_stage = ctx->module_stage_images[mi].rgba;
                 size_t bytes = static_cast<size_t>(tw) * static_cast<size_t>(th) * 4u;
                 std::memcpy(module_tables[mi].data(), src_stage, bytes);
-            }
-            // render table into temp and composite
-            std::vector<uint8_t> tmp_buf(module_tables[mi].size());
-            int ok = gp_table_render_rgba_with_state(t, nullptr, tmp_buf.data(), static_cast<int32_t>(tmp_buf.size()), &geom, hits.data(), hitcap, &hits_written);
-            if (ok) {
-                size_t pixels = static_cast<size_t>(tw) * static_cast<size_t>(th);
-                uint8_t* dst = module_tables[mi].data();
-                const uint8_t* src = tmp_buf.data();
-                for (size_t pi = 0; pi < pixels; ++pi) {
-                    const uint8_t sa = src[pi * 4 + 3];
-                    if (sa == 0) continue; // leave base (stage) pixel
-                    if (sa >= 255) {
-                        dst[pi * 4 + 0] = src[pi * 4 + 0];
-                        dst[pi * 4 + 1] = src[pi * 4 + 1];
-                        dst[pi * 4 + 2] = src[pi * 4 + 2];
-                        dst[pi * 4 + 3] = 255;
-                    } else {
-                        float a = sa / 255.0f;
-                        for (int cc = 0; cc < 3; ++cc) {
-                            dst[pi * 4 + cc] = static_cast<uint8_t>(std::lround(src[pi * 4 + cc] * a + dst[pi * 4 + cc] * (1.0f - a)));
+                std::vector<uint8_t> tmp_buf(module_tables[mi].size());
+                int ok = gp_table_render_rgba_with_state(t, nullptr, tmp_buf.data(), static_cast<int32_t>(tmp_buf.size()), &geom, hits.data(), hitcap, &hits_written);
+                if (ok) {
+                    size_t pixels = static_cast<size_t>(tw) * static_cast<size_t>(th);
+                    uint8_t* dst = module_tables[mi].data();
+                    const uint8_t* src = tmp_buf.data();
+                    for (size_t pi = 0; pi < pixels; ++pi) {
+                        const uint8_t sa = src[pi * 4 + 3];
+                        if (sa == 0) continue;
+                        if (sa >= 255) {
+                            dst[pi * 4 + 0] = src[pi * 4 + 0];
+                            dst[pi * 4 + 1] = src[pi * 4 + 1];
+                            dst[pi * 4 + 2] = src[pi * 4 + 2];
+                            dst[pi * 4 + 3] = 255;
+                        } else {
+                            float a = sa / 255.0f;
+                            for (int cc = 0; cc < 3; ++cc) {
+                                dst[pi * 4 + cc] = static_cast<uint8_t>(std::lround(src[pi * 4 + cc] * a + dst[pi * 4 + cc] * (1.0f - a)));
+                            }
+                            dst[pi * 4 + 3] = 255;
                         }
-                        dst[pi * 4 + 3] = 255;
                     }
                 }
             }
         } else {
-            gp_table_render_rgba_with_state(t, nullptr, module_tables[mi].data(), static_cast<int32_t>(module_tables[mi].size()), &geom, hits.data(), hitcap, &hits_written);
+            geom.height_px = table_render_h;
+            std::vector<uint8_t> tmp_buf(static_cast<size_t>(tw) * static_cast<size_t>(table_render_h) * 4u);
+            int ok = gp_table_render_rgba_with_state(t, nullptr, tmp_buf.data(), static_cast<int32_t>(tmp_buf.size()), &geom, hits.data(), hitcap, &hits_written);
+            if (ok) {
+                int copy_h = std::min(table_clip_h, table_render_h);
+                for (int yy = 0; yy < copy_h; ++yy) {
+                    const uint8_t* src = tmp_buf.data() + static_cast<size_t>(yy) * static_cast<size_t>(tw) * 4u;
+                    uint8_t* dst = module_tables[mi].data() + static_cast<size_t>(yy) * static_cast<size_t>(tw) * 4u;
+                    std::memcpy(dst, src, static_cast<size_t>(tw) * 4u);
+                }
+            }
         }
         if (hits_written > 0) {
-            module_hitboxes[mi].assign(hits.begin(), hits.begin() + hits_written);
+            for (int hi = 0; hi < hits_written; ++hi) {
+                const auto &hb = hits[hi];
+                if (!is_stage && hb.y0 >= table_clip_h) continue;
+                module_hitboxes[mi].push_back(hb);
+            }
         }
         auto &light_map = module_contact_lights[mi];
         light_map.clear();
@@ -4741,8 +4833,9 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         Color led_on{st.led_on_rgba[0], st.led_on_rgba[1], st.led_on_rgba[2], st.led_on_rgba[3]};
         int in_count = (mi >= 0 && mi < static_cast<int>(ctx->module_io_in_count.size())) ? ctx->module_io_in_count[mi] : 0;
         int out_count = (mi >= 0 && mi < static_cast<int>(ctx->module_io_out_count.size())) ? ctx->module_io_out_count[mi] : 0;
-        for (int hi = 0; hi < hits_written; ++hi) {
-            const auto &hb = hits[hi];
+        const auto &hits_filtered = module_hitboxes[mi];
+        for (size_t hi = 0; hi < hits_filtered.size(); ++hi) {
+            const auto &hb = hits_filtered[hi];
             if (hb.part != GP_TABLE_HIT_LED && hb.part != GP_TABLE_HIT_LED_ARG && hb.part != GP_TABLE_HIT_LED_TABLE) continue;
             int contact_idx = resolve_contact_index(ctx, mi, hb);
             if (contact_idx < 0) continue;
@@ -4871,16 +4964,26 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         int sy = m.y - ctx->offset_y;
         std::vector<InputRayLight> inputs;
         bool is_stage = (mi >= 0 && mi < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[mi]);
-        bool bg_done = false;
+        Color bgc{40,40,50,255};
+        if (!is_stage) {
+            memset_rect(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bgc);
+        }
         if (mi >= 0 && mi < static_cast<int>(ctx->module_bg.size())) {
             auto &bg = ctx->module_bg[mi];
             if (bg.cb) {
-                ensure_module_bg_storage(bg, m.w, m.h, /*oversample=*/1);
-                bg.cb(bg.user, mi, m.w, m.h, bg.scratch.data(), m.w * 4);
-                if (!is_stage) {
-                    blit_module_buffer(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bg.scratch);
-                    bg_done = true;
+                if (is_stage) {
+                    ensure_module_bg_storage(bg, m.w, m.h, /*oversample=*/1);
+                    bg.cb(bg.user, mi, m.w, m.h, bg.scratch.data(), m.w * 4);
                 } else {
+                    ModuleLayout layout = module_layout_for(m);
+                    int preview_h = layout.preview_h;
+                    if (preview_h > 0) {
+                        ensure_module_bg_storage(bg, m.w, preview_h, /*oversample=*/1);
+                        bg.cb(bg.user, mi, m.w, preview_h, bg.scratch.data(), m.w * 4);
+                        blit_module_buffer(out_rgba, w, h, pitch, sx, sy + layout.preview_y, m.w, preview_h, bg.scratch);
+                    }
+                }
+                if (is_stage) {
                     // Stage modules: embed the stage scratch buffer inside the table's content
                     // image cell and re-render the table now that the stage buffer is current.
                     if (mi >= static_cast<int>(ctx->module_stage_images.size())) ctx->module_stage_images.resize(mi + 1);
@@ -4980,17 +5083,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                         }
                     }
                 }
-            } else if (bg.mode == 1) {
-                if (!is_stage) {
-                    render_module_raytrace_bg(bg, m.w, m.h, inputs);
-                    blit_module_buffer(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bg.scratch);
-                    bg_done = true;
+            } else if (bg.mode == 1 && !is_stage) {
+                ModuleLayout layout = module_layout_for(m);
+                int preview_h = layout.preview_h;
+                if (preview_h > 0) {
+                    render_module_raytrace_bg(bg, m.w, preview_h, inputs);
+                    blit_module_buffer(out_rgba, w, h, pitch, sx, sy + layout.preview_y, m.w, preview_h, bg.scratch);
                 }
+            } else if (bg.mode == 1) {
+                render_module_raytrace_bg(bg, m.w, m.h, inputs);
+                blit_module_buffer(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bg.scratch);
             }
-        }
-        if (!bg_done) {
-            Color bgc{40,40,50,255};
-            memset_rect(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bgc);
         }
         if (mi >= 0 && mi < static_cast<int>(module_tables.size()) && !module_tables[mi].empty()) {
             uint8_t table_alpha = 255;
@@ -5004,8 +5107,6 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             if (is_stage) {
                 // Stage imagery is embedded into the table buffer; blend using the table's per-pixel alpha.
                 blit_module_buffer_srcalpha(out_rgba, w, h, pitch, sx, sy, m.w, m.h, module_tables[mi]);
-            } else if (table_alpha >= 255) {
-                blit_module_buffer(out_rgba, w, h, pitch, sx, sy, m.w, m.h, module_tables[mi]);
             } else {
                 blit_module_buffer_alpha(out_rgba, w, h, pitch, sx, sy, m.w, m.h, module_tables[mi], table_alpha);
             }
