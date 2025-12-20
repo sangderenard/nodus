@@ -13,6 +13,27 @@
 
 struct GP_TableContext;
 
+enum class ModuleRowKind : int8_t {
+    Input = 0,
+    Tool = 1,
+    Output = 2,
+};
+
+enum class ModuleToolKind : int8_t {
+    None = 0,
+    Add = 1,
+    Subtract = 2,
+    Multiply = 3,
+    Divide = 4,
+    Modulo = 5,
+};
+
+struct ModuleIORow {
+    ModuleRowKind kind = ModuleRowKind::Tool;
+    int contact_idx = 0;
+    ModuleToolKind tool = ModuleToolKind::None;
+};
+
 class ThreadManager {
 public:
     enum class Mode : int32_t {

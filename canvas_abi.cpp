@@ -5,6 +5,7 @@
 #include "stage_abi.h"
 #include "text_render_helper.h"
 #include "thread_manager.h"
+#include "labels.h"
 
 #include <vector>
 #include <string>
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <iterator>
 #include <stdio.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -274,11 +276,6 @@ struct MolexLayoutInfo {
     std::vector<uint32_t> hashes;
 };
 
-struct ModuleIORow {
-    bool is_input = false;
-    int contact_idx = 0;
-};
-
 static uint32_t hash_connector(int module_idx, bool is_input, int pin_number, int grid_row, int grid_col) {
     uint32_t h = static_cast<uint32_t>(module_idx + 1);
     h = (h * 0x9E3779B1u) ^ static_cast<uint32_t>(pin_number * 0x165667B1u);
@@ -379,6 +376,7 @@ struct GP_CanvasContextImpl {
     std::vector<MolexLayoutInfo> module_input_layout;
     std::vector<MolexLayoutInfo> module_output_layout;
     std::vector<std::vector<ModuleIORow>> module_io_rows;
+    std::vector<std::vector<ModuleToolKind>> module_tool_stack;
     // optional per-module key-recorder state pointer
     std::vector<void*> module_key_recorder_state;
     // per-module lightweight chat state (used to visually confirm rope traffic)
@@ -410,8 +408,9 @@ struct GP_CanvasContextImpl {
     // tool selection state: separate groups (exclusive within group)
     // canvas tool group: 0 = select, 1 = new table, 2 = edge mode, 3 = new stage
     int selected_tool_canvas = 0;
-    // table tool group: 0 = neutral, 1 = select, 2 = edit (placeholder)
+    // table tool group: 0 = neutral, 1 = select, 2 = menu
     int selected_tool_table = 0;
+    bool tool_menu_open = false;
     // which module (if any) has keyboard/focus for table editing
     int focused_module = -1;
     // registered host windows (opaque pointers)
@@ -574,6 +573,12 @@ enum CanvasActionId {
     CANVAS_ACT_IO_OUT_DEC = 2032,
     CANVAS_ACT_IO_OUT_INC = 2033,
     CANVAS_ACT_MODULE_LED = 2040,
+    CANVAS_ACT_MENU_KEY_RECORDER = 2100,
+    CANVAS_ACT_MENU_TOOL_ADD = 2101,
+    CANVAS_ACT_MENU_TOOL_SUB = 2102,
+    CANVAS_ACT_MENU_TOOL_MUL = 2103,
+    CANVAS_ACT_MENU_TOOL_DIV = 2104,
+    CANVAS_ACT_MENU_TOOL_MOD = 2105,
 };
 
 struct InputRayLight {
@@ -804,6 +809,76 @@ static void render_module_raytrace_bg(GP_CanvasContextImpl::ModuleBg& bg, int mw
     }
 }
 
+static const char* tool_label(ModuleToolKind tool) {
+    switch (tool) {
+        case ModuleToolKind::Add: return LABEL_TOOL_ADD;
+        case ModuleToolKind::Subtract: return LABEL_TOOL_SUB;
+        case ModuleToolKind::Multiply: return LABEL_TOOL_MUL;
+        case ModuleToolKind::Divide: return LABEL_TOOL_DIV;
+        case ModuleToolKind::Modulo: return LABEL_TOOL_MOD;
+        case ModuleToolKind::None:
+        default:
+            return "";
+    }
+}
+
+struct ToolMenuItem {
+    int action_id = 0;
+    const char* label = "";
+    ModuleToolKind tool = ModuleToolKind::None;
+};
+
+static const ToolMenuItem kToolMenuItems[] = {
+    { CANVAS_ACT_MENU_KEY_RECORDER, LABEL_MENU_KEY_RECORDER, ModuleToolKind::None },
+    { CANVAS_ACT_MENU_TOOL_ADD, LABEL_TOOL_ADD, ModuleToolKind::Add },
+    { CANVAS_ACT_MENU_TOOL_SUB, LABEL_TOOL_SUB, ModuleToolKind::Subtract },
+    { CANVAS_ACT_MENU_TOOL_MUL, LABEL_TOOL_MUL, ModuleToolKind::Multiply },
+    { CANVAS_ACT_MENU_TOOL_DIV, LABEL_TOOL_DIV, ModuleToolKind::Divide },
+    { CANVAS_ACT_MENU_TOOL_MOD, LABEL_TOOL_MOD, ModuleToolKind::Modulo },
+};
+
+struct ToolMenuLayout {
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+    int header_h = 0;
+    int row_h = 0;
+    int item_start_y = 0;
+    int stack_start_y = 0;
+    int stack_count = 0;
+};
+
+static ToolMenuLayout compute_tool_menu_layout(const GP_CanvasContextImpl* ctx) {
+    ToolMenuLayout layout{};
+    if (!ctx) return layout;
+    const int padding = 8;
+    const int margin = 12;
+    const int header_h = 18;
+    const int row_h = 22;
+    const int w = 200;
+    int stack_count = 0;
+    if (ctx->focused_module >= 0 && ctx->focused_module < static_cast<int>(ctx->module_tool_stack.size())) {
+        stack_count = static_cast<int>(ctx->module_tool_stack[ctx->focused_module].size());
+    }
+    int h = padding * 2 + header_h + static_cast<int>(std::size(kToolMenuItems)) * row_h;
+    if (stack_count > 0) {
+        h += padding + header_h + stack_count * row_h;
+    }
+    int x = std::max(margin, ctx->width - w - margin);
+    int y = ctx->rope_bar_h + ctx->control_bar_h + margin;
+    layout.x = x;
+    layout.y = y;
+    layout.w = w;
+    layout.h = h;
+    layout.header_h = header_h;
+    layout.row_h = row_h;
+    layout.item_start_y = y + padding + header_h;
+    layout.stack_start_y = layout.item_start_y + static_cast<int>(std::size(kToolMenuItems)) * row_h + padding;
+    layout.stack_count = stack_count;
+    return layout;
+}
+
 static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SIM_SEGS_DEC, CANVAS_ACT_SIM_SEGS_DEC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SIM_SEGS_INC, CANVAS_ACT_SIM_SEGS_INC },
@@ -820,6 +895,12 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_IN_INC, CANVAS_ACT_IO_IN_INC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_OUT_DEC, CANVAS_ACT_IO_OUT_DEC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_OUT_INC, CANVAS_ACT_IO_OUT_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_KEY_RECORDER, CANVAS_ACT_MENU_KEY_RECORDER },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_DIV, CANVAS_ACT_MENU_TOOL_DIV },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MOD, CANVAS_ACT_MENU_TOOL_MOD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_ARG, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_TABLE, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
@@ -830,6 +911,8 @@ static void canvas_setup_stage_table(GP_TableContext* t, int w_px);
 static void canvas_setup_stage_defaults(GP_StageContext* st, int w_px, int h_px);
 static void stage_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
 static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx);
+static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_idx);
+static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKind tool);
 
 // Per-module recorder state stored by the canvas so it can be freed on table destroy.
 struct KeyRecorderState {
@@ -868,7 +951,7 @@ static void canvas_install_key_recorder_table(GP_CanvasContextImpl* ctx, int mod
     r.selected = 0;
     r.cell_count = 1;
     r.cells[0].kind = GP_TABLE_CELL_TEXT;
-    std::snprintf(r.cells[0].text, sizeof(r.cells[0].text), "Key Recorder");
+    std::snprintf(r.cells[0].text, sizeof(r.cells[0].text), "%s", LABEL_MENU_KEY_RECORDER);
     gp_table_set_rows(t, &r, 1);
 
     // We'll attach a key callback that both records the key locally and
@@ -1017,7 +1100,13 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 // debug: table-tool button clicked (before state change)
                 printf("gp_canvas_on_click: table-tool button clicked action_id=%d selected_tool_table(before)=%d\n", action_id, c->selected_tool_table);
                 int tool = static_cast<int>(action_id - CANVAS_ACT_TOOL_TABLE_0);
-                if (c->selected_tool_table == tool) c->selected_tool_table = 0; else c->selected_tool_table = tool;
+                if (tool == 2) {
+                    c->tool_menu_open = !c->tool_menu_open;
+                    c->selected_tool_table = c->tool_menu_open ? tool : 0;
+                } else {
+                    if (c->selected_tool_table == tool) c->selected_tool_table = 0; else c->selected_tool_table = tool;
+                    c->tool_menu_open = false;
+                }
                 printf("gp_canvas_on_click: table tool %d toggled -> selected_tool_table=%d\n", tool, c->selected_tool_table);
                 break;
             }
@@ -1055,6 +1144,29 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 if (c->dispatch_module_idx >= 0) {
                     canvas_handle_module_led_hit(c, c->dispatch_module_idx, *hit);
                 }
+                break;
+            case CANVAS_ACT_MENU_KEY_RECORDER:
+                if (c->focused_module >= 0) {
+                    gp_canvas_destroy_table(reinterpret_cast<GP_CanvasContext*>(c), c->focused_module);
+                    canvas_install_key_recorder_table(c, c->focused_module);
+                }
+                c->tool_menu_open = false;
+                c->selected_tool_table = 0;
+                break;
+            case CANVAS_ACT_MENU_TOOL_ADD:
+                canvas_push_tool_to_focused(c, ModuleToolKind::Add);
+                break;
+            case CANVAS_ACT_MENU_TOOL_SUB:
+                canvas_push_tool_to_focused(c, ModuleToolKind::Subtract);
+                break;
+            case CANVAS_ACT_MENU_TOOL_MUL:
+                canvas_push_tool_to_focused(c, ModuleToolKind::Multiply);
+                break;
+            case CANVAS_ACT_MENU_TOOL_DIV:
+                canvas_push_tool_to_focused(c, ModuleToolKind::Divide);
+                break;
+            case CANVAS_ACT_MENU_TOOL_MOD:
+                canvas_push_tool_to_focused(c, ModuleToolKind::Modulo);
                 break;
             default:
                 break;
@@ -1197,10 +1309,10 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             rows[i].selected = 0;
             rows[i].cell_count = 3;
         }
-        fill_text(rows[0].cells[0], "Input");
+        fill_text(rows[0].cells[0], LABEL_IO_INPUT);
         fill_led_single(rows[0].cells[1]);
         fill_text(rows[0].cells[2], "");
-        fill_text(rows[1].cells[0], "Output");
+        fill_text(rows[1].cells[0], LABEL_IO_OUTPUT);
         fill_text(rows[1].cells[1], "");
         fill_led_single(rows[1].cells[2]);
 
@@ -1215,8 +1327,8 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         // update metadata so control surfaces know there are two contacts
         if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
         ctx->module_io_rows[module_idx].clear();
-        ctx->module_io_rows[module_idx].push_back({true, 0});
-        ctx->module_io_rows[module_idx].push_back({false, 1});
+        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Input, 0, ModuleToolKind::None});
+        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 1, ModuleToolKind::None});
 
         auto bind_port = [&](int row_idx, int led_col_idx, bool is_output, int channel) {
             uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) << 32) |
@@ -1286,7 +1398,11 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     cols[3].kind = GP_TABLE_CELL_TEXT; cols[3].width_px = 28; cols[3].align = 1;
     gp_table_set_columns(t, cols, 4);
 
-        int total_rows = in_count + out_count;
+        int tool_count = 0;
+        if (module_idx < static_cast<int>(ctx->module_tool_stack.size())) {
+            tool_count = static_cast<int>(ctx->module_tool_stack[module_idx].size());
+        }
+        int total_rows = in_count + out_count + tool_count;
         if (total_rows <= 0) {
             GP_TableRow prow{}; memset(&prow, 0, sizeof(prow));
             prow.kind = GP_TABLE_ROW_HEADER; prow.depth = 0; prow.expanded = 1; prow.selected = 0;
@@ -1320,7 +1436,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     std::vector<ModuleIORow> row_meta;
     row_meta.reserve(static_cast<size_t>(total_rows));
 
-    auto append_row = [&](const char* label, bool is_input, int contact_idx) {
+    auto append_row = [&](const char* label, ModuleRowKind kind, int contact_idx, ModuleToolKind tool_kind) {
         GP_TableRow r{};
         memset(&r, 0, sizeof(r));
         r.kind = GP_TABLE_ROW_DEVICE;
@@ -1330,14 +1446,22 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         r.cell_count = 4;
         fill_text_cell(r.cells[0], label);
         fill_led_cell(r.cells[1]);
-        fill_text_cell(r.cells[2], "-");
-        fill_text_cell(r.cells[3], "+");
+        fill_text_cell(r.cells[2], LABEL_IO_MINUS);
+        fill_text_cell(r.cells[3], LABEL_IO_PLUS);
         rows.push_back(r);
-        row_meta.push_back({is_input, contact_idx});
+        row_meta.push_back({kind, contact_idx, tool_kind});
     };
 
-    for (int i = 0; i < in_count; ++i) append_row("INPUT", true, i);
-    for (int o = 0; o < out_count; ++o) append_row("OUTPUT", false, o);
+    for (int i = 0; i < in_count; ++i) {
+        append_row(LABEL_IO_INPUT, ModuleRowKind::Input, i, ModuleToolKind::None);
+    }
+    if (module_idx >= static_cast<int>(ctx->module_tool_stack.size())) ctx->module_tool_stack.resize(module_idx + 1);
+    for (ModuleToolKind tool : ctx->module_tool_stack[module_idx]) {
+        append_row(tool_label(tool), ModuleRowKind::Tool, -1, tool);
+    }
+    for (int o = 0; o < out_count; ++o) {
+        append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, o, ModuleToolKind::None);
+    }
 
     gp_table_set_rows(t, rows.data(), static_cast<int>(rows.size()));
     if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
@@ -1345,7 +1469,9 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         // Annotate LED keys for created rows with explicit input/output hints
         // so the table renderer's glow pass can recognize IO roles.
         for (int ri = 0; ri < static_cast<int>(rows.size()); ++ri) {
-            bool is_input = row_meta[ri].is_input;
+            ModuleRowKind kind = row_meta[ri].kind;
+            if (kind == ModuleRowKind::Tool) continue;
+            bool is_input = (kind == ModuleRowKind::Input);
             int col_idx = 1; // LED cell column
         if (col_idx >= rows[ri].cell_count) continue;
         const GP_TableCell &cell = rows[ri].cells[col_idx];
@@ -1372,6 +1498,18 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     ctx->module_input_layout[module_idx] = make_molex_layout(module_idx, true, in_count);
     ctx->module_output_layout[module_idx] = make_molex_layout(module_idx, false, out_count);
     return;
+}
+
+static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKind tool) {
+    if (!ctx) return;
+    int focused = ctx->focused_module;
+    if (focused < 0 || focused >= static_cast<int>(ctx->modules.size())) return;
+    if (focused >= static_cast<int>(ctx->module_tool_stack.size())) ctx->module_tool_stack.resize(focused + 1);
+    ctx->module_tool_stack[focused].push_back(tool);
+    sync_module_table_io_layout(ctx, focused);
+    update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
+    ctx->tool_menu_open = false;
+    ctx->selected_tool_table = 0;
 }
 
 static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& found) {
@@ -1512,6 +1650,7 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_input_layout.emplace_back();
     c->module_output_layout.emplace_back();
     c->module_io_rows.emplace_back();
+    c->module_tool_stack.emplace_back();
     c->module_key_recorder_state.push_back(nullptr);
     c->module_chat_text.push_back(std::string());
     c->module_chat_color.push_back(ChatCol{});
@@ -1633,6 +1772,21 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             }
         }
     }
+    if (c->tool_menu_open) {
+        ToolMenuLayout layout = compute_tool_menu_layout(c);
+        if (view_x >= layout.x && view_x < layout.x + layout.w && view_y >= layout.y && view_y < layout.y + layout.h) {
+            int item_y = layout.item_start_y;
+            for (size_t i = 0; i < std::size(kToolMenuItems); ++i) {
+                int y0 = item_y + static_cast<int>(i) * layout.row_h;
+                if (view_y >= y0 && view_y < y0 + layout.row_h) {
+                    if (canvas_dispatch_root_action(c, kToolMenuItems[i].action_id)) return 1;
+                }
+            }
+            return 1;
+        }
+        c->tool_menu_open = false;
+        c->selected_tool_table = 0;
+    }
     for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
         const auto &m = c->modules[mi];
         // If module has an attached table, ask the table for hit information
@@ -1689,7 +1843,9 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                                     const auto &meta = c->module_io_rows[mi];
                                     if (found.row_idx >= 0 && found.row_idx < static_cast<int>(meta.size())) {
                                         bool inc = (found.col_idx == 3);
-                                        bool is_input = meta[found.row_idx].is_input;
+                                        ModuleRowKind kind = meta[found.row_idx].kind;
+                                        if (kind == ModuleRowKind::Tool) return 1;
+                                        bool is_input = (kind == ModuleRowKind::Input);
                                         int &target_count = is_input ? c->module_io_in_count[mi] : c->module_io_out_count[mi];
                                         target_count = std::clamp(target_count + (inc ? 1 : -1), 0, 64);
                                         printf(
@@ -1747,7 +1903,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int nx = world_x - 20;
         int ny = world_y - 16;
         d.x = nx; d.y = ny; d.w = 320; d.h = 240;
-        char lbl[64]; std::snprintf(lbl, sizeof(lbl), "Table %zu", c->modules.size()); std::memset(d.label,0,sizeof(d.label)); std::memcpy(d.label,lbl,std::min<size_t>(strlen(lbl), sizeof(d.label)-1));
+        std::memset(d.label, 0, sizeof(d.label));
+        std::memcpy(d.label, LABEL_MODULE_TABLE, std::min<size_t>(std::strlen(LABEL_MODULE_TABLE), sizeof(d.label) - 1));
         int new_idx = gp_canvas_add_module(ctx_, &d);
         if (new_idx >= 0) {
             // Tool==1 => create a table at click position
@@ -1764,7 +1921,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int nx = world_x - 20;
         int ny = world_y - 16;
         d.x = nx; d.y = ny; d.w = 320; d.h = 240;
-        char lbl[64]; std::snprintf(lbl, sizeof(lbl), "Stage %zu", c->modules.size()); std::memset(d.label,0,sizeof(d.label)); std::memcpy(d.label,lbl,std::min<size_t>(strlen(lbl), sizeof(d.label)-1));
+        std::memset(d.label, 0, sizeof(d.label));
+        std::memcpy(d.label, LABEL_MODULE_STAGE, std::min<size_t>(std::strlen(LABEL_MODULE_STAGE), sizeof(d.label) - 1));
         int new_idx = gp_canvas_add_module(ctx_, &d);
         if (new_idx >= 0) {
             // Mark as stage module and set up stage + frame table.
@@ -1807,17 +1965,6 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             c->focused_module = mi;
             // debug: report focus and current table-tool selection before any action
             printf("gp_canvas_on_click: focus set -> module=%d selected_tool_table=%d selected_tool_canvas=%d\n", mi, c->selected_tool_table, c->selected_tool_canvas);
-            // Table-tool: if table-edit tool selected, install key-recorder table
-            if (c->selected_tool_table == 1) {
-                // debug: log intention to install recorder
-                printf("gp_canvas_on_click: installing key-recorder for module=%d (selected_tool_table=%d)\n", mi, c->selected_tool_table);
-                // destroy existing table (if any) and install recorder
-                int destroy_ok = gp_canvas_destroy_table(reinterpret_cast<GP_CanvasContext*>(c), mi);
-                printf("gp_canvas_on_click: gp_canvas_destroy_table returned %d for module=%d\n", destroy_ok, mi);
-                canvas_install_key_recorder_table(c, mi);
-                update_canvas_scroll_state(c, /*pull_from_container=*/false);
-                return 1;
-            }
             if (mi < static_cast<int>(c->module_tables.size()) && c->module_tables[mi] && c->selected_tool_canvas == 0) {
                 // local coords; only forward clicks into attached tables when
                 // canvas is in select/interaction mode (tool 0). In edge-mode
@@ -3214,6 +3361,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     c->edges.clear();
     c->nodes.clear();
     c->module_node_id.clear();
+    c->module_tool_stack.clear();
 
     std::string line;
     // optionally read header
@@ -3259,6 +3407,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             c->module_tables.push_back(nullptr);
             c->module_table_owned.push_back(0);
             c->module_bg.emplace_back();
+            c->module_tool_stack.emplace_back();
             // assign node id for this module
             int nid = c->next_node_id++;
             c->module_node_id.push_back(nid);
@@ -3340,7 +3489,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         int bx2 = w - 8 - bw*2 - spacing; memset_rect(out_rgba, w, h, pitch, bx2, byy, bw, rb - 8, Color{60,60,72,255}); bx2 += bw + spacing; memset_rect(out_rgba, w, h, pitch, bx2, byy, bw, rb - 8, Color{60,60,72,255});
         // value text (render_text_to_rgba is available)
         {
-            std::string s = std::string("segs:") + std::to_string(ctx->sim_segs) + " slack:" + std::to_string(ctx->sim_slack);
+            std::string s = std::string(LABEL_ROPE_SEGS_PREFIX) + std::to_string(ctx->sim_segs) + LABEL_ROPE_SLACK_PREFIX + std::to_string(ctx->sim_slack);
             auto bm = render_text_to_rgba(s, 1.0f, {220,220,220,255});
             if (!bm.pixels.empty()) {
                 int tx = (w - bm.width) / 2;
@@ -3369,7 +3518,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             int spacing = 8;
             int bx = 8;
             int byy = 4;
-            std::vector<std::string> lbls = {"Seg -", "Seg +"};
+            std::vector<std::string> lbls = {LABEL_ROPE_SEGS_DEC, LABEL_ROPE_SEGS_INC};
             for (int i = 0; i < 2; ++i) {
                 int bx_i = bx + i * (bw + spacing);
                 auto tb = render_text_to_rgba(lbls[i], 0.9f, {230,230,230,255});
@@ -3395,7 +3544,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
             }
             int bx2 = w - 8 - bw*2 - spacing;
-            std::vector<std::string> lbls2 = {"Slack -", "Slack +"};
+            std::vector<std::string> lbls2 = {LABEL_ROPE_SLACK_DEC, LABEL_ROPE_SLACK_INC};
             for (int i = 0; i < 2; ++i) {
                 int bx_i = bx2 + i * (bw + spacing);
                 auto tb = render_text_to_rgba(lbls2[i], 0.9f, {230,230,230,255});
@@ -3448,9 +3597,19 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
             }
             // render canvas tool labels (full text) and a short letter inside the button
-            const char* canvas_labels[4] = { "Select", "New Table", "Edge Mode", "New Stage" };
+            const char* canvas_labels[4] = {
+                LABEL_CANVAS_TOOL_SELECT,
+                LABEL_CANVAS_TOOL_NEW_TABLE,
+                LABEL_CANVAS_TOOL_EDGE_MODE,
+                LABEL_CANVAS_TOOL_NEW_STAGE
+            };
             auto lbm = render_text_to_rgba(canvas_labels[bi], 0.95f, {240,240,240,255});
-            const char canvas_short[4] = { 'S', 'T', 'E', 'G' };
+            const char* canvas_short[4] = {
+                LABEL_CANVAS_TOOL_SHORT_SELECT,
+                LABEL_CANVAS_TOOL_SHORT_TABLE,
+                LABEL_CANVAS_TOOL_SHORT_EDGE,
+                LABEL_CANVAS_TOOL_SHORT_STAGE
+            };
             if (!lbm.pixels.empty()) {
                 int tx = bx_i + (bw - lbm.width) / 2;
                 int ty = by + (bh - lbm.height) / 2;
@@ -3470,7 +3629,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
             }
             // small centered letter inside the square button for quick ID
-            auto small = render_text_to_rgba(std::string(1, canvas_short[bi]), 1.1f, {240,240,240,255});
+            auto small = render_text_to_rgba(canvas_short[bi], 1.1f, {240,240,240,255});
             if (!small.pixels.empty()) {
                 int txs = bx_i + (bw - small.width) / 2;
                 int tys = by + (bh - small.height) / 2;
@@ -3506,9 +3665,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
             }
             // render table tool labels (full text) and a short letter inside the button
-            const char* table_labels[3] = { "Tbl Select", "Tbl Edit", "Tbl More" };
+            const char* table_labels[3] = {
+                LABEL_TABLE_TOOL_SELECT,
+                LABEL_TABLE_TOOL_EDIT,
+                LABEL_TABLE_TOOL_MORE
+            };
             auto lbm2 = render_text_to_rgba(table_labels[bi], 0.85f, {230,220,240,255});
-            const char table_short[3] = { 's', 'e', 'm' };
+            const char* table_short[3] = {
+                LABEL_TABLE_TOOL_SHORT_SELECT,
+                LABEL_TABLE_TOOL_SHORT_EDIT,
+                LABEL_TABLE_TOOL_SHORT_MORE
+            };
             if (!lbm2.pixels.empty()) {
                 int tx = bx_i + (bw - lbm2.width) / 2;
                 int ty = by + (bh - lbm2.height) / 2;
@@ -3527,7 +3694,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     }
                 }
                     // small centered letter inside the square button for quick ID
-                    auto small2 = render_text_to_rgba(std::string(1, table_short[bi]), 1.0f, {230,220,240,255});
+                    auto small2 = render_text_to_rgba(table_short[bi], 1.0f, {230,220,240,255});
                     if (!small2.pixels.empty()) {
                         int txs = bx_i + (bw - small2.width) / 2;
                         int tys = by + (bh - small2.height) / 2;
@@ -3620,8 +3787,8 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         if (focused >= 0 && focused < static_cast<int>(ctx->module_io_in_count.size())) in_count = ctx->module_io_in_count[focused];
         if (focused >= 0 && focused < static_cast<int>(ctx->module_io_out_count.size())) out_count = ctx->module_io_out_count[focused];
         // outputs group on the left, inputs group to the right with extra separation
-        draw_io_group(io_base_x -  (bw + spacing + 80), io_by, out_count, "out");
-        draw_io_group(io_base_x, io_by, in_count, "in");
+        draw_io_group(io_base_x -  (bw + spacing + 80), io_by, out_count, LABEL_IO_OUT_SHORT);
+        draw_io_group(io_base_x, io_by, in_count, LABEL_IO_IN_SHORT);
     }
 
     // Prepare storage for per-module table hitboxes discovered during table rendering.
@@ -4088,6 +4255,56 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 (void)hue_count;
                 (void)hue_intensity;
                 table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, samples_per_segment);
+            }
+        }
+    }
+
+    if (ctx->tool_menu_open) {
+        ToolMenuLayout layout = compute_tool_menu_layout(ctx);
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y, layout.w, layout.h, Color{32,32,40,230});
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y, layout.w, 1, Color{90,90,110,255});
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y + layout.h - 1, layout.w, 1, Color{10,10,14,255});
+        auto blit_text = [&](const char* text, int tx, int ty, float scale, Color col) {
+            if (!text || text[0] == '\0') return;
+            auto bm = render_text_to_rgba(text, scale, {col.r, col.g, col.b, col.a});
+            if (bm.pixels.empty()) return;
+            for (int yy = 0; yy < bm.height; ++yy) {
+                int dst_y = ty + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < bm.width; ++xx) {
+                    int dst_x = tx + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        };
+        int title_x = layout.x + 8;
+        int title_y = layout.y + 6;
+        blit_text(LABEL_MENU_TITLE, title_x, title_y, 0.95f, Color{220,220,230,255});
+        int item_y = layout.item_start_y;
+        for (size_t i = 0; i < std::size(kToolMenuItems); ++i) {
+            int y0 = item_y + static_cast<int>(i) * layout.row_h;
+            memset_rect(out_rgba, w, h, pitch, layout.x + 4, y0, layout.w - 8, layout.row_h - 2, Color{45,45,58,240});
+            blit_text(kToolMenuItems[i].label, layout.x + 12, y0 + 3, 0.9f, Color{240,240,240,255});
+        }
+        if (layout.stack_count > 0) {
+            int stack_title_y = layout.stack_start_y - layout.header_h + 2;
+            blit_text(LABEL_MENU_STACK_TITLE, layout.x + 8, stack_title_y, 0.9f, Color{200,200,210,255});
+            int stack_y = layout.stack_start_y;
+            if (ctx->focused_module >= 0 && ctx->focused_module < static_cast<int>(ctx->module_tool_stack.size())) {
+                const auto &stack = ctx->module_tool_stack[ctx->focused_module];
+                for (size_t i = 0; i < stack.size(); ++i) {
+                    int y0 = stack_y + static_cast<int>(i) * layout.row_h;
+                    memset_rect(out_rgba, w, h, pitch, layout.x + 4, y0, layout.w - 8, layout.row_h - 2, Color{36,36,48,240});
+                    blit_text(tool_label(stack[i]), layout.x + 12, y0 + 3, 0.85f, Color{210,210,220,255});
+                }
             }
         }
     }
