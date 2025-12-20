@@ -1441,8 +1441,9 @@ static void canvas_append_io_row(GP_CanvasContextImpl* ctx, int module_idx, bool
         }
     } else {
         ctx->module_io_output_rows[module_idx].push_back(count);
-    if (module_idx < static_cast<int>(ctx->module_io_rows.size())) {
-        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 0, ModuleToolKind::None, count});
+        if (module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+            ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 0, ModuleToolKind::None, count});
+        }
     }
 }
 
