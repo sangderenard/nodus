@@ -1473,9 +1473,11 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         r.depth = 0;
         r.expanded = 1;
         r.selected = 0;
-        r.cell_count = 2;
+        r.cell_count = (kind == ModuleRowKind::Tool) ? 1 : 2;
         fill_text_cell(r.cells[0], label);
-        fill_led_cell(r.cells[1], attachment_count);
+        if (kind != ModuleRowKind::Tool) {
+            fill_led_cell(r.cells[1], attachment_count);
+        }
         rows.push_back(r);
         row_meta.push_back({kind, contact_idx, tool_kind, attachment_count});
     };
