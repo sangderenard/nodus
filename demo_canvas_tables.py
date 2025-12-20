@@ -732,7 +732,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="Host for HTTP server")
     parser.add_argument("--port", type=int, default=8000, help="Port for HTTP server")
     parser.add_argument("--width", type=int, default=1000, help="Canvas width in pixels")
-    parser.add_argument("--height", type=int, default=360, help="Canvas height in pixels")
+    parser.add_argument("--height", type=int, default=720, help="Canvas height in pixels")
     parser.add_argument("--step-dt", type=float, default=1.0 / 60.0, help="Simulation step size in seconds")
     return parser.parse_args(argv)
 
