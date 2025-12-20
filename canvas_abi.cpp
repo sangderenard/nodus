@@ -413,6 +413,10 @@ struct GP_CanvasContextImpl {
     // tool selection state: separate groups (exclusive within group)
     // canvas tool group: 0 = select, 1 = new table, 2 = edge mode, 3 = new stage
     int selected_tool_canvas = 0;
+    // edge tool group: 0=create, 1=destroy, 2=on-change, 3=continuous (-1 = none)
+    int selected_tool_edge = 0;
+    int edge_order_value = 0;
+    int edge_order_tool_active = 0;
     // table tool group: 0 = neutral, 1 = select, 2 = menu
     int selected_tool_table = 0;
     bool tool_menu_open = false;
@@ -707,14 +711,21 @@ enum CanvasActionId {
     CANVAS_ACT_TOOL_CANVAS_1 = 2011,
     CANVAS_ACT_TOOL_CANVAS_2 = 2012,
     CANVAS_ACT_TOOL_CANVAS_3 = 2013,
-    CANVAS_ACT_TOOL_TABLE_0 = 2020,
-    CANVAS_ACT_TOOL_TABLE_1 = 2021,
-    CANVAS_ACT_TOOL_TABLE_2 = 2022,
-    CANVAS_ACT_IO_COUNT_DEC = 2030,
-    CANVAS_ACT_IO_COUNT_INC = 2031,
-    CANVAS_ACT_IO_CONSUMER_ADD = 2032,
-    CANVAS_ACT_IO_PRODUCER_ADD = 2033,
-    CANVAS_ACT_MODULE_LED = 2040,
+    CANVAS_ACT_TOOL_EDGE_0 = 2014,
+    CANVAS_ACT_TOOL_EDGE_1 = 2015,
+    CANVAS_ACT_TOOL_EDGE_2 = 2016,
+    CANVAS_ACT_TOOL_EDGE_3 = 2017,
+    CANVAS_ACT_EDGE_ORDER_DEC = 2018,
+    CANVAS_ACT_EDGE_ORDER_INC = 2019,
+    CANVAS_ACT_EDGE_ORDER_TOOL = 2020,
+    CANVAS_ACT_TOOL_TABLE_0 = 2030,
+    CANVAS_ACT_TOOL_TABLE_1 = 2031,
+    CANVAS_ACT_TOOL_TABLE_2 = 2032,
+    CANVAS_ACT_IO_COUNT_DEC = 2040,
+    CANVAS_ACT_IO_COUNT_INC = 2041,
+    CANVAS_ACT_IO_CONSUMER_ADD = 2042,
+    CANVAS_ACT_IO_PRODUCER_ADD = 2043,
+    CANVAS_ACT_MODULE_LED = 2050,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
     CANVAS_ACT_MENU_TOOL_SUB = 2102,
     CANVAS_ACT_MENU_TOOL_MUL = 2103,
@@ -1037,6 +1048,13 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_CANVAS_1, CANVAS_ACT_TOOL_CANVAS_1 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_CANVAS_2, CANVAS_ACT_TOOL_CANVAS_2 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_CANVAS_3, CANVAS_ACT_TOOL_CANVAS_3 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_EDGE_0, CANVAS_ACT_TOOL_EDGE_0 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_EDGE_1, CANVAS_ACT_TOOL_EDGE_1 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_EDGE_2, CANVAS_ACT_TOOL_EDGE_2 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_EDGE_3, CANVAS_ACT_TOOL_EDGE_3 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_EDGE_ORDER_DEC, CANVAS_ACT_EDGE_ORDER_DEC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_EDGE_ORDER_INC, CANVAS_ACT_EDGE_ORDER_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_EDGE_ORDER_TOOL, CANVAS_ACT_EDGE_ORDER_TOOL },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_TABLE_0, CANVAS_ACT_TOOL_TABLE_0 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_TABLE_1, CANVAS_ACT_TOOL_TABLE_1 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_TABLE_2, CANVAS_ACT_TOOL_TABLE_2 },
@@ -1249,6 +1267,27 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 printf("gp_canvas_on_click: canvas tool %d toggled -> selected_tool_canvas=%d\n", tool, c->selected_tool_canvas);
                 break;
             }
+            case CANVAS_ACT_TOOL_EDGE_0:
+            case CANVAS_ACT_TOOL_EDGE_1:
+            case CANVAS_ACT_TOOL_EDGE_2:
+            case CANVAS_ACT_TOOL_EDGE_3: {
+                int tool = static_cast<int>(action_id - CANVAS_ACT_TOOL_EDGE_0);
+                if (c->selected_tool_edge == tool) c->selected_tool_edge = -1; else c->selected_tool_edge = tool;
+                printf("gp_canvas_on_click: edge tool %d toggled -> selected_tool_edge=%d\n", tool, c->selected_tool_edge);
+                break;
+            }
+            case CANVAS_ACT_EDGE_ORDER_DEC:
+            case CANVAS_ACT_EDGE_ORDER_INC: {
+                int delta = (action_id == CANVAS_ACT_EDGE_ORDER_INC) ? 1 : -1;
+                c->edge_order_value = std::clamp(c->edge_order_value + delta, -4, 4);
+                printf("gp_canvas_on_click: edge_order_value -> %d\n", c->edge_order_value);
+                break;
+            }
+            case CANVAS_ACT_EDGE_ORDER_TOOL: {
+                c->edge_order_tool_active = c->edge_order_tool_active ? 0 : 1;
+                printf("gp_canvas_on_click: edge_order_tool_active -> %d\n", c->edge_order_tool_active);
+                break;
+            }
             
             case CANVAS_ACT_TOOL_TABLE_0:
             case CANVAS_ACT_TOOL_TABLE_1:
@@ -1402,10 +1441,129 @@ static void canvas_append_io_row(GP_CanvasContextImpl* ctx, int module_idx, bool
         }
     } else {
         ctx->module_io_output_rows[module_idx].push_back(count);
-        if (module_idx < static_cast<int>(ctx->module_io_rows.size())) {
-            ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 0, ModuleToolKind::None, count});
+    if (module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 0, ModuleToolKind::None, count});
+    }
+}
+
+static uint64_t canvas_root_key_for_contact(int module_idx, int contact_idx) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) |
+           (static_cast<uint64_t>(static_cast<uint32_t>(contact_idx)) << 16) |
+           static_cast<uint64_t>(0);
+}
+
+static void canvas_collect_edges_for_contact(const GP_CanvasContextImpl* ctx, int module_idx, int contact_idx, std::vector<int> &out_indices) {
+    out_indices.clear();
+    if (!ctx) return;
+    for (size_t i = 0; i < ctx->edges.size(); ++i) {
+        const auto &e = ctx->edges[i].desc;
+        if ((e.a_module == module_idx && e.a_contact_idx == contact_idx) ||
+            (e.b_module == module_idx && e.b_contact_idx == contact_idx)) {
+            out_indices.push_back(static_cast<int>(i));
         }
     }
+}
+
+static void canvas_set_delta_mode_for_edge(GP_CanvasContextImpl* ctx, const GP_CanvasEdgeDesc &desc, bool delta_mode) {
+    if (!ctx) return;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (!root) return;
+    uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+    uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+    int edge_idx = -1;
+    if (gp_table_edge_index_for_pair(root, ka, kb, &edge_idx)) {
+        gp_table_edge_set_delta_mode(root, edge_idx, delta_mode ? 1 : 0);
+    } else if (gp_table_edge_index_for_pair(root, kb, ka, &edge_idx)) {
+        gp_table_edge_set_delta_mode(root, edge_idx, delta_mode ? 1 : 0);
+    }
+}
+
+static void canvas_set_order_mode_for_edge(GP_CanvasContextImpl* ctx, const GP_CanvasEdgeDesc &desc, int order_mode) {
+    if (!ctx) return;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (!root) return;
+    uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+    uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+    int edge_idx = -1;
+    if (gp_table_edge_index_for_pair(root, ka, kb, &edge_idx)) {
+        gp_table_edge_set_order_mode(root, edge_idx, order_mode);
+    } else if (gp_table_edge_index_for_pair(root, kb, ka, &edge_idx)) {
+        gp_table_edge_set_order_mode(root, edge_idx, order_mode);
+    }
+}
+
+static void canvas_remove_edge_at(GP_CanvasContextImpl* ctx, int edge_idx) {
+    if (!ctx || edge_idx < 0 || edge_idx >= static_cast<int>(ctx->edges.size())) return;
+    const auto desc = ctx->edges[static_cast<size_t>(edge_idx)].desc;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (root) {
+        uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+        uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+        gp_table_remove_edge_pair(root, ka, kb);
+    }
+    ctx->edges.erase(ctx->edges.begin() + edge_idx);
+}
+
+static float point_segment_distance_sq(float px, float py, float ax, float ay, float bx, float by) {
+    float vx = bx - ax;
+    float vy = by - ay;
+    float wx = px - ax;
+    float wy = py - ay;
+    float c1 = vx * wx + vy * wy;
+    if (c1 <= 0.0f) {
+        float dx = px - ax;
+        float dy = py - ay;
+        return dx * dx + dy * dy;
+    }
+    float c2 = vx * vx + vy * vy;
+    if (c2 <= c1) {
+        float dx = px - bx;
+        float dy = py - by;
+        return dx * dx + dy * dy;
+    }
+    float t = c1 / c2;
+    float projx = ax + t * vx;
+    float projy = ay + t * vy;
+    float dx = px - projx;
+    float dy = py - projy;
+    return dx * dx + dy * dy;
+}
+
+static int canvas_pick_edge_by_rope(GP_CanvasContextImpl* ctx, int world_x, int world_y, float max_dist) {
+    if (!ctx) return -1;
+    RopeSim* sim = canvas_root_sim(ctx);
+    if (!sim) return -1;
+    float max_dist_sq = max_dist * max_dist;
+    int best_edge = -1;
+    float best_dist = max_dist_sq;
+    for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+        int ridx = ctx->edges[ei].rope_idx;
+        if (ridx < 0) continue;
+        int vc = rope_sim_get_vertex_count(sim, ridx);
+        if (vc < 2) continue;
+        std::vector<float> verts(static_cast<size_t>(vc) * 2u);
+        int got = rope_sim_get_vertices(sim, ridx, verts.data(), static_cast<int>(verts.size()));
+        if (got < 2) continue;
+        float dx0 = verts[0] - static_cast<float>(world_x);
+        float dy0 = verts[1] - static_cast<float>(world_y);
+        float dx1 = verts[(got - 1) * 2] - static_cast<float>(world_x);
+        float dy1 = verts[(got - 1) * 2 + 1] - static_cast<float>(world_y);
+        if ((dx0 * dx0 + dy0 * dy0) <= max_dist_sq) continue;
+        if ((dx1 * dx1 + dy1 * dy1) <= max_dist_sq) continue;
+        for (int vi = 0; vi < got - 1; ++vi) {
+            float ax = verts[vi * 2];
+            float ay = verts[vi * 2 + 1];
+            float bx = verts[(vi + 1) * 2];
+            float by = verts[(vi + 1) * 2 + 1];
+            float dist_sq = point_segment_distance_sq(static_cast<float>(world_x), static_cast<float>(world_y), ax, ay, bx, by);
+            if (dist_sq <= best_dist) {
+                best_dist = dist_sq;
+                best_edge = static_cast<int>(ei);
+            }
+        }
+    }
+    return best_edge;
+}
     sync_module_table_io_layout(ctx, module_idx);
     update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
 }
@@ -1769,6 +1927,38 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
     int contact_idx = resolve_contact_index(ctx, module_idx, found);
     if (contact_idx < 0) return 0;
     ctx->focused_module = module_idx;
+    if (ctx->edge_order_tool_active) {
+        std::vector<int> edge_indices;
+        canvas_collect_edges_for_contact(ctx, module_idx, contact_idx, edge_indices);
+        if (!edge_indices.empty()) {
+            for (int idx : edge_indices) {
+                if (idx < 0 || idx >= static_cast<int>(ctx->edges.size())) continue;
+                canvas_set_order_mode_for_edge(ctx, ctx->edges[static_cast<size_t>(idx)].desc, ctx->edge_order_value);
+            }
+            ctx->selected.module = -1; ctx->selected.contact_idx = -1; ctx->selected.left = -1; ctx->selected.anchor_x = -1; ctx->selected.anchor_y = -1;
+            if (ctx->prospective_rope_idx >= 0) ctx->prospective_rope_idx = -1;
+            return 1;
+        }
+    }
+    if (ctx->selected_tool_edge >= 0 && ctx->selected_tool_edge != 0) {
+        std::vector<int> edge_indices;
+        canvas_collect_edges_for_contact(ctx, module_idx, contact_idx, edge_indices);
+        if (!edge_indices.empty()) {
+            if (ctx->selected_tool_edge == 1) {
+                std::sort(edge_indices.begin(), edge_indices.end(), std::greater<int>());
+                for (int idx : edge_indices) canvas_remove_edge_at(ctx, idx);
+            } else {
+                bool delta_mode = (ctx->selected_tool_edge == 2);
+                for (int idx : edge_indices) {
+                    if (idx < 0 || idx >= static_cast<int>(ctx->edges.size())) continue;
+                    canvas_set_delta_mode_for_edge(ctx, ctx->edges[static_cast<size_t>(idx)].desc, delta_mode);
+                }
+            }
+            ctx->selected.module = -1; ctx->selected.contact_idx = -1; ctx->selected.left = -1; ctx->selected.anchor_x = -1; ctx->selected.anchor_y = -1;
+            if (ctx->prospective_rope_idx >= 0) ctx->prospective_rope_idx = -1;
+            return 1;
+        }
+    }
     // Determine producer/consumer using row metadata when available.
     bool is_producer = false;
     bool resolved_role = false;
@@ -1989,17 +2179,27 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     // check control bar button regions first — buttons are canvas-local coords (shifted down by rope_bar_h)
     if (view_y >= c->rope_bar_h && view_y < c->rope_bar_h + c->control_bar_h) {
         const int canvas_btn_count = 4;
+        const int edge_btn_count = 4;
         const int table_btn_count = 3;
-        const int spacing = 12;
+        const int spacing = 8;
         int by = c->rope_bar_h + 4;
         int bh = std::max(4, c->control_bar_h - 8);
         int bw = bh; // square buttons
         // left canvas group
         int bx = 8;
+        int canvas_group_w = canvas_btn_count * (bw + spacing) - spacing;
         for (int bi = 0; bi < canvas_btn_count; ++bi) {
             int bx_i = bx + bi * (bw + spacing);
             if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
                 int action_id = CANVAS_ACT_TOOL_CANVAS_0 + bi;
+                if (canvas_dispatch_root_action(c, action_id)) return 1;
+            }
+        }
+        int bx_edge = bx + canvas_group_w + spacing * 2;
+        for (int bi = 0; bi < edge_btn_count; ++bi) {
+            int bx_i = bx_edge + bi * (bw + spacing);
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
+                int action_id = CANVAS_ACT_TOOL_EDGE_0 + bi;
                 if (canvas_dispatch_root_action(c, action_id)) return 1;
             }
         }
@@ -2022,6 +2222,9 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int action_gap = 16;
         int pair_gap = 10;
         int pair_total_w = nbw * 2 + pair_gap;
+        int order_num_w = std::max(28, nbw * 2);
+        int order_total_w = nbw + gap + order_num_w + gap + nbw + gap + nbw;
+        int order_left_x = io_base_x - counter_total_w - action_gap - pair_total_w - action_gap - order_total_w;
         int pair_left_x = io_base_x - counter_total_w - action_gap - pair_total_w;
         int bx_consumer = pair_left_x;
         int bx_producer = bx_consumer + nbw + pair_gap;
@@ -2031,6 +2234,21 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             }
             if (view_x >= bx_producer && view_x < bx_producer + nbw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_PRODUCER_ADD)) return 1;
+            }
+        }
+        if (view_y >= by && view_y < by + bh) {
+            int bx_down = order_left_x;
+            int bx_num = bx_down + nbw + gap;
+            int bx_up = bx_num + order_num_w + gap;
+            int bx_tool = bx_up + nbw + gap;
+            if (view_x >= bx_down && view_x < bx_down + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_EDGE_ORDER_DEC)) return 1;
+            }
+            if (view_x >= bx_up && view_x < bx_up + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_EDGE_ORDER_INC)) return 1;
+            }
+            if (view_x >= bx_tool && view_x < bx_tool + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_EDGE_ORDER_TOOL)) return 1;
             }
         }
         // counter group positions
@@ -2131,6 +2349,25 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     }
                 }
             }
+        }
+    }
+    if (c->edge_order_tool_active) {
+        int edge_idx = canvas_pick_edge_by_rope(c, world_x, world_y, static_cast<float>(pick_r));
+        if (edge_idx >= 0 && edge_idx < static_cast<int>(c->edges.size())) {
+            canvas_set_order_mode_for_edge(c, c->edges[static_cast<size_t>(edge_idx)].desc, c->edge_order_value);
+            return 1;
+        }
+    }
+    if (c->selected_tool_edge >= 0 && c->selected_tool_edge != 0) {
+        int edge_idx = canvas_pick_edge_by_rope(c, world_x, world_y, static_cast<float>(pick_r));
+        if (edge_idx >= 0 && edge_idx < static_cast<int>(c->edges.size())) {
+            if (c->selected_tool_edge == 1) {
+                canvas_remove_edge_at(c, edge_idx);
+            } else {
+                bool delta_mode = (c->selected_tool_edge == 2);
+                canvas_set_delta_mode_for_edge(c, c->edges[static_cast<size_t>(edge_idx)].desc, delta_mode);
+            }
+            return 1;
         }
     }
     // click not on any contact: clear selection
@@ -3739,12 +3976,14 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         memset_rect(out_rgba, w, h, pitch, 0, rb, w, cbh, Color{28,28,34,255});
         // two tool groups: canvas (left) and table (right)
         const int canvas_btn_count = 4;
+        const int edge_btn_count = 4;
         const int table_btn_count = 3;
         const int spacing = 8;
         int bh = std::max(4, cbh - 8);
         int bw = bh; // square buttons
         // left (canvas) group
         int bx = 8; int by = rb + 4;
+        int canvas_group_w = canvas_btn_count * (bw + spacing) - spacing;
         for (int bi = 0; bi < canvas_btn_count; ++bi) {
             int bx_i = bx + bi * (bw + spacing);
             bool selected = (ctx->selected_tool_canvas == bi);
@@ -3793,6 +4032,72 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             }
             // small centered letter inside the square button for quick ID
             auto small = render_text_to_rgba(canvas_short[bi], 1.1f, {240,240,240,255});
+            if (!small.pixels.empty()) {
+                int txs = bx_i + (bw - small.width) / 2;
+                int tys = by + (bh - small.height) / 2;
+                for (int yy = 0; yy < small.height; ++yy) {
+                    int dst_y = tys + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < small.width; ++xx) {
+                        int dst_x = txs + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &small.pixels[(yy * small.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        // middle (edge) group
+        int bx_edge = bx + canvas_group_w + spacing * 2;
+        for (int bi = 0; bi < edge_btn_count; ++bi) {
+            int bx_i = bx_edge + bi * (bw + spacing);
+            bool selected = (ctx->selected_tool_edge == bi);
+            Color fill = selected ? Color{90,80,70,255} : Color{60,54,48,255};
+            memset_rect(out_rgba, w, h, pitch, bx_i, by, bw, bh, fill);
+            for (int oy = 0; oy < bh; ++oy) {
+                int y = by + oy; if (y < 0 || y >= h) continue;
+                int left_x = bx_i; int right_x = bx_i + bw - 1;
+                uint8_t* pleft = out_rgba + y * pitch + left_x * 4;
+                uint8_t* pright = out_rgba + y * pitch + right_x * 4;
+                pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
+                pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
+            }
+            const char* edge_labels[4] = {
+                LABEL_EDGE_TOOL_CREATE,
+                LABEL_EDGE_TOOL_DESTROY,
+                LABEL_EDGE_TOOL_ON_CHANGE,
+                LABEL_EDGE_TOOL_CONTINUOUS
+            };
+            auto lbm = render_text_to_rgba(edge_labels[bi], 0.85f, {235,228,218,255});
+            const char* edge_short[4] = {
+                LABEL_EDGE_TOOL_SHORT_CREATE,
+                LABEL_EDGE_TOOL_SHORT_DESTROY,
+                LABEL_EDGE_TOOL_SHORT_ON_CHANGE,
+                LABEL_EDGE_TOOL_SHORT_CONTINUOUS
+            };
+            if (!lbm.pixels.empty()) {
+                int tx = bx_i + (bw - lbm.width) / 2;
+                int ty = by + (bh - lbm.height) / 2;
+                for (int yy = 0; yy < lbm.height; ++yy) {
+                    int dst_y = ty + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < lbm.width; ++xx) {
+                        int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &lbm.pixels[(yy * lbm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+            auto small = render_text_to_rgba(edge_short[bi], 1.05f, {235,228,218,255});
             if (!small.pixels.empty()) {
                 int txs = bx_i + (bw - small.width) / 2;
                 int tys = by + (bh - small.height) / 2;
@@ -3974,6 +4279,69 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             if (left_label && left_label[0] != '\0') draw_label(bx_left, left_label);
             if (right_label && right_label[0] != '\0') draw_label(bx_right, right_label);
         };
+        auto draw_edge_order_group = [&](int left_x, int byy, int value, bool tool_active) {
+            int nbw = bw;
+            int num_w = std::max(28, nbw * 2);
+            int gap = 10;
+            int tool_gap = 10;
+            int bx_down = left_x;
+            int bx_num = bx_down + nbw + gap;
+            int bx_up = bx_num + num_w + gap;
+            int bx_tool = bx_up + nbw + tool_gap;
+            memset_rect(out_rgba, w, h, pitch, bx_down, byy, nbw, bh, Color{50,50,56,255});
+            memset_rect(out_rgba, w, h, pitch, bx_num, byy, num_w, bh, Color{36,36,42,255});
+            memset_rect(out_rgba, w, h, pitch, bx_up, byy, nbw, bh, Color{50,50,56,255});
+            Color tool_fill = tool_active ? Color{90,80,70,255} : Color{60,54,48,255};
+            memset_rect(out_rgba, w, h, pitch, bx_tool, byy, nbw, bh, tool_fill);
+            auto draw_label = [&](int bx, const char* label, float scale, Color col) {
+                auto bm = render_text_to_rgba(label, scale, {col.r, col.g, col.b, col.a});
+                if (!bm.pixels.empty()) {
+                    int tx = bx + (nbw - bm.width) / 2;
+                    int ty = byy + (bh - bm.height) / 2;
+                    for (int yy = 0; yy < bm.height; ++yy) {
+                        int dst_y = ty + yy;
+                        if (dst_y < 0 || dst_y >= h) continue;
+                        for (int xx = 0; xx < bm.width; ++xx) {
+                            int dst_x = tx + xx;
+                            if (dst_x < 0 || dst_x >= w) continue;
+                            uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                            const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                            float sa = src[3] / 255.0f;
+                            if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                            else if (sa > 0.001f) {
+                                for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                                dst[3] = 255;
+                            }
+                        }
+                    }
+                }
+            };
+            draw_label(bx_down, LABEL_IO_MINUS, 1.0f, {230,230,235,255});
+            draw_label(bx_up, LABEL_IO_PLUS, 1.0f, {230,230,235,255});
+            draw_label(bx_tool, LABEL_EDGE_ORDER_TOOL, 0.8f, {235,228,218,255});
+            std::string s = (value >= 0) ? ("+" + std::to_string(value)) : std::to_string(value);
+            auto bm = render_text_to_rgba(s, 0.95f, {255,255,255,255});
+            if (!bm.pixels.empty()) {
+                int tx = bx_num + (num_w - bm.width) / 2;
+                int ty = byy + (bh - bm.height) / 2;
+                for (int yy = 0; yy < bm.height; ++yy) {
+                    int dst_y = ty + yy;
+                    if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < bm.width; ++xx) {
+                        int dst_x = tx + xx;
+                        if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        };
         // compute left of table buttons start for groups placement
         int io_base_x = bx_r; // place IO groups to the left of the table buttons
         int io_by = by;
@@ -3985,7 +4353,11 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         int action_gap = 16;
         int pair_gap = 10;
         int pair_total_w = nbw * 2 + pair_gap;
+        int order_num_w = std::max(28, nbw * 2);
+        int order_total_w = nbw + gap + order_num_w + gap + nbw + gap + nbw;
+        int order_left_x = io_base_x - counter_total_w - action_gap - pair_total_w - action_gap - order_total_w;
         int pair_left_x = io_base_x - counter_total_w - action_gap - pair_total_w;
+        draw_edge_order_group(order_left_x, io_by, ctx->edge_order_value, ctx->edge_order_tool_active != 0);
         draw_io_action_pair(pair_left_x, io_by, LABEL_IO_CONSUMER_SHORT, LABEL_IO_PRODUCER_SHORT);
         draw_io_group(io_base_x, io_by, counter_value, LABEL_IO_COUNT_SHORT);
     }

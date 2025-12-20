@@ -363,6 +363,11 @@ int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned lo
 int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata);
 int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeBatchMetadata* out_metadata);
 int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx);
+int32_t gp_table_edge_index_for_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b, int32_t* out_edge_idx);
+int32_t gp_table_edge_set_delta_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t delta_mode);
+int32_t gp_table_edge_set_order_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t order_mode);
+int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx);
+int32_t gp_table_remove_edge_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b);
 
 // Queued UI operations: enqueue structural edits from UI threads to be applied
 // by the manager thread. These mirror immediate APIs but defer application.
