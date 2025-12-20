@@ -1355,6 +1355,7 @@ struct StagePortBinding {
 
 struct EdgeTensorFifo {
     static constexpr size_t kMaxReaders = 64;
+    static constexpr int32_t kMaxOrder = 4;
 
     struct ReaderEntry {
         std::atomic<uint64_t> key{0};
@@ -1388,6 +1389,15 @@ struct EdgeTensorFifo {
 
     std::vector<int32_t> shape;
     std::unique_ptr<Impl> impl;
+    std::vector<float> last_sample;
+    bool last_sample_valid = false;
+    bool delta_mode = false;
+    std::vector<float> order_history;
+    std::vector<float> order_integrator;
+    std::vector<float> scratch;
+    int32_t order_mode = 0;
+    int32_t order_history_count = 0;
+    int32_t order_history_cursor = 0;
 
     EdgeTensorFifo() : impl(new Impl()) {}
     EdgeTensorFifo(EdgeTensorFifo&&) noexcept = default;
@@ -1408,6 +1418,15 @@ struct EdgeTensorFifo {
         impl->stride = std::max<size_t>(1, stride_local);
         impl->slots = std::max<size_t>(1, slot_count);
         impl->top_k = topk;
+
+        last_sample.assign(impl->stride, 0.0f);
+        last_sample_valid = false;
+        order_history.assign(static_cast<size_t>(kMaxOrder) * impl->stride, 0.0f);
+        order_integrator.assign(static_cast<size_t>(kMaxOrder) * impl->stride, 0.0f);
+        scratch.assign(impl->stride, 0.0f);
+        order_mode = 0;
+        order_history_count = 0;
+        order_history_cursor = 0;
 
         impl->storage.reset(new float[impl->stride * impl->slots]);
         impl->slot_seq.reset(new std::atomic<uint64_t>[impl->slots]);
@@ -1431,6 +1450,16 @@ struct EdgeTensorFifo {
     }
 
     size_t elem_count() const { return impl ? impl->stride : 0; }
+
+    void set_delta_mode(bool enabled) { delta_mode = enabled; }
+    void set_order_mode(int32_t mode) {
+        order_mode = std::clamp(mode, -kMaxOrder, kMaxOrder);
+        order_history_count = 0;
+        order_history_cursor = 0;
+        std::fill(order_history.begin(), order_history.end(), 0.0f);
+        std::fill(order_integrator.begin(), order_integrator.end(), 0.0f);
+        last_sample_valid = false;
+    }
 
     void maybe_claim_writer(uint64_t key) {
         if (!impl) return;
@@ -1645,6 +1674,50 @@ struct EdgeTensorFifo {
         bound = impl->writer.load(std::memory_order_relaxed);
         if (bound != 0 && bound != writer_id) return false;
 
+        const float* effective_sample = sample;
+        if (order_mode != 0 && scratch.size() == impl->stride) {
+            int32_t mode = std::clamp(order_mode, -kMaxOrder, kMaxOrder);
+            if (mode > 0) {
+                for (size_t i = 0; i < impl->stride; ++i) {
+                    float acc = sample[i];
+                    order_integrator[i] += acc;
+                    for (int32_t level = 1; level < mode; ++level) {
+                        size_t idx = static_cast<size_t>(level) * impl->stride + i;
+                        size_t prev = static_cast<size_t>(level - 1) * impl->stride + i;
+                        order_integrator[idx] += order_integrator[prev];
+                    }
+                    scratch[i] = order_integrator[static_cast<size_t>(mode - 1) * impl->stride + i];
+                }
+            } else {
+                int32_t order = -mode;
+                if (order_history_count >= order) {
+                    for (size_t i = 0; i < impl->stride; ++i) {
+                        float sum = sample[i];
+                        int32_t coef = 1;
+                        for (int32_t k = 1; k <= order; ++k) {
+                            coef = (coef * (order - (k - 1))) / k;
+                            int32_t idx = order_history_cursor - k;
+                            if (idx < 0) idx += kMaxOrder;
+                            float prev = order_history[static_cast<size_t>(idx) * impl->stride + i];
+                            float sign = (k % 2 == 0) ? 1.0f : -1.0f;
+                            sum += sign * static_cast<float>(coef) * prev;
+                        }
+                        scratch[i] = sum;
+                    }
+                } else {
+                    std::memcpy(scratch.data(), sample, impl->stride * sizeof(float));
+                }
+            }
+            effective_sample = scratch.data();
+        }
+
+        if (delta_mode && last_sample_valid && last_sample.size() == impl->stride) {
+            if (std::memcmp(last_sample.data(), effective_sample, impl->stride * sizeof(float)) == 0) {
+                if (out_dropped) *out_dropped = 0;
+                return true;
+            }
+        }
+
         uint64_t seq = impl->write_seq.load(std::memory_order_relaxed);
         bool dropped = false;
         if (!ensure_space_for_write(seq, &dropped, edge_id)) {
@@ -1654,10 +1727,20 @@ struct EdgeTensorFifo {
 
         size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
         float* dst = impl->storage.get() + slot * impl->stride;
-        std::memcpy(dst, sample, impl->stride * sizeof(float));
+        std::memcpy(dst, effective_sample, impl->stride * sizeof(float));
         impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
         impl->write_seq.store(seq + 1, std::memory_order_release);
         note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
+        if (!order_history.empty()) {
+            size_t base = static_cast<size_t>(order_history_cursor) * impl->stride;
+            std::memcpy(order_history.data() + base, sample, impl->stride * sizeof(float));
+            order_history_cursor = (order_history_cursor + 1) % kMaxOrder;
+            order_history_count = std::min(order_history_count + 1, kMaxOrder);
+        }
+        if (last_sample.size() == impl->stride) {
+            std::memcpy(last_sample.data(), effective_sample, impl->stride * sizeof(float));
+            last_sample_valid = true;
+        }
         impl->cv.notify_all();
         if (out_dropped) *out_dropped = dropped ? 1 : 0;
         return true;
@@ -3833,6 +3916,76 @@ int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led
         if (e.first == led_key || e.second == led_key) {
             *out_edge_idx = static_cast<int32_t>(i);
             return 1;
+        }
+    }
+    return 0;
+}
+
+int32_t gp_table_edge_index_for_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b, int32_t* out_edge_idx) {
+    if (!ctx || !out_edge_idx) return 0;
+    ensure_edge_fifos(ctx);
+    for (size_t i = 0; i < ctx->edges.size(); ++i) {
+        const auto& e = ctx->edges[i];
+        if (e.first == a && e.second == b) {
+            *out_edge_idx = static_cast<int32_t>(i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int32_t gp_table_edge_set_delta_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t delta_mode) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].set_delta_mode(delta_mode != 0);
+    return 1;
+}
+
+int32_t gp_table_edge_set_order_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t order_mode) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].set_order_mode(order_mode);
+    return 1;
+}
+
+int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edges.size())) return 0;
+    ThreadManager* tm = ThreadManager::global();
+    if (tm && edge_idx < static_cast<int32_t>(ctx->edge_subscriber_slots.size())) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        for (const auto &kv : m) {
+            int slot = kv.second;
+            if (slot > 0) tm->unregister_reader_slot(slot);
+        }
+        m.clear();
+    }
+    auto erase_at = [&](auto &vec) {
+        if (edge_idx >= 0 && edge_idx < static_cast<int32_t>(vec.size())) {
+            vec.erase(vec.begin() + edge_idx);
+        }
+    };
+    erase_at(ctx->edges);
+    erase_at(ctx->edge_fifos);
+    erase_at(ctx->edge_batch_metadata);
+    erase_at(ctx->edge_uids);
+    erase_at(ctx->edge_subscriber_slots);
+    erase_at(ctx->relax_value);
+    erase_at(ctx->relax_vel);
+    erase_at(ctx->rope_sim_idx);
+    return 1;
+}
+
+int32_t gp_table_remove_edge_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    for (size_t i = 0; i < ctx->edges.size(); ++i) {
+        const auto &e = ctx->edges[i];
+        if ((e.first == a && e.second == b) || (e.first == b && e.second == a)) {
+            return gp_table_remove_edge(ctx, static_cast<int32_t>(i));
         }
     }
     return 0;
