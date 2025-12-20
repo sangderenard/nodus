@@ -34,6 +34,11 @@
 #define LABEL_IO_OUT_SHORT "out"
 #define LABEL_IO_MINUS "-"
 #define LABEL_IO_PLUS "+"
+#define LABEL_IO_COUNT_SHORT "n"
+#define LABEL_IO_CONSUMER "CONSUMER"
+#define LABEL_IO_PRODUCER "PRODUCER"
+#define LABEL_IO_CONSUMER_SHORT "C"
+#define LABEL_IO_PRODUCER_SHORT "P"
 
 // Menu labels
 #define LABEL_MENU_TITLE "Tool Menu"

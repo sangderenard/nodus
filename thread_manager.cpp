@@ -324,6 +324,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             } else {
                 int row_count = gp_table_get_row_count(mod.table);
                 io_rows.resize(row_count);
+                int output_offset = std::max(0, mod.in_count);
                 for (int i = 0; i < row_count; ++i) {
                     ModuleRowKind kind = ModuleRowKind::Tool;
                     if (i < mod.in_count) {
@@ -331,8 +332,10 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     } else if (i >= row_count - mod.out_count) {
                         kind = ModuleRowKind::Output;
                     }
-                    int contact_idx = (kind == ModuleRowKind::Output) ? (i - (row_count - mod.out_count)) : i;
-                    io_rows[i] = ModuleIORow{kind, contact_idx, ModuleToolKind::None};
+                    int contact_idx = (kind == ModuleRowKind::Output)
+                        ? (output_offset + (i - (row_count - mod.out_count)))
+                        : i;
+                    io_rows[i] = ModuleIORow{kind, contact_idx, ModuleToolKind::None, 1};
                 }
             }
         }
@@ -346,32 +349,36 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             return v;
         };
         for (int row = 0; row < row_count; ++row) {
-            ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None};
+            ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None, 0};
             if (meta.kind == ModuleRowKind::Input) {
                 // Consume from FIFO for this input contact
-                float val = 0.0f;
-                // Find the edge index for this input (mod_idx is the consumer)
-                int edge_idx = -1;
-                uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)meta.contact_idx << 16) | 0u;
-                // Find the edge in req.edges where b_module == mod_idx and b_contact_idx == meta.contact_idx
-                for (const auto& e : req.edges) {
-                    if (e.b_module == mod_idx && e.b_contact_idx == meta.contact_idx) {
-                        edge_idx = e.edge_idx;
-                        break;
-                    }
-                }
-                if (edge_idx >= 0) {
-                    int32_t unread = 0;
-                    gp_table_edge_unread(mod.table, edge_idx, reader_key, &unread);
-                    if (unread > 0) {
-                        float sample[1] = {0.0f};
-                        int32_t written = 0;
-                        if (gp_table_edge_consume(mod.table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
-                            val = sample[0];
+                int attachments = std::max(1, meta.attachment_count);
+                for (int ai = 0; ai < attachments; ++ai) {
+                    float val = 0.0f;
+                    int contact_idx = meta.contact_idx + ai;
+                    // Find the edge index for this input (mod_idx is the consumer)
+                    int edge_idx = -1;
+                    uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
+                    // Find the edge in req.edges where b_module == mod_idx and b_contact_idx == contact_idx
+                    for (const auto& e : req.edges) {
+                        if (e.b_module == mod_idx && e.b_contact_idx == contact_idx) {
+                            edge_idx = e.edge_idx;
+                            break;
                         }
                     }
+                    if (edge_idx >= 0) {
+                        int32_t unread = 0;
+                        gp_table_edge_unread(mod.table, edge_idx, reader_key, &unread);
+                        if (unread > 0) {
+                            float sample[1] = {0.0f};
+                            int32_t written = 0;
+                            if (gp_table_edge_consume(mod.table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
+                                val = sample[0];
+                            }
+                        }
+                    }
+                    stack.push_back(val);
                 }
-                stack.push_back(val);
             }
             // Tool row: pass stack through (no-op for now)
             if (meta.kind == ModuleRowKind::Tool) {
@@ -407,20 +414,24 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             }
             if (meta.kind == ModuleRowKind::Output) {
                 // Output row: publish from stack to FIFO
-                float val = stack.empty() ? 0.0f : stack.back();
-                int edge_idx = -1;
-                uint64_t writer_key = ((uint64_t)mod_idx << 32) | ((uint64_t)meta.contact_idx << 16) | 0u;
-                // Find the edge in req.edges where a_module == mod_idx and a_contact_idx == meta.contact_idx
-                for (const auto& e : req.edges) {
-                    if (e.a_module == mod_idx && e.a_contact_idx == meta.contact_idx) {
-                        edge_idx = e.edge_idx;
-                        break;
+                int attachments = std::max(1, meta.attachment_count);
+                for (int ai = 0; ai < attachments; ++ai) {
+                    float val = pop_value();
+                    int contact_idx = meta.contact_idx + ai;
+                    int edge_idx = -1;
+                    uint64_t writer_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
+                    // Find the edge in req.edges where a_module == mod_idx and a_contact_idx == contact_idx
+                    for (const auto& e : req.edges) {
+                        if (e.a_module == mod_idx && e.a_contact_idx == contact_idx) {
+                            edge_idx = e.edge_idx;
+                            break;
+                        }
                     }
-                }
-                if (edge_idx >= 0) {
-                    int dropped = 0;
-                    float payload[1] = {val};
-                    gp_table_edge_publish(mod.table, edge_idx, writer_key, payload, 1, &dropped);
+                    if (edge_idx >= 0) {
+                        int dropped = 0;
+                        float payload[1] = {val};
+                        gp_table_edge_publish(mod.table, edge_idx, writer_key, payload, 1, &dropped);
+                    }
                 }
             }
         }
