@@ -12,6 +12,7 @@
 extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
 extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
 extern void canvas_clear_module_input_pulses(int module_idx);
+extern void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count);
 
 // Scheduling helpers used inside run_scheduled_tick.
 namespace {
@@ -422,6 +423,10 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         stack.push_back(mx);
                         break;
                     }
+                    case ModuleToolKind::StackDisplay: {
+                        canvas_set_module_stack_snapshot(mod_idx, row, stack.data(), static_cast<int>(stack.size()));
+                        break;
+                    }
                     case ModuleToolKind::Add:
                     case ModuleToolKind::Subtract:
                     case ModuleToolKind::Multiply:
@@ -429,9 +434,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     case ModuleToolKind::Modulo:
                     case ModuleToolKind::None:
                     default: {
-                        size_t before = stack.size();
-                        float b = pop_value();
-                        float a = pop_value();
+                        ToolStackSpec spec = module_tool_stack_spec(meta.tool);
+                        float b = (spec.consumes >= 1) ? pop_value() : 0.0f;
+                        float a = (spec.consumes >= 2) ? pop_value() : 0.0f;
                         switch (meta.tool) {
                             case ModuleToolKind::Add:
                                 stack.push_back(a + b);
@@ -450,12 +455,6 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 break;
                             case ModuleToolKind::None:
                             default:
-                                if (before >= 2) {
-                                    stack.push_back(a);
-                                    stack.push_back(b);
-                                } else if (before == 1) {
-                                    stack.push_back(a);
-                                }
                                 break;
                         }
                         break;

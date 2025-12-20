@@ -683,6 +683,34 @@ static void draw_scrollbar(
     memset_rect(img, w, h, pitch, bar_x, thumb_y + thumb_h - 1, bar_w, 1, Color{0, 0, 0, 96});
 }
 
+static void blit_text_bitmap(uint8_t* img, int w, int h, int pitch, const TextBitmap& bm, int x, int y, int clip_x0, int clip_y0, int clip_x1, int clip_y1) {
+    if (!img || bm.pixels.empty()) return;
+    for (int yy = 0; yy < bm.height; ++yy) {
+        int dst_y = y + yy;
+        if (dst_y < clip_y0 || dst_y >= clip_y1 || dst_y < 0 || dst_y >= h) continue;
+        for (int xx = 0; xx < bm.width; ++xx) {
+            int dst_x = x + xx;
+            if (dst_x < clip_x0 || dst_x >= clip_x1 || dst_x < 0 || dst_x >= w) continue;
+            uint8_t* dst = img + dst_y * pitch + dst_x * 4;
+            const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+            float sa = src[3] / 255.0f;
+            if (sa >= 0.999f) {
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+            } else if (sa > 0.001f) {
+                for (int cch = 0; cch < 3; ++cch) {
+                    float s = src[cch] / 255.0f;
+                    float d = dst[cch] / 255.0f;
+                    float out = s * sa + d * (1.0f - sa);
+                    dst[cch] = static_cast<uint8_t>(std::lround(out * 255.0f));
+                }
+                float da = dst[3] / 255.0f;
+                float outa = sa + da * (1.0f - sa);
+                dst[3] = static_cast<uint8_t>(std::lround(outa * 255.0f));
+            }
+        }
+    }
+}
+
 static void compute_columns(const GP_TableColumn* cols, int col_count, int table_w, int name_w, int* out_x0, int* out_w) {
     int x = name_w;
     for (int i = 0; i < col_count && i < 8; ++i) {
@@ -958,6 +986,7 @@ int32_t gp_table_raster_rgba_with_hits(
             int x0 = col_x0[c];
             int cw = col_w[c];
             if (cw <= 0) continue;
+            int align = cols[c].align;
 
             // Whole-cell hitbox (moved to emit AFTER per-part hitboxes)
             // (previously emitted here which caused coarse hits to shadow per-LED hits)
@@ -1145,7 +1174,28 @@ int32_t gp_table_raster_rgba_with_hits(
                 }
                 case GP_TABLE_CELL_TEXT:
                 default:
-                    // Text is not rendered in this minimal raster; leave blank.
+                    if (cell.text[0] != '\0') {
+                        Color tc = (r.kind == GP_TABLE_ROW_HEADER) ? st.text_hdr : st.text;
+                        float scale = 0.9f;
+                        if (rh <= 16) scale = 0.75f;
+                        if (rh <= 12) scale = 0.65f;
+                        TextBitmap bm = render_text_to_rgba(cell.text, scale, {tc.r, tc.g, tc.b, tc.a});
+                        if (!bm.pixels.empty()) {
+                            const int pad = 4;
+                            int tx = x0 + pad;
+                            if (align == 1) {
+                                tx = x0 + (cw - bm.width) / 2;
+                            } else if (align == 2) {
+                                tx = x0 + cw - bm.width - pad;
+                            }
+                            int ty = y0 + (rh - bm.height) / 2;
+                            int clip_x0 = x0 + 1;
+                            int clip_x1 = x0 + cw - 1;
+                            int clip_y0 = y0 + 1;
+                            int clip_y1 = y0 + rh - 1;
+                            blit_text_bitmap(out_rgba, w, h, w * 4, bm, tx, ty, clip_x0, clip_y0, clip_x1, clip_y1);
+                        }
+                    }
                     break;
             }
             // Emit whole-cell hitbox after all per-part hitboxes so small parts (LEDs)

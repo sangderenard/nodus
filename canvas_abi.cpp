@@ -378,6 +378,8 @@ struct GP_CanvasContextImpl {
     std::vector<MolexLayoutInfo> module_input_layout;
     std::vector<MolexLayoutInfo> module_output_layout;
     std::vector<std::vector<ModuleIORow>> module_io_rows;
+    std::vector<std::vector<ModuleIORow>> module_table_rows;
+    std::vector<std::unordered_map<int, std::vector<float>>> module_stack_snapshots;
     std::vector<std::vector<ModuleToolKind>> module_tool_stack;
     // optional per-module key-recorder state pointer
     std::vector<void*> module_key_recorder_state;
@@ -478,6 +480,20 @@ void canvas_clear_module_input_pulses(int module_idx) {
     state.key_event = 0;
 }
 
+void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count) {
+    if (!g_canvas_context_singleton) return;
+    if (module_idx < 0) return;
+    if (module_idx >= static_cast<int>(g_canvas_context_singleton->module_stack_snapshots.size())) {
+        g_canvas_context_singleton->module_stack_snapshots.resize(module_idx + 1);
+    }
+    auto &snapshots = g_canvas_context_singleton->module_stack_snapshots[module_idx];
+    std::vector<float> data;
+    if (values && count > 0) {
+        data.assign(values, values + count);
+    }
+    snapshots[row_idx] = std::move(data);
+}
+
 static bool module_has_tool(const GP_CanvasContextImpl* ctx, int module_idx, ModuleToolKind tool) {
     if (!ctx) return false;
     if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
@@ -552,8 +568,15 @@ static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
 
 static int resolve_contact_index(const GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& hb) {
     if (!ctx) return table_hit_contact_index(hb);
-    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
-        const auto &rows = ctx->module_io_rows[module_idx];
+    const std::vector<ModuleIORow>* rows_ptr = nullptr;
+    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_table_rows.size()) &&
+        !ctx->module_table_rows[module_idx].empty()) {
+        rows_ptr = &ctx->module_table_rows[module_idx];
+    } else if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+        rows_ptr = &ctx->module_io_rows[module_idx];
+    }
+    if (rows_ptr) {
+        const auto &rows = *rows_ptr;
         if (hb.row_idx >= 0 && hb.row_idx < static_cast<int>(rows.size())) {
             const ModuleIORow &meta = rows[hb.row_idx];
             if (meta.kind == ModuleRowKind::Tool) return -1;
@@ -700,6 +723,7 @@ enum CanvasActionId {
     CANVAS_ACT_MENU_TOOL_MOD = 2105,
     CANVAS_ACT_MENU_TOOL_KEYBOARD = 2106,
     CANVAS_ACT_MENU_TOOL_MOUSE = 2107,
+    CANVAS_ACT_MENU_TOOL_STACK = 2108,
 };
 
 struct InputRayLight {
@@ -939,6 +963,7 @@ static const char* tool_label(ModuleToolKind tool) {
         case ModuleToolKind::Modulo: return LABEL_TOOL_MOD;
         case ModuleToolKind::KeyboardListener: return LABEL_TOOL_KEYBOARD;
         case ModuleToolKind::MouseListener: return LABEL_TOOL_MOUSE;
+        case ModuleToolKind::StackDisplay: return LABEL_TOOL_STACK;
         case ModuleToolKind::None:
         default:
             return "";
@@ -960,6 +985,7 @@ static const ToolMenuItem kToolMenuItems[] = {
     { CANVAS_ACT_MENU_TOOL_MOD, LABEL_TOOL_MOD, ModuleToolKind::Modulo },
     { CANVAS_ACT_MENU_TOOL_KEYBOARD, LABEL_TOOL_KEYBOARD, ModuleToolKind::KeyboardListener },
     { CANVAS_ACT_MENU_TOOL_MOUSE, LABEL_TOOL_MOUSE, ModuleToolKind::MouseListener },
+    { CANVAS_ACT_MENU_TOOL_STACK, LABEL_TOOL_STACK, ModuleToolKind::StackDisplay },
 };
 
 struct ToolMenuLayout {
@@ -1028,6 +1054,7 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MOD, CANVAS_ACT_MENU_TOOL_MOD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_KEYBOARD, CANVAS_ACT_MENU_TOOL_KEYBOARD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MOUSE, CANVAS_ACT_MENU_TOOL_MOUSE },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_STACK, CANVAS_ACT_MENU_TOOL_STACK },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_ARG, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_TABLE, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
@@ -1153,6 +1180,10 @@ static void canvas_install_key_recorder_table(GP_CanvasContextImpl* ctx, int mod
     ctx->focused_module = module_idx;
     if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
     ctx->module_io_rows[module_idx].clear();
+    if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
+    ctx->module_table_rows[module_idx].clear();
+    if (module_idx >= static_cast<int>(ctx->module_stack_snapshots.size())) ctx->module_stack_snapshots.resize(module_idx + 1);
+    ctx->module_stack_snapshots[module_idx].clear();
     // If there's another module available, create a canvas/root edge from this module to the next module
     if (ctx->modules.size() > 1) {
         int target = (module_idx + 1) % static_cast<int>(ctx->modules.size());
@@ -1291,6 +1322,9 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 break;
             case CANVAS_ACT_MENU_TOOL_MOUSE:
                 canvas_push_tool_to_focused(c, ModuleToolKind::MouseListener);
+                break;
+            case CANVAS_ACT_MENU_TOOL_STACK:
+                canvas_push_tool_to_focused(c, ModuleToolKind::StackDisplay);
                 break;
             default:
                 break;
@@ -1476,6 +1510,10 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         ctx->module_io_rows[module_idx].clear();
         ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Input, 0, ModuleToolKind::None, 1});
         ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 1, ModuleToolKind::None, 1});
+        if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
+        ctx->module_table_rows[module_idx].clear();
+        if (module_idx >= static_cast<int>(ctx->module_stack_snapshots.size())) ctx->module_stack_snapshots.resize(module_idx + 1);
+        ctx->module_stack_snapshots[module_idx].clear();
 
         auto bind_port = [&](int row_idx, int led_col_idx, bool is_output, int channel) {
             uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) << 32) |
@@ -1533,18 +1571,23 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     cols[1].kind = GP_TABLE_CELL_LEDS_ARG; cols[1].width_px = 120; cols[1].align = 0;
     gp_table_set_columns(t, cols, 2);
 
-        int total_rows = static_cast<int>(ordered_rows.size());
-        if (total_rows <= 0) {
-            GP_TableRow prow{}; memset(&prow, 0, sizeof(prow));
-            prow.kind = GP_TABLE_ROW_HEADER; prow.depth = 0; prow.expanded = 1; prow.selected = 0;
-            prow.cell_count = 2;
-            prow.cells[0].kind = GP_TABLE_CELL_TEXT;
-            prow.cells[1].kind = GP_TABLE_CELL_TEXT;
-            gp_table_set_rows(t, &prow, 1);
-            if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
-            ctx->module_io_rows[module_idx].clear();
-            return;
-        }
+    GP_TableStyle st{};
+    gp_table_get_style(t, &st);
+    int base_row_h = st.row_h_px > 0 ? st.row_h_px : 20;
+    int stack_value_row_h = std::max(12, base_row_h - 6);
+
+    int total_rows = static_cast<int>(ordered_rows.size());
+    if (total_rows <= 0) {
+        GP_TableRow prow{}; memset(&prow, 0, sizeof(prow));
+        prow.kind = GP_TABLE_ROW_HEADER; prow.depth = 0; prow.expanded = 1; prow.selected = 0;
+        prow.cell_count = 2;
+        prow.cells[0].kind = GP_TABLE_CELL_TEXT;
+        prow.cells[1].kind = GP_TABLE_CELL_TEXT;
+        gp_table_set_rows(t, &prow, 1);
+        if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
+        ctx->module_table_rows[module_idx].clear();
+        return;
+    }
 
     auto fill_text_cell = [](GP_TableCell &cell, const char* text) {
         cell.kind = GP_TABLE_CELL_TEXT;
@@ -1583,9 +1626,48 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         row_meta.push_back({kind, contact_idx, tool_kind, attachment_count});
     };
 
+    auto append_stack_display_rows = [&](int logical_row_idx) {
+        GP_TableRow header{};
+        memset(&header, 0, sizeof(header));
+        header.kind = GP_TABLE_ROW_HEADER;
+        header.depth = 0;
+        header.expanded = 1;
+        header.selected = 0;
+        header.cell_count = 1;
+        fill_text_cell(header.cells[0], LABEL_TOOL_STACK);
+        rows.push_back(header);
+        row_meta.push_back({ModuleRowKind::Tool, -1, ModuleToolKind::StackDisplay, 0});
+
+        const std::vector<float>* snapshot = nullptr;
+        if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_stack_snapshots.size())) {
+            auto &snapshots = ctx->module_stack_snapshots[module_idx];
+            auto it = snapshots.find(logical_row_idx);
+            if (it != snapshots.end()) snapshot = &it->second;
+        }
+        if (!snapshot || snapshot->empty()) return;
+
+        int display_idx = 0;
+        for (auto it = snapshot->rbegin(); it != snapshot->rend(); ++it, ++display_idx) {
+            GP_TableRow vr{};
+            memset(&vr, 0, sizeof(vr));
+            vr.kind = GP_TABLE_ROW_NOTE;
+            vr.depth = 0;
+            vr.expanded = 1;
+            vr.selected = 0;
+            vr.cell_count = 1;
+            vr.reserved0 = stack_value_row_h;
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%d: %.6g", display_idx, *it);
+            fill_text_cell(vr.cells[0], buf);
+            rows.push_back(vr);
+            row_meta.push_back({ModuleRowKind::Tool, -1, ModuleToolKind::StackDisplay, 0});
+        }
+    };
+
     int input_contact = 0;
     int output_contact = 0;
-    for (const auto &row : ordered_rows) {
+    for (size_t row_idx = 0; row_idx < ordered_rows.size(); ++row_idx) {
+        const auto &row = ordered_rows[row_idx];
         if (row.kind == ModuleRowKind::Input) {
             int attachments = std::clamp(row.attachment_count, 1, 32);
             append_row(LABEL_IO_INPUT, ModuleRowKind::Input, input_contact, attachments, ModuleToolKind::None);
@@ -1595,13 +1677,17 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, in_count + output_contact, attachments, ModuleToolKind::None);
             output_contact += attachments;
         } else {
-            append_row(tool_label(row.tool), ModuleRowKind::Tool, -1, 0, row.tool);
+            if (row.tool == ModuleToolKind::StackDisplay) {
+                append_stack_display_rows(static_cast<int>(row_idx));
+            } else {
+                append_row(tool_label(row.tool), ModuleRowKind::Tool, -1, 0, row.tool);
+            }
         }
     }
 
     gp_table_set_rows(t, rows.data(), static_cast<int>(rows.size()));
-    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
-    ctx->module_io_rows[module_idx] = row_meta;
+    if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
+    ctx->module_table_rows[module_idx] = row_meta;
         // Annotate LED keys for created rows with explicit input/output hints
         // so the table renderer's glow pass can recognize IO roles.
         for (int ri = 0; ri < static_cast<int>(rows.size()); ++ri) {
@@ -1697,8 +1783,15 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
     // Determine producer/consumer using row metadata when available.
     bool is_producer = false;
     bool resolved_role = false;
-    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
-        const auto &rows = ctx->module_io_rows[module_idx];
+    const std::vector<ModuleIORow>* rows_ptr = nullptr;
+    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_table_rows.size()) &&
+        !ctx->module_table_rows[module_idx].empty()) {
+        rows_ptr = &ctx->module_table_rows[module_idx];
+    } else if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+        rows_ptr = &ctx->module_io_rows[module_idx];
+    }
+    if (rows_ptr) {
+        const auto &rows = *rows_ptr;
         if (found.row_idx >= 0 && found.row_idx < static_cast<int>(rows.size())) {
             const auto &meta = rows[found.row_idx];
             if (meta.kind == ModuleRowKind::Input || meta.kind == ModuleRowKind::Output) {
@@ -1837,6 +1930,8 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_input_layout.emplace_back();
     c->module_output_layout.emplace_back();
     c->module_io_rows.emplace_back();
+    c->module_table_rows.emplace_back();
+    c->module_stack_snapshots.emplace_back();
     c->module_tool_stack.emplace_back();
     c->module_key_recorder_state.push_back(nullptr);
     c->module_input_state.emplace_back();
@@ -3514,6 +3609,8 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     c->module_input_layout.clear();
     c->module_output_layout.clear();
     c->module_io_rows.clear();
+    c->module_table_rows.clear();
+    c->module_stack_snapshots.clear();
     c->module_input_state.clear();
     c->edges.clear();
     c->nodes.clear();
@@ -3572,6 +3669,8 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             c->module_input_layout.emplace_back();
             c->module_output_layout.emplace_back();
             c->module_io_rows.emplace_back();
+            c->module_table_rows.emplace_back();
+            c->module_stack_snapshots.emplace_back();
             c->module_input_state.emplace_back();
             // assign node id for this module
             int nid = c->next_node_id++;

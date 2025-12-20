@@ -53,6 +53,7 @@
 #define LABEL_TOOL_MOD "Modulo"
 #define LABEL_TOOL_KEYBOARD "Keyboard"
 #define LABEL_TOOL_MOUSE "Mouse"
+#define LABEL_TOOL_STACK "Stack"
 
 // Module labels
 #define LABEL_MODULE_TABLE "Table"
