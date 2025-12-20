@@ -32,6 +32,7 @@ struct ModuleIORow {
     ModuleRowKind kind = ModuleRowKind::Tool;
     int contact_idx = 0;
     ModuleToolKind tool = ModuleToolKind::None;
+    int attachment_count = 1;
 };
 
 class ThreadManager {

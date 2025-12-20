@@ -373,6 +373,8 @@ struct GP_CanvasContextImpl {
     // per-module IO counts (inputs, outputs) exposed in the control bar
     std::vector<int> module_io_in_count;
     std::vector<int> module_io_out_count;
+    std::vector<std::vector<int>> module_io_input_rows;
+    std::vector<std::vector<int>> module_io_output_rows;
     std::vector<MolexLayoutInfo> module_input_layout;
     std::vector<MolexLayoutInfo> module_output_layout;
     std::vector<std::vector<ModuleIORow>> module_io_rows;
@@ -411,6 +413,7 @@ struct GP_CanvasContextImpl {
     // table tool group: 0 = neutral, 1 = select, 2 = menu
     int selected_tool_table = 0;
     bool tool_menu_open = false;
+    int io_attachment_count = 1;
     // which module (if any) has keyboard/focus for table editing
     int focused_module = -1;
     // registered host windows (opaque pointers)
@@ -468,6 +471,34 @@ static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
     return hb.aux0;
 }
 
+static int resolve_contact_index(const GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& hb) {
+    if (!ctx) return table_hit_contact_index(hb);
+    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+        const auto &rows = ctx->module_io_rows[module_idx];
+        if (hb.row_idx >= 0 && hb.row_idx < static_cast<int>(rows.size())) {
+            const ModuleIORow &meta = rows[hb.row_idx];
+            if (meta.kind == ModuleRowKind::Tool) return -1;
+            int attachment_count = std::max(1, meta.attachment_count);
+            int led_idx = 0;
+            if (hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG) {
+                led_idx = std::clamp(hb.aux0, 0, attachment_count - 1);
+            } else if (hb.part == GP_TABLE_HIT_LED_TABLE) {
+                led_idx = std::clamp(hb.aux1, 0, attachment_count - 1);
+            }
+            return meta.contact_idx + led_idx;
+        }
+    }
+    return table_hit_contact_index(hb);
+}
+
+static int resolve_side_contact_index(const GP_CanvasContextImpl* ctx, int module_idx, bool is_input, int contact_idx) {
+    if (is_input) return contact_idx;
+    if (!ctx) return contact_idx;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_io_in_count.size())) return contact_idx;
+    int offset = std::max(0, ctx->module_io_in_count[module_idx]);
+    return contact_idx - offset;
+}
+
 struct CanvasBounds {
     int min_x = 0;
     int max_x = 0;
@@ -503,8 +534,9 @@ static uint32_t lookup_molex_hash(const GP_CanvasContextImpl* ctx, int module_id
     const auto &layout = is_input ? ctx->module_input_layout : ctx->module_output_layout;
     if (module_idx < 0 || module_idx >= static_cast<int>(layout.size())) return 0;
     const MolexLayoutInfo &info = layout[module_idx];
-    if (contact_idx >= static_cast<int>(info.hashes.size())) return 0;
-    return info.hashes[contact_idx];
+    int side_idx = resolve_side_contact_index(ctx, module_idx, is_input, contact_idx);
+    if (side_idx < 0 || side_idx >= static_cast<int>(info.hashes.size())) return 0;
+    return info.hashes[side_idx];
 }
 
 static void clamp_offset_to_bounds(GP_CanvasContextImpl* ctx, const CanvasBounds& b) {
@@ -576,10 +608,10 @@ enum CanvasActionId {
     CANVAS_ACT_TOOL_TABLE_0 = 2020,
     CANVAS_ACT_TOOL_TABLE_1 = 2021,
     CANVAS_ACT_TOOL_TABLE_2 = 2022,
-    CANVAS_ACT_IO_IN_DEC = 2030,
-    CANVAS_ACT_IO_IN_INC = 2031,
-    CANVAS_ACT_IO_OUT_DEC = 2032,
-    CANVAS_ACT_IO_OUT_INC = 2033,
+    CANVAS_ACT_IO_COUNT_DEC = 2030,
+    CANVAS_ACT_IO_COUNT_INC = 2031,
+    CANVAS_ACT_IO_CONSUMER_ADD = 2032,
+    CANVAS_ACT_IO_PRODUCER_ADD = 2033,
     CANVAS_ACT_MODULE_LED = 2040,
     CANVAS_ACT_MENU_KEY_RECORDER = 2100,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
@@ -899,10 +931,10 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_TABLE_0, CANVAS_ACT_TOOL_TABLE_0 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_TABLE_1, CANVAS_ACT_TOOL_TABLE_1 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_TABLE_2, CANVAS_ACT_TOOL_TABLE_2 },
-    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_IN_DEC, CANVAS_ACT_IO_IN_DEC },
-    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_IN_INC, CANVAS_ACT_IO_IN_INC },
-    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_OUT_DEC, CANVAS_ACT_IO_OUT_DEC },
-    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_OUT_INC, CANVAS_ACT_IO_OUT_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_COUNT_DEC, CANVAS_ACT_IO_COUNT_DEC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_COUNT_INC, CANVAS_ACT_IO_COUNT_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_CONSUMER_ADD, CANVAS_ACT_IO_CONSUMER_ADD },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_PRODUCER_ADD, CANVAS_ACT_IO_PRODUCER_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_KEY_RECORDER, CANVAS_ACT_MENU_KEY_RECORDER },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
@@ -919,6 +951,7 @@ static void canvas_setup_stage_table(GP_TableContext* t, int w_px);
 static void canvas_setup_stage_defaults(GP_StageContext* st, int w_px, int h_px);
 static void stage_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
 static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx);
+static void canvas_append_io_row(GP_CanvasContextImpl* ctx, int module_idx, bool is_input, int attachment_count);
 static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_idx);
 static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKind tool);
 
@@ -1118,33 +1151,23 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 printf("gp_canvas_on_click: table tool %d toggled -> selected_tool_table=%d\n", tool, c->selected_tool_table);
                 break;
             }
-            case CANVAS_ACT_IO_IN_DEC:
-            case CANVAS_ACT_IO_IN_INC: {
-                int focused = c->focused_module;
-                if (focused >= 0 && focused < static_cast<int>(c->module_io_in_count.size())) {
-                    int in_count = c->module_io_in_count[focused];
-                    int delta = (action_id == CANVAS_ACT_IO_IN_INC) ? 1 : -1;
-                    c->module_io_in_count[focused] = std::clamp(in_count + delta, 0, 64);
-                    if (action_id == CANVAS_ACT_IO_IN_INC) {
-                        printf("gp_canvas_on_click: inc inputs for module %d -> %d\n", focused, c->module_io_in_count[focused]);
-                    } else {
-                        printf("gp_canvas_on_click: dec inputs for module %d -> %d\n", focused, c->module_io_in_count[focused]);
-                    }
-                }
+            case CANVAS_ACT_IO_COUNT_DEC:
+            case CANVAS_ACT_IO_COUNT_INC: {
+                int delta = (action_id == CANVAS_ACT_IO_COUNT_INC) ? 1 : -1;
+                c->io_attachment_count = std::clamp(c->io_attachment_count + delta, 1, 32);
+                printf("gp_canvas_on_click: io_attachment_count -> %d\n", c->io_attachment_count);
                 break;
             }
-            case CANVAS_ACT_IO_OUT_DEC:
-            case CANVAS_ACT_IO_OUT_INC: {
+            case CANVAS_ACT_IO_CONSUMER_ADD:
+            case CANVAS_ACT_IO_PRODUCER_ADD: {
                 int focused = c->focused_module;
-                if (focused >= 0 && focused < static_cast<int>(c->module_io_out_count.size())) {
-                    int out_count = c->module_io_out_count[focused];
-                    int delta = (action_id == CANVAS_ACT_IO_OUT_INC) ? 1 : -1;
-                    c->module_io_out_count[focused] = std::clamp(out_count + delta, 0, 64);
-                    if (action_id == CANVAS_ACT_IO_OUT_INC) {
-                        printf("gp_canvas_on_click: inc outputs for module %d -> %d\n", focused, c->module_io_out_count[focused]);
-                    } else {
-                        printf("gp_canvas_on_click: dec outputs for module %d -> %d\n", focused, c->module_io_out_count[focused]);
-                    }
+                if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
+                    bool is_input = (action_id == CANVAS_ACT_IO_CONSUMER_ADD);
+                    canvas_append_io_row(c, focused, is_input, c->io_attachment_count);
+                    printf("gp_canvas_on_click: module=%d add %s row (attachments=%d)\n",
+                        focused,
+                        is_input ? "consumer" : "producer",
+                        c->io_attachment_count);
                 }
                 break;
             }
@@ -1248,6 +1271,22 @@ static void get_table_io_counts(GP_TableContext* t, int &out_in_count, int &out_
     if (nout > 0) out_out_count = nout;
 }
 
+static void canvas_append_io_row(GP_CanvasContextImpl* ctx, int module_idx, bool is_input, int attachment_count) {
+    if (!ctx) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
+    if (module_idx < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[module_idx]) return;
+    if (module_idx >= static_cast<int>(ctx->module_io_input_rows.size())) ctx->module_io_input_rows.resize(module_idx + 1);
+    if (module_idx >= static_cast<int>(ctx->module_io_output_rows.size())) ctx->module_io_output_rows.resize(module_idx + 1);
+    int count = std::clamp(attachment_count, 1, 32);
+    if (is_input) {
+        ctx->module_io_input_rows[module_idx].push_back(count);
+    } else {
+        ctx->module_io_output_rows[module_idx].push_back(count);
+    }
+    sync_module_table_io_layout(ctx, module_idx);
+    update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
+}
+
 // Ensure the attached table reflects the canvas' requested IO counts for the module.
 // Creates columns/rows and LED cells (GP_TABLE_CELL_LEDS_ARG) to display counts.
 static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_idx) {
@@ -1335,8 +1374,8 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         // update metadata so control surfaces know there are two contacts
         if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
         ctx->module_io_rows[module_idx].clear();
-        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Input, 0, ModuleToolKind::None});
-        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 1, ModuleToolKind::None});
+        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Input, 0, ModuleToolKind::None, 1});
+        ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Output, 1, ModuleToolKind::None, 1});
 
         auto bind_port = [&](int row_idx, int led_col_idx, bool is_output, int channel) {
             uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) << 32) |
@@ -1354,39 +1393,24 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     if (!t) return;
     // only touch the currently focused module to avoid clobbering other tables
     if (ctx->focused_module != module_idx) return;
+    if (module_idx >= static_cast<int>(ctx->module_io_input_rows.size())) ctx->module_io_input_rows.resize(module_idx + 1);
+    if (module_idx >= static_cast<int>(ctx->module_io_output_rows.size())) ctx->module_io_output_rows.resize(module_idx + 1);
+    int legacy_in_count = (module_idx < static_cast<int>(ctx->module_io_in_count.size())) ? ctx->module_io_in_count[module_idx] : 0;
+    int legacy_out_count = (module_idx < static_cast<int>(ctx->module_io_out_count.size())) ? ctx->module_io_out_count[module_idx] : 0;
+    auto &input_rows = ctx->module_io_input_rows[module_idx];
+    auto &output_rows = ctx->module_io_output_rows[module_idx];
+    if (input_rows.empty() && legacy_in_count > 0) input_rows.assign(static_cast<size_t>(legacy_in_count), 1);
+    if (output_rows.empty() && legacy_out_count > 0) output_rows.assign(static_cast<size_t>(legacy_out_count), 1);
     int in_count = 0;
-    if (module_idx < static_cast<int>(ctx->module_io_in_count.size())) in_count = ctx->module_io_in_count[module_idx];
+    for (int count : input_rows) in_count += std::max(0, count);
     int out_count = 0;
-    if (module_idx < static_cast<int>(ctx->module_io_out_count.size())) out_count = ctx->module_io_out_count[module_idx];
+    for (int count : output_rows) out_count += std::max(0, count);
+    if (module_idx >= static_cast<int>(ctx->module_io_in_count.size())) ctx->module_io_in_count.resize(module_idx + 1, 0);
+    if (module_idx >= static_cast<int>(ctx->module_io_out_count.size())) ctx->module_io_out_count.resize(module_idx + 1, 0);
+    ctx->module_io_in_count[module_idx] = in_count;
+    ctx->module_io_out_count[module_idx] = out_count;
 
-    {
-        const GP_CanvasModuleDesc& m = ctx->modules[module_idx];
-        int tw = std::max(1, m.w);
-        int th = std::max(1, m.h);
-        std::vector<uint8_t> tmp(static_cast<size_t>(tw) * th * 4);
-        GP_TableGeom geom{};
-        gp_table_get_geom(t, &geom);
-        geom.width_px = tw;
-        geom.height_px = th;
-        const int hitcap = 4096;
-        std::vector<GP_TableHitBox> hits(hitcap);
-        int hits_written = 0;
-        int ok = gp_table_render_rgba_with_state(t, nullptr, tmp.data(), static_cast<int32_t>(tmp.size()), &geom, hits.data(), hitcap, &hits_written);
-        if (ok && hits_written > 0) {
-            int max_left_idx = -1;
-            int max_right_idx = -1;
-            for (int hi = 0; hi < hits_written; ++hi) {
-                const auto& hb = hits[hi];
-                if (hb.part != GP_TABLE_HIT_LED && hb.part != GP_TABLE_HIT_LED_ARG && hb.part != GP_TABLE_HIT_LED_TABLE) continue;
-                int contact_idx = table_hit_contact_index(hb);
-                if (hb.col_idx == 0) max_left_idx = std::max(max_left_idx, contact_idx);
-                else max_right_idx = std::max(max_right_idx, contact_idx);
-            }
-            bool left_ok = (in_count <= 0) || (max_left_idx >= in_count - 1);
-            bool right_ok = (out_count <= 0) || (max_right_idx >= out_count - 1);
-            if (left_ok && right_ok) return;
-        }
-    }
+    // always rebuild the table layout to reflect ordered IO rows
 
     // If there's no attached table but the UI has non-zero IO counts, create
     // a canvas-owned table so the user sees the LED cells immediately.
@@ -1398,27 +1422,23 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     }
     if (!t) return;
 
-    // Create columns: label, LED grid, minus button, plus button.
-    GP_TableColumn cols[4];
+    // Create columns: label, LED grid.
+    GP_TableColumn cols[2];
     cols[0].kind = GP_TABLE_CELL_TEXT; cols[0].width_px = 80; cols[0].align = 0;
     cols[1].kind = GP_TABLE_CELL_LEDS_ARG; cols[1].width_px = 120; cols[1].align = 0;
-    cols[2].kind = GP_TABLE_CELL_TEXT; cols[2].width_px = 28; cols[2].align = 1;
-    cols[3].kind = GP_TABLE_CELL_TEXT; cols[3].width_px = 28; cols[3].align = 1;
-    gp_table_set_columns(t, cols, 4);
+    gp_table_set_columns(t, cols, 2);
 
         int tool_count = 0;
         if (module_idx < static_cast<int>(ctx->module_tool_stack.size())) {
             tool_count = static_cast<int>(ctx->module_tool_stack[module_idx].size());
         }
-        int total_rows = in_count + out_count + tool_count;
+        int total_rows = static_cast<int>(input_rows.size() + output_rows.size()) + tool_count;
         if (total_rows <= 0) {
             GP_TableRow prow{}; memset(&prow, 0, sizeof(prow));
             prow.kind = GP_TABLE_ROW_HEADER; prow.depth = 0; prow.expanded = 1; prow.selected = 0;
-            prow.cell_count = 4;
+            prow.cell_count = 2;
             prow.cells[0].kind = GP_TABLE_CELL_TEXT;
             prow.cells[1].kind = GP_TABLE_CELL_TEXT;
-            prow.cells[2].kind = GP_TABLE_CELL_TEXT;
-            prow.cells[3].kind = GP_TABLE_CELL_TEXT;
             gp_table_set_rows(t, &prow, 1);
             if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
             ctx->module_io_rows[module_idx].clear();
@@ -1432,11 +1452,13 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         cell.text[len] = '\0';
     };
 
-    auto fill_led_cell = [](GP_TableCell &cell) {
+    auto fill_led_cell = [](GP_TableCell &cell, int count) {
         cell.kind = GP_TABLE_CELL_LEDS_ARG;
-        cell.value = 1.0f;
-        cell.flags = 1u;
-        cell.reserved0 = static_cast<int32_t>(1u);
+        int clamped = std::clamp(count, 1, 32);
+        cell.value = static_cast<float>(clamped);
+        uint32_t mask = (clamped >= 32) ? 0xFFFFFFFFu : ((1u << clamped) - 1u);
+        cell.flags = mask;
+        cell.reserved0 = static_cast<int32_t>(mask);
     };
 
     std::vector<GP_TableRow> rows;
@@ -1444,31 +1466,35 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     std::vector<ModuleIORow> row_meta;
     row_meta.reserve(static_cast<size_t>(total_rows));
 
-    auto append_row = [&](const char* label, ModuleRowKind kind, int contact_idx, ModuleToolKind tool_kind) {
+    auto append_row = [&](const char* label, ModuleRowKind kind, int contact_idx, int attachment_count, ModuleToolKind tool_kind) {
         GP_TableRow r{};
         memset(&r, 0, sizeof(r));
         r.kind = GP_TABLE_ROW_DEVICE;
         r.depth = 0;
         r.expanded = 1;
         r.selected = 0;
-        r.cell_count = 4;
+        r.cell_count = 2;
         fill_text_cell(r.cells[0], label);
-        fill_led_cell(r.cells[1]);
-        fill_text_cell(r.cells[2], LABEL_IO_MINUS);
-        fill_text_cell(r.cells[3], LABEL_IO_PLUS);
+        fill_led_cell(r.cells[1], attachment_count);
         rows.push_back(r);
-        row_meta.push_back({kind, contact_idx, tool_kind});
+        row_meta.push_back({kind, contact_idx, tool_kind, attachment_count});
     };
 
-    for (int i = 0; i < in_count; ++i) {
-        append_row(LABEL_IO_INPUT, ModuleRowKind::Input, i, ModuleToolKind::None);
+    int input_contact = 0;
+    for (int count : input_rows) {
+        int attachments = std::clamp(count, 1, 32);
+        append_row(LABEL_IO_INPUT, ModuleRowKind::Input, input_contact, attachments, ModuleToolKind::None);
+        input_contact += attachments;
     }
     if (module_idx >= static_cast<int>(ctx->module_tool_stack.size())) ctx->module_tool_stack.resize(module_idx + 1);
     for (ModuleToolKind tool : ctx->module_tool_stack[module_idx]) {
-        append_row(tool_label(tool), ModuleRowKind::Tool, -1, tool);
+        append_row(tool_label(tool), ModuleRowKind::Tool, -1, 0, tool);
     }
-    for (int o = 0; o < out_count; ++o) {
-        append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, o, ModuleToolKind::None);
+    int output_contact = 0;
+    for (int count : output_rows) {
+        int attachments = std::clamp(count, 1, 32);
+        append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, in_count + output_contact, attachments, ModuleToolKind::None);
+        output_contact += attachments;
     }
 
     gp_table_set_rows(t, rows.data(), static_cast<int>(rows.size()));
@@ -1527,13 +1553,24 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
     if (found.part != GP_TABLE_HIT_LED && found.part != GP_TABLE_HIT_LED_ARG && found.part != GP_TABLE_HIT_LED_TABLE) return 0;
     int ax = m.x + (found.x0 + found.x1) / 2;
     int ay = m.y + (found.y0 + found.y1) / 2;
-    int contact_idx = table_hit_contact_index(found);
+    int contact_idx = resolve_contact_index(ctx, module_idx, found);
+    if (contact_idx < 0) return 0;
     ctx->focused_module = module_idx;
-    // Determine producer/consumer using the canvas' IO counts (stable and doesn't
-    // depend on table-side metadata).
+    // Determine producer/consumer using row metadata when available.
     bool is_producer = false;
     bool resolved_role = false;
-    if (module_idx < static_cast<int>(ctx->module_io_in_count.size()) && module_idx < static_cast<int>(ctx->module_io_out_count.size())) {
+    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+        const auto &rows = ctx->module_io_rows[module_idx];
+        if (found.row_idx >= 0 && found.row_idx < static_cast<int>(rows.size())) {
+            const auto &meta = rows[found.row_idx];
+            if (meta.kind == ModuleRowKind::Input || meta.kind == ModuleRowKind::Output) {
+                bool is_input = (meta.kind == ModuleRowKind::Input);
+                is_producer = !is_input;
+                resolved_role = true;
+            }
+        }
+    }
+    if (!resolved_role && module_idx < static_cast<int>(ctx->module_io_in_count.size()) && module_idx < static_cast<int>(ctx->module_io_out_count.size())) {
         int in_count = ctx->module_io_in_count[module_idx];
         int out_count = ctx->module_io_out_count[module_idx];
         int total = std::max(0, in_count) + std::max(0, out_count);
@@ -1657,6 +1694,8 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_bg.back().mode = default_bg_mode;
     c->module_io_in_count.push_back(0);
     c->module_io_out_count.push_back(0);
+    c->module_io_input_rows.emplace_back();
+    c->module_io_output_rows.emplace_back();
     c->module_input_layout.emplace_back();
     c->module_output_layout.emplace_back();
     c->module_io_rows.emplace_back();
@@ -1756,29 +1795,31 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int nbw = bw;
         int num_w = std::max(24, nbw * 2);
         int gap = 10;
-        // focused module drives which counts are shown/modified
-        int focused = c->focused_module;
-        if (focused >= 0 && focused < static_cast<int>(c->module_io_in_count.size())) {
-            // inputs group positions
-            int bx_minus_in = io_base_x - (nbw + gap + num_w + gap + nbw);
-            int bx_num_in = bx_minus_in + nbw + gap;
-            int bx_plus_in = bx_num_in + num_w + gap;
-            if (view_x >= bx_minus_in && view_x < bx_minus_in + nbw && view_y >= by && view_y < by + bh) {
-                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_IN_DEC)) return 1;
+        int counter_total_w = nbw + gap + num_w + gap + nbw;
+        int action_gap = 16;
+        int pair_gap = 10;
+        int pair_total_w = nbw * 2 + pair_gap;
+        int pair_left_x = io_base_x - counter_total_w - action_gap - pair_total_w;
+        int bx_consumer = pair_left_x;
+        int bx_producer = bx_consumer + nbw + pair_gap;
+        if (view_y >= by && view_y < by + bh) {
+            if (view_x >= bx_consumer && view_x < bx_consumer + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_CONSUMER_ADD)) return 1;
             }
-            if (view_x >= bx_plus_in && view_x < bx_plus_in + nbw && view_y >= by && view_y < by + bh) {
-                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_IN_INC)) return 1;
+            if (view_x >= bx_producer && view_x < bx_producer + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_PRODUCER_ADD)) return 1;
             }
-            // outputs group slightly left of inputs group (as drawn)
-            int io_shift = (nbw + spacing + 80);
-            int bx_minus_out = io_base_x - io_shift - (nbw + gap + num_w + gap + nbw);
-            int bx_num_out = bx_minus_out + nbw + gap;
-            int bx_plus_out = bx_num_out + num_w + gap;
-            if (view_x >= bx_minus_out && view_x < bx_minus_out + nbw && view_y >= by && view_y < by + bh) {
-                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_OUT_DEC)) return 1;
+        }
+        // counter group positions
+        int bx_minus = io_base_x - (nbw + gap + num_w + gap + nbw);
+        int bx_num = bx_minus + nbw + gap;
+        int bx_plus = bx_num + num_w + gap;
+        if (view_y >= by && view_y < by + bh) {
+            if (view_x >= bx_minus && view_x < bx_minus + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_COUNT_DEC)) return 1;
             }
-            if (view_x >= bx_plus_out && view_x < bx_plus_out + nbw && view_y >= by && view_y < by + bh) {
-                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_OUT_INC)) return 1;
+            if (view_x >= bx_plus && view_x < bx_plus + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_COUNT_INC)) return 1;
             }
         }
     }
@@ -1847,29 +1888,6 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         int handled = canvas_dispatch_root_hit(c, found);
                         c->dispatch_module_idx = -1;
                         if (handled) return 1;
-                        if (found.part == GP_TABLE_HIT_CELL && found.col_idx >= 0 && found.row_idx >= 0) {
-                            if (found.col_idx == 2 || found.col_idx == 3) {
-                                if (mi < static_cast<int>(c->module_io_rows.size())) {
-                                    const auto &meta = c->module_io_rows[mi];
-                                    if (found.row_idx >= 0 && found.row_idx < static_cast<int>(meta.size())) {
-                                        bool inc = (found.col_idx == 3);
-                                        ModuleRowKind kind = meta[found.row_idx].kind;
-                                        if (kind == ModuleRowKind::Tool) return 1;
-                                        bool is_input = (kind == ModuleRowKind::Input);
-                                        int &target_count = is_input ? c->module_io_in_count[mi] : c->module_io_out_count[mi];
-                                        target_count = std::clamp(target_count + (inc ? 1 : -1), 0, 64);
-                                        printf(
-                                            "gp_canvas_on_click: module=%d %s count adjusted -> %d\n",
-                                            mi,
-                                            (is_input ? "inputs" : "outputs"),
-                                            target_count);
-                                        sync_module_table_io_layout(c, mi);
-                                        update_canvas_scroll_state(c, /*pull_from_container=*/false);
-                                        return 1;
-                                    }
-                                }
-                            }
-                        }
                         // If LED hit, handle canvas-level connection flow. In
                         // edge-drawing mode we avoid calling into the table so
                         // we don't toggle its internal selection state.
@@ -3346,6 +3364,13 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     c->module_stage_integrator_mode.clear();
     c->module_stage_integrator_accum.clear();
     c->module_bg.clear();
+    c->module_io_in_count.clear();
+    c->module_io_out_count.clear();
+    c->module_io_input_rows.clear();
+    c->module_io_output_rows.clear();
+    c->module_input_layout.clear();
+    c->module_output_layout.clear();
+    c->module_io_rows.clear();
     c->edges.clear();
     c->nodes.clear();
     c->module_node_id.clear();
@@ -3396,6 +3421,13 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             c->module_table_owned.push_back(0);
             c->module_bg.emplace_back();
             c->module_tool_stack.emplace_back();
+            c->module_io_in_count.push_back(0);
+            c->module_io_out_count.push_back(0);
+            c->module_io_input_rows.emplace_back();
+            c->module_io_output_rows.emplace_back();
+            c->module_input_layout.emplace_back();
+            c->module_output_layout.emplace_back();
+            c->module_io_rows.emplace_back();
             // assign node id for this module
             int nid = c->next_node_id++;
             c->module_node_id.push_back(nid);
@@ -3703,7 +3735,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     }
             }
         }
-        // IO counts (inputs / outputs) shown to the left of the table buttons
+        // IO counter shown to the left of the table buttons
         auto draw_io_group = [&](int base_x, int byy, int in_count, const char* label) {
             // minus box, number area, plus box
             int nbw = bw;
@@ -3766,17 +3798,53 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
             }
         };
+        auto draw_io_action_pair = [&](int left_x, int byy, const char* left_label, const char* right_label) {
+            int nbw = bw;
+            int gap = 10;
+            int bx_left = left_x;
+            int bx_right = bx_left + nbw + gap;
+            memset_rect(out_rgba, w, h, pitch, bx_left, byy, nbw, bh, Color{50,50,56,255});
+            memset_rect(out_rgba, w, h, pitch, bx_right, byy, nbw, bh, Color{50,50,56,255});
+            auto draw_label = [&](int bx, const char* label) {
+                auto bm = render_text_to_rgba(label, 0.9f, {230,230,235,255});
+                if (!bm.pixels.empty()) {
+                    int tx = bx + (nbw - bm.width) / 2;
+                    int ty = byy + (bh - bm.height) / 2;
+                    for (int yy = 0; yy < bm.height; ++yy) {
+                        int dst_y = ty + yy;
+                        if (dst_y < 0 || dst_y >= h) continue;
+                        for (int xx = 0; xx < bm.width; ++xx) {
+                            int dst_x = tx + xx;
+                            if (dst_x < 0 || dst_x >= w) continue;
+                            uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                            const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                            float sa = src[3] / 255.0f;
+                            if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                            else if (sa > 0.001f) {
+                                for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                                dst[3] = 255;
+                            }
+                        }
+                    }
+                }
+            };
+            if (left_label && left_label[0] != '\0') draw_label(bx_left, left_label);
+            if (right_label && right_label[0] != '\0') draw_label(bx_right, right_label);
+        };
         // compute left of table buttons start for groups placement
         int io_base_x = bx_r; // place IO groups to the left of the table buttons
         int io_by = by;
-        // inputs group
-        int focused = ctx->focused_module;
-        int in_count = 0, out_count = 0;
-        if (focused >= 0 && focused < static_cast<int>(ctx->module_io_in_count.size())) in_count = ctx->module_io_in_count[focused];
-        if (focused >= 0 && focused < static_cast<int>(ctx->module_io_out_count.size())) out_count = ctx->module_io_out_count[focused];
-        // outputs group on the left, inputs group to the right with extra separation
-        draw_io_group(io_base_x -  (bw + spacing + 80), io_by, out_count, LABEL_IO_OUT_SHORT);
-        draw_io_group(io_base_x, io_by, in_count, LABEL_IO_IN_SHORT);
+        int counter_value = std::max(1, ctx->io_attachment_count);
+        int nbw = bw;
+        int num_w = std::max(24, nbw * 2);
+        int gap = 10;
+        int counter_total_w = nbw + gap + num_w + gap + nbw;
+        int action_gap = 16;
+        int pair_gap = 10;
+        int pair_total_w = nbw * 2 + pair_gap;
+        int pair_left_x = io_base_x - counter_total_w - action_gap - pair_total_w;
+        draw_io_action_pair(pair_left_x, io_by, LABEL_IO_CONSUMER_SHORT, LABEL_IO_PRODUCER_SHORT);
+        draw_io_group(io_base_x, io_by, counter_value, LABEL_IO_COUNT_SHORT);
     }
 
     // Prepare storage for per-module table hitboxes discovered during table rendering.
@@ -3874,7 +3942,8 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         for (int hi = 0; hi < hits_written; ++hi) {
             const auto &hb = hits[hi];
             if (hb.part != GP_TABLE_HIT_LED && hb.part != GP_TABLE_HIT_LED_ARG && hb.part != GP_TABLE_HIT_LED_TABLE) continue;
-            int contact_idx = table_hit_contact_index(hb);
+            int contact_idx = resolve_contact_index(ctx, mi, hb);
+            if (contact_idx < 0) continue;
             int on = 0, active = 0;
             if (!gp_table_get_led_info(t, hb.row_idx, hb.col_idx, hb.aux0, &on, &active, nullptr, nullptr)) continue;
             float glow = 0.0f;
@@ -3926,7 +3995,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         bool resolvedA = false, resolvedB = false;
         if (edge.a_module < static_cast<int>(module_hitboxes.size()) && !module_hitboxes[edge.a_module].empty()) {
             for (const auto &hb : module_hitboxes[edge.a_module]) {
-                if ((hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG || hb.part == GP_TABLE_HIT_LED_TABLE) && table_hit_contact_index(hb) == edge.a_contact_idx) {
+                if ((hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG || hb.part == GP_TABLE_HIT_LED_TABLE) && resolve_contact_index(ctx, edge.a_module, hb) == edge.a_contact_idx) {
                     int local_x = (hb.x0 + hb.x1) / 2;
                     int local_y = (hb.y0 + hb.y1) / 2;
                     ax = ctx->modules[edge.a_module].x + local_x;
@@ -3942,7 +4011,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
         if (edge.b_module < static_cast<int>(module_hitboxes.size()) && !module_hitboxes[edge.b_module].empty()) {
             for (const auto &hb : module_hitboxes[edge.b_module]) {
-                if ((hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG || hb.part == GP_TABLE_HIT_LED_TABLE) && table_hit_contact_index(hb) == edge.b_contact_idx) {
+                if ((hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG || hb.part == GP_TABLE_HIT_LED_TABLE) && resolve_contact_index(ctx, edge.b_module, hb) == edge.b_contact_idx) {
                     int local_x = (hb.x0 + hb.x1) / 2;
                     int local_y = (hb.y0 + hb.y1) / 2;
                     bx = ctx->modules[edge.b_module].x + local_x;
