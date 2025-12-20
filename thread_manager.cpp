@@ -309,21 +309,77 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             gp_stage_perform_tick(reinterpret_cast<GP_StageContext*>(st.stage), st.table, batch_id, nullptr, st.out_rgba, st.out_pitch, st.width, st.height);
         }
     }
+    // Per-module, row-sequential, stack-based tool pipeline execution
+    // For each module, wire up IO row metadata and FIFO consume/publish
     for (int mod_idx : order) {
         if (mod_idx < 0 || mod_idx >= (int)req.modules.size()) continue;
         const auto& mod = req.modules[static_cast<size_t>(mod_idx)];
         if (!mod.table) continue;
-        if (mod.in_count <= 0 && mod.out_count <= 0) continue;
-
-        std::vector<float> inputs(static_cast<size_t>(std::max(0, mod.in_count)));
-        std::vector<float> outputs(static_cast<size_t>(std::max(0, mod.out_count)));
-        std::fill(inputs.begin(), inputs.end(), 0.0f);
-        std::fill(outputs.begin(), outputs.end(), 0.0f);
-        gp_table_step(mod.table,
-            inputs.empty() ? nullptr : inputs.data(), mod.in_count,
-            outputs.empty() ? nullptr : outputs.data(), mod.out_count,
-            req.dt);
-
+        std::vector<ModuleIORow> io_rows;
+        {
+            extern GP_CanvasContextImpl* g_canvas_context_singleton;
+            if (g_canvas_context_singleton && mod_idx < (int)g_canvas_context_singleton->module_io_rows.size()) {
+                io_rows = g_canvas_context_singleton->module_io_rows[mod_idx];
+            } else {
+                int row_count = gp_table_get_row_count(mod.table);
+                io_rows.resize(row_count);
+                for (int i = 0; i < row_count; ++i) io_rows[i] = ModuleIORow{false, i};
+            }
+        }
+        int row_count = gp_table_get_row_count(mod.table);
+        std::vector<float> stack;
+        stack.reserve(32);
+        for (int row = 0; row < row_count; ++row) {
+            ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{false, row};
+            if (meta.is_input) {
+                // Consume from FIFO for this input contact
+                float val = 0.0f;
+                // Find the edge index for this input (mod_idx is the consumer)
+                int edge_idx = -1;
+                uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)meta.contact_idx << 16) | 0u;
+                // Find the edge in req.edges where b_module == mod_idx and b_contact_idx == meta.contact_idx
+                for (const auto& e : req.edges) {
+                    if (e.b_module == mod_idx && e.b_contact_idx == meta.contact_idx) {
+                        edge_idx = e.edge_idx;
+                        break;
+                    }
+                }
+                if (edge_idx >= 0) {
+                    int32_t unread = 0;
+                    gp_table_edge_unread(mod.table, edge_idx, reader_key, &unread);
+                    if (unread > 0) {
+                        float sample[1] = {0.0f};
+                        int32_t written = 0;
+                        if (gp_table_edge_consume(mod.table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
+                            val = sample[0];
+                        }
+                    }
+                }
+                stack.push_back(val);
+            }
+            // Tool row: pass stack through (no-op for now)
+            if (!meta.is_input && (row < row_count - mod.out_count)) {
+                // No-op (tool row placeholder)
+            }
+            if (!meta.is_input && (row >= row_count - mod.out_count)) {
+                // Output row: publish from stack to FIFO
+                float val = stack.empty() ? 0.0f : stack.back();
+                int edge_idx = -1;
+                uint64_t writer_key = ((uint64_t)mod_idx << 32) | ((uint64_t)meta.contact_idx << 16) | 0u;
+                // Find the edge in req.edges where a_module == mod_idx and a_contact_idx == meta.contact_idx
+                for (const auto& e : req.edges) {
+                    if (e.a_module == mod_idx && e.a_contact_idx == meta.contact_idx) {
+                        edge_idx = e.edge_idx;
+                        break;
+                    }
+                }
+                if (edge_idx >= 0) {
+                    int dropped = 0;
+                    float payload[1] = {val};
+                    gp_table_edge_publish(mod.table, edge_idx, writer_key, payload, 1, &dropped);
+                }
+            }
+        }
         if (mod.module_idx >= 0) {
             std::lock_guard<std::mutex> lk(mu_);
             if (static_cast<size_t>(mod.module_idx) >= module_ledger_.size()) {
