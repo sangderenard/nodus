@@ -4905,9 +4905,13 @@ int32_t gp_table_render_rgba_with_state(
             float glow_b = edge_glow_b[ei];
             float ev = 1.0f;
             if (ei < ctx->relax_value.size()) ev = ctx->relax_value[ei];
-            Color producer_col = ctx->st.led_on;
-            float glow_a_eff = glow_a * ev;
-            float glow_b_eff = glow_b * ev;
+            Color rope_light_col = ctx->st.led_on;
+            if (ctx->st.cable_fifo_light_mode) {
+                rope_light_col = ctx->st.led_edge;
+                rope_light_col.a = 255;
+            }
+            float glow_a_eff = ctx->st.cable_fifo_light_mode ? 0.0f : (glow_a * ev);
+            float glow_b_eff = ctx->st.cable_fifo_light_mode ? 0.0f : (glow_b * ev);
             float fifo_write_glow = 0.0f;
             float fifo_read_glow = 0.0f;
             float fifo_tint = 0.0f;
@@ -4918,6 +4922,7 @@ int32_t gp_table_render_rgba_with_state(
             float fifo_write_phase = 0.0f;
             float fifo_read_phase = 0.0f;
             bool fifo_has_state = false;
+            float fifo_core_intensity = 0.0f;
             if (ctx->st.cable_fifo_light_mode && ei < ctx->edge_fifos.size()) {
                 auto &fifo = ctx->edge_fifos[ei];
                 fifo.tick_friction(sim_dt, ctx->st.cable_fifo_friction_half_life);
@@ -4927,6 +4932,8 @@ int32_t gp_table_render_rgba_with_state(
                 float mag = std::sqrt(wf * wf + rf * rf);
                 fifo_write_glow = std::min(1.0f, wf * gain);
                 fifo_read_glow = std::min(1.0f, rf * gain);
+                float fifo_write_glow_eff = std::clamp(fifo_write_glow * ev, 0.0f, 1.0f);
+                float fifo_read_glow_eff = std::clamp(fifo_read_glow * ev, 0.0f, 1.0f);
                 float fifo_mag = std::min(1.0f, mag * gain);
                 fifo_phase_delta = fifo.phase_delta();
                 float theta = std::abs(fifo_phase_delta) * 2.0f * kPi;
@@ -4935,22 +4942,29 @@ int32_t gp_table_render_rgba_with_state(
                 fifo_read_phase = fifo.read_phase();
                 uint64_t edge_id = (ei < ctx->edge_uids.size()) ? ctx->edge_uids[ei] : 0ull;
                 fifo_has_state = fifo.fill_state(edge_id, fifo_fill, fifo_head_phase, fifo_tail_phase);
+                float fifo_fill_glow = fifo_has_state ? std::clamp(fifo_fill * ev, 0.0f, 1.0f) : 0.0f;
+                fifo_core_intensity = std::max({fifo_fill_glow, fifo_write_glow_eff, fifo_read_glow_eff});
                 if (fifo_mag > 0.0f) {
                     if (info_a.is_output && info_b.is_input) {
-                        glow_a_eff = std::max(glow_a_eff, fifo_write_glow);
-                        glow_b_eff = std::max(glow_b_eff, fifo_read_glow);
+                        glow_a_eff = std::max(glow_a_eff, fifo_write_glow_eff);
+                        glow_b_eff = std::max(glow_b_eff, fifo_read_glow_eff);
                     } else if (info_b.is_output && info_a.is_input) {
-                        glow_b_eff = std::max(glow_b_eff, fifo_write_glow);
-                        glow_a_eff = std::max(glow_a_eff, fifo_read_glow);
+                        glow_b_eff = std::max(glow_b_eff, fifo_write_glow_eff);
+                        glow_a_eff = std::max(glow_a_eff, fifo_read_glow_eff);
                     } else {
-                        glow_a_eff = std::max(glow_a_eff, fifo_mag);
-                        glow_b_eff = std::max(glow_b_eff, fifo_mag);
+                        glow_a_eff = std::max(glow_a_eff, fifo_mag * ev);
+                        glow_b_eff = std::max(glow_b_eff, fifo_mag * ev);
                     }
+                }
+                if (fifo_fill_glow > 0.0f) {
+                    glow_a_eff = std::max(glow_a_eff, fifo_fill_glow);
+                    glow_b_eff = std::max(glow_b_eff, fifo_fill_glow);
                 }
             }
             bool reverse_phases = info_b.is_output && !info_a.is_output;
-            Color core_col = producer_col;
-            core_col.a = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(float(core_col.a) * ctx->st.cable_core_alpha * ev)), 0, 255));
+            Color core_col = rope_light_col;
+            float core_alpha_scale = ctx->st.cable_fifo_light_mode ? std::clamp(fifo_core_intensity, 0.0f, 1.0f) : ev;
+            core_col.a = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(float(core_col.a) * ctx->st.cable_core_alpha * core_alpha_scale)), 0, 255));
             int rope_idx = ctx->rope_sim_idx[ei];
             if (rope_idx < 0) continue;
             int vc = rope_sim_get_vertex_count(ctx->rope_sim, rope_idx);
@@ -5000,7 +5014,7 @@ int32_t gp_table_render_rgba_with_state(
                 float read_phase = orient_phase(fifo_read_phase);
                 int write_idx = std::clamp(static_cast<int>(std::floor(write_phase * fifo_segments)), 0, fifo_segments - 1);
                 int read_idx = std::clamp(static_cast<int>(std::floor(read_phase * fifo_segments)), 0, fifo_segments - 1);
-                Color led_col = producer_col;
+                Color led_col = rope_light_col;
                 led_col.a = 255;
                 Color write_col = tint_color_hue(led_col, ctx->st.cable_fifo_friction_tint, 1.0f);
                 Color read_col = tint_color_hue(led_col, -ctx->st.cable_fifo_friction_tint, 1.0f);
@@ -5044,6 +5058,10 @@ int32_t gp_table_render_rgba_with_state(
                 bool lit_b = info_b.on || info_b.active;
                 Color led_a = lit_a ? ctx->st.led_on : ctx->st.led_off;
                 Color led_b = lit_b ? ctx->st.led_on : ctx->st.led_off;
+                if (ctx->st.cable_fifo_light_mode) {
+                    led_a = rope_light_col;
+                    led_b = rope_light_col;
+                }
                 if (ctx->st.cable_fifo_light_mode && fifo_tint > 0.0f) {
                     float hue_shift = (fifo_phase_delta >= 0.0f) ? fifo_tint : -fifo_tint;
                     led_a = tint_color_hue(led_a, hue_shift, fifo_tint);

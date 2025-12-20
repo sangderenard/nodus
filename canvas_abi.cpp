@@ -715,7 +715,6 @@ enum CanvasActionId {
     CANVAS_ACT_IO_CONSUMER_ADD = 2032,
     CANVAS_ACT_IO_PRODUCER_ADD = 2033,
     CANVAS_ACT_MODULE_LED = 2040,
-    CANVAS_ACT_MENU_KEY_RECORDER = 2100,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
     CANVAS_ACT_MENU_TOOL_SUB = 2102,
     CANVAS_ACT_MENU_TOOL_MUL = 2103,
@@ -977,7 +976,6 @@ struct ToolMenuItem {
 };
 
 static const ToolMenuItem kToolMenuItems[] = {
-    { CANVAS_ACT_MENU_KEY_RECORDER, LABEL_MENU_KEY_RECORDER, ModuleToolKind::None },
     { CANVAS_ACT_MENU_TOOL_ADD, LABEL_TOOL_ADD, ModuleToolKind::Add },
     { CANVAS_ACT_MENU_TOOL_SUB, LABEL_TOOL_SUB, ModuleToolKind::Subtract },
     { CANVAS_ACT_MENU_TOOL_MUL, LABEL_TOOL_MUL, ModuleToolKind::Multiply },
@@ -1046,7 +1044,6 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_COUNT_INC, CANVAS_ACT_IO_COUNT_INC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_CONSUMER_ADD, CANVAS_ACT_IO_CONSUMER_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_PRODUCER_ADD, CANVAS_ACT_IO_PRODUCER_ADD },
-    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_KEY_RECORDER, CANVAS_ACT_MENU_KEY_RECORDER },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
@@ -1293,14 +1290,6 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 if (c->dispatch_module_idx >= 0) {
                     canvas_handle_module_led_hit(c, c->dispatch_module_idx, *hit);
                 }
-                break;
-            case CANVAS_ACT_MENU_KEY_RECORDER:
-                if (c->focused_module >= 0) {
-                    gp_canvas_destroy_table(reinterpret_cast<GP_CanvasContext*>(c), c->focused_module);
-                    canvas_install_key_recorder_table(c, c->focused_module);
-                }
-                c->tool_menu_open = false;
-                c->selected_tool_table = 0;
                 break;
             case CANVAS_ACT_MENU_TOOL_ADD:
                 canvas_push_tool_to_focused(c, ModuleToolKind::Add);
@@ -2685,6 +2674,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
     if (c->thread_mgr) {
         ThreadManager::TickRequest req;
         req.dt = static_cast<double>(dt);
+        req.root_table = canvas_ensure_root_table(c);
         req.modules.reserve(c->modules.size());
         for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
             ThreadManager::ModuleContract mod{};
