@@ -381,6 +381,7 @@ struct GP_CanvasContextImpl {
     std::vector<std::vector<ModuleToolKind>> module_tool_stack;
     // optional per-module key-recorder state pointer
     std::vector<void*> module_key_recorder_state;
+    std::vector<ModuleInputState> module_input_state;
     // per-module lightweight chat state (used to visually confirm rope traffic)
     std::vector<std::string> module_chat_text;
     std::vector<ChatCol> module_chat_color;
@@ -459,6 +460,53 @@ const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx) {
     if (!g_canvas_context_singleton) return nullptr;
     if (module_idx < 0 || module_idx >= static_cast<int>(g_canvas_context_singleton->module_io_rows.size())) return nullptr;
     return &g_canvas_context_singleton->module_io_rows[module_idx];
+}
+
+bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state) {
+    if (!g_canvas_context_singleton || !out_state) return false;
+    if (module_idx < 0 || module_idx >= static_cast<int>(g_canvas_context_singleton->module_input_state.size())) return false;
+    *out_state = g_canvas_context_singleton->module_input_state[module_idx];
+    return true;
+}
+
+void canvas_clear_module_input_pulses(int module_idx) {
+    if (!g_canvas_context_singleton) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(g_canvas_context_singleton->module_input_state.size())) return;
+    auto &state = g_canvas_context_singleton->module_input_state[module_idx];
+    state.mouse_down = 0;
+    state.mouse_up = 0;
+    state.key_event = 0;
+}
+
+static bool module_has_tool(const GP_CanvasContextImpl* ctx, int module_idx, ModuleToolKind tool) {
+    if (!ctx) return false;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_tool_stack.size())) return false;
+    const auto &tools = ctx->module_tool_stack[module_idx];
+    return std::find(tools.begin(), tools.end(), tool) != tools.end();
+}
+
+static void canvas_record_key_input(GP_CanvasContextImpl* ctx, int key, int action) {
+    if (!ctx || action == 0) return;
+    for (int mi = 0; mi < static_cast<int>(ctx->module_tool_stack.size()); ++mi) {
+        if (!module_has_tool(ctx, mi, ModuleToolKind::KeyboardListener)) continue;
+        if (mi < 0 || mi >= static_cast<int>(ctx->module_input_state.size())) continue;
+        auto &state = ctx->module_input_state[mi];
+        state.key = key;
+        state.key_event = 1;
+    }
+}
+
+static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, bool down, bool up) {
+    if (!ctx) return;
+    for (int mi = 0; mi < static_cast<int>(ctx->module_tool_stack.size()); ++mi) {
+        if (!module_has_tool(ctx, mi, ModuleToolKind::MouseListener)) continue;
+        if (mi < 0 || mi >= static_cast<int>(ctx->module_input_state.size())) continue;
+        auto &state = ctx->module_input_state[mi];
+        state.mouse_x = static_cast<float>(x);
+        state.mouse_y = static_cast<float>(y);
+        if (down) state.mouse_down = 1;
+        if (up) state.mouse_up = 1;
+    }
 }
 
 
@@ -619,6 +667,8 @@ enum CanvasActionId {
     CANVAS_ACT_MENU_TOOL_MUL = 2103,
     CANVAS_ACT_MENU_TOOL_DIV = 2104,
     CANVAS_ACT_MENU_TOOL_MOD = 2105,
+    CANVAS_ACT_MENU_TOOL_KEYBOARD = 2106,
+    CANVAS_ACT_MENU_TOOL_MOUSE = 2107,
 };
 
 struct InputRayLight {
@@ -856,6 +906,8 @@ static const char* tool_label(ModuleToolKind tool) {
         case ModuleToolKind::Multiply: return LABEL_TOOL_MUL;
         case ModuleToolKind::Divide: return LABEL_TOOL_DIV;
         case ModuleToolKind::Modulo: return LABEL_TOOL_MOD;
+        case ModuleToolKind::KeyboardListener: return LABEL_TOOL_KEYBOARD;
+        case ModuleToolKind::MouseListener: return LABEL_TOOL_MOUSE;
         case ModuleToolKind::None:
         default:
             return "";
@@ -875,6 +927,8 @@ static const ToolMenuItem kToolMenuItems[] = {
     { CANVAS_ACT_MENU_TOOL_MUL, LABEL_TOOL_MUL, ModuleToolKind::Multiply },
     { CANVAS_ACT_MENU_TOOL_DIV, LABEL_TOOL_DIV, ModuleToolKind::Divide },
     { CANVAS_ACT_MENU_TOOL_MOD, LABEL_TOOL_MOD, ModuleToolKind::Modulo },
+    { CANVAS_ACT_MENU_TOOL_KEYBOARD, LABEL_TOOL_KEYBOARD, ModuleToolKind::KeyboardListener },
+    { CANVAS_ACT_MENU_TOOL_MOUSE, LABEL_TOOL_MOUSE, ModuleToolKind::MouseListener },
 };
 
 struct ToolMenuLayout {
@@ -941,6 +995,8 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_DIV, CANVAS_ACT_MENU_TOOL_DIV },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MOD, CANVAS_ACT_MENU_TOOL_MOD },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_KEYBOARD, CANVAS_ACT_MENU_TOOL_KEYBOARD },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MOUSE, CANVAS_ACT_MENU_TOOL_MOUSE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_ARG, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_TABLE, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
@@ -1198,6 +1254,12 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 break;
             case CANVAS_ACT_MENU_TOOL_MOD:
                 canvas_push_tool_to_focused(c, ModuleToolKind::Modulo);
+                break;
+            case CANVAS_ACT_MENU_TOOL_KEYBOARD:
+                canvas_push_tool_to_focused(c, ModuleToolKind::KeyboardListener);
+                break;
+            case CANVAS_ACT_MENU_TOOL_MOUSE:
+                canvas_push_tool_to_focused(c, ModuleToolKind::MouseListener);
                 break;
             default:
                 break;
@@ -1541,7 +1603,24 @@ static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKin
     int focused = ctx->focused_module;
     if (focused < 0 || focused >= static_cast<int>(ctx->modules.size())) return;
     if (focused >= static_cast<int>(ctx->module_tool_stack.size())) ctx->module_tool_stack.resize(focused + 1);
-    ctx->module_tool_stack[focused].push_back(tool);
+    auto &tools = ctx->module_tool_stack[focused];
+    if (tool == ModuleToolKind::KeyboardListener) {
+        auto insert_after = std::find(tools.begin(), tools.end(), ModuleToolKind::MouseListener);
+        if (insert_after != tools.end()) {
+            tools.insert(insert_after + 1, tool);
+        } else {
+            tools.push_back(tool);
+        }
+    } else if (tool == ModuleToolKind::MouseListener) {
+        auto insert_before = std::find(tools.begin(), tools.end(), ModuleToolKind::KeyboardListener);
+        if (insert_before != tools.end()) {
+            tools.insert(insert_before, tool);
+        } else {
+            tools.push_back(tool);
+        }
+    } else {
+        tools.push_back(tool);
+    }
     sync_module_table_io_layout(ctx, focused);
     update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
     ctx->tool_menu_open = false;
@@ -1703,6 +1782,7 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_io_rows.emplace_back();
     c->module_tool_stack.emplace_back();
     c->module_key_recorder_state.push_back(nullptr);
+    c->module_input_state.emplace_back();
     c->module_chat_text.push_back(std::string());
     c->module_chat_color.push_back(ChatCol{});
     c->module_chat_ttl.push_back(0);
@@ -2015,6 +2095,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
 extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    canvas_record_mouse_input(c, x, y, /*down=*/true, /*up=*/false);
     if (gp_canvas_on_click(ctx_, x, y)) return 1;
     int world_x = x + c->offset_x;
     int world_y = y + c->offset_y;
@@ -2059,6 +2140,7 @@ extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
 extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    canvas_record_mouse_input(c, x, y, /*down=*/false, /*up=*/false);
     if (!c->drag.panning) {
         update_canvas_scroll_state(c, /*pull_from_container=*/true);
     }
@@ -2107,6 +2189,7 @@ extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
 extern "C" int gp_canvas_on_mouse_up(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    canvas_record_mouse_input(c, x, y, /*down=*/false, /*up=*/true);
     if (!c->drag.dragging) return 0;
     c->drag.dragging = 0;
     c->drag.panning = 0;
@@ -2120,6 +2203,7 @@ extern "C" int gp_canvas_on_key(GP_CanvasContext* ctx_, int key, int scancode, i
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     printf("gp_canvas_on_key: canvas=%p key=%d scancode=%d action=%d mods=%d focused=%d\n", (void*)c, key, scancode, action, mods, c->focused_module);
+    canvas_record_key_input(c, key, action);
     int mi = c->focused_module;
     if (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) {
         GP_TableContext* t = c->module_tables[mi];
@@ -3373,6 +3457,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     c->module_input_layout.clear();
     c->module_output_layout.clear();
     c->module_io_rows.clear();
+    c->module_input_state.clear();
     c->edges.clear();
     c->nodes.clear();
     c->module_node_id.clear();
@@ -3430,6 +3515,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             c->module_input_layout.emplace_back();
             c->module_output_layout.emplace_back();
             c->module_io_rows.emplace_back();
+            c->module_input_state.emplace_back();
             // assign node id for this module
             int nid = c->next_node_id++;
             c->module_node_id.push_back(nid);

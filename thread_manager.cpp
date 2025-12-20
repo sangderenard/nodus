@@ -9,6 +9,10 @@
 #include <cmath>
 #include <limits>
 
+extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
+extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
+extern void canvas_clear_module_input_pulses(int module_idx);
+
 // Scheduling helpers used inside run_scheduled_tick.
 namespace {
 
@@ -318,7 +322,6 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         if (!mod.table) continue;
         std::vector<ModuleIORow> io_rows;
         {
-            extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
             if (const auto* rows = canvas_get_module_io_rows(mod_idx)) {
                 io_rows = *rows;
             } else {
@@ -342,6 +345,15 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         int row_count = gp_table_get_row_count(mod.table);
         std::vector<float> stack;
         stack.reserve(32);
+        ModuleInputState input_state{};
+        bool input_state_loaded = false;
+        bool input_state_used = false;
+        auto load_input_state = [&]() -> bool {
+            if (!input_state_loaded) {
+                input_state_loaded = canvas_get_module_input_state(mod_idx, &input_state);
+            }
+            return input_state_loaded;
+        };
         auto pop_value = [&stack]() -> float {
             if (stack.empty()) return 0.0f;
             float v = stack.back();
@@ -382,34 +394,72 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             }
             // Tool row: pass stack through (no-op for now)
             if (meta.kind == ModuleRowKind::Tool) {
-                size_t before = stack.size();
-                float b = pop_value();
-                float a = pop_value();
                 switch (meta.tool) {
+                    case ModuleToolKind::KeyboardListener: {
+                        float val = 0.0f;
+                        if (load_input_state() && input_state.key_event) {
+                            val = static_cast<float>(input_state.key);
+                        }
+                        stack.push_back(val);
+                        if (input_state_loaded) input_state_used = true;
+                        break;
+                    }
+                    case ModuleToolKind::MouseListener: {
+                        float mx = 0.0f;
+                        float my = 0.0f;
+                        float down = 0.0f;
+                        float up = 0.0f;
+                        if (load_input_state()) {
+                            mx = input_state.mouse_x;
+                            my = input_state.mouse_y;
+                            down = input_state.mouse_down ? 1.0f : 0.0f;
+                            up = input_state.mouse_up ? 1.0f : 0.0f;
+                            input_state_used = true;
+                        }
+                        stack.push_back(up);
+                        stack.push_back(down);
+                        stack.push_back(my);
+                        stack.push_back(mx);
+                        break;
+                    }
                     case ModuleToolKind::Add:
-                        stack.push_back(a + b);
-                        break;
                     case ModuleToolKind::Subtract:
-                        stack.push_back(a - b);
-                        break;
                     case ModuleToolKind::Multiply:
-                        stack.push_back(a * b);
-                        break;
                     case ModuleToolKind::Divide:
-                        stack.push_back((b == 0.0f) ? 0.0f : (a / b));
-                        break;
                     case ModuleToolKind::Modulo:
-                        stack.push_back((b == 0.0f) ? 0.0f : std::fmod(a, b));
-                        break;
                     case ModuleToolKind::None:
-                    default:
-                        if (before >= 2) {
-                            stack.push_back(a);
-                            stack.push_back(b);
-                        } else if (before == 1) {
-                            stack.push_back(a);
+                    default: {
+                        size_t before = stack.size();
+                        float b = pop_value();
+                        float a = pop_value();
+                        switch (meta.tool) {
+                            case ModuleToolKind::Add:
+                                stack.push_back(a + b);
+                                break;
+                            case ModuleToolKind::Subtract:
+                                stack.push_back(a - b);
+                                break;
+                            case ModuleToolKind::Multiply:
+                                stack.push_back(a * b);
+                                break;
+                            case ModuleToolKind::Divide:
+                                stack.push_back((b == 0.0f) ? 0.0f : (a / b));
+                                break;
+                            case ModuleToolKind::Modulo:
+                                stack.push_back((b == 0.0f) ? 0.0f : std::fmod(a, b));
+                                break;
+                            case ModuleToolKind::None:
+                            default:
+                                if (before >= 2) {
+                                    stack.push_back(a);
+                                    stack.push_back(b);
+                                } else if (before == 1) {
+                                    stack.push_back(a);
+                                }
+                                break;
                         }
                         break;
+                    }
                 }
             }
             if (meta.kind == ModuleRowKind::Output) {
@@ -434,6 +484,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     }
                 }
             }
+        }
+        if (input_state_used) {
+            canvas_clear_module_input_pulses(mod_idx);
         }
         if (mod.module_idx >= 0) {
             std::lock_guard<std::mutex> lk(mu_);
