@@ -26,6 +26,8 @@ enum class ModuleToolKind : int8_t {
     Multiply = 3,
     Divide = 4,
     Modulo = 5,
+    KeyboardListener = 6,
+    MouseListener = 7,
 };
 
 struct ModuleIORow {
@@ -33,6 +35,15 @@ struct ModuleIORow {
     int contact_idx = 0;
     ModuleToolKind tool = ModuleToolKind::None;
     int attachment_count = 1;
+};
+
+struct ModuleInputState {
+    float mouse_x = 0.0f;
+    float mouse_y = 0.0f;
+    int32_t mouse_down = 0;
+    int32_t mouse_up = 0;
+    int32_t key = 0;
+    int32_t key_event = 0;
 };
 
 class ThreadManager {
