@@ -51,6 +51,8 @@
 #define LABEL_TOOL_MUL "Multiply"
 #define LABEL_TOOL_DIV "Divide"
 #define LABEL_TOOL_MOD "Modulo"
+#define LABEL_TOOL_KEYBOARD "Keyboard"
+#define LABEL_TOOL_MOUSE "Mouse"
 
 // Module labels
 #define LABEL_MODULE_TABLE "Table"
