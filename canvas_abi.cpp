@@ -707,6 +707,16 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
 // NOTE: legacy per-side contact geometry removed. Contact hit/position
 // information is authoritative from attached `GP_TableContext` hitboxes.
 
+constexpr int kModuleDefaultWidth = 420;
+constexpr int kModuleDefaultHeight = 620;
+constexpr int kModulePreviewMinTableHeight = 120;
+constexpr int kModuleLedPerSide = 2;
+constexpr int kModuleColLeftLed = 0;
+constexpr int kModuleColText = 1;
+constexpr int kModuleColRightLed = 2;
+constexpr int kModuleColScroll = 3;
+constexpr int kModuleColCount = 4;
+
 static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
     if (hb.row_idx >= 0) return hb.row_idx;
     if (hb.part == GP_TABLE_HIT_LED_TABLE) return hb.aux1;
@@ -764,16 +774,6 @@ struct CanvasBounds {
     int max_y = 0;
     bool has_any = false;
 };
-
-constexpr int kModuleDefaultWidth = 420;
-constexpr int kModuleDefaultHeight = 620;
-constexpr int kModulePreviewMinTableHeight = 120;
-constexpr int kModuleLedPerSide = 2;
-constexpr int kModuleColLeftLed = 0;
-constexpr int kModuleColText = 1;
-constexpr int kModuleColRightLed = 2;
-constexpr int kModuleColScroll = 3;
-constexpr int kModuleColCount = 4;
 
 struct ModuleLayout {
     int table_clip_h = 0;
