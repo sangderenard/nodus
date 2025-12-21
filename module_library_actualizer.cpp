@@ -103,6 +103,11 @@ struct ToolPortPlan {
     int32_t returns = 0;
 };
 
+struct ToolStep {
+    ModuleToolKind kind = ModuleToolKind::None;
+    int attachment_count = 0;
+};
+
 ToolPortPlan build_port_plan(const std::vector<ModuleToolKind>& tools) {
     int32_t stack = 0;
     int32_t args = 0;
@@ -125,17 +130,184 @@ ToolPortPlan build_port_plan(const std::vector<ModuleToolKind>& tools) {
     return plan;
 }
 
+void emit_stack_step(std::ostringstream& ss, ModuleToolKind kind, int attachment_count) {
+    switch (kind) {
+        case ModuleToolKind::KeyboardListener:
+            ss << "        {\n";
+            ss << "            float val = 0.0f;\n";
+            ss << "            if (input && input->key_event) {\n";
+            ss << "                val = static_cast<float>(input->key);\n";
+            ss << "            }\n";
+            ss << "            tool_stack_push(stack, val);\n";
+            ss << "        }\n";
+            break;
+        case ModuleToolKind::MouseListener:
+            ss << "        {\n";
+            ss << "            float mx = 0.0f;\n";
+            ss << "            float my = 0.0f;\n";
+            ss << "            float down = 0.0f;\n";
+            ss << "            float up = 0.0f;\n";
+            ss << "            if (input) {\n";
+            ss << "                mx = input->mouse_x;\n";
+            ss << "                my = input->mouse_y;\n";
+            ss << "                down = input->mouse_down ? 1.0f : 0.0f;\n";
+            ss << "                up = input->mouse_up ? 1.0f : 0.0f;\n";
+            ss << "            }\n";
+            ss << "            tool_stack_push(stack, up);\n";
+            ss << "            tool_stack_push(stack, down);\n";
+            ss << "            tool_stack_push(stack, my);\n";
+            ss << "            tool_stack_push(stack, mx);\n";
+            ss << "        }\n";
+            break;
+        case ModuleToolKind::StackDisplay:
+            ss << "        {\n";
+            ss << "            // StackDisplay: snapshot handled externally; no stack mutation here.\n";
+            ss << "        }\n";
+            break;
+        case ModuleToolKind::TableNumber:
+            ss << "        {\n";
+            ss << "            float val = static_cast<float>(std::max(0, " << attachment_count << "));\n";
+            ss << "            tool_stack_push(stack, val);\n";
+            ss << "        }\n";
+            break;
+        case ModuleToolKind::Clone:
+            ss << "        {\n";
+            ss << "            float count_f = tool_stack_pop(stack);\n";
+            ss << "            float value = tool_stack_pop(stack);\n";
+            ss << "            int count = std::max(0, static_cast<int>(std::lround(count_f)));\n";
+            ss << "            for (int i = 0; i < count; ++i) {\n";
+            ss << "                tool_stack_push(stack, value);\n";
+            ss << "            }\n";
+            ss << "        }\n";
+            break;
+        case ModuleToolKind::RectRgba:
+            ss << "        {\n";
+            ss << "            float height = tool_stack_pop(stack);\n";
+            ss << "            float width = tool_stack_pop(stack);\n";
+            ss << "            float bg[4] = { tool_stack_pop(stack), tool_stack_pop(stack), tool_stack_pop(stack), tool_stack_pop(stack) };\n";
+            ss << "            float border[4] = { tool_stack_pop(stack), tool_stack_pop(stack), tool_stack_pop(stack), tool_stack_pop(stack) };\n";
+            ss << "            float border_width = tool_stack_pop(stack);\n";
+            ss << "            float corner_radius = tool_stack_pop(stack);\n";
+            ss << "            int raster_h = std::max(0, static_cast<int>(std::lround(height)));\n";
+            ss << "            int raster_w = std::max(0, static_cast<int>(std::lround(width)));\n";
+            ss << "            float out = 0.0f;\n";
+            ss << "            uint64_t cycle = tool_cycle_++;\n";
+            ss << "            if (raster_w > 0 && raster_h > 0) {\n";
+            ss << "                uint64_t pixel_count = static_cast<uint64_t>(raster_w) * static_cast<uint64_t>(raster_h);\n";
+            ss << "                uint64_t total = pixel_count * 4ull;\n";
+            ss << "                if (total > 0) {\n";
+            ss << "                    uint64_t idx = cycle % total;\n";
+            ss << "                    int channel = static_cast<int>(idx % 4ull);\n";
+            ss << "                    uint64_t pix = idx / 4ull;\n";
+            ss << "                    int x = static_cast<int>(pix % static_cast<uint64_t>(raster_w));\n";
+            ss << "                    int y = static_cast<int>(pix / static_cast<uint64_t>(raster_w));\n";
+            ss << "                    float px = static_cast<float>(x) + 0.5f;\n";
+            ss << "                    float py = static_cast<float>(y) + 0.5f;\n";
+            ss << "                    float fw = static_cast<float>(raster_w);\n";
+            ss << "                    float fh = static_cast<float>(raster_h);\n";
+            ss << "                    float bw = std::max(0.0f, border_width);\n";
+            ss << "                    float cr = std::max(0.0f, corner_radius);\n";
+            ss << "                    bool inside = point_in_rounded_rect(px, py, fw, fh, cr);\n";
+            ss << "                    if (inside) {\n";
+            ss << "                        bool use_bg = true;\n";
+            ss << "                        float inner_w = fw - 2.0f * bw;\n";
+            ss << "                        float inner_h = fh - 2.0f * bw;\n";
+            ss << "                        if (bw > 0.0f && inner_w > 0.0f && inner_h > 0.0f) {\n";
+            ss << "                            float inner_r = std::max(0.0f, cr - bw);\n";
+            ss << "                            use_bg = point_in_rounded_rect(px - bw, py - bw, inner_w, inner_h, inner_r);\n";
+            ss << "                        }\n";
+            ss << "                        const float* src = use_bg ? bg : border;\n";
+            ss << "                        out = src[channel];\n";
+            ss << "                    }\n";
+            ss << "                }\n";
+            ss << "            }\n";
+            ss << "            tool_stack_push(stack, out);\n";
+            ss << "        }\n";
+            break;
+        case ModuleToolKind::Add:
+        case ModuleToolKind::Subtract:
+        case ModuleToolKind::Multiply:
+        case ModuleToolKind::Divide:
+        case ModuleToolKind::Modulo:
+        case ModuleToolKind::None:
+        default:
+            ss << "        {\n";
+            ss << "            float b = tool_stack_pop(stack);\n";
+            ss << "            float a = tool_stack_pop(stack);\n";
+            switch (kind) {
+                case ModuleToolKind::Add:
+                    ss << "            tool_stack_push(stack, a + b);\n";
+                    break;
+                case ModuleToolKind::Subtract:
+                    ss << "            tool_stack_push(stack, a - b);\n";
+                    break;
+                case ModuleToolKind::Multiply:
+                    ss << "            tool_stack_push(stack, a * b);\n";
+                    break;
+                case ModuleToolKind::Divide:
+                    ss << "            tool_stack_push(stack, (b == 0.0f) ? 0.0f : (a / b));\n";
+                    break;
+                case ModuleToolKind::Modulo:
+                    ss << "            tool_stack_push(stack, (b == 0.0f) ? 0.0f : std::fmod(a, b));\n";
+                    break;
+                case ModuleToolKind::None:
+                default:
+                    ss << "            (void)a; (void)b;\n";
+                    break;
+            }
+            ss << "        }\n";
+            break;
+    }
+}
+
+void emit_stack_execution(std::ostringstream& ss, const std::vector<ToolStep>& steps) {
+    ss << "    void execute_stack(ToolStackContext& ctx) override {\n";
+    ss << "        ToolStackFrame& stack = ctx.stack;\n";
+    ss << "        const ToolInputState* input = ctx.input;\n";
+    ss << "        (void)input;\n";
+    for (size_t i = 0; i < steps.size(); ++i) {
+        const auto& step = steps[i];
+        ss << "        // step " << i << ": " << gp_module_tool_kind_name(step.kind) << "\n";
+        emit_stack_step(ss, step.kind, step.attachment_count);
+    }
+    ss << "    }\n\n";
+}
+
 std::string generate_tool_source(const GP_ModuleLibraryModule& module,
                                  const std::string& tool_id,
                                  const std::string& tool_name,
-                                 const ToolPortPlan& plan) {
+                                 const ToolPortPlan& plan,
+                                 const std::vector<ToolStep>& steps) {
     std::ostringstream ss;
     std::string class_name = "Tool_" + sanitize_identifier(tool_id);
+    bool has_rect = false;
+    for (const auto& step : steps) {
+        if (step.kind == ModuleToolKind::RectRgba) {
+            has_rect = true;
+            break;
+        }
+    }
 
     ss << "// Generated from module " << module.id << "\n";
     ss << "#include \"tool_api.h\"\n\n";
     ss << "#include <cstdint>\n";
+    ss << "#include <cmath>\n";
+    ss << "#include <algorithm>\n";
     ss << "#include <string>\n\n";
+    if (has_rect) {
+        ss << "static bool point_in_rounded_rect(float px, float py, float w, float h, float r) {\n";
+        ss << "    if (r <= 0.0f) return (px >= 0.0f && py >= 0.0f && px <= w && py <= h);\n";
+        ss << "    float inner_w = std::max(0.0f, w - 2.0f * r);\n";
+        ss << "    float inner_h = std::max(0.0f, h - 2.0f * r);\n";
+        ss << "    if (px >= r && px <= r + inner_w && py >= 0.0f && py <= h) return true;\n";
+        ss << "    if (py >= r && py <= r + inner_h && px >= 0.0f && px <= w) return true;\n";
+        ss << "    float dx = 0.0f;\n";
+        ss << "    float dy = 0.0f;\n";
+        ss << "    if (px < r) dx = px - r; else if (px > w - r) dx = px - (w - r);\n";
+        ss << "    if (py < r) dy = py - r; else if (py > h - r) dy = py - (h - r);\n";
+        ss << "    return (dx * dx + dy * dy) <= (r * r);\n";
+        ss << "}\n\n";
+    }
     ss << "class " << class_name << " : public ITool {\n";
     ss << "public:\n";
     ss << "    std::string id() const override { return \"" << tool_id << "\"; }\n";
@@ -152,6 +324,8 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
     ss << "    void shutdown() override {}\n\n";
     ss << "    void tick(double /*dt*/, HostAPI& /*host*/) override {}\n\n";
     ss << "    void render(RenderContext& /*ctx*/) override {}\n\n";
+
+    emit_stack_execution(ss, steps);
 
     ss << "    int32_t port_count() const override {\n";
     ss << "        return static_cast<int32_t>(kPortCount);\n";
@@ -186,6 +360,9 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
         ss << "    static constexpr int kPortCount = 0;\n";
     }
 
+    if (has_rect) {
+        ss << "    uint64_t tool_cycle_ = 0;\n";
+    }
     ss << "};\n\n";
     ss << "#if defined(_WIN32)\n";
     ss << "extern \"C\" __declspec(dllexport) ITool* create_tool() {\n";
@@ -196,6 +373,16 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
     ss << "}\n";
 
     return ss.str();
+}
+
+std::string generate_builtin_tool_source(const GP_ModuleLibraryTool& tool) {
+    std::vector<ToolStep> steps;
+    steps.push_back(ToolStep{tool.kind, 1});
+    ToolPortPlan plan = build_port_plan({tool.kind});
+    GP_ModuleLibraryModule dummy{};
+    dummy.id = tool.id;
+    dummy.tool_caps = 0;
+    return generate_tool_source(dummy, tool.id, tool.name.empty() ? tool.id : tool.name, plan, steps);
 }
 } // namespace
 
@@ -221,7 +408,12 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
             ? std::filesystem::path(gp_module_library_tool_source_path(root.string(), tool.id))
             : std::filesystem::path(tool.source_path);
         if (!tool_path.is_absolute()) tool_path = root / tool_path;
-        std::string contents = "// Placeholder tool source for " + tool.id + " (" + tool.name + ")\n";
+        std::string contents;
+        if (tool.kind != ModuleToolKind::None) {
+            contents = generate_builtin_tool_source(tool);
+        } else {
+            contents = "// Placeholder tool source for " + tool.id + " (" + tool.name + ")\n";
+        }
         if (!write_placeholder_if_missing(tool_path, contents, err)) {
             std::cerr << "error writing tool source '" << tool_path.string() << "': " << err << "\n";
             ok = false;
@@ -254,7 +446,14 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
 
             ToolPortPlan plan = build_port_plan(tool_stack);
             std::string tool_name = module.label.empty() ? tool_id : module.label;
-            std::string contents = generate_tool_source(module, tool_id, tool_name, plan);
+            std::vector<ToolStep> steps;
+            steps.reserve(sorted_tools.size());
+            for (const auto& instance : sorted_tools) {
+                auto it = tool_kind_by_id.find(instance.tool_id);
+                ModuleToolKind kind = it == tool_kind_by_id.end() ? ModuleToolKind::None : it->second;
+                steps.push_back(ToolStep{kind, instance.attachment_count});
+            }
+            std::string contents = generate_tool_source(module, tool_id, tool_name, plan, steps);
             if (!write_placeholder_if_missing(tool_path, contents, err)) {
                 std::cerr << "error writing tool source '" << tool_path.string() << "': " << err << "\n";
                 ok = false;

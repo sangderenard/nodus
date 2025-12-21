@@ -77,6 +77,39 @@ struct ToolPortSpec {
     int32_t count = 0;
 };
 
+struct ToolInputState {
+    float mouse_x = 0.0f;
+    float mouse_y = 0.0f;
+    int32_t mouse_down = 0;
+    int32_t mouse_up = 0;
+    int32_t key = 0;
+    int32_t key_event = 0;
+};
+
+struct ToolStackFrame {
+    float* values = nullptr;
+    int32_t count = 0;
+    int32_t capacity = 0;
+};
+
+struct ToolStackContext {
+    ToolStackFrame stack{};
+    const ToolInputState* input = nullptr;
+};
+
+inline float tool_stack_pop(ToolStackFrame& frame) {
+    if (!frame.values || frame.count <= 0) return 0.0f;
+    float v = frame.values[frame.count - 1];
+    frame.count -= 1;
+    return v;
+}
+
+inline void tool_stack_push(ToolStackFrame& frame, float v) {
+    if (!frame.values || frame.count >= frame.capacity) return;
+    frame.values[frame.count] = v;
+    frame.count += 1;
+}
+
 struct OutputArchive {
     virtual ~OutputArchive() = default;
     virtual bool write(const void* data, size_t len) = 0;
@@ -146,6 +179,8 @@ struct ITool {
 
     virtual int32_t port_count() const { return 0; }
     virtual ToolPortSpec port_spec(int32_t /*idx*/) const { return ToolPortSpec{}; }
+
+    virtual void execute_stack(ToolStackContext& /*ctx*/) {}
 
     virtual bool serialize(OutputArchive& /*out*/) const { return false; }
     virtual bool deserialize(InputArchive& /*in*/) { return false; }
