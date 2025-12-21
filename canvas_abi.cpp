@@ -328,6 +328,26 @@ struct ModuleStackTail {
     std::array<float, 64> values{};
     std::atomic<int> count{0};
     std::atomic<uint32_t> seq{0};
+
+    ModuleStackTail() = default;
+    // disable copy: std::atomic is non-copyable
+    ModuleStackTail(const ModuleStackTail&) = delete;
+    ModuleStackTail& operator=(const ModuleStackTail&) = delete;
+
+    // provide move semantics: copy underlying values and atomics via load/store
+    ModuleStackTail(ModuleStackTail&& other) noexcept {
+        values = other.values;
+        count.store(other.count.load());
+        seq.store(other.seq.load());
+    }
+    ModuleStackTail& operator=(ModuleStackTail&& other) noexcept {
+        if (this != &other) {
+            values = other.values;
+            count.store(other.count.load());
+            seq.store(other.seq.load());
+        }
+        return *this;
+    }
 };
 
 static ModuleFrameLedGroup make_module_frame_led_group() {
@@ -546,6 +566,9 @@ struct GP_CanvasContextImpl {
 // (global drag map removed; each canvas has its own DragState member)
 
 static GP_CanvasContextImpl* g_canvas_context_singleton = nullptr;
+
+// forward declaration: write the tail values into a module's stack snapshot
+static void module_stack_tail_write(GP_CanvasContextImpl* ctx, int module_idx, const float* values, int count);
 
 const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx) {
     if (!g_canvas_context_singleton) return nullptr;
