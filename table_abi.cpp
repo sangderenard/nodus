@@ -4636,8 +4636,10 @@ int32_t gp_table_render_rgba_with_state(
         local_rs.highlight_row = mapped;
     }
 
-    // Call the raster on the visible rows
+    // Call the raster on the visible rows. Honor caller-provided geometry so
+    // buffers sized to a clipped viewport still render correctly.
     GP_TableGeom local_geom{};
+    GP_TableGeom* geom_ptr = out_geom ? out_geom : &local_geom;
     int ok = gp_table_raster_rgba_with_hits(
         vis_rows.data(), static_cast<int32_t>(vis_rows.size()),
         ctx->cols.data(), static_cast<int32_t>(ctx->cols.size()),
@@ -4645,7 +4647,7 @@ int32_t gp_table_render_rgba_with_state(
         render_state ? &local_rs : nullptr,
         out_rgba,
         out_len_bytes,
-        &local_geom,
+        geom_ptr,
         hitboxes_out,
         hitboxes_cap,
         hitboxes_written);
@@ -4664,14 +4666,14 @@ int32_t gp_table_render_rgba_with_state(
     // Prepare column geometry for overlay placement.
     int col_x0[8] = {0};
     int col_w[8] = {0};
-    compute_columns(ctx->cols.data(), static_cast<int>(ctx->cols.size()), local_geom.width_px, ctx->st.name_w, col_x0, col_w);
+    compute_columns(ctx->cols.data(), static_cast<int>(ctx->cols.size()), geom_ptr->width_px, ctx->st.name_w, col_x0, col_w);
 
     // Cache row layout for the visible row set (for post passes that compute LED centers).
     Style st_local = load_style(&ctx->style_raw);
-    st_local.w = std::max(1, local_geom.width_px);
+    st_local.w = std::max(1, geom_ptr->width_px);
     std::vector<int> vis_row_y0;
     std::vector<int> vis_row_h;
-    compute_row_layout(vis_rows.data(), static_cast<int>(vis_rows.size()), st_local, local_geom.height_px, vis_row_y0, vis_row_h);
+    compute_row_layout(vis_rows.data(), static_cast<int>(vis_rows.size()), st_local, geom_ptr->height_px, vis_row_y0, vis_row_h);
 
     auto find_visible_row = [&](uint32_t orig_idx) -> int {
         for (size_t vi = 0; vi < map_vis_to_orig.size(); ++vi) {
@@ -4682,8 +4684,8 @@ int32_t gp_table_render_rgba_with_state(
 
     // Optional LED glow pass driven by per-key strengths and input/output hints.
     if (out_rgba && (!ctx->led_glow_strength.empty() || !ctx->key_is_input.empty() || !ctx->key_is_output.empty())) {
-        int w_local = local_geom.width_px;
-        int h_local = local_geom.height_px;
+        int w_local = geom_ptr->width_px;
+        int h_local = geom_ptr->height_px;
         int pitch_local = w_local * 4;
 
         // Track processed keys so we do not double-apply when a key is both input and output.
