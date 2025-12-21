@@ -1,0 +1,16 @@
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/canvas_abi.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/module_preview.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/module_library.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/module_library_actualizer.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/table_abi.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/table_node_groups.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/menu_waveform.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/menu_waveform_abi.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/rope_sim.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/raytrace_2d.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/raytrace_3d.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/stage_abi.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/subject_capture.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/text_render_helper.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/tool_registry.obj
+C:/dev/Powershell/nodus/build_test/canvas_tables.dir/RelWithDebInfo/thread_manager.obj

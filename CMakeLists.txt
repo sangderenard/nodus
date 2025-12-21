@@ -24,6 +24,12 @@ add_library(canvas_tables SHARED
     thread_manager.cpp
 )
 
+# Small helper executable to run the module actualizer from the built project
+add_executable(modlib_actualize tools/modlib_actualize_main.cpp)
+target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(modlib_actualize PRIVATE canvas_tables)
+target_compile_features(modlib_actualize PUBLIC cxx_std_17)
+
 find_package(Eigen3 REQUIRED)
 
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

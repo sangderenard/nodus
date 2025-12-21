@@ -6,6 +6,7 @@
 #include "text_render_helper.h"
 #include "thread_manager.h"
 #include "module_library.h"
+#include "module_library_actualizer.h"
 #include "labels.h"
 #include "module_preview.h"
 
@@ -25,6 +26,7 @@
 #include <atomic>
 #include <fstream>
 #include <sstream>
+#include <filesystem>
 #include <Eigen/Dense>
 #include <chrono>
 
@@ -1295,6 +1297,19 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
     draw_button(pause_x, btn_y, pause_w, control_h, Color{44,52,60,255}, pause_label, 1.0f);
     draw_button(menu_x, btn_y, menu_w, control_h, Color{50,50,62,255}, LABEL_MODULE_MENU, 0.85f);
 
+    // Module action buttons: Clone / Clear / Destroy / Export (right-aligned)
+    int module_btn_count = 4;
+    int module_btn_w = nbw;
+    int module_gap = 6;
+    int btns_total_w = module_btn_count * (module_btn_w + module_gap) - module_gap;
+    int btns_right = pause_x - module_gap;
+    int btns_left = btns_right - btns_total_w;
+    int bx_btn = btns_left;
+    draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_CLONE_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
+    draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_CLEAR_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
+    draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_DESTROY_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
+    draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{44,60,48,255}, "EXP", 0.9f);
+
     cursor_y += kModuleControlRowH + kModuleTopGap;
     constexpr float kLedLabelScale = 0.7f;
     constexpr int kLedLabelGap = 6;
@@ -1565,6 +1580,7 @@ enum CanvasActionId {
     CANVAS_ACT_MODULE_CLONE = 2073,
     CANVAS_ACT_MODULE_CLEAR = 2074,
     CANVAS_ACT_MODULE_DESTROY = 2075,
+    CANVAS_ACT_MODULE_EXPORT = 2076,
     CANVAS_ACT_TOOL_SUBGROUP_0 = 2080,
     CANVAS_ACT_TOOL_SUBGROUP_1 = 2081,
     CANVAS_ACT_TOOL_SUBGROUP_2 = 2082,
@@ -1972,6 +1988,7 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_CLONE, CANVAS_ACT_MODULE_CLONE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_CLEAR, CANVAS_ACT_MODULE_CLEAR },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_DESTROY, CANVAS_ACT_MODULE_DESTROY },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_EXPORT, CANVAS_ACT_MODULE_EXPORT },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_0, CANVAS_ACT_TOOL_SUBGROUP_0 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_1, CANVAS_ACT_TOOL_SUBGROUP_1 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_2, CANVAS_ACT_TOOL_SUBGROUP_2 },
@@ -2324,6 +2341,13 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 int focused = c->focused_module;
                 if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
                     canvas_destroy_module(c, focused);
+                }
+                break;
+            }
+            case CANVAS_ACT_MODULE_EXPORT: {
+                int focused = c->focused_module;
+                if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
+                    gp_canvas_export_module_to_root(reinterpret_cast<GP_CanvasContext*>(c), focused, nullptr);
                 }
                 break;
             }
@@ -3468,18 +3492,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             if (view_x >= bx_play && view_x < bx_play + bw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_TOGGLE)) return 1;
             }
-            int bx_clone = bx_action_left;
-            int bx_clear = bx_clone + bw + action_btn_gap;
-            int bx_destroy = bx_clear + bw + action_btn_gap;
-            if (view_x >= bx_clone && view_x < bx_clone + bw) {
-                if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_CLONE)) return 1;
-            }
-            if (view_x >= bx_clear && view_x < bx_clear + bw) {
-                if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_CLEAR)) return 1;
-            }
-            if (view_x >= bx_destroy && view_x < bx_destroy + bw) {
-                if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_DESTROY)) return 1;
-            }
+            // Module-level clone/clear/destroy buttons moved into module top UI.
             if (view_x >= bx_delay_minus && view_x < bx_delay_minus + nbw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_DELAY_DEC)) return 1;
             }
@@ -3695,6 +3708,55 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             c->focused_module = mi;
             // debug: report focus and current table-tool selection before any action
             printf("gp_canvas_on_click: focus set -> module=%d selected_tool_table=%d selected_tool_canvas=%d\n", mi, c->selected_tool_table, c->selected_tool_canvas);
+            // Detect clicks on module-top action buttons (Clone/Clear/Destroy/Export)
+            {
+                ModuleLayout layout = module_layout_for(c, mi, m);
+                if (layout.top_h > 0) {
+                    int sx = m.x;
+                    int sy = m.y;
+                    int cursor_y = sy + kModuleTopPadding;
+                    cursor_y += kModuleTitleRowH;
+                    cursor_y += kModuleThumbRowH + kModuleTopGap;
+                    int control_y = cursor_y;
+                    int control_h = std::max(1, kModuleControlRowH - 2);
+                    int btn_y = control_y + 1;
+                    int nbw = control_h;
+                    int gap = 6;
+                    int right_x = sx + m.w - kModuleTopPadding;
+                    int menu_w = std::max(30, control_h);
+                    int pause_w = std::max(42, control_h * 2);
+                    int menu_x = right_x - menu_w;
+                    int pause_x = menu_x - gap - pause_w;
+                    int module_btn_count = 4;
+                    int module_btn_w = nbw;
+                    int module_gap = 6;
+                    int btns_total_w = module_btn_count * (module_btn_w + module_gap) - module_gap;
+                    int btns_right = pause_x - module_gap;
+                    int btns_left = btns_right - btns_total_w;
+                    int bx = btns_left;
+                    if (world_y >= btn_y && world_y < btn_y + control_h) {
+                        // Clone
+                        if (world_x >= bx && world_x < bx + module_btn_w) {
+                            if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_CLONE)) return 1;
+                        }
+                        bx += module_btn_w + module_gap;
+                        // Clear
+                        if (world_x >= bx && world_x < bx + module_btn_w) {
+                            if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_CLEAR)) return 1;
+                        }
+                        bx += module_btn_w + module_gap;
+                        // Destroy
+                        if (world_x >= bx && world_x < bx + module_btn_w) {
+                            if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_DESTROY)) return 1;
+                        }
+                        bx += module_btn_w + module_gap;
+                        // Export
+                        if (world_x >= bx && world_x < bx + module_btn_w) {
+                            if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_EXPORT)) return 1;
+                        }
+                    }
+                }
+            }
             if (mi < static_cast<int>(c->module_tables.size()) && c->module_tables[mi] && c->selected_tool_canvas == 0) {
                 // local coords; only forward clicks into attached tables when
                 // canvas is in select/interaction mode (tool 0). In edge-mode
@@ -5276,8 +5338,9 @@ extern "C" int gp_canvas_export_module_library(GP_CanvasContext* ctx_, const cha
         module.module_idx = static_cast<int>(i);
         module.id = gp_module_library_module_id(module.module_idx);
         module.label = canvas_module_label(mod);
-        module.serialized_path = gp_module_library_module_serialized_path(library.root_dir, module.id);
-        module.source_path = gp_module_library_module_source_path(library.root_dir, module.id);
+        // Use relative paths (no root) so actualizer will join with the chosen root
+        module.serialized_path = gp_module_library_module_serialized_path(std::string(), module.id);
+        module.source_path = gp_module_library_module_source_path(std::string(), module.id);
 
         if (i < c->module_io_rows.size()) {
             const auto &rows = c->module_io_rows[i];
@@ -5292,7 +5355,8 @@ extern "C" int gp_canvas_export_module_library(GP_CanvasContext* ctx_, const cha
                     tool.kind = tool_kind;
                     tool.id = gp_module_library_tool_id(tool_kind);
                     tool.name = gp_module_tool_kind_name(tool_kind);
-                    tool.source_path = gp_module_library_tool_source_path(library.root_dir, tool.id);
+                    // Use relative tool source path
+                    tool.source_path = gp_module_library_tool_source_path(std::string(), tool.id);
                     tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
                 }
                 GP_ModuleToolInstance instance{};
@@ -5310,6 +5374,104 @@ extern "C" int gp_canvas_export_module_library(GP_CanvasContext* ctx_, const cha
     }
 
     return gp_module_library_write_to_file(library, path);
+}
+
+extern "C" int gp_canvas_actualize_to_root(GP_CanvasContext* ctx_, const char* output_root) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+
+    GP_ModuleLibrary library{};
+    library.root_dir = gp_module_library_default_root();
+    std::map<int, GP_ModuleLibraryTool> tool_registry_by_kind;
+
+    for (size_t i = 0; i < c->modules.size(); ++i) {
+        const auto &mod = c->modules[i];
+        GP_ModuleLibraryModule module{};
+        module.module_idx = static_cast<int>(i);
+        module.id = gp_module_library_module_id(module.module_idx);
+        module.label = canvas_module_label(mod);
+        // Use relative paths (no root) so actualizer will join with the chosen root
+        module.serialized_path = gp_module_library_module_serialized_path(std::string(), module.id);
+        module.source_path = gp_module_library_module_source_path(std::string(), module.id);
+
+        if (i < c->module_io_rows.size()) {
+            const auto &rows = c->module_io_rows[i];
+            for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
+                const auto &row = rows[row_idx];
+                if (row.kind != ModuleRowKind::Tool) continue;
+                ModuleToolKind tool_kind = row.tool;
+                if (tool_kind == ModuleToolKind::None) continue;
+                auto tool_it = tool_registry_by_kind.find(static_cast<int>(tool_kind));
+                if (tool_it == tool_registry_by_kind.end()) {
+                    GP_ModuleLibraryTool tool{};
+                    tool.kind = tool_kind;
+                    tool.id = gp_module_library_tool_id(tool_kind);
+                    tool.name = gp_module_tool_kind_name(tool_kind);
+                    // Use relative tool source path
+                    tool.source_path = gp_module_library_tool_source_path(std::string(), tool.id);
+                    tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
+                }
+                GP_ModuleToolInstance instance{};
+                instance.row_idx = static_cast<int>(row_idx);
+                instance.attachment_count = row.attachment_count;
+                instance.tool_id = gp_module_library_tool_id(tool_kind);
+                module.tool_instances.push_back(std::move(instance));
+            }
+        }
+        library.modules.push_back(std::move(module));
+    }
+
+    for (auto &entry : tool_registry_by_kind) {
+        library.tool_registry.push_back(std::move(entry.second));
+    }
+
+    const char* root = output_root ? output_root : nullptr;
+    // If output_root is null, let actualizer use library.root_dir (which defaults to "module_library")
+    std::string root_str = root ? std::string(root) : std::string();
+    return gp_module_library_actualize_sources(library, root_str.empty() ? nullptr : root_str.c_str());
+}
+
+extern "C" int gp_canvas_export_module_to_root(GP_CanvasContext* ctx_, int module_idx, const char* output_root) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return 0;
+
+    std::string root = output_root ? std::string(output_root) : gp_module_library_default_root();
+    std::string module_id = gp_module_library_module_id(module_idx);
+    std::string rel = gp_module_library_module_serialized_path(std::string(), module_id);
+    std::filesystem::path full = std::filesystem::path(root) / rel;
+
+    try {
+        std::filesystem::create_directories(full.parent_path());
+    } catch (...) {
+        // ignore
+    }
+
+    GP_TableContext* t = (module_idx >= 0 && module_idx < static_cast<int>(c->module_tables.size())) ? c->module_tables[module_idx] : nullptr;
+    if (!t) {
+        // create an empty placeholder file
+        std::ofstream ofs(full, std::ios::binary | std::ios::trunc);
+        if (!ofs.good()) return 0;
+        ofs.close();
+        return 1;
+    }
+
+    int32_t need = gp_table_serialize(t, nullptr, 0);
+    if (need <= 0) {
+        // create empty file
+        std::ofstream ofs(full, std::ios::binary | std::ios::trunc);
+        if (!ofs.good()) return 0;
+        ofs.close();
+        return 1;
+    }
+    std::vector<char> buf(static_cast<size_t>(need));
+    int32_t written = gp_table_serialize(t, buf.data(), need);
+    if (written != need) return 0;
+    std::ofstream ofs(full, std::ios::binary | std::ios::trunc);
+    if (!ofs.good()) return 0;
+    ofs.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+    ofs.close();
+    return 1;
 }
 
 extern "C" int gp_canvas_set_cable_style(GP_CanvasContext* ctx_, int jacket_px, int jacket_border) {

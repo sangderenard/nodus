@@ -23,9 +23,10 @@ class ToolDllTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        cls.compiler = _compiler()
-        if not cls.compiler:
-            raise unittest.SkipTest("No C++ compiler available")
+        cls.cmake = shutil.which("cmake")
+        if not cls.cmake:
+            raise unittest.SkipTest("No CMake available")
+        # We will use CMake to build the test loader and tools, so no direct compiler is required here.
         cls.serialized = sorted(
             glob.glob(os.path.join(cls.repo_root, "module_library", "serialized", "*.gpmod"))
         )
@@ -56,33 +57,24 @@ class ToolDllTest(unittest.TestCase):
                 f.write("\n".join(module_lines))
                 f.write("\n")
 
-            generator = os.path.join(temp_root, "modlib_actualize")
-            generator_cpp = os.path.join(temp_root, "modlib_actualize.cpp")
-            with open(generator_cpp, "w", encoding="utf-8") as f:
-                f.write(
-                    "#include \"module_library_actualizer.h\"\n"
-                    "#include <iostream>\n\n"
-                    "int main(int argc, char** argv) {\n"
-                    "    if (argc < 3) {\n"
-                    "        std::cerr << \"usage: modlib_actualize <lib> <root>\\n\";\n"
-                    "        return 2;\n"
-                    "    }\n"
-                    "    return gp_module_library_actualize_from_file(argv[1], argv[2]) ? 0 : 1;\n"
-                    "}\n"
-                )
+            # Build the project's `modlib_actualize` target via CMake
+            repo_build = os.path.join(self.repo_root, "build")
+            subprocess.run([self.cmake, "--build", repo_build, "--target", "modlib_actualize", "--config", "Release"], check=True)
 
-            compile_cmd = [
-                self.compiler,
-                "-std=c++17",
-                "-I",
-                self.repo_root,
-                generator_cpp,
-                os.path.join(self.repo_root, "module_library_actualizer.cpp"),
-                os.path.join(self.repo_root, "module_library.cpp"),
-                "-o",
-                generator,
-            ]
-            subprocess.run(compile_cmd, check=True)
+            # Locate built executable
+            if sys.platform.startswith("win"):
+                generator = os.path.join(repo_build, "Release", "modlib_actualize.exe")
+            else:
+                generator = os.path.join(repo_build, "modlib_actualize")
+            if not os.path.exists(generator):
+                # try common places
+                for root, _, files in os.walk(repo_build):
+                    for fn in files:
+                        if fn.startswith("modlib_actualize"):
+                            generator = os.path.join(root, fn)
+                            break
+                    if os.path.exists(generator):
+                        break
 
             subprocess.run([generator, modlib_path, source_root], check=True)
 
@@ -160,55 +152,102 @@ class ToolDllTest(unittest.TestCase):
                     "}\n"
                 )
 
-            compile_cmd = [
-                self.compiler,
-                "-std=c++17",
-                "-I",
-                self.repo_root,
-                loader_cpp,
-                "-o",
-                loader,
-            ]
+            # Build the loader with CMake to avoid relying on a specific compiler command.
+            proj_dir = os.path.join(temp_root, "loader_cmake")
+            build_dir = os.path.join(proj_dir, "build")
+            os.makedirs(proj_dir, exist_ok=True)
+            cmakelists = """
+cmake_minimum_required(VERSION 3.15)
+project(tool_loader LANGUAGES CXX)
+add_executable(tool_loader "%s")
+target_include_directories(tool_loader PRIVATE "%s")
+set_target_properties(tool_loader PROPERTIES CXX_STANDARD 17)
+""" % (loader_cpp.replace("\\", "/"), self.repo_root.replace("\\", "/"))
             if not sys.platform.startswith("win"):
-                compile_cmd.append("-ldl")
-            subprocess.run(compile_cmd, check=True)
+                cmakelists += "\nfind_package(Threads REQUIRED)\nset(CMAKE_THREAD_LIBS_INIT ${CMAKE_THREAD_LIBS_INIT})\nadd_definitions(-D_POSIX_C_SOURCE=200112L)\n" \
+                           + "target_link_libraries(tool_loader PRIVATE dl)\n"
+
+            cmake_file = os.path.join(proj_dir, "CMakeLists.txt")
+            with open(cmake_file, "w", encoding="utf-8") as f:
+                f.write(cmakelists)
+
+            subprocess.run([self.cmake, "-S", proj_dir, "-B", build_dir, "-DCMAKE_BUILD_TYPE=Release"], check=True)
+            subprocess.run([self.cmake, "--build", build_dir, "--config", "Release"], check=True)
+
+            if sys.platform.startswith("win"):
+                loader_exec = os.path.join(build_dir, "Release", "tool_loader.exe")
+            else:
+                loader_exec = os.path.join(build_dir, "tool_loader")
 
             tool_sources = glob.glob(os.path.join(source_root, "source", "tools", "*.cpp"))
             self.assertTrue(tool_sources, "No tool sources generated")
 
             for tool_source in tool_sources:
                 tool_name = os.path.splitext(os.path.basename(tool_source))[0]
-                tool_lib = os.path.join(temp_root, tool_name + _shared_lib_ext())
-                build_cmd = [
-                    self.compiler,
-                    "-std=c++17",
-                    "-shared",
-                    "-fPIC",
-                    "-I",
-                    self.repo_root,
-                    tool_source,
-                    "-o",
-                    tool_lib,
-                ]
+
+                # Create a tiny CMake project to build this tool as a shared library.
+                proj_dir = os.path.join(temp_root, "cmake_" + tool_name)
+                build_dir = os.path.join(proj_dir, "build")
+                os.makedirs(proj_dir, exist_ok=True)
+
+                cmakelists = """
+cmake_minimum_required(VERSION 3.15)
+project(%s LANGUAGES CXX)
+add_library(%s SHARED "%s")
+target_include_directories(%s PRIVATE "%s")
+set_target_properties(%s PROPERTIES CXX_STANDARD 17)
+""" % (tool_name, tool_name, tool_source.replace('\\', '/'), tool_name, self.repo_root.replace('\\', '/'), tool_name)
+
+                cmake_file = os.path.join(proj_dir, "CMakeLists.txt")
+                with open(cmake_file, "w", encoding="utf-8") as f:
+                    f.write(cmakelists)
+
+                # Prefer using Ninja + g++/clang++ when available (avoids MSVC-specific compile issues).
+                preferred_cxx = shutil.which("g++") or shutil.which("clang++")
+                have_ninja = shutil.which("ninja") is not None
+                if preferred_cxx and have_ninja:
+                    subprocess.run([
+                        "cmake",
+                        "-S",
+                        proj_dir,
+                        "-B",
+                        build_dir,
+                        "-G",
+                        "Ninja",
+                        "-DCMAKE_BUILD_TYPE=Release",
+                        "-DCMAKE_CXX_COMPILER=%s" % preferred_cxx,
+                    ], check=True)
+                    subprocess.run(["cmake", "--build", build_dir], check=True)
+                else:
+                    subprocess.run(["cmake", "-S", proj_dir, "-B", build_dir, "-DCMAKE_BUILD_TYPE=Release"], check=True)
+                    # Use --config Release for multi-config generators (e.g., MSVC)
+                    subprocess.run(["cmake", "--build", build_dir, "--config", "Release"], check=True)
+
+                # Find the built shared library.
+                tool_lib = None
+                # Common locations: build/Release/<name>.dll (Windows) or build/lib<name>.so (Unix)
                 if sys.platform.startswith("win"):
-                    build_cmd = [
-                        self.compiler,
-                        "-std=c++17",
-                        "-shared",
-                        "-I",
-                        self.repo_root,
-                        tool_source,
-                        "-o",
-                        tool_lib,
-                    ]
-                subprocess.run(build_cmd, check=True)
+                    candidate = os.path.join(build_dir, "Release", tool_name + _shared_lib_ext())
+                    if os.path.exists(candidate):
+                        tool_lib = candidate
+                if not tool_lib:
+                    # search build dir for lib matching tool_name
+                    for root, _, files in os.walk(build_dir):
+                        for fn in files:
+                            if fn.endswith(_shared_lib_ext()) and tool_name in fn:
+                                tool_lib = os.path.join(root, fn)
+                                break
+                        if tool_lib:
+                            break
+                if not tool_lib:
+                    raise RuntimeError("Failed to locate built tool library for %s" % tool_name)
 
                 module_id = tool_name.replace("tool_", "", 1)
                 serialized = next(
                     (p for p in self.serialized if os.path.splitext(os.path.basename(p))[0] == module_id),
                     None,
                 )
-                subprocess.run([loader, tool_lib, serialized or ""], check=True)
+                subprocess.run([loader_exec, tool_lib, serialized or ""], check=True)
 
 
 if __name__ == "__main__":

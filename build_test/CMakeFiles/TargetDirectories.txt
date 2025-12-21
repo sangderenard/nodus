@@ -1,0 +1,6 @@
+C:/dev/Powershell/nodus/build_test/CMakeFiles/canvas_tables.dir
+C:/dev/Powershell/nodus/build_test/CMakeFiles/modlib_actualize.dir
+C:/dev/Powershell/nodus/build_test/CMakeFiles/test_thread_manager.dir
+C:/dev/Powershell/nodus/build_test/CMakeFiles/RUN_TESTS.dir
+C:/dev/Powershell/nodus/build_test/CMakeFiles/ALL_BUILD.dir
+C:/dev/Powershell/nodus/build_test/CMakeFiles/ZERO_CHECK.dir

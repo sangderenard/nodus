@@ -130,6 +130,14 @@ int gp_canvas_load_from_file(GP_CanvasContext* ctx, const char* path);
 // Export a module library serialization with tool/source references. Returns 1 on success.
 int gp_canvas_export_module_library(GP_CanvasContext* ctx, const char* path);
 
+// Actualize the current canvas into an output root directory (create
+// module_library/{serialized,source} placeholders and tool sources).
+// Returns 1 on success.
+int gp_canvas_actualize_to_root(GP_CanvasContext* ctx, const char* output_root);
+// Export a single module's serialized blob to the given output root.
+// If output_root is NULL, uses the default `module_library` root.
+int gp_canvas_export_module_to_root(GP_CanvasContext* ctx, int module_idx, const char* output_root);
+
 // Templates directory: set a global library directory for templates (used by
 // table template APIs if they are invoked with dir==NULL).
 int gp_canvas_set_templates_dir(const char* dir);

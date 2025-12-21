@@ -1,0 +1,54 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "regular",
+      "displayName": "Regular build",
+      "description": "Configure regular project build",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MODULE_LIBRARY_MODE": "regular"
+      }
+    },
+    {
+      "name": "module-library-test",
+      "displayName": "Module library - test",
+      "description": "Configure build to generate test module library sources",
+      "binaryDir": "${sourceDir}/build_test",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MODULE_LIBRARY_MODE": "test",
+        "GENERATE_TEST_MODULE_LIBRARY": "ON"
+      }
+    },
+    {
+      "name": "module-library-real",
+      "displayName": "Module library - real",
+      "description": "Configure build to generate real module library sources",
+      "binaryDir": "${sourceDir}/build_real",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MODULE_LIBRARY_MODE": "real",
+        "GENERATE_REAL_MODULE_LIBRARY": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "regular-build",
+      "configurePreset": "regular",
+      "configuration": "Release"
+    },
+    {
+      "name": "module-library-test-build",
+      "configurePreset": "module-library-test",
+      "configuration": "Release"
+    },
+    {
+      "name": "module-library-real-build",
+      "configurePreset": "module-library-real",
+      "configuration": "Release"
+    }
+  ]
+}

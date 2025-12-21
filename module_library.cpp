@@ -33,15 +33,15 @@ std::string gp_module_library_module_id(int module_idx) {
 }
 
 std::string gp_module_library_tool_source_path(const std::string& root_dir, const std::string& tool_id) {
-    return join_path(root_dir + "/" + kSourceDir + "/" + kToolDir, "", tool_id + ".cpp");
+    return join_path(root_dir, std::string(kSourceDir) + "/" + std::string(kToolDir), tool_id + ".cpp");
 }
 
 std::string gp_module_library_module_source_path(const std::string& root_dir, const std::string& module_id) {
-    return join_path(root_dir + "/" + kSourceDir + "/" + kModuleDir, "", module_id + ".cpp");
+    return join_path(root_dir, std::string(kSourceDir) + "/" + std::string(kModuleDir), module_id + ".cpp");
 }
 
 std::string gp_module_library_module_serialized_path(const std::string& root_dir, const std::string& module_id) {
-    return join_path(root_dir + "/" + kSerializedDir, "", module_id + ".gpmod");
+    return join_path(root_dir, std::string(kSerializedDir), module_id + ".gpmod");
 }
 
 const char* gp_module_tool_kind_name(ModuleToolKind kind) {

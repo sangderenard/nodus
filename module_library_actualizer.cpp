@@ -12,6 +12,9 @@
 
 #include "tool_api.h"
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -30,6 +33,7 @@ bool ensure_parent_dir(const std::filesystem::path& path, std::string& err) {
 }
 
 bool atomic_write_file(const std::filesystem::path& target, const std::string& contents, std::string& err) {
+    std::filesystem::path tmp;
     try {
         if (!ensure_parent_dir(target, err)) return false;
         // create a temp file name in the same directory
@@ -38,7 +42,7 @@ bool atomic_write_file(const std::filesystem::path& target, const std::string& c
         uint64_t v = gen();
         std::ostringstream ss;
         ss << std::hex << v;
-        auto tmp = target.parent_path() / (target.filename().string() + ".tmp-" + ss.str());
+        tmp = target.parent_path() / (target.filename().string() + ".tmp-" + ss.str());
 
         std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
         if (!ofs.good()) {
@@ -62,7 +66,7 @@ bool atomic_write_file(const std::filesystem::path& target, const std::string& c
         return true;
     } catch (const std::exception& e) {
         err = e.what();
-        try { std::filesystem::remove(target); } catch (...) {}
+        try { if (!tmp.empty() && std::filesystem::exists(tmp)) std::filesystem::remove(tmp); } catch (...) {}
         return false;
     }
 }
@@ -150,26 +154,44 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
     ss << "    void render(RenderContext& /*ctx*/) override {}\n\n";
 
     ss << "    int32_t port_count() const override {\n";
-    ss << "        return static_cast<int32_t>(sizeof(kPorts) / sizeof(kPorts[0]));\n";
+    ss << "        return static_cast<int32_t>(kPortCount);\n";
     ss << "    }\n\n";
     ss << "    ToolPortSpec port_spec(int32_t idx) const override {\n";
     ss << "        if (idx < 0 || idx >= port_count()) return ToolPortSpec{};\n";
     ss << "        return kPorts[idx];\n";
     ss << "    }\n\n";
     ss << "private:\n";
-    ss << "    static constexpr ToolPortSpec kPorts[] = {\n";
-    if (plan.args > 0) {
-        ss << "        {ToolPortKind::Argument, " << plan.args << "},\n";
+
+    // decide how many ports we will emit
+    int k_total_ports = 0;
+    if (plan.args > 0) k_total_ports += 1;
+    if (plan.internal > 0) k_total_ports += 1;
+    if (plan.returns > 0) k_total_ports += 1;
+
+    if (k_total_ports > 0) {
+        ss << "    static constexpr ToolPortSpec kPorts[] = {\n";
+        if (plan.args > 0) {
+            ss << "        {ToolPortKind::Argument, " << plan.args << "},\n";
+        }
+        if (plan.internal > 0) {
+            ss << "        {ToolPortKind::Internal, " << plan.internal << "},\n";
+        }
+        if (plan.returns > 0) {
+            ss << "        {ToolPortKind::Return, " << plan.returns << "},\n";
+        }
+        ss << "    };\n";
+        ss << "    static constexpr int kPortCount = static_cast<int>(sizeof(kPorts) / sizeof(kPorts[0]));\n";
+    } else {
+        ss << "    static constexpr const ToolPortSpec* kPorts = nullptr;\n";
+        ss << "    static constexpr int kPortCount = 0;\n";
     }
-    if (plan.internal > 0) {
-        ss << "        {ToolPortKind::Internal, " << plan.internal << "},\n";
-    }
-    if (plan.returns > 0) {
-        ss << "        {ToolPortKind::Return, " << plan.returns << "},\n";
-    }
-    ss << "    };\n";
+
     ss << "};\n\n";
+    ss << "#if defined(_WIN32)\n";
+    ss << "extern \"C\" __declspec(dllexport) ITool* create_tool() {\n";
+    ss << "#else\n";
     ss << "extern \"C\" ITool* create_tool() {\n";
+    ss << "#endif\n";
     ss << "    return new " << class_name << "();\n";
     ss << "}\n";
 
