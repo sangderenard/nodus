@@ -61,6 +61,8 @@
 #define LABEL_MENU_TITLE "Tool Menu"
 #define LABEL_MENU_STACK_TITLE "Stack"
 #define LABEL_MENU_KEY_RECORDER "Key Recorder"
+#define LABEL_MENU_TABLE_NUMBER "Table Number"
+#define LABEL_MENU_TABLE_NUMBER_SHORT "n"
 
 // Tool labels
 #define LABEL_TOOL_ADD "Add"

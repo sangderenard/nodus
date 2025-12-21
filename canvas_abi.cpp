@@ -425,6 +425,7 @@ struct GP_CanvasContextImpl {
     int selected_tool_table = 0;
     bool tool_menu_open = false;
     int io_attachment_count = 1;
+    int table_tool_number = 1;
     // which module (if any) has keyboard/focus for table editing
     int focused_module = -1;
     // registered host windows (opaque pointers)
@@ -909,6 +910,8 @@ enum CanvasActionId {
     CANVAS_ACT_IO_COUNT_INC = 2041,
     CANVAS_ACT_IO_CONSUMER_ADD = 2042,
     CANVAS_ACT_IO_PRODUCER_ADD = 2043,
+    CANVAS_ACT_TABLE_TOOL_NUM_DEC = 2044,
+    CANVAS_ACT_TABLE_TOOL_NUM_INC = 2045,
     CANVAS_ACT_MODULE_LED = 2050,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
     CANVAS_ACT_MENU_TOOL_SUB = 2102,
@@ -1194,6 +1197,9 @@ struct ToolMenuLayout {
     int item_start_y = 0;
     int stack_start_y = 0;
     int stack_count = 0;
+    int table_section_y = 0;
+    int table_control_y = 0;
+    int table_control_h = 0;
 };
 
 static ToolMenuLayout compute_tool_menu_layout(const GP_CanvasContextImpl* ctx) {
@@ -1212,6 +1218,7 @@ static ToolMenuLayout compute_tool_menu_layout(const GP_CanvasContextImpl* ctx) 
     if (stack_count > 0) {
         h += padding + header_h + stack_count * row_h;
     }
+    h += padding + header_h + row_h;
     int x = std::max(margin, ctx->width - w - margin);
     int y = ctx->rope_bar_h + ctx->control_bar_h + margin;
     layout.x = x;
@@ -1223,7 +1230,44 @@ static ToolMenuLayout compute_tool_menu_layout(const GP_CanvasContextImpl* ctx) 
     layout.item_start_y = y + padding + header_h;
     layout.stack_start_y = layout.item_start_y + static_cast<int>(std::size(kToolMenuItems)) * row_h + padding;
     layout.stack_count = stack_count;
+    int table_start_y = layout.item_start_y + static_cast<int>(std::size(kToolMenuItems)) * row_h + padding;
+    if (stack_count > 0) {
+        table_start_y = layout.stack_start_y + stack_count * row_h + padding;
+    }
+    layout.table_section_y = table_start_y;
+    layout.table_control_y = table_start_y + header_h;
+    layout.table_control_h = row_h;
     return layout;
+}
+
+struct ToolMenuCounterLayout {
+    int bx_minus = 0;
+    int bx_num = 0;
+    int bx_plus = 0;
+    int by = 0;
+    int nbw = 0;
+    int num_w = 0;
+    int h = 0;
+};
+
+static ToolMenuCounterLayout compute_tool_menu_counter_layout(const ToolMenuLayout& layout) {
+    ToolMenuCounterLayout out{};
+    int control_x = layout.x + 8;
+    int control_w = layout.w - 16;
+    int control_h = std::max(18, layout.table_control_h - 2);
+    int gap = 8;
+    int nbw = control_h;
+    int num_w = std::max(32, control_w - nbw * 2 - gap * 2);
+    int total_w = nbw + gap + num_w + gap + nbw;
+    int bx_minus = control_x + (control_w - total_w) / 2;
+    out.bx_minus = bx_minus;
+    out.bx_num = bx_minus + nbw + gap;
+    out.bx_plus = out.bx_num + num_w + gap;
+    out.by = layout.table_control_y + 1;
+    out.nbw = nbw;
+    out.num_w = num_w;
+    out.h = control_h;
+    return out;
 }
 
 static const GP_TableAction kCanvasRootActions[] = {
@@ -1251,6 +1295,8 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_COUNT_INC, CANVAS_ACT_IO_COUNT_INC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_CONSUMER_ADD, CANVAS_ACT_IO_CONSUMER_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_PRODUCER_ADD, CANVAS_ACT_IO_PRODUCER_ADD },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TABLE_TOOL_NUM_DEC, CANVAS_ACT_TABLE_TOOL_NUM_DEC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TABLE_TOOL_NUM_INC, CANVAS_ACT_TABLE_TOOL_NUM_INC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
@@ -1524,6 +1570,13 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                         is_input ? "consumer" : "producer",
                         c->io_attachment_count);
                 }
+                break;
+            }
+            case CANVAS_ACT_TABLE_TOOL_NUM_DEC:
+            case CANVAS_ACT_TABLE_TOOL_NUM_INC: {
+                int delta = (action_id == CANVAS_ACT_TABLE_TOOL_NUM_INC) ? 1 : -1;
+                c->table_tool_number = std::clamp(c->table_tool_number + delta, 0, 99);
+                printf("gp_canvas_on_click: table_tool_number -> %d\n", c->table_tool_number);
                 break;
             }
             case CANVAS_ACT_MODULE_LED:
@@ -2540,6 +2593,15 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 int y0 = item_y + static_cast<int>(i) * layout.row_h;
                 if (view_y >= y0 && view_y < y0 + layout.row_h) {
                     if (canvas_dispatch_root_action(c, kToolMenuItems[i].action_id)) return 1;
+                }
+            }
+            ToolMenuCounterLayout counter = compute_tool_menu_counter_layout(layout);
+            if (view_y >= counter.by && view_y < counter.by + counter.h) {
+                if (view_x >= counter.bx_minus && view_x < counter.bx_minus + counter.nbw) {
+                    if (canvas_dispatch_root_action(c, CANVAS_ACT_TABLE_TOOL_NUM_DEC)) return 1;
+                }
+                if (view_x >= counter.bx_plus && view_x < counter.bx_plus + counter.nbw) {
+                    if (canvas_dispatch_root_action(c, CANVAS_ACT_TABLE_TOOL_NUM_INC)) return 1;
                 }
             }
             return 1;
@@ -3691,6 +3753,20 @@ extern "C" int gp_canvas_get_autosave(GP_CanvasContext* ctx_, char* out_path, in
         if (to_write > 0) memcpy(out_path, c->autosave_path.data(), static_cast<size_t>(to_write));
     }
     if (out_interval_s) *out_interval_s = c->autosave_interval_s;
+    return 1;
+}
+
+extern "C" int gp_canvas_set_table_tool_number(GP_CanvasContext* ctx_, int value) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->table_tool_number = std::clamp(value, 0, 99);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_table_tool_number(GP_CanvasContext* ctx_, int* out_value) {
+    if (!ctx_ || !out_value) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    *out_value = c->table_tool_number;
     return 1;
 }
 
@@ -5299,6 +5375,97 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                         std::snprintf(label, sizeof(label), "%s", tool_label(row.tool));
                     }
                     blit_text(label, layout.x + 12, y0 + 3, 0.85f, Color{210,210,220,255});
+                }
+            }
+        }
+        int table_title_y = layout.table_section_y + 2;
+        blit_text(LABEL_MENU_TABLE_NUMBER, layout.x + 8, table_title_y, 0.9f, Color{200,200,210,255});
+        ToolMenuCounterLayout counter = compute_tool_menu_counter_layout(layout);
+        memset_rect(out_rgba, w, h, pitch, counter.bx_minus, counter.by, counter.nbw, counter.h, Color{50,50,56,255});
+        memset_rect(out_rgba, w, h, pitch, counter.bx_num, counter.by, counter.num_w, counter.h, Color{36,36,42,255});
+        memset_rect(out_rgba, w, h, pitch, counter.bx_plus, counter.by, counter.nbw, counter.h, Color{50,50,56,255});
+        auto minus = render_text_to_rgba(LABEL_IO_MINUS, 1.0f, {230,230,235,255});
+        if (!minus.pixels.empty()) {
+            int tx = counter.bx_minus + (counter.nbw - minus.width) / 2;
+            int ty = counter.by + (counter.h - minus.height) / 2;
+            for (int yy = 0; yy < minus.height; ++yy) {
+                int dst_y = ty + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < minus.width; ++xx) {
+                    int dst_x = tx + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &minus.pixels[(yy * minus.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        }
+        auto plus = render_text_to_rgba(LABEL_IO_PLUS, 1.0f, {230,230,235,255});
+        if (!plus.pixels.empty()) {
+            int tx = counter.bx_plus + (counter.nbw - plus.width) / 2;
+            int ty = counter.by + (counter.h - plus.height) / 2;
+            for (int yy = 0; yy < plus.height; ++yy) {
+                int dst_y = ty + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < plus.width; ++xx) {
+                    int dst_x = tx + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &plus.pixels[(yy * plus.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        }
+        std::string s = std::to_string(std::max(0, ctx->table_tool_number));
+        auto bm = render_text_to_rgba(s, 1.0f, {255,255,255,255});
+        if (!bm.pixels.empty()) {
+            int tx = counter.bx_num + (counter.num_w - bm.width) / 2;
+            int ty = counter.by + (counter.h - bm.height) / 2;
+            for (int yy = 0; yy < bm.height; ++yy) {
+                int dst_y = ty + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < bm.width; ++xx) {
+                    int dst_x = tx + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        }
+        auto lb = render_text_to_rgba(LABEL_MENU_TABLE_NUMBER_SHORT, 0.75f, {200,200,200,255});
+        if (!lb.pixels.empty()) {
+            int tx = counter.bx_num + (counter.num_w - lb.width) / 2;
+            int ty = counter.by - lb.height - 2;
+            for (int yy = 0; yy < lb.height; ++yy) {
+                int dst_y = ty + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < lb.width; ++xx) {
+                    int dst_x = tx + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &lb.pixels[(yy * lb.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
                 }
             }
         }
