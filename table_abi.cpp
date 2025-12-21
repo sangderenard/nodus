@@ -1630,6 +1630,7 @@ struct EdgeTensorFifo {
     float read_friction() const { return impl ? impl->read_friction.load(std::memory_order_relaxed) : 0.0f; }
     float write_phase() const { return impl ? impl->write_phase.load(std::memory_order_relaxed) : 0.0f; }
     float read_phase() const { return impl ? impl->read_phase.load(std::memory_order_relaxed) : 0.0f; }
+    uint64_t write_seq() const { return impl ? impl->write_seq.load(std::memory_order_relaxed) : 0; }
 
     float phase_delta() const {
         if (!impl) return 0.0f;
@@ -1896,8 +1897,11 @@ struct GP_TableContext {
     // selected LED keys: packed (row<<32) | (col<<16) | led_index
     std::unordered_set<uint64_t> selected_leds;
     std::unordered_map<uint64_t, float> led_glow_strength;
+    std::unordered_map<uint64_t, float> led_flow_glow_strength;
     std::vector<std::pair<uint64_t,uint64_t>> edges;
     std::vector<EdgeTensorFifo> edge_fifos; // companion FIFO per rope edge
+    std::vector<uint64_t> edge_last_write_seq;
+    std::vector<float> edge_flow_phase;
     std::vector<GP_TableEdgeBatchMetadata> edge_batch_metadata;
     std::vector<uint32_t> edge_subgroup_flags;
     // per-edge persistent unique id used for ThreadManager registration
@@ -4668,6 +4672,41 @@ int32_t gp_table_render_rgba_with_hits(
         hitboxes_written);
 }
 
+static void update_led_flow_glow(GP_TableContext* ctx, float dt_frame) {
+    if (!ctx) return;
+    const size_t edge_count = ctx->edges.size();
+    if (ctx->edge_last_write_seq.size() != edge_count) {
+        ctx->edge_last_write_seq.assign(edge_count, 0);
+        ctx->edge_flow_phase.assign(edge_count, 0.0f);
+    }
+    ctx->led_flow_glow_strength.clear();
+    if (edge_count == 0 || ctx->edge_fifos.empty()) return;
+    if (dt_frame <= 0.0f) dt_frame = 1.0f / 60.0f;
+    for (size_t ei = 0; ei < edge_count; ++ei) {
+        if (ei >= ctx->edge_fifos.size()) break;
+        uint64_t seq = ctx->edge_fifos[ei].write_seq();
+        uint64_t prev = ctx->edge_last_write_seq[ei];
+        ctx->edge_last_write_seq[ei] = seq;
+        if (prev == 0 || seq <= prev) continue;
+        float rate = static_cast<float>(seq - prev) / dt_frame;
+        float freq = std::min(30.0f, rate);
+        float amp = std::clamp(rate / 30.0f, 0.0f, 1.0f);
+        float phase = ctx->edge_flow_phase[ei];
+        phase = std::fmod(phase + 2.0f * kPi * freq * dt_frame, 2.0f * kPi);
+        if (phase < 0.0f) phase += 2.0f * kPi;
+        ctx->edge_flow_phase[ei] = phase;
+        float glow = 0.5f * (std::sin(phase) + 1.0f) * amp;
+        if (glow <= 0.0f) continue;
+        auto update_glow = [&](uint64_t key) {
+            auto it = ctx->led_flow_glow_strength.find(key);
+            if (it == ctx->led_flow_glow_strength.end()) ctx->led_flow_glow_strength[key] = glow;
+            else it->second = std::max(it->second, glow);
+        };
+        update_glow(ctx->edges[ei].first);
+        update_glow(ctx->edges[ei].second);
+    }
+}
+
 int32_t gp_table_render_rgba_with_state(
     GP_TableContext* ctx,
     const GP_TableRenderState* render_state,
@@ -4760,8 +4799,21 @@ int32_t gp_table_render_rgba_with_state(
         return -1;
     };
 
+    double dt_frame = 1.0 / 60.0;
+    if (out_rgba) {
+        using namespace std::chrono;
+        double now_frame = duration<double>(high_resolution_clock::now().time_since_epoch()).count();
+        double last_frame = ctx->relax_last_time;
+        if (last_frame <= 0.0) last_frame = now_frame;
+        dt_frame = now_frame - last_frame;
+        if (dt_frame <= 0.0) dt_frame = 1.0 / 60.0;
+        ctx->relax_last_time = now_frame;
+        // GUI-thread flow visualization: normalize flow rate to a sub-30Hz oscillation.
+        update_led_flow_glow(ctx, static_cast<float>(dt_frame));
+    }
+
     // Optional LED glow pass driven by per-key strengths and input/output hints.
-    if (out_rgba && (!ctx->led_glow_strength.empty() || !ctx->key_is_input.empty() || !ctx->key_is_output.empty())) {
+    if (out_rgba && (!ctx->led_glow_strength.empty() || !ctx->led_flow_glow_strength.empty() || !ctx->key_is_input.empty() || !ctx->key_is_output.empty())) {
         int w_local = geom_ptr->width_px;
         int h_local = geom_ptr->height_px;
         int pitch_local = w_local * 4;
@@ -4839,7 +4891,13 @@ int32_t gp_table_render_rgba_with_state(
             }
         };
 
-        for (const auto &kv : ctx->led_glow_strength) {
+        std::unordered_map<uint64_t, float> combined_glow = ctx->led_glow_strength;
+        for (const auto &kv : ctx->led_flow_glow_strength) {
+            auto it = combined_glow.find(kv.first);
+            if (it == combined_glow.end()) combined_glow[kv.first] = kv.second;
+            else it->second = std::max(it->second, kv.second);
+        }
+        for (const auto &kv : combined_glow) {
             process_key(kv.first, kv.second);
         }
         for (uint64_t key : ctx->key_is_input) {
@@ -4957,6 +5015,8 @@ int32_t gp_table_render_rgba_with_state(
         float glow = 0.0f;
         auto it = ctx->led_glow_strength.find(key);
         if (it != ctx->led_glow_strength.end()) glow = std::max(glow, std::clamp(it->second, 0.0f, 1.0f));
+        auto flow_it = ctx->led_flow_glow_strength.find(key);
+        if (flow_it != ctx->led_flow_glow_strength.end()) glow = std::max(glow, std::clamp(flow_it->second, 0.0f, 1.0f));
         if (glow <= 0.0f && info.is_output && lit) {
             glow = 0.35f;
         }
@@ -4973,15 +5033,6 @@ int32_t gp_table_render_rgba_with_state(
     // render a live prospective edge. This updates small state in the context
     // so behavior is smooth across frames.
     if (out_rgba) {
-        double dt_frame = 1.0 / 60.0; // default frame dt
-        // compute wall-time dt once per frame and step relaxation so edges animate between frames
-        using namespace std::chrono;
-        double now_frame = duration<double>(high_resolution_clock::now().time_since_epoch()).count();
-        double last_frame = ctx->relax_last_time;
-        if (last_frame <= 0.0) last_frame = now_frame;
-        dt_frame = now_frame - last_frame;
-        if (dt_frame <= 0.0) dt_frame = 1.0 / 60.0;
-        ctx->relax_last_time = now_frame;
         // step relax values by the frame dt (keeps animation in render loop)
         gp_table_relax_step(ctx, static_cast<float>(dt_frame));
         // attempt prospective update/draw if enabled
