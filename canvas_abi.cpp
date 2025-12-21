@@ -6,6 +6,7 @@
 #include "text_render_helper.h"
 #include "thread_manager.h"
 #include "labels.h"
+#include "module_preview.h"
 
 #include <vector>
 #include <string>
@@ -309,6 +310,19 @@ struct ModuleFrameLedGroup {
     std::array<std::array<GP_TableCell, kModuleExtraLedCount>, kModuleExtraLedRows> cells{};
 };
 
+struct ModuleFrameLink {
+    std::array<void*, kModuleExtraLedCount> send_ptrs{};
+    std::array<void*, kModuleExtraLedCount> receive_ptrs{};
+};
+
+struct ModulePreviewBuffer {
+    std::vector<uint8_t> rgba;
+    std::vector<GP_TableHitBox> hitboxes;
+    int width_px = 0;
+    int height_px = 0;
+    int pitch_bytes = 0;
+};
+
 static ModuleFrameLedGroup make_module_frame_led_group() {
     ModuleFrameLedGroup group{};
     for (int row = 0; row < kModuleExtraLedRows; ++row) {
@@ -434,6 +448,8 @@ struct GP_CanvasContextImpl {
     std::vector<std::vector<ModuleIORow>> module_io_rows;
     std::vector<std::vector<ModuleIORow>> module_table_rows;
     std::vector<ModuleFrameLedGroup> module_frame_leds;
+    std::vector<ModuleFrameLink> module_frame_links;
+    std::vector<ModulePreviewBuffer> module_preview_buffers;
     std::vector<std::unordered_map<int, std::vector<float>>> module_stack_snapshots;
     std::vector<std::vector<ModuleToolKind>> module_tool_stack;
     // optional per-module key-recorder state pointer
@@ -715,6 +731,8 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->module_io_rows.clear();
     ctx->module_table_rows.clear();
     ctx->module_frame_leds.clear();
+    ctx->module_frame_links.clear();
+    ctx->module_preview_buffers.clear();
     ctx->module_stack_snapshots.clear();
     ctx->module_tool_stack.clear();
     ctx->module_key_recorder_state.clear();
@@ -869,6 +887,20 @@ static GP_TableCell* module_frame_led_cell(GP_CanvasContextImpl* ctx, int module
     if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_frame_leds.size())) return nullptr;
     auto &group = ctx->module_frame_leds[module_idx];
     return &group.cells[static_cast<size_t>(row)][static_cast<size_t>(idx)];
+}
+
+static void build_module_preview_input(const GP_CanvasContextImpl* ctx, int module_idx, GP_ModulePreviewInput &out) {
+    std::memset(&out, 0, sizeof(out));
+    if (!ctx) return;
+    out.rows = 0;
+    out.cols = 0;
+    out.layout_strategy = 0;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_frame_links.size())) return;
+    const auto &links = ctx->module_frame_links[module_idx];
+    for (int i = 0; i < kModuleExtraLedCount; ++i) {
+        out.send_ptrs[i] = links.send_ptrs[static_cast<size_t>(i)];
+        out.receive_ptrs[i] = links.receive_ptrs[static_cast<size_t>(i)];
+    }
 }
 
 static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const GP_CanvasModuleDesc& m, uint8_t* out_rgba, int w, int h, int pitch) {
@@ -2828,6 +2860,8 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_io_rows.emplace_back();
     c->module_table_rows.emplace_back();
     c->module_frame_leds.push_back(make_module_frame_led_group());
+    c->module_frame_links.emplace_back();
+    c->module_preview_buffers.emplace_back();
     c->module_stack_snapshots.emplace_back();
     c->module_tool_stack.emplace_back();
     c->module_key_recorder_state.push_back(nullptr);
@@ -4168,6 +4202,20 @@ extern "C" int gp_canvas_attach_table(GP_CanvasContext* ctx_, int module_idx, GP
                 }
             }
         }
+    }
+    return 1;
+}
+
+extern "C" int gp_canvas_set_module_frame_ptr(GP_CanvasContext* ctx_, int module_idx, int is_send, int led_idx, void* ptr) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx < 0 || module_idx >= static_cast<int>(c->module_frame_links.size())) return 0;
+    if (led_idx < 0 || led_idx >= kModuleExtraLedCount) return 0;
+    auto &links = c->module_frame_links[module_idx];
+    if (is_send) {
+        links.send_ptrs[static_cast<size_t>(led_idx)] = ptr;
+    } else {
+        links.receive_ptrs[static_cast<size_t>(led_idx)] = ptr;
     }
     return 1;
 }
@@ -5696,6 +5744,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         if (!is_stage) {
             memset_rect(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bgc);
         }
+        ModuleLayout layout = module_layout_for(ctx, mi, m);
         if (mi >= 0 && mi < static_cast<int>(ctx->module_bg.size())) {
             auto &bg = ctx->module_bg[mi];
             if (bg.cb) {
@@ -5703,7 +5752,6 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     ensure_module_bg_storage(bg, m.w, m.h, /*oversample=*/1);
                     bg.cb(bg.user, mi, m.w, m.h, bg.scratch.data(), m.w * 4);
                 } else {
-                    ModuleLayout layout = module_layout_for(ctx, mi, m);
                     int preview_h = layout.preview_h;
                     if (preview_h > 0) {
                         ensure_module_bg_storage(bg, m.w, preview_h, /*oversample=*/1);
@@ -5818,7 +5866,6 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     }
                 }
             } else if (bg.mode == 1 && !is_stage) {
-                ModuleLayout layout = module_layout_for(ctx, mi, m);
                 int preview_h = layout.preview_h;
                 if (preview_h > 0) {
                     render_module_raytrace_bg(bg, m.w, preview_h, inputs);
@@ -5827,6 +5874,33 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             } else if (bg.mode == 1) {
                 render_module_raytrace_bg(bg, m.w, m.h, inputs);
                 blit_module_buffer(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bg.scratch);
+            }
+        }
+        if (!is_stage && layout.preview_h > 0 && mi >= 0 && mi < static_cast<int>(ctx->module_preview_buffers.size())) {
+            ModulePreviewBuffer &preview = ctx->module_preview_buffers[mi];
+            int preview_w = std::max(1, m.w);
+            int preview_h = layout.preview_h;
+            int preview_pitch = preview_w * 4;
+            if (preview.width_px != preview_w || preview.height_px != preview_h || preview.pitch_bytes != preview_pitch) {
+                preview.width_px = preview_w;
+                preview.height_px = preview_h;
+                preview.pitch_bytes = preview_pitch;
+                preview.rgba.assign(static_cast<size_t>(preview_w) * static_cast<size_t>(preview_h) * 4u, 0);
+            }
+            if (preview.hitboxes.size() < 1024) preview.hitboxes.resize(1024);
+            GP_ModulePreviewInput input{};
+            build_module_preview_input(ctx, mi, input);
+            GP_ModulePreviewOutput output{};
+            output.rgba = preview.rgba.data();
+            output.width_px = preview.width_px;
+            output.height_px = preview.height_px;
+            output.pitch_bytes = preview.pitch_bytes;
+            output.hitboxes = preview.hitboxes.data();
+            output.hitbox_capacity = static_cast<int32_t>(preview.hitboxes.size());
+            output.hitbox_count = 0;
+            gp_module_preview_build(&input, &output);
+            if (!preview.rgba.empty()) {
+                blit_module_buffer_srcalpha(out_rgba, w, h, pitch, sx, sy + layout.preview_y, preview_w, preview_h, preview.rgba);
             }
         }
         if (mi >= 0 && mi < static_cast<int>(module_tables.size()) && !module_tables[mi].empty()) {
