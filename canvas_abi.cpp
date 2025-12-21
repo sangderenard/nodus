@@ -2562,7 +2562,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 GP_TableGeom geom{};
                 gp_table_get_geom(t, &geom);
                 geom.width_px = tw;
-                int table_render_h = std::max(1, geom.height_px);
+                int table_render_h = std::max(1, table_clip_h);
                 int th = std::max(1, table_render_h);
                 std::vector<uint8_t> tmp(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
                 geom.height_px = th;
@@ -4765,11 +4765,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         int th = std::max(1, m.h);
         ModuleLayout layout = module_layout_for(m);
         int table_clip_h = std::max(1, layout.table_clip_h);
+        GP_TableStyle st{};
+        gp_table_get_style(t, &st);
+        Color table_bg{st.bg_rgba[0], st.bg_rgba[1], st.bg_rgba[2], st.bg_rgba[3]};
         GP_TableGeom geom{};
         gp_table_get_geom(t, &geom);
         geom.width_px = tw;
-        int table_render_h = std::max(1, geom.height_px);
+        int table_render_h = std::max(1, layout.table_clip_h);
         module_tables[mi].assign(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4u, 0);
+        if (!is_stage) {
+            memset_rect(module_tables[mi].data(), tw, th, tw * 4, 0, 0, tw, table_clip_h, table_bg);
+        }
         const int hitcap = 4096;
         std::vector<GP_TableHitBox> hits(hitcap);
         int hits_written = 0;
@@ -4828,8 +4834,6 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
         auto &light_map = module_contact_lights[mi];
         light_map.clear();
-        GP_TableStyle st{};
-        gp_table_get_style(t, &st);
         Color led_on{st.led_on_rgba[0], st.led_on_rgba[1], st.led_on_rgba[2], st.led_on_rgba[3]};
         int in_count = (mi >= 0 && mi < static_cast<int>(ctx->module_io_in_count.size())) ? ctx->module_io_in_count[mi] : 0;
         int out_count = (mi >= 0 && mi < static_cast<int>(ctx->module_io_out_count.size())) ? ctx->module_io_out_count[mi] : 0;
