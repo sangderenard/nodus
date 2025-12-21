@@ -23,6 +23,9 @@ struct GP_ModuleLibraryModule {
     std::string label;
     std::string serialized_path;
     std::string source_path;
+    bool convert_to_tool = false;
+    std::string tool_id;
+    uint32_t tool_caps = 0;
     std::vector<GP_ModuleToolInstance> tool_instances;
 };
 

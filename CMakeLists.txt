@@ -20,6 +20,7 @@ add_library(canvas_tables SHARED
     stage_abi.cpp
     subject_capture.cpp
     text_render_helper.cpp
+    tool_registry.cpp
     thread_manager.cpp
 )
 
@@ -37,6 +38,9 @@ add_executable(test_thread_manager
 )
 target_link_libraries(test_thread_manager PRIVATE canvas_tables)
 add_test(NAME thread_manager_test COMMAND test_thread_manager)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME tool_dll_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_dll_test.py)
 
 # Scaffold test target
 # scaffold_test removed
