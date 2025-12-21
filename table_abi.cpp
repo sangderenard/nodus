@@ -1899,6 +1899,7 @@ struct GP_TableContext {
     std::vector<std::pair<uint64_t,uint64_t>> edges;
     std::vector<EdgeTensorFifo> edge_fifos; // companion FIFO per rope edge
     std::vector<GP_TableEdgeBatchMetadata> edge_batch_metadata;
+    std::vector<uint32_t> edge_subgroup_flags;
     // per-edge persistent unique id used for ThreadManager registration
     std::vector<uint64_t> edge_uids;
     uint64_t next_edge_uid = 1;
@@ -2273,6 +2274,12 @@ static void ensure_edge_fifos(GP_TableContext* ctx) {
     }
     if (ctx->edge_batch_metadata.size() > ctx->edges.size()) {
         ctx->edge_batch_metadata.resize(ctx->edges.size());
+    }
+    while (ctx->edge_subgroup_flags.size() < ctx->edges.size()) {
+        ctx->edge_subgroup_flags.push_back(0u);
+    }
+    if (ctx->edge_subgroup_flags.size() > ctx->edges.size()) {
+        ctx->edge_subgroup_flags.resize(ctx->edges.size());
     }
     // keep subscriber slot maps in sync with edges
     while (ctx->edge_subscriber_slots.size() < ctx->edges.size()) ctx->edge_subscriber_slots.emplace_back();
@@ -3686,6 +3693,9 @@ int32_t gp_table_clear_edges(GP_TableContext* ctx) {
     ctx->relax_value.clear();
     ctx->relax_vel.clear();
     ctx->edge_fifos.clear();
+    ctx->edge_batch_metadata.clear();
+    ctx->edge_subgroup_flags.clear();
+    ctx->edge_subscriber_slots.clear();
     // reset rope simulator indices and recreate sim to free resources
     ctx->rope_sim_idx.clear();
     if (ctx->rope_sim && ctx->rope_sim_owned) {
@@ -3955,6 +3965,22 @@ int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx,
     return 1;
 }
 
+int32_t gp_table_edge_set_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t flags) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_subgroup_flags.size())) return 0;
+    ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)] = flags;
+    return 1;
+}
+
+int32_t gp_table_edge_get_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t* out_flags) {
+    if (!ctx || !out_flags) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_subgroup_flags.size())) return 0;
+    *out_flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
+    return 1;
+}
+
 int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx) {
     if (!ctx || !out_edge_idx) return 0;
     ensure_edge_fifos(ctx);
@@ -4018,6 +4044,7 @@ int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx) {
     erase_at(ctx->edges);
     erase_at(ctx->edge_fifos);
     erase_at(ctx->edge_batch_metadata);
+    erase_at(ctx->edge_subgroup_flags);
     erase_at(ctx->edge_uids);
     erase_at(ctx->edge_subscriber_slots);
     erase_at(ctx->relax_value);
