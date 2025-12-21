@@ -1083,6 +1083,53 @@ int32_t gp_table_raster_rgba_with_hits(
                     }
                     break;
                 }
+                case GP_TABLE_CELL_COUNTER: {
+                    int pad = 2;
+                    int inner_w = std::max(1, cw - pad * 2);
+                    int box_h = std::max(10, rh - 4);
+                    int by = y0 + (rh - box_h) / 2;
+                    int gap = std::max(4, box_h / 5);
+                    int nbw = std::max(10, std::min(box_h, (inner_w - gap * 2) / 4));
+                    int num_w = std::max(20, inner_w - nbw * 2 - gap * 2);
+                    int total_w = nbw + gap + num_w + gap + nbw;
+                    int bx_minus = x0 + pad + (inner_w - total_w) / 2;
+                    int bx_num = bx_minus + nbw + gap;
+                    int bx_plus = bx_num + num_w + gap;
+                    memset_rect(out_rgba, w, h, w * 4, bx_minus, by, nbw, box_h, st.hdr);
+                    memset_rect(out_rgba, w, h, w * 4, bx_num, by, num_w, box_h, st.axis_bg);
+                    memset_rect(out_rgba, w, h, w * 4, bx_plus, by, nbw, box_h, st.hdr);
+                    auto draw_centered = [&](const char* text, int x, int y, int bw, int bh, float scale, Color col) {
+                        TextBitmap bm = render_text_to_rgba(text, scale, {col.r, col.g, col.b, col.a});
+                        if (bm.pixels.empty()) return;
+                        int tx = x + (bw - bm.width) / 2;
+                        int ty = y + (bh - bm.height) / 2;
+                        int clip_x0 = x;
+                        int clip_y0 = y;
+                        int clip_x1 = x + bw;
+                        int clip_y1 = y + bh;
+                        blit_text_bitmap(out_rgba, w, h, w * 4, bm, tx, ty, clip_x0, clip_y0, clip_x1, clip_y1);
+                    };
+                    draw_centered("-", bx_minus, by, nbw, box_h, 1.0f, st.text_hdr);
+                    draw_centered("+", bx_plus, by, nbw, box_h, 1.0f, st.text_hdr);
+                    int val = std::max(0, static_cast<int>(std::lround(cell.value)));
+                    std::string num = std::to_string(val);
+                    draw_centered(num.c_str(), bx_num, by, num_w, box_h, 1.0f, st.text);
+                    if (cell.text[0] != '\0') {
+                        TextBitmap lb = render_text_to_rgba(cell.text, 0.7f, {st.text_hdr.r, st.text_hdr.g, st.text_hdr.b, st.text_hdr.a});
+                        if (!lb.pixels.empty()) {
+                            int tx = x0 + (cw - lb.width) / 2;
+                            int ty = std::max(y0 + 1, by - lb.height - 2);
+                            int clip_x0 = x0 + 1;
+                            int clip_y0 = y0 + 1;
+                            int clip_x1 = x0 + cw - 1;
+                            int clip_y1 = y0 + rh - 1;
+                            blit_text_bitmap(out_rgba, w, h, w * 4, lb, tx, ty, clip_x0, clip_y0, clip_x1, clip_y1);
+                        }
+                    }
+                    push_hit(bx_minus, by, bx_minus + nbw, by + box_h, i, c, GP_TABLE_CELL_COUNTER, GP_TABLE_HIT_COUNTER_DEC, 0, 0, 0);
+                    push_hit(bx_plus, by, bx_plus + nbw, by + box_h, i, c, GP_TABLE_CELL_COUNTER, GP_TABLE_HIT_COUNTER_INC, 0, 0, 0);
+                    break;
+                }
                 case GP_TABLE_CELL_SCROLL: {
                     float v = cell.value;            // 0..1 scroll fraction
                     int total = std::max(1, int(cell.hold_s));    // total rows/items
