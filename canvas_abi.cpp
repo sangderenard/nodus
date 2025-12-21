@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
 #include <fstream>
 #include <sstream>
 #include <Eigen/Dense>
@@ -724,13 +725,14 @@ constexpr int kModuleThumbRowH = 16;
 constexpr int kModuleControlRowH = 24;
 constexpr int kModuleLedRowH = 20;
 constexpr int kModuleExtraLedCount = 16;
+constexpr int kModuleExtraLedRows = 2;
 constexpr int kModuleTopUiHeight =
     kModuleTopPadding * 2 +
     kModuleTitleRowH +
     kModuleThumbRowH +
     kModuleControlRowH +
-    kModuleLedRowH +
-    kModuleTopGap * 3;
+    kModuleLedRowH * kModuleExtraLedRows +
+    kModuleTopGap * (3 + (kModuleExtraLedRows - 1));
 constexpr int kModuleColLeftLed = 0;
 constexpr int kModuleColText = 1;
 constexpr int kModuleColRightLed = 2;
@@ -937,23 +939,58 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
     draw_button(menu_x, btn_y, menu_w, control_h, Color{50,50,62,255}, LABEL_MODULE_MENU, 0.85f);
 
     cursor_y += kModuleControlRowH + kModuleTopGap;
-    int led_row_y = cursor_y;
+    constexpr float kLedLabelScale = 0.7f;
+    constexpr int kLedLabelGap = 6;
+    const std::array<const char*, kModuleExtraLedRows> led_labels = { "send", "receive" };
+    std::array<TextBitmap, kModuleExtraLedRows> label_bitmaps;
+    int label_w = 0;
+    for (int i = 0; i < kModuleExtraLedRows; ++i) {
+        label_bitmaps[static_cast<size_t>(i)] = render_text_to_rgba(led_labels[static_cast<size_t>(i)], kLedLabelScale, {190,190,205,255});
+        label_w = std::max(label_w, label_bitmaps[static_cast<size_t>(i)].width);
+    }
+    const int label_pad = (label_w > 0) ? kLedLabelGap : 0;
     int led_row_h = kModuleLedRowH;
-    int led_avail_w = std::max(1, m.w - kModuleTopPadding * 2);
+    int led_area_x = sx + kModuleTopPadding + label_w + label_pad;
+    int led_area_w = std::max(1, m.w - kModuleTopPadding * 2 - label_w - label_pad);
     int led_gap = 4;
-    int led_size = (led_avail_w - led_gap * (kModuleExtraLedCount - 1)) / kModuleExtraLedCount;
+    int led_size = (led_area_w - led_gap * (kModuleExtraLedCount - 1)) / kModuleExtraLedCount;
     if (led_size < 8) {
         led_gap = 2;
-        led_size = (led_avail_w - led_gap * (kModuleExtraLedCount - 1)) / kModuleExtraLedCount;
+        led_size = (led_area_w - led_gap * (kModuleExtraLedCount - 1)) / kModuleExtraLedCount;
     }
     led_size = std::max(4, std::min(led_size, led_row_h - 4));
     int led_total_w = led_size * kModuleExtraLedCount + led_gap * (kModuleExtraLedCount - 1);
-    int led_start_x = sx + (m.w - led_total_w) / 2;
-    int led_y = led_row_y + (led_row_h - led_size) / 2;
-    for (int i = 0; i < kModuleExtraLedCount; ++i) {
-        int lx = led_start_x + i * (led_size + led_gap);
-        memset_rect(out_rgba, w, h, pitch, lx, led_y, led_size, led_size, Color{58,58,74,255});
-        memset_rect(out_rgba, w, h, pitch, lx + 1, led_y + 1, led_size - 2, led_size - 2, Color{88,90,120,255});
+    for (int row = 0; row < kModuleExtraLedRows; ++row) {
+        int led_row_y = cursor_y + row * (kModuleLedRowH + kModuleTopGap);
+        const auto &bm = label_bitmaps[static_cast<size_t>(row)];
+        if (!bm.pixels.empty()) {
+            int label_x = sx + kModuleTopPadding;
+            int label_y = led_row_y + (led_row_h - bm.height) / 2;
+            for (int yy = 0; yy < bm.height; ++yy) {
+                int dst_y = label_y + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < bm.width; ++xx) {
+                    int dst_x = label_x + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        }
+        int led_offset = std::max(0, (led_area_w - led_total_w) / 2);
+        int led_start_x = led_area_x + led_offset;
+        int led_y = led_row_y + (led_row_h - led_size) / 2;
+        for (int i = 0; i < kModuleExtraLedCount; ++i) {
+            int lx = led_start_x + i * (led_size + led_gap);
+            memset_rect(out_rgba, w, h, pitch, lx, led_y, led_size, led_size, Color{58,58,74,255});
+            memset_rect(out_rgba, w, h, pitch, lx + 1, led_y + 1, led_size - 2, led_size - 2, Color{88,90,120,255});
+        }
     }
 }
 
