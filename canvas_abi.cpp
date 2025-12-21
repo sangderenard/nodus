@@ -717,11 +717,24 @@ constexpr int kModuleDefaultWidth = 420;
 constexpr int kModuleDefaultHeight = 620;
 constexpr int kModulePreviewMinTableHeight = 120;
 constexpr int kModuleLedPerSide = 2;
+constexpr int kModuleTopPadding = 6;
+constexpr int kModuleTopGap = 4;
+constexpr int kModuleTitleRowH = 24;
+constexpr int kModuleThumbRowH = 16;
+constexpr int kModuleControlRowH = 24;
+constexpr int kModuleLedRowH = 20;
+constexpr int kModuleExtraLedCount = 16;
+constexpr int kModuleTopUiHeight =
+    kModuleTopPadding * 2 +
+    kModuleTitleRowH +
+    kModuleThumbRowH +
+    kModuleControlRowH +
+    kModuleLedRowH +
+    kModuleTopGap * 3;
 constexpr int kModuleColLeftLed = 0;
 constexpr int kModuleColText = 1;
 constexpr int kModuleColRightLed = 2;
-constexpr int kModuleColScroll = 3;
-constexpr int kModuleColCount = 4;
+constexpr int kModuleColCount = 3;
 
 static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
     if (hb.row_idx >= 0) return hb.row_idx;
@@ -782,23 +795,166 @@ struct CanvasBounds {
 };
 
 struct ModuleLayout {
+    int top_h = 0;
+    int table_y = 0;
     int table_clip_h = 0;
     int preview_h = 0;
     int preview_y = 0;
+    int drag_y = 0;
+    int drag_h = 0;
 };
 
 static ModuleLayout module_layout_for(const GP_CanvasModuleDesc& m) {
     ModuleLayout layout{};
     if (m.w <= 0 || m.h <= 0) return layout;
-    int preview_h = std::min(m.w, m.h);
-    if ((m.h - preview_h) < kModulePreviewMinTableHeight) {
-        preview_h = std::max(0, m.h - kModulePreviewMinTableHeight);
+    layout.top_h = std::min(m.h, kModuleTopUiHeight);
+    layout.table_y = layout.top_h;
+    int available_h = std::max(0, m.h - layout.top_h);
+    int preview_h = std::min(m.w, available_h);
+    if ((available_h - preview_h) < kModulePreviewMinTableHeight) {
+        preview_h = std::max(0, available_h - kModulePreviewMinTableHeight);
         preview_h = std::min(preview_h, m.w);
     }
     layout.preview_h = std::max(0, preview_h);
     layout.preview_y = std::max(0, m.h - layout.preview_h);
-    layout.table_clip_h = std::max(1, layout.preview_y);
+    layout.table_clip_h = std::max(1, layout.preview_y - layout.table_y);
+    layout.drag_y = std::min(layout.top_h, kModuleTopPadding + kModuleTitleRowH);
+    layout.drag_h = std::max(0, std::min(kModuleThumbRowH, layout.top_h - layout.drag_y));
     return layout;
+}
+
+static ModuleLayout module_layout_for(const GP_CanvasContextImpl* ctx, int module_idx, const GP_CanvasModuleDesc& m) {
+    ModuleLayout layout = module_layout_for(m);
+    bool is_stage = ctx && module_idx >= 0 && module_idx < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[module_idx];
+    if (is_stage) {
+        layout.top_h = 0;
+        layout.table_y = 0;
+        layout.preview_h = 0;
+        layout.preview_y = std::max(0, m.h);
+        layout.table_clip_h = std::max(1, m.h);
+        layout.drag_y = 0;
+        layout.drag_h = std::min(kModuleThumbRowH, std::max(0, m.h));
+    }
+    return layout;
+}
+
+static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const GP_CanvasModuleDesc& m, uint8_t* out_rgba, int w, int h, int pitch) {
+    if (!ctx || !out_rgba) return;
+    ModuleLayout layout = module_layout_for(ctx, module_idx, m);
+    if (layout.top_h <= 0) return;
+    int sx = m.x - ctx->offset_x;
+    int sy = m.y - ctx->offset_y;
+    int top_h = layout.top_h;
+    memset_rect(out_rgba, w, h, pitch, sx, sy, m.w, top_h, Color{34,34,46,235});
+    memset_rect(out_rgba, w, h, pitch, sx, sy + top_h - 1, m.w, 1, Color{18,18,26,255});
+
+    auto blit_text = [&](const char* text, int tx, int ty, float scale, Color col) {
+        if (!text || text[0] == '\0') return;
+        auto bm = render_text_to_rgba(text, scale, {col.r, col.g, col.b, col.a});
+        if (bm.pixels.empty()) return;
+        for (int yy = 0; yy < bm.height; ++yy) {
+            int dst_y = ty + yy;
+            if (dst_y < 0 || dst_y >= h) continue;
+            for (int xx = 0; xx < bm.width; ++xx) {
+                int dst_x = tx + xx;
+                if (dst_x < 0 || dst_x >= w) continue;
+                uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                float sa = src[3] / 255.0f;
+                if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                else if (sa > 0.001f) {
+                    for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                    dst[3] = 255;
+                }
+            }
+        }
+    };
+
+    int cursor_y = sy + kModuleTopPadding;
+    const char* title = (m.label[0] != '\0') ? m.label : "Module";
+    blit_text(title, sx + kModuleTopPadding, cursor_y, 1.05f, Color{220,220,230,255});
+    cursor_y += kModuleTitleRowH;
+
+    int thumb_y = cursor_y;
+    int thumb_x = sx + kModuleTopPadding;
+    int thumb_w = std::max(1, m.w - kModuleTopPadding * 2);
+    memset_rect(out_rgba, w, h, pitch, thumb_x, thumb_y, thumb_w, kModuleThumbRowH, Color{40,40,52,255});
+    for (int i = 0; i < 3; ++i) {
+        int bar_w = thumb_w / 4;
+        int bar_x = thumb_x + (thumb_w - bar_w) / 2;
+        int bar_y = thumb_y + 3 + i * 4;
+        memset_rect(out_rgba, w, h, pitch, bar_x, bar_y, bar_w, 2, Color{70,70,88,255});
+    }
+    cursor_y += kModuleThumbRowH + kModuleTopGap;
+
+    int control_y = cursor_y;
+    int control_h = std::max(1, kModuleControlRowH - 2);
+    int gap = 6;
+    auto draw_button = [&](int bx, int by, int bw, int bh, Color fill, const char* label, float scale) {
+        memset_rect(out_rgba, w, h, pitch, bx, by, bw, bh, fill);
+        memset_rect(out_rgba, w, h, pitch, bx, by, bw, 1, Color{20,20,28,255});
+        memset_rect(out_rgba, w, h, pitch, bx, by + bh - 1, bw, 1, Color{12,12,18,255});
+        if (label && label[0] != '\0') {
+            auto bm = render_text_to_rgba(label, scale, {230,230,235,255});
+            if (!bm.pixels.empty()) {
+                int tx = bx + (bw - bm.width) / 2;
+                int ty = by + (bh - bm.height) / 2;
+                for (int yy = 0; yy < bm.height; ++yy) {
+                    int dst_y = ty + yy;
+                    if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < bm.width; ++xx) {
+                        int dst_x = tx + xx;
+                        if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    int group_x = sx + kModuleTopPadding;
+    int nbw = control_h;
+    int num_w = std::max(40, control_h * 2);
+    int btn_y = control_y + 1;
+    draw_button(group_x, btn_y, nbw, control_h, Color{52,52,64,255}, LABEL_IO_MINUS, 1.0f);
+    draw_button(group_x + nbw + gap, btn_y, num_w, control_h, Color{36,36,46,255}, "0", 0.9f);
+    draw_button(group_x + nbw + gap + num_w + gap, btn_y, nbw, control_h, Color{52,52,64,255}, LABEL_IO_PLUS, 1.0f);
+
+    int right_x = sx + m.w - kModuleTopPadding;
+    int menu_w = std::max(30, control_h);
+    int pause_w = std::max(42, control_h * 2);
+    int menu_x = right_x - menu_w;
+    int pause_x = menu_x - gap - pause_w;
+    const char* pause_label = ctx->thread_mgr_paused ? LABEL_THREAD_PLAY_SHORT : LABEL_THREAD_PAUSE_SHORT;
+    draw_button(pause_x, btn_y, pause_w, control_h, Color{44,52,60,255}, pause_label, 1.0f);
+    draw_button(menu_x, btn_y, menu_w, control_h, Color{50,50,62,255}, LABEL_MODULE_MENU, 0.85f);
+
+    cursor_y += kModuleControlRowH + kModuleTopGap;
+    int led_row_y = cursor_y;
+    int led_row_h = kModuleLedRowH;
+    int led_avail_w = std::max(1, m.w - kModuleTopPadding * 2);
+    int led_gap = 4;
+    int led_size = (led_avail_w - led_gap * (kModuleExtraLedCount - 1)) / kModuleExtraLedCount;
+    if (led_size < 8) {
+        led_gap = 2;
+        led_size = (led_avail_w - led_gap * (kModuleExtraLedCount - 1)) / kModuleExtraLedCount;
+    }
+    led_size = std::max(4, std::min(led_size, led_row_h - 4));
+    int led_total_w = led_size * kModuleExtraLedCount + led_gap * (kModuleExtraLedCount - 1);
+    int led_start_x = sx + (m.w - led_total_w) / 2;
+    int led_y = led_row_y + (led_row_h - led_size) / 2;
+    for (int i = 0; i < kModuleExtraLedCount; ++i) {
+        int lx = led_start_x + i * (led_size + led_gap);
+        memset_rect(out_rgba, w, h, pitch, lx, led_y, led_size, led_size, Color{58,58,74,255});
+        memset_rect(out_rgba, w, h, pitch, lx + 1, led_y + 1, led_size - 2, led_size - 2, Color{88,90,120,255});
+    }
 }
 
 static CanvasBounds compute_canvas_bounds(const GP_CanvasContextImpl* ctx) {
@@ -2032,14 +2188,12 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     gp_table_set_style(t, &st);
 
     int content_w = std::max(1, st.width_px);
-    int scroll_w = 18;
-    int led_w = std::max(30, std::min(52, (content_w - scroll_w) / 4));
-    int text_w = std::max(1, content_w - scroll_w - 2 * led_w);
+    int led_w = std::max(30, std::min(60, content_w / 3));
+    int text_w = std::max(1, content_w - 2 * led_w);
     GP_TableColumn cols[kModuleColCount];
     cols[kModuleColLeftLed] = { GP_TABLE_CELL_LEDS_ARG, led_w, 0 };
     cols[kModuleColText] = { GP_TABLE_CELL_TEXT, text_w, 0 };
     cols[kModuleColRightLed] = { GP_TABLE_CELL_LEDS_ARG, led_w, 0 };
-    cols[kModuleColScroll] = { GP_TABLE_CELL_SCROLL, scroll_w, 0 };
     gp_table_set_columns(t, cols, kModuleColCount);
 
     int base_row_h = st.row_h_px > 0 ? st.row_h_px : 22;
@@ -2052,10 +2206,9 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         prow.kind = GP_TABLE_ROW_HEADER; prow.depth = 0; prow.expanded = 1; prow.selected = 0;
         prow.cell_count = kModuleColCount;
         prow.reserved0 = tool_row_h;
-        prow.cells[kModuleColLeftLed].kind = GP_TABLE_CELL_LEDS_ARG;
+        prow.cells[kModuleColLeftLed].kind = GP_TABLE_CELL_TEXT;
         prow.cells[kModuleColText].kind = GP_TABLE_CELL_TEXT;
-        prow.cells[kModuleColRightLed].kind = GP_TABLE_CELL_LEDS_ARG;
-        prow.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
+        prow.cells[kModuleColRightLed].kind = GP_TABLE_CELL_TEXT;
         gp_table_set_rows(t, &prow, 1);
         if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
         ctx->module_table_rows[module_idx].clear();
@@ -2107,14 +2260,18 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         uint32_t mask = (attachment_count >= 32) ? 0xFFFFFFFFu : ((1u << std::max(1, attachment_count)) - 1u);
         uint32_t left_mask = left_active ? mask : 0u;
         uint32_t right_mask = right_active ? mask : 0u;
-        fill_led_cell(r.cells[kModuleColLeftLed], std::max(1, left_active ? attachment_count : kModuleLedPerSide), left_mask, left_mask);
+        if (kind == ModuleRowKind::Tool) {
+            fill_text_cell(r.cells[kModuleColLeftLed], "");
+            fill_text_cell(r.cells[kModuleColRightLed], "");
+        } else {
+            fill_led_cell(r.cells[kModuleColLeftLed], std::max(1, left_active ? attachment_count : kModuleLedPerSide), left_mask, left_mask);
+            fill_led_cell(r.cells[kModuleColRightLed], std::max(1, right_active ? attachment_count : kModuleLedPerSide), right_mask, right_mask);
+        }
         if (kind == ModuleRowKind::Tool && tool_kind == ModuleToolKind::TableNumber) {
             fill_counter_cell(r.cells[kModuleColText], tool_value, label);
         } else {
             fill_text_cell(r.cells[kModuleColText], label);
         }
-        fill_led_cell(r.cells[kModuleColRightLed], std::max(1, right_active ? attachment_count : kModuleLedPerSide), right_mask, right_mask);
-        r.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
         rows.push_back(r);
         row_meta.push_back({kind, contact_idx, tool_kind, attachment_count});
     };
@@ -2128,10 +2285,9 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         header.selected = 0;
         header.cell_count = kModuleColCount;
         header.reserved0 = tool_row_h;
-        fill_led_cell(header.cells[kModuleColLeftLed], kModuleLedPerSide, 0u, 0u);
+        fill_text_cell(header.cells[kModuleColLeftLed], "");
         fill_text_cell(header.cells[kModuleColText], LABEL_TOOL_STACK);
-        fill_led_cell(header.cells[kModuleColRightLed], kModuleLedPerSide, 0u, 0u);
-        header.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
+        fill_text_cell(header.cells[kModuleColRightLed], "");
         rows.push_back(header);
         row_meta.push_back({ModuleRowKind::Tool, logical_row_idx, ModuleToolKind::StackDisplay, 0});
 
@@ -2155,10 +2311,9 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             vr.reserved0 = stack_value_row_h;
             char buf[96];
             std::snprintf(buf, sizeof(buf), "%d: %.6g", display_idx, *it);
-            fill_led_cell(vr.cells[kModuleColLeftLed], kModuleLedPerSide, 0u, 0u);
+            fill_text_cell(vr.cells[kModuleColLeftLed], "");
             fill_text_cell(vr.cells[kModuleColText], buf);
-            fill_led_cell(vr.cells[kModuleColRightLed], kModuleLedPerSide, 0u, 0u);
-            vr.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
+            fill_text_cell(vr.cells[kModuleColRightLed], "");
             rows.push_back(vr);
             row_meta.push_back({ModuleRowKind::Tool, -1, ModuleToolKind::StackDisplay, 0});
         }
@@ -2199,20 +2354,20 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         }
     }
 
-    float scroll_frac = 0.0f;
-    gp_table_get_scroll_fraction(t, &scroll_frac);
-    ModuleLayout layout = module_layout_for(mod);
-    int visible_rows = std::max(1, layout.table_clip_h / std::max(1, base_row_h));
-    int total_rows_render = std::max(1, static_cast<int>(rows.size()));
-    for (auto &r : rows) {
-        if (r.cell_count <= kModuleColScroll) continue;
-        GP_TableCell &cell = r.cells[kModuleColScroll];
-        cell.kind = GP_TABLE_CELL_SCROLL;
-        cell.value = scroll_frac;
-        cell.hold_s = static_cast<float>(total_rows_render);
-        cell.last_s = static_cast<float>(visible_rows);
+    auto row_height_for = [&](const GP_TableRow& row) {
+        int h = row.reserved0 > 0 ? row.reserved0 : base_row_h;
+        return std::max(1, h);
+    };
+    int table_content_h = 0;
+    for (const auto &r : rows) table_content_h += row_height_for(r);
+    bool is_stage = (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[module_idx]);
+    if (!is_stage) {
+        int preview_target = std::max(1, mod.w);
+        int target_h = kModuleTopUiHeight + table_content_h + preview_target;
+        if (mod.h < target_h && module_idx >= 0 && module_idx < static_cast<int>(ctx->modules.size())) {
+            ctx->modules[module_idx].h = target_h;
+        }
     }
-
     gp_table_set_rows(t, rows.data(), static_cast<int>(rows.size()));
     if (module_idx >= static_cast<int>(ctx->module_table_rows.size())) ctx->module_table_rows.resize(module_idx + 1);
     ctx->module_table_rows[module_idx] = row_meta;
@@ -2751,9 +2906,10 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 int lx = world_x - m.x;
                 int ly = world_y - m.y;
                 int tw = std::max(1, m.w);
-                ModuleLayout layout = module_layout_for(m);
+                ModuleLayout layout = module_layout_for(c, mi, m);
                 int table_clip_h = std::max(1, layout.table_clip_h);
-                if (ly >= table_clip_h) continue;
+                int ly_table = ly - layout.table_y;
+                if (ly_table < 0 || ly_table >= table_clip_h) continue;
                 GP_TableGeom geom{};
                 gp_table_get_geom(t, &geom);
                 geom.width_px = tw;
@@ -2777,7 +2933,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     for (int hi = 0; hi < hits_written; ++hi) {
                         const GP_TableHitBox &hb = hits[hi];
                         if (hb.y0 >= table_clip_h) continue;
-                        if (lx >= hb.x0 && lx < hb.x1 && ly >= hb.y0 && ly < hb.y1) { found = hb; found_any = true; break; }
+                        if (lx >= hb.x0 && lx < hb.x1 && ly_table >= hb.y0 && ly_table < hb.y1) { found = hb; found_any = true; break; }
                     }
                     if (!found_any) {
                         printf("gp_canvas_on_click: module=%d table_hits_present=%d but none contain (%d,%d) local\n", mi, hits_written, lx, ly);
@@ -2902,10 +3058,10 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 // letting the table change its own selection state here.
                 int lx = world_x - m.x;
                 int ly = world_y - m.y;
-                ModuleLayout layout = module_layout_for(m);
-                if (ly >= layout.table_clip_h) break;
+                ModuleLayout layout = module_layout_for(c, mi, m);
+                if (ly < layout.table_y || ly >= layout.table_y + layout.table_clip_h) break;
                 GP_TableHitBox hb{};
-                int ok = gp_table_on_click(c->module_tables[mi], lx, ly, &hb);
+                int ok = gp_table_on_click(c->module_tables[mi], lx, ly - layout.table_y, &hb);
                 if (ok) return 1;
             }
             break;
@@ -2927,8 +3083,12 @@ extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
         // Only start a drag if the mouse is within a small header area at the
         // top of the module. This prevents clicks on embedded table content or
         // contacts from immediately initiating a window move.
-        int header_h = std::min(24, std::max(8, m.h / 6));
-        if (world_x >= m.x && world_x < m.x + m.w && world_y >= m.y && world_y < m.y + header_h) {
+        ModuleLayout layout = module_layout_for(c, mi, m);
+        int drag_y = layout.drag_y;
+        int drag_h = std::max(0, layout.drag_h);
+        int drag_top = m.y + drag_y;
+        int drag_bottom = drag_top + drag_h;
+        if (world_x >= m.x && world_x < m.x + m.w && world_y >= drag_top && world_y < drag_bottom) {
             // start drag: record in per-canvas DragState
             c->drag.dragging = 1;
             c->drag.module = mi;
@@ -5118,8 +5278,9 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         bool is_stage = (mi >= 0 && mi < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[mi]);
         int tw = std::max(1, m.w);
         int th = std::max(1, m.h);
-        ModuleLayout layout = module_layout_for(m);
+        ModuleLayout layout = module_layout_for(ctx, mi, m);
         int table_clip_h = std::max(1, layout.table_clip_h);
+        int table_offset_y = layout.table_y;
         GP_TableStyle st{};
         gp_table_get_style(t, &st);
         Color table_bg{st.bg_rgba[0], st.bg_rgba[1], st.bg_rgba[2], st.bg_rgba[3]};
@@ -5129,7 +5290,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         int table_render_h = std::max(1, layout.table_clip_h);
         module_tables[mi].assign(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4u, 0);
         if (!is_stage) {
-            memset_rect(module_tables[mi].data(), tw, th, tw * 4, 0, 0, tw, table_clip_h, table_bg);
+            memset_rect(module_tables[mi].data(), tw, th, tw * 4, 0, table_offset_y, tw, table_clip_h, table_bg);
         }
         const int hitcap = 4096;
         std::vector<GP_TableHitBox> hits(hitcap);
@@ -5175,7 +5336,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 int copy_h = std::min(table_clip_h, table_render_h);
                 for (int yy = 0; yy < copy_h; ++yy) {
                     const uint8_t* src = tmp_buf.data() + static_cast<size_t>(yy) * static_cast<size_t>(tw) * 4u;
-                    uint8_t* dst = module_tables[mi].data() + static_cast<size_t>(yy) * static_cast<size_t>(tw) * 4u;
+                    uint8_t* dst = module_tables[mi].data() + static_cast<size_t>(yy + table_offset_y) * static_cast<size_t>(tw) * 4u;
                     std::memcpy(dst, src, static_cast<size_t>(tw) * 4u);
                 }
             }
@@ -5184,7 +5345,10 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             for (int hi = 0; hi < hits_written; ++hi) {
                 const auto &hb = hits[hi];
                 if (!is_stage && hb.y0 >= table_clip_h) continue;
-                module_hitboxes[mi].push_back(hb);
+                GP_TableHitBox adjusted = hb;
+                adjusted.y0 += table_offset_y;
+                adjusted.y1 += table_offset_y;
+                module_hitboxes[mi].push_back(adjusted);
             }
         }
         auto &light_map = module_contact_lights[mi];
@@ -5334,7 +5498,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     ensure_module_bg_storage(bg, m.w, m.h, /*oversample=*/1);
                     bg.cb(bg.user, mi, m.w, m.h, bg.scratch.data(), m.w * 4);
                 } else {
-                    ModuleLayout layout = module_layout_for(m);
+                    ModuleLayout layout = module_layout_for(ctx, mi, m);
                     int preview_h = layout.preview_h;
                     if (preview_h > 0) {
                         ensure_module_bg_storage(bg, m.w, preview_h, /*oversample=*/1);
@@ -5449,7 +5613,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     }
                 }
             } else if (bg.mode == 1 && !is_stage) {
-                ModuleLayout layout = module_layout_for(m);
+                ModuleLayout layout = module_layout_for(ctx, mi, m);
                 int preview_h = layout.preview_h;
                 if (preview_h > 0) {
                     render_module_raytrace_bg(bg, m.w, preview_h, inputs);
@@ -5476,6 +5640,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 blit_module_buffer_alpha(out_rgba, w, h, pitch, sx, sy, m.w, m.h, module_tables[mi], table_alpha);
             }
         }
+        draw_module_top_ui(ctx, mi, m, out_rgba, w, h, pitch);
         if (mi == ctx->focused_module) {
             Color fb{60,120,220,255};
             int t = 2;
