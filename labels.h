@@ -78,6 +78,7 @@
 #define LABEL_MENU_KEY_RECORDER "Key Recorder"
 #define LABEL_MENU_TABLE_NUMBER "Table Number"
 #define LABEL_MENU_TABLE_NUMBER_SHORT "n"
+#define LABEL_MODULE_MENU "Menu"
 
 // Tool labels
 #define LABEL_TOOL_ADD "Add"
