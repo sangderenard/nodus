@@ -29,6 +29,7 @@ enum class ModuleToolKind : int8_t {
     KeyboardListener = 6,
     MouseListener = 7,
     StackDisplay = 8,
+    RectRgba = 9,
 };
 
 struct ModuleIORow {
@@ -65,6 +66,9 @@ inline ToolStackSpec module_tool_stack_spec(ModuleToolKind tool) {
         case ModuleToolKind::MouseListener:
             return {0, 4};
         case ModuleToolKind::StackDisplay:
+            return {0, 0};
+        case ModuleToolKind::RectRgba:
+            return {12, 1};
         case ModuleToolKind::None:
         default:
             return {0, 0};
@@ -163,6 +167,7 @@ private:
         uint64_t ticks = 0;
         uint64_t last_tick_id = 0;
         double last_dt = 0.0;
+        uint64_t tool_cycle = 0;
     };
 
     void run_loop();

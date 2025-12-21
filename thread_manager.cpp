@@ -73,6 +73,24 @@ static std::vector<int> compute_alap_iter(int N, const std::vector<std::vector<i
     return alap;
 }
 
+static bool point_in_rounded_rect(float px, float py, float w, float h, float r) {
+    if (w <= 0.0f || h <= 0.0f) return false;
+    r = std::clamp(r, 0.0f, 0.5f * std::min(w, h));
+    float dx = 0.0f;
+    float dy = 0.0f;
+    if (px < r) {
+        dx = r - px;
+    } else if (px > w - r) {
+        dx = px - (w - r);
+    }
+    if (py < r) {
+        dy = r - py;
+    } else if (py > h - r) {
+        dy = py - (h - r);
+    }
+    return (dx * dx + dy * dy) <= (r * r);
+}
+
 } // namespace
 
 
@@ -352,6 +370,17 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         ModuleInputState input_state{};
         bool input_state_loaded = false;
         bool input_state_used = false;
+        uint64_t tool_cycle = 0;
+        bool has_ledger = false;
+        int ledger_idx = mod.module_idx;
+        if (ledger_idx >= 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (static_cast<size_t>(ledger_idx) >= module_ledger_.size()) {
+                module_ledger_.resize(static_cast<size_t>(ledger_idx) + 1);
+            }
+            tool_cycle = module_ledger_[static_cast<size_t>(ledger_idx)].tool_cycle;
+            has_ledger = true;
+        }
         auto load_input_state = [&]() -> bool {
             if (!input_state_loaded) {
                 input_state_loaded = canvas_get_module_input_state(mod_idx, &input_state);
@@ -433,6 +462,49 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         canvas_set_module_stack_snapshot(mod_idx, row, stack.data(), static_cast<int>(stack.size()));
                         break;
                     }
+                    case ModuleToolKind::RectRgba: {
+                        float height = pop_value();
+                        float width = pop_value();
+                        float bg[4] = { pop_value(), pop_value(), pop_value(), pop_value() };
+                        float border[4] = { pop_value(), pop_value(), pop_value(), pop_value() };
+                        float border_width = pop_value();
+                        float corner_radius = pop_value();
+                        int raster_h = std::max(0, static_cast<int>(std::lround(height)));
+                        int raster_w = std::max(0, static_cast<int>(std::lround(width)));
+                        float out = 0.0f;
+                        uint64_t cycle = tool_cycle++;
+                        if (raster_w > 0 && raster_h > 0) {
+                            uint64_t pixel_count = static_cast<uint64_t>(raster_w) * static_cast<uint64_t>(raster_h);
+                            uint64_t total = pixel_count * 4ull;
+                            if (total > 0) {
+                                uint64_t idx = cycle % total;
+                                int channel = static_cast<int>(idx % 4ull);
+                                uint64_t pix = idx / 4ull;
+                                int x = static_cast<int>(pix % static_cast<uint64_t>(raster_w));
+                                int y = static_cast<int>(pix / static_cast<uint64_t>(raster_w));
+                                float px = static_cast<float>(x) + 0.5f;
+                                float py = static_cast<float>(y) + 0.5f;
+                                float fw = static_cast<float>(raster_w);
+                                float fh = static_cast<float>(raster_h);
+                                float bw = std::max(0.0f, border_width);
+                                float cr = std::max(0.0f, corner_radius);
+                                bool inside = point_in_rounded_rect(px, py, fw, fh, cr);
+                                if (inside) {
+                                    bool use_bg = true;
+                                    float inner_w = fw - 2.0f * bw;
+                                    float inner_h = fh - 2.0f * bw;
+                                    if (bw > 0.0f && inner_w > 0.0f && inner_h > 0.0f) {
+                                        float inner_r = std::max(0.0f, cr - bw);
+                                        use_bg = point_in_rounded_rect(px - bw, py - bw, inner_w, inner_h, inner_r);
+                                    }
+                                    const float* src = use_bg ? bg : border;
+                                    out = src[channel];
+                                }
+                            }
+                        }
+                        stack.push_back(out);
+                        break;
+                    }
                     case ModuleToolKind::Add:
                     case ModuleToolKind::Subtract:
                     case ModuleToolKind::Multiply:
@@ -502,6 +574,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             ledger.ticks += 1;
             ledger.last_tick_id = req.tick_id;
             ledger.last_dt = req.dt;
+            if (has_ledger) {
+                ledger.tool_cycle = tool_cycle;
+            }
         }
     }
 }
