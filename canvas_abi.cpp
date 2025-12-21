@@ -2124,7 +2124,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             append_stack_display_rows(static_cast<int>(row_idx));
         } else {
             int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : kModuleLedPerSide;
-            int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : 0;
+            //int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : 0;
             append_row(tool_label(row.tool), ModuleRowKind::Tool, static_cast<int>(row_idx), kModuleLedPerSide, tool_value, row.tool, tool_row_h, false, false);
         }
     }
