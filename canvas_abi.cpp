@@ -2499,8 +2499,16 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             fill_text_cell(r.cells[kModuleColLeftLed], "");
             fill_text_cell(r.cells[kModuleColRightLed], "");
         } else {
-            fill_led_cell(r.cells[kModuleColLeftLed], std::max(1, left_active ? attachment_count : kModuleLedPerSide), left_mask, left_mask);
-            fill_led_cell(r.cells[kModuleColRightLed], std::max(1, right_active ? attachment_count : kModuleLedPerSide), right_mask, right_mask);
+            if (left_active) {
+                fill_led_cell(r.cells[kModuleColLeftLed], std::max(1, attachment_count), left_mask, left_mask);
+            } else {
+                fill_text_cell(r.cells[kModuleColLeftLed], "");
+            }
+            if (right_active) {
+                fill_led_cell(r.cells[kModuleColRightLed], std::max(1, attachment_count), right_mask, right_mask);
+            } else {
+                fill_text_cell(r.cells[kModuleColRightLed], "");
+            }
         }
         if (kind == ModuleRowKind::Tool && tool_kind == ModuleToolKind::TableNumber) {
             fill_counter_cell(r.cells[kModuleColText], tool_value, label);
@@ -2558,18 +2566,15 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     int output_contact = 0;
     for (size_t row_idx = 0; row_idx < ordered_rows.size(); ++row_idx) {
         const auto &row = ordered_rows[row_idx];
-        if (row.kind != ModuleRowKind::Tool) continue;
-        if (row.tool == ModuleToolKind::StackDisplay) {
-            append_stack_display_rows(static_cast<int>(row_idx));
-        } else {
-            int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : kModuleLedPerSide;
-            //int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : 0;
-            append_row(tool_label(row.tool), ModuleRowKind::Tool, static_cast<int>(row_idx), kModuleLedPerSide, tool_value, row.tool, tool_row_h, false, false);
+        if (row.kind == ModuleRowKind::Tool) {
+            if (row.tool == ModuleToolKind::StackDisplay) {
+                append_stack_display_rows(static_cast<int>(row_idx));
+            } else {
+                int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : kModuleLedPerSide;
+                append_row(tool_label(row.tool), ModuleRowKind::Tool, static_cast<int>(row_idx), kModuleLedPerSide, tool_value, row.tool, tool_row_h, false, false);
+            }
+            continue;
         }
-    }
-
-    for (size_t row_idx = 0; row_idx < ordered_rows.size(); ++row_idx) {
-        const auto &row = ordered_rows[row_idx];
         if (row.kind == ModuleRowKind::Input) {
             int remaining = std::clamp(row.attachment_count, 1, 32);
             while (remaining > 0) {
@@ -3197,6 +3202,9 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         }
                     }
                     if (found_any) {
+                        GP_TableHitBox adjusted = found;
+                        adjusted.y0 += layout.table_y;
+                        adjusted.y1 += layout.table_y;
                         c->dispatch_module_idx = mi;
                         if (canvas_handle_module_counter_hit(c, mi, found)) {
                             c->dispatch_module_idx = -1;
@@ -3209,7 +3217,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         // edge-drawing mode we avoid calling into the table so
                         // we don't toggle its internal selection state.
                         if (found.part == GP_TABLE_HIT_LED || found.part == GP_TABLE_HIT_LED_ARG || found.part == GP_TABLE_HIT_LED_TABLE) {
-                            if (canvas_handle_module_led_hit(c, mi, found)) return 1;
+                            if (canvas_handle_module_led_hit(c, mi, adjusted)) return 1;
                         } else {
                             // Non-LED hit: let table handle the click unless we're
                             // in canvas-level edge-only mode (tool index 2).
