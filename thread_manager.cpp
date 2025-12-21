@@ -13,6 +13,7 @@ extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx)
 extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
 extern void canvas_clear_module_input_pulses(int module_idx);
 extern void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count);
+extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
 
 // Scheduling helpers used inside run_scheduled_tick.
 namespace {
@@ -579,6 +580,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         if (input_state_used) {
             canvas_clear_module_input_pulses(mod_idx);
         }
+        canvas_set_module_stack_tail(mod_idx, stack.data(), static_cast<int>(stack.size()));
         if (mod.module_idx >= 0) {
             std::lock_guard<std::mutex> lk(mu_);
             if (static_cast<size_t>(mod.module_idx) >= module_ledger_.size()) {

@@ -90,6 +90,9 @@ int gp_canvas_attach_table(GP_CanvasContext* ctx, int module_idx, GP_TableContex
 // it will destroy it. Returns 1 on success.
 int gp_canvas_detach_table(GP_CanvasContext* ctx, int module_idx);
 
+// Attach a pointer to a module-frame LED cell (send row if is_send!=0, receive row otherwise).
+int gp_canvas_set_module_frame_ptr(GP_CanvasContext* ctx, int module_idx, int is_send, int led_idx, void* ptr);
+
 // Per-module background rasterizer hook. Returns 1 on success.
 int gp_canvas_set_module_bg_callback(GP_CanvasContext* ctx, int module_idx, GP_CanvasModuleBgFn cb, void* user);
 int gp_canvas_clear_module_bg_callback(GP_CanvasContext* ctx, int module_idx);
