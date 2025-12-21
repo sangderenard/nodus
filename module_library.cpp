@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <filesystem>
 
 namespace {
 constexpr const char* kLibraryRoot = "module_library";
@@ -12,12 +13,10 @@ constexpr const char* kToolDir = "tools";
 constexpr const char* kModuleDir = "modules";
 
 std::string join_path(const std::string& root, const std::string& subdir, const std::string& filename) {
-    std::string path = root;
-    if (!path.empty() && path.back() != '/') path.push_back('/');
-    path += subdir;
-    if (!path.empty() && path.back() != '/') path.push_back('/');
-    path += filename;
-    return path;
+    std::filesystem::path p = root;
+    if (!subdir.empty()) p /= subdir;
+    if (!filename.empty()) p /= filename;
+    return p.string();
 }
 } // namespace
 
