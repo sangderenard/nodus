@@ -3425,7 +3425,7 @@ static void stage_bg_callback(void* user, int module_idx, int width, int height,
                 const uint8_t* src = c->module_stage_cache_rgba[module_idx].data();
                 if (src && !c->module_stage_cache_rgba[module_idx].empty()) {
                     for (int y = 0; y < height; ++y) {
-                        uint8_t* row = out_rgba + y * out_pitch;
+                        uint8_t* row = tmp.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4u;
                         if (y < ch) {
                             const uint8_t* srow = src + static_cast<size_t>(y) * static_cast<size_t>(cp);
                             std::memcpy(row, srow, static_cast<size_t>(width) * 4);
@@ -3453,7 +3453,7 @@ static void stage_bg_callback(void* user, int module_idx, int width, int height,
                 const uint8_t* src = c->module_stage_cache_rgba[module_idx].data();
                 if (src && !c->module_stage_cache_rgba[module_idx].empty()) {
                     for (int y = 0; y < height; ++y) {
-                        uint8_t* row = out_rgba + y * out_pitch;
+                        uint8_t* row = tmp.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4u;
                         if (y < ch) {
                             const uint8_t* srow = src + static_cast<size_t>(y) * static_cast<size_t>(cp);
                             std::memcpy(row, srow, static_cast<size_t>(width) * 4);
@@ -5027,6 +5027,12 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                             if (changed) gp_table_set_rows(t, rows.data(), rc);
                         }
                         if (mi >= 0 && mi < static_cast<int>(module_tables.size()) && !module_tables[mi].empty()) {
+                            if (img.rgba) {
+                                size_t bytes = static_cast<size_t>(m.w) * static_cast<size_t>(m.h) * 4u;
+                                if (module_tables[mi].size() >= bytes) {
+                                    std::memcpy(module_tables[mi].data(), img.rgba, bytes);
+                                }
+                            }
                             GP_TableGeom geom{};
                             geom.width_px = std::max(1, m.w);
                             geom.height_px = std::max(1, m.h);
