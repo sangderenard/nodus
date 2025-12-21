@@ -127,6 +127,8 @@ int gp_canvas_get_module_node_id(GP_CanvasContext* ctx, int module_idx);
 // Persist/restore canvas state to a simple text file. Returns 1 on success.
 int gp_canvas_save_to_file(GP_CanvasContext* ctx, const char* path);
 int gp_canvas_load_from_file(GP_CanvasContext* ctx, const char* path);
+// Export a module library serialization with tool/source references. Returns 1 on success.
+int gp_canvas_export_module_library(GP_CanvasContext* ctx, const char* path);
 
 // Templates directory: set a global library directory for templates (used by
 // table template APIs if they are invoked with dir==NULL).
