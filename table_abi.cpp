@@ -2968,6 +2968,7 @@ static float draw_rope_diffused_glow(
     float depth_fade,
     float gain,
     Color glow_col,
+    const std::vector<Color>* jacket_colors,
     float min_z,
     float max_z,
     int radius) {
@@ -2996,8 +2997,8 @@ static float draw_rope_diffused_glow(
         return start_is_front ? d : (total_len - d);
     };
 
-    // modest diffusion: lower decay spreads glow more along cable
-    const float decay = 0.65f;
+    // modest diffusion: higher decay keeps glow tighter along cable
+    const float decay = 1.1f;
     for (size_t i = 0; i + 1 < samples.size(); ++i) {
         float da = dist_from_start(i);
         float db = dist_from_start(i + 1);
@@ -3007,7 +3008,19 @@ static float draw_rope_diffused_glow(
         float depth_scale = 0.5f * (depth_scale_at(i) + depth_scale_at(i + 1));
         float alpha_scale = gain * clamped_glow * atten * depth_scale;
         if (img && alpha_scale > 0.0f) {
-            draw_segment_kernel_glow(img, w, h, pitch, samples[i].first, samples[i].second, samples[i+1].first, samples[i+1].second, float(radius), glow_col, alpha_scale);
+            Color seg_glow = glow_col;
+            if (jacket_colors && !jacket_colors->empty()) {
+                float u = (total_len > 1e-4f) ? ((prefix[i] + prefix[i + 1]) * 0.5f / total_len) : 0.0f;
+                int seg_idx = static_cast<int>(std::floor(u * static_cast<float>(jacket_colors->size())));
+                seg_idx = std::clamp(seg_idx, 0, static_cast<int>(jacket_colors->size()) - 1);
+                Color jacket_col = (*jacket_colors)[static_cast<size_t>(seg_idx)];
+                if (jacket_col.a > 0) {
+                    float jacket_weight = std::clamp(static_cast<float>(jacket_col.a) / 255.0f, 0.0f, 1.0f) * 0.4f;
+                    seg_glow = lerp_color(seg_glow, jacket_col, jacket_weight);
+                    seg_glow.a = glow_col.a;
+                }
+            }
+            draw_segment_kernel_glow(img, w, h, pitch, samples[i].first, samples[i].second, samples[i+1].first, samples[i+1].second, float(radius), seg_glow, alpha_scale);
         }
     }
 
@@ -5088,7 +5101,7 @@ int32_t gp_table_render_rgba_with_state(
                                         glow_col.a = static_cast<uint8_t>(std::lround(float(glow_col.a) * 0.85f));
                                         int glow_r = fiber_r;
                                         // increase multiplier so more of the source glow transmits
-                                        draw_rope_diffused_glow(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, true, sel_glow, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain * 0.8f, glow_col, min_z, max_z, glow_r);
+                                        draw_rope_diffused_glow(out_rgba, p_w, p_h, p_pitch, fiber_samples, depth_samples, true, sel_glow, ctx->st.cable_depth_fade, ctx->st.cable_fiber_gain * 0.8f, glow_col, nullptr, min_z, max_z, glow_r);
                                     }
                                 }
                             }
@@ -5244,20 +5257,11 @@ int32_t gp_table_render_rgba_with_state(
             build_rope_samples_with_tangents(proj_xy.data(), got, ctx->st.cable_jacket_px, jacket_samples, jacket_tangents);
             int jacket_segments = std::max(1, got - 1);
             std::vector<Color> base_jacket_colors(static_cast<size_t>(jacket_segments), Color{200, 200, 200, 13});
-            draw_rope_jacket_overlay(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, base_jacket_colors);
-            auto make_led_color = [&](const LedContactInfo &info, float glow) {
-                Color c = (info.on || info.active) ? ctx->st.led_on : ctx->st.led_off;
-                c.a = static_cast<uint8_t>(std::lround(255.0f * std::clamp(glow, 0.0f, 1.0f)));
-                return c;
-            };
-            Color core_a = make_led_color(info_a, glow_a_eff);
-            Color core_b = make_led_color(info_b, glow_b_eff);
-            float core_intensity = (ctx->st.cable_fifo_light_mode ? std::clamp(fifo_core_intensity, 0.0f, 1.0f) : ev)
-                                   * std::clamp(ctx->st.cable_core_alpha, 0.0f, 1.0f);
-            draw_rope_core_gradient(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, core_a, core_b, core_intensity);
+            std::vector<Color> fifo_jacket_colors;
+            bool has_fifo_jacket = false;
             if (ctx->st.cable_fifo_light_mode && fifo_has_state) {
                 int fifo_segments = jacket_segments;
-                std::vector<Color> jacket_colors(static_cast<size_t>(fifo_segments), Color{0, 0, 0, 0});
+                fifo_jacket_colors.assign(static_cast<size_t>(fifo_segments), Color{0, 0, 0, 0});
                 auto normalize_phase = [&](float p) {
                     float v = p - std::floor(p);
                     if (v < 0.0f) v += 1.0f;
@@ -5320,9 +5324,9 @@ int32_t gp_table_render_rgba_with_state(
                     apply_tint(fill_col, fill_local, 170);
                     apply_tint(write_col, write_local, 200);
                     apply_tint(read_col, read_local, 200);
-                    jacket_colors[static_cast<size_t>(si)] = out;
+                    fifo_jacket_colors[static_cast<size_t>(si)] = out;
                 }
-                draw_rope_jacket_overlay(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, jacket_colors);
+                has_fifo_jacket = true;
             }
             if (dominant_glow > 0.0f) {
                 bool lit_a = info_a.on || info_a.active;
@@ -5347,18 +5351,26 @@ int32_t gp_table_render_rgba_with_state(
             std::vector<float> depth_samples;
             build_rope_samples_with_depth(proj_xy.data(), proj_z.data(), got, ctx->st.cable_jacket_px, fiber_samples, &depth_samples);
                 if (!fiber_samples.empty()) {
-                int fiber_r = std::max(2, static_cast<int>(std::lround(float(ctx->st.cable_jacket_px) * ctx->st.cable_fiber_radius_scale * 1.35f)));
+                int fiber_r = std::max(1, static_cast<int>(std::lround(float(ctx->st.cable_jacket_px) * ctx->st.cable_fiber_radius_scale * 0.95f)));
                 // fiber pass removed: jacket/core will be tinted directly by SDF; keep fiber_r for glow radius
                 bool lit_a = info_a.on || info_a.active;
                 bool lit_b = info_b.on || info_b.active;
                 Color glow_col_a = lit_a ? ctx->st.led_on : ctx->st.led_off;
                 Color glow_col_b = lit_b ? ctx->st.led_on : ctx->st.led_off;
-                glow_col_a.a = static_cast<uint8_t>(std::lround(float(glow_col_a.a) * 0.85f));
-                glow_col_b.a = static_cast<uint8_t>(std::lround(float(glow_col_b.a) * 0.85f));
-                // increase glow multiplier to transfer more hue along cable
-                float glow_gain = ctx->st.cable_fiber_gain * 1.25f;
+                glow_col_a.a = static_cast<uint8_t>(std::lround(float(glow_col_a.a) * 0.6f));
+                glow_col_b.a = static_cast<uint8_t>(std::lround(float(glow_col_b.a) * 0.6f));
+                // keep glow multiplier subtle so it doesn't overpower jacket/core
+                float glow_gain = ctx->st.cable_fiber_gain * 0.85f;
+                std::vector<Color> glow_jacket_colors = base_jacket_colors;
+                if (has_fifo_jacket && fifo_jacket_colors.size() == glow_jacket_colors.size()) {
+                    for (size_t si = 0; si < glow_jacket_colors.size(); ++si) {
+                        if (fifo_jacket_colors[si].a == 0) continue;
+                        glow_jacket_colors[si] = lerp_color(glow_jacket_colors[si], fifo_jacket_colors[si], 0.7f);
+                        glow_jacket_colors[si].a = std::max(glow_jacket_colors[si].a, fifo_jacket_colors[si].a);
+                    }
+                }
                 if (info_a.is_output && glow_a_eff > 0.0f) {
-                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, true, glow_a_eff, ctx->st.cable_depth_fade, glow_gain, glow_col_a, min_z, max_z, fiber_r);
+                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, true, glow_a_eff, ctx->st.cable_depth_fade, glow_gain, glow_col_a, &glow_jacket_colors, min_z, max_z, fiber_r);
                     if (info_b.is_input && transmitted > 0.0f) {
                         Color input_col = glow_col_a;
                         float boost = std::min(1.0f, transmitted * 0.6f);
@@ -5371,7 +5383,7 @@ int32_t gp_table_render_rgba_with_state(
                     }
                 }
                 if (info_b.is_output && glow_b_eff > 0.0f) {
-                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, false, glow_b_eff, ctx->st.cable_depth_fade, glow_gain, glow_col_b, min_z, max_z, fiber_r);
+                    float transmitted = draw_rope_diffused_glow(out_rgba, w_local, h_local, pitch_local, fiber_samples, depth_samples, false, glow_b_eff, ctx->st.cable_depth_fade, glow_gain, glow_col_b, &glow_jacket_colors, min_z, max_z, fiber_r);
                     if (info_a.is_input && transmitted > 0.0f) {
                         Color input_col = glow_col_b;
                         float boost = std::min(1.0f, transmitted * 0.6f);
@@ -5384,6 +5396,20 @@ int32_t gp_table_render_rgba_with_state(
                     }
                         // edge sliver removed - parametric SDF and glow provide saturation
                 }
+            }
+            draw_rope_jacket_overlay(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, base_jacket_colors);
+            auto make_led_color = [&](const LedContactInfo &info, float glow) {
+                Color c = (info.on || info.active) ? ctx->st.led_on : ctx->st.led_off;
+                c.a = static_cast<uint8_t>(std::lround(255.0f * std::clamp(glow, 0.0f, 1.0f)));
+                return c;
+            };
+            Color core_a = make_led_color(info_a, glow_a_eff);
+            Color core_b = make_led_color(info_b, glow_b_eff);
+            float core_intensity = (ctx->st.cable_fifo_light_mode ? std::clamp(fifo_core_intensity, 0.0f, 1.0f) : ev)
+                                   * std::clamp(ctx->st.cable_core_alpha, 0.0f, 1.0f);
+            draw_rope_core_gradient(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, core_a, core_b, core_intensity);
+            if (has_fifo_jacket) {
+                draw_rope_jacket_overlay(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, fifo_jacket_colors);
             }
         }
     }
