@@ -467,6 +467,15 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         stack.push_back(val);
                         break;
                     }
+                    case ModuleToolKind::Clone: {
+                        float count_f = pop_value();
+                        float value = pop_value();
+                        int count = std::max(0, static_cast<int>(std::lround(count_f)));
+                        for (int i = 0; i < count; ++i) {
+                            stack.push_back(value);
+                        }
+                        break;
+                    }
                     case ModuleToolKind::RectRgba: {
                         float height = pop_value();
                         float width = pop_value();
