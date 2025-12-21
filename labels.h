@@ -51,6 +51,14 @@
 #define LABEL_THREAD_PAUSE_SHORT "||"
 #define LABEL_THREAD_DELAY_SHORT "ms"
 
+// Module control labels
+#define LABEL_MODULE_CLONE "Clone"
+#define LABEL_MODULE_CLEAR "Clear"
+#define LABEL_MODULE_DESTROY "Destroy"
+#define LABEL_MODULE_CLONE_SHORT "CLN"
+#define LABEL_MODULE_CLEAR_SHORT "CLR"
+#define LABEL_MODULE_DESTROY_SHORT "X"
+
 // Rope bar labels
 #define LABEL_ROPE_SEGS_DEC "Seg -"
 #define LABEL_ROPE_SEGS_INC "Seg +"

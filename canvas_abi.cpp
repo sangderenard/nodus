@@ -852,6 +852,159 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->next_node_id = std::max(1, max_window_node + 1);
 }
 
+static void canvas_clear_module_table(GP_CanvasContextImpl* ctx, int module_idx) {
+    if (!ctx) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
+    if (module_idx < static_cast<int>(ctx->module_tables.size()) && ctx->module_tables[module_idx]) {
+        gp_table_clear_edges(ctx->module_tables[module_idx]);
+        gp_table_clear_led_glow(ctx->module_tables[module_idx]);
+    }
+    if (module_idx < static_cast<int>(ctx->module_stack_snapshots.size())) {
+        ctx->module_stack_snapshots[module_idx].clear();
+    }
+    if (module_idx < static_cast<int>(ctx->module_stack_tail.size())) {
+        ModuleStackTail &tail = ctx->module_stack_tail[module_idx];
+        tail.count.store(0);
+        tail.seq.store(tail.seq.load() + 1);
+    }
+    if (module_idx < static_cast<int>(ctx->module_chat_text.size())) ctx->module_chat_text[module_idx].clear();
+    if (module_idx < static_cast<int>(ctx->module_chat_ttl.size())) ctx->module_chat_ttl[module_idx] = 0;
+}
+
+static int canvas_clone_module(GP_CanvasContextImpl* ctx, int module_idx) {
+    if (!ctx) return -1;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return -1;
+    GP_CanvasModuleDesc d = ctx->modules[module_idx];
+    d.x += 24;
+    d.y += 24;
+    int new_idx = gp_canvas_add_module(reinterpret_cast<GP_CanvasContext*>(ctx), &d);
+    if (new_idx < 0) return -1;
+    bool is_stage = (module_idx < static_cast<int>(ctx->module_is_stage.size()) && ctx->module_is_stage[module_idx]);
+    if (is_stage) {
+        canvas_configure_stage_module(ctx, new_idx, d.w, d.h);
+    } else if (module_idx < static_cast<int>(ctx->module_bg.size()) && new_idx < static_cast<int>(ctx->module_bg.size())) {
+        const auto &src = ctx->module_bg[module_idx];
+        auto &dst = ctx->module_bg[new_idx];
+        dst.mode = src.mode;
+        dst.rays = src.rays;
+        dst.reflections = src.reflections;
+        dst.blur_sigma = src.blur_sigma;
+        dst.oversample = src.oversample;
+        dst.temporal_decay = src.temporal_decay;
+        dst.temporal_max = src.temporal_max;
+        dst.ray_exposure = src.ray_exposure;
+        dst.ray_bounce_decay = src.ray_bounce_decay;
+        dst.ray_air_decay = src.ray_air_decay;
+        dst.table_alpha = src.table_alpha;
+        dst.table_alpha_ray = src.table_alpha_ray;
+        dst.header_margin_px = src.header_margin_px;
+    }
+    const std::vector<ModuleIORow>* rows_ptr = nullptr;
+    if (module_idx < static_cast<int>(ctx->module_table_rows.size()) &&
+        !ctx->module_table_rows[module_idx].empty()) {
+        rows_ptr = &ctx->module_table_rows[module_idx];
+    } else if (module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+        rows_ptr = &ctx->module_io_rows[module_idx];
+    }
+    if (rows_ptr) {
+        canvas_apply_io_rows(ctx, new_idx, *rows_ptr);
+        sync_module_table_io_layout(ctx, new_idx);
+    }
+    return new_idx;
+}
+
+static void canvas_destroy_module(GP_CanvasContextImpl* ctx, int module_idx) {
+    if (!ctx) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
+    if (module_idx < static_cast<int>(ctx->module_tables.size()) &&
+        module_idx < static_cast<int>(ctx->module_table_owned.size()) &&
+        ctx->module_tables[module_idx] && ctx->module_table_owned[module_idx]) {
+        gp_table_destroy(ctx->module_tables[module_idx]);
+    }
+    if (module_idx < static_cast<int>(ctx->module_stages.size()) &&
+        module_idx < static_cast<int>(ctx->module_stage_owned.size()) &&
+        ctx->module_stages[module_idx] && ctx->module_stage_owned[module_idx]) {
+        gp_stage_destroy(ctx->module_stages[module_idx]);
+    }
+    if (module_idx < static_cast<int>(ctx->module_key_recorder_state.size())) {
+        void* s = ctx->module_key_recorder_state[module_idx];
+        if (s) delete reinterpret_cast<KeyRecorderState*>(s);
+    }
+    if (module_idx < static_cast<int>(ctx->module_bg.size()) && ctx->module_bg[module_idx].ray) {
+        raytrace2d_destroy(ctx->module_bg[module_idx].ray);
+        ctx->module_bg[module_idx].ray = nullptr;
+    }
+    for (size_t i = 0; i < ctx->edges.size();) {
+        auto &edge = ctx->edges[i];
+        if (edge.desc.a_module == module_idx || edge.desc.b_module == module_idx) {
+            ctx->edges.erase(ctx->edges.begin() + static_cast<long>(i));
+            continue;
+        }
+        if (edge.desc.a_module > module_idx) --edge.desc.a_module;
+        if (edge.desc.b_module > module_idx) --edge.desc.b_module;
+        ++i;
+    }
+    for (auto it = ctx->nodes.begin(); it != ctx->nodes.end();) {
+        if (it->module_idx == module_idx) {
+            it = ctx->nodes.erase(it);
+            continue;
+        }
+        if (it->module_idx > module_idx) --it->module_idx;
+        ++it;
+    }
+    auto erase_at = [&](auto &vec) {
+        if (module_idx >= 0 && module_idx < static_cast<int>(vec.size())) {
+            vec.erase(vec.begin() + module_idx);
+        }
+    };
+    erase_at(ctx->modules);
+    erase_at(ctx->module_tables);
+    erase_at(ctx->module_table_owned);
+    erase_at(ctx->module_stages);
+    erase_at(ctx->module_stage_owned);
+    erase_at(ctx->module_is_stage);
+    erase_at(ctx->module_stage_images);
+    erase_at(ctx->module_stage_cache_rgba);
+    erase_at(ctx->module_stage_cache_w);
+    erase_at(ctx->module_stage_cache_h);
+    erase_at(ctx->module_stage_cache_pitch);
+    erase_at(ctx->module_stage_cache_mu);
+    erase_at(ctx->module_stage_integrator_mode);
+    erase_at(ctx->module_stage_integrator_accum);
+    erase_at(ctx->module_bg);
+    erase_at(ctx->module_io_in_count);
+    erase_at(ctx->module_io_out_count);
+    erase_at(ctx->module_io_input_rows);
+    erase_at(ctx->module_io_output_rows);
+    erase_at(ctx->module_input_layout);
+    erase_at(ctx->module_output_layout);
+    erase_at(ctx->module_io_rows);
+    erase_at(ctx->module_table_rows);
+    erase_at(ctx->module_frame_leds);
+    erase_at(ctx->module_frame_links);
+    erase_at(ctx->module_preview_buffers);
+    erase_at(ctx->module_stack_tail);
+    erase_at(ctx->module_stack_snapshots);
+    erase_at(ctx->module_tool_stack);
+    erase_at(ctx->module_key_recorder_state);
+    erase_at(ctx->module_input_state);
+    erase_at(ctx->module_chat_text);
+    erase_at(ctx->module_chat_color);
+    erase_at(ctx->module_chat_ttl);
+    erase_at(ctx->module_node_id);
+    if (ctx->focused_module == module_idx) ctx->focused_module = -1;
+    else if (ctx->focused_module > module_idx) --ctx->focused_module;
+    if (ctx->selected.module == module_idx) {
+        ctx->selected = {};
+        ctx->prospective_rope_idx = -1;
+    } else if (ctx->selected.module > module_idx) {
+        --ctx->selected.module;
+    }
+    if (ctx->dispatch_module_idx == module_idx) ctx->dispatch_module_idx = -1;
+    else if (ctx->dispatch_module_idx > module_idx) --ctx->dispatch_module_idx;
+    update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
+}
+
 static void canvas_record_key_input(GP_CanvasContextImpl* ctx, int key, int action) {
     if (!ctx || action == 0) return;
     for (int mi = 0; mi < static_cast<int>(ctx->module_input_state.size()); ++mi) {
@@ -1198,8 +1351,11 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
             bool on = cell && ((cell->flags & 0x1u) != 0u);
             bool active = cell && ((static_cast<uint32_t>(cell->reserved0) & 0x1u) != 0u);
             Color fill = (on || active) ? led_on : led_off;
-            memset_rect(out_rgba, w, h, pitch, lx, led_y, led_size, led_size, led_edge);
-            memset_rect(out_rgba, w, h, pitch, lx + 1, led_y + 1, led_size - 2, led_size - 2, fill);
+            int cx = lx + led_size / 2;
+            int cy = led_y + led_size / 2;
+            int radius = std::max(2, led_size / 2 - 1);
+            draw_circle(out_rgba, w, h, pitch, cx, cy, radius, led_edge);
+            draw_circle(out_rgba, w, h, pitch, cx, cy, std::max(1, radius - 1), fill);
         }
     }
 }
@@ -1398,6 +1554,9 @@ enum CanvasActionId {
     CANVAS_ACT_THREAD_TOGGLE = 2070,
     CANVAS_ACT_THREAD_DELAY_DEC = 2071,
     CANVAS_ACT_THREAD_DELAY_INC = 2072,
+    CANVAS_ACT_MODULE_CLONE = 2073,
+    CANVAS_ACT_MODULE_CLEAR = 2074,
+    CANVAS_ACT_MODULE_DESTROY = 2075,
     CANVAS_ACT_TOOL_SUBGROUP_0 = 2080,
     CANVAS_ACT_TOOL_SUBGROUP_1 = 2081,
     CANVAS_ACT_TOOL_SUBGROUP_2 = 2082,
@@ -1802,6 +1961,9 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_TOGGLE, CANVAS_ACT_THREAD_TOGGLE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_DELAY_DEC, CANVAS_ACT_THREAD_DELAY_DEC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_DELAY_INC, CANVAS_ACT_THREAD_DELAY_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_CLONE, CANVAS_ACT_MODULE_CLONE },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_CLEAR, CANVAS_ACT_MODULE_CLEAR },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_DESTROY, CANVAS_ACT_MODULE_DESTROY },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_0, CANVAS_ACT_TOOL_SUBGROUP_0 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_1, CANVAS_ACT_TOOL_SUBGROUP_1 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_2, CANVAS_ACT_TOOL_SUBGROUP_2 },
@@ -2133,6 +2295,28 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 int delta = (action_id == CANVAS_ACT_THREAD_DELAY_INC) ? 10 : -10;
                 c->thread_mgr_delay_ms = std::clamp(c->thread_mgr_delay_ms + delta, 0, 2000);
                 printf("gp_canvas_on_click: thread_mgr_delay_ms -> %d\n", c->thread_mgr_delay_ms);
+                break;
+            }
+            case CANVAS_ACT_MODULE_CLONE: {
+                int focused = c->focused_module;
+                if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
+                    int new_idx = canvas_clone_module(c, focused);
+                    if (new_idx >= 0) c->focused_module = new_idx;
+                }
+                break;
+            }
+            case CANVAS_ACT_MODULE_CLEAR: {
+                int focused = c->focused_module;
+                if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
+                    canvas_clear_module_table(c, focused);
+                }
+                break;
+            }
+            case CANVAS_ACT_MODULE_DESTROY: {
+                int focused = c->focused_module;
+                if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
+                    canvas_destroy_module(c, focused);
+                }
                 break;
             }
             case CANVAS_ACT_MODULE_LED:
@@ -3248,7 +3432,12 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int delay_total_w = nbw + delay_gap + delay_num_w + delay_gap + nbw;
         int play_gap = 12;
         int bx_play = c->width - 8 - bw;
-        int bx_delay_plus = bx_play - play_gap;
+        int action_btn_gap = 6;
+        int action_btn_count = 3;
+        int action_group_w = action_btn_count * bw + action_btn_gap * (action_btn_count - 1);
+        int bx_action_right = bx_play - play_gap;
+        int bx_action_left = bx_action_right - action_group_w;
+        int bx_delay_plus = bx_action_left - play_gap;
         int bx_delay_minus = bx_delay_plus - delay_total_w;
         int kpn_group_w = kpn_btn_count * (bw + spacing) - spacing;
         int kpn_right = bx_kpn + kpn_group_w;
@@ -3270,6 +3459,18 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         if (view_y >= by1 && view_y < by1 + bh) {
             if (view_x >= bx_play && view_x < bx_play + bw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_TOGGLE)) return 1;
+            }
+            int bx_clone = bx_action_left;
+            int bx_clear = bx_clone + bw + action_btn_gap;
+            int bx_destroy = bx_clear + bw + action_btn_gap;
+            if (view_x >= bx_clone && view_x < bx_clone + bw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_CLONE)) return 1;
+            }
+            if (view_x >= bx_clear && view_x < bx_clear + bw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_CLEAR)) return 1;
+            }
+            if (view_x >= bx_destroy && view_x < bx_destroy + bw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_DESTROY)) return 1;
             }
             if (view_x >= bx_delay_minus && view_x < bx_delay_minus + nbw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_DELAY_DEC)) return 1;
@@ -5612,6 +5813,36 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
             }
         };
+        auto draw_action_button = [&](int bx, int byy, const char* label, Color fill) {
+            memset_rect(out_rgba, w, h, pitch, bx, byy, bw, bh, fill);
+            for (int oy = 0; oy < bh; ++oy) {
+                int y = byy + oy; if (y < 0 || y >= h) continue;
+                int left_x = bx; int right_x = bx + bw - 1;
+                uint8_t* pleft = out_rgba + y * pitch + left_x * 4;
+                uint8_t* pright = out_rgba + y * pitch + right_x * 4;
+                pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
+                pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
+            }
+            auto text = render_text_to_rgba(label, 0.8f, {230,230,230,255});
+            if (!text.pixels.empty()) {
+                int tx = bx + (bw - text.width) / 2;
+                int ty = byy + (bh - text.height) / 2;
+                for (int yy = 0; yy < text.height; ++yy) {
+                    int dst_y = ty + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < text.width; ++xx) {
+                        int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &text.pixels[(yy * text.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        };
         // compute left of table buttons start for groups placement
         int io_base_x = bx_save - spacing * 2; // place IO groups to the left of save/clear buttons
         int io_by = by;
@@ -5703,7 +5934,12 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         int delay_total_w = nbw + delay_gap + delay_num_w + delay_gap + nbw;
         int play_gap = 12;
         int bx_play = w - 8 - bw;
-        int bx_delay_plus = bx_play - play_gap;
+        int action_btn_gap = 6;
+        int action_btn_count = 3;
+        int action_group_w = action_btn_count * bw + action_btn_gap * (action_btn_count - 1);
+        int bx_action_right = bx_play - play_gap;
+        int bx_action_left = bx_action_right - action_group_w;
+        int bx_delay_plus = bx_action_left - play_gap;
         int delay_left = bx_delay_plus - delay_total_w;
         int subgroup_btn_count = kSubgroupBinCount;
         int subgroup_group_w = subgroup_btn_count * (bw + spacing) - spacing;
@@ -5749,6 +5985,13 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             }
         }
         draw_io_group(bx_delay_plus, kpn_by, std::max(0, ctx->thread_mgr_delay_ms), LABEL_THREAD_DELAY_SHORT);
+
+        int bx_clone = bx_action_left;
+        int bx_clear = bx_clone + bw + action_btn_gap;
+        int bx_destroy = bx_clear + bw + action_btn_gap;
+        draw_action_button(bx_clone, kpn_by, LABEL_MODULE_CLONE_SHORT, Color{58,58,70,255});
+        draw_action_button(bx_clear, kpn_by, LABEL_MODULE_CLEAR_SHORT, Color{64,56,52,255});
+        draw_action_button(bx_destroy, kpn_by, LABEL_MODULE_DESTROY_SHORT, Color{70,52,52,255});
 
         Color play_fill = ctx->thread_mgr_paused ? Color{70,60,70,255} : Color{60,80,60,255};
         memset_rect(out_rgba, w, h, pitch, bx_play, kpn_by, bw, bh, play_fill);
