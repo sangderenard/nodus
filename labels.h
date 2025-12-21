@@ -74,6 +74,7 @@
 #define LABEL_TOOL_MOUSE "Mouse"
 #define LABEL_TOOL_STACK "Stack"
 #define LABEL_TOOL_RECT "RectRGBA"
+#define LABEL_TOOL_NUMBER "Number"
 
 // Module labels
 #define LABEL_MODULE_TABLE "Table"

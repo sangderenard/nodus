@@ -30,6 +30,7 @@ enum class ModuleToolKind : int8_t {
     MouseListener = 7,
     StackDisplay = 8,
     RectRgba = 9,
+    TableNumber = 10,
 };
 
 struct ModuleIORow {
@@ -69,6 +70,8 @@ inline ToolStackSpec module_tool_stack_spec(ModuleToolKind tool) {
             return {0, 0};
         case ModuleToolKind::RectRgba:
             return {12, 1};
+        case ModuleToolKind::TableNumber:
+            return {0, 1};
         case ModuleToolKind::None:
         default:
             return {0, 0};

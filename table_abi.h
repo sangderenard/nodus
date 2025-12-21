@@ -26,8 +26,9 @@ typedef enum GP_TableCellKind {
     GP_TABLE_CELL_CALIB = 5, // compact calibration strip (INV/TRIM/CAP/DED/RST)
     GP_TABLE_CELL_LEDS_ARG = 6,    // signal arg LEDs (required vs linked)
     GP_TABLE_CELL_LEDS_TABLE = 7,  // stacked LED strips encoded inside one cell
-    GP_TABLE_CELL_SCROLL = 8,      // vertical scrollbar (arrows + track + thumb)
-    GP_TABLE_CELL_IMAGE = 9,       // RGBA image content
+    GP_TABLE_CELL_COUNTER = 8,     // minus/number/plus control
+    GP_TABLE_CELL_SCROLL = 9,      // vertical scrollbar (arrows + track + thumb)
+    GP_TABLE_CELL_IMAGE = 10,      // RGBA image content
 } GP_TableCellKind;
 
 // Hitbox parts for interactive regions.
@@ -42,6 +43,8 @@ typedef enum GP_TableHitPart {
     GP_TABLE_HIT_SCROLL_THUMB = 7,
     GP_TABLE_HIT_LED_TABLE = 8,
     GP_TABLE_HIT_LED_ARG = 9,
+    GP_TABLE_HIT_COUNTER_DEC = 10,
+    GP_TABLE_HIT_COUNTER_INC = 11,
 } GP_TableHitPart;
 
 // Hitbox emitted per interactive sub-element (pixel coords in table-local space).

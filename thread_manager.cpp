@@ -462,6 +462,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         canvas_set_module_stack_snapshot(mod_idx, row, stack.data(), static_cast<int>(stack.size()));
                         break;
                     }
+                    case ModuleToolKind::TableNumber: {
+                        float val = static_cast<float>(std::max(0, meta.attachment_count));
+                        stack.push_back(val);
+                        break;
+                    }
                     case ModuleToolKind::RectRgba: {
                         float height = pop_value();
                         float width = pop_value();

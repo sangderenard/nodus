@@ -569,7 +569,7 @@ static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, cons
     int out_offset = 0;
     for (const auto &row : rows) {
         if (row.kind == ModuleRowKind::Tool) {
-            ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Tool, -1, row.tool, 0});
+            ctx->module_io_rows[module_idx].push_back({ModuleRowKind::Tool, -1, row.tool, row.attachment_count});
             ctx->module_tool_stack[module_idx].push_back(row.tool);
             continue;
         }
@@ -922,6 +922,7 @@ enum CanvasActionId {
     CANVAS_ACT_MENU_TOOL_MOUSE = 2107,
     CANVAS_ACT_MENU_TOOL_STACK = 2108,
     CANVAS_ACT_MENU_TOOL_RECT = 2109,
+    CANVAS_ACT_MENU_TOOL_NUMBER = 2110,
 };
 
 struct InputRayLight {
@@ -1163,6 +1164,7 @@ static const char* tool_label(ModuleToolKind tool) {
         case ModuleToolKind::MouseListener: return LABEL_TOOL_MOUSE;
         case ModuleToolKind::StackDisplay: return LABEL_TOOL_STACK;
         case ModuleToolKind::RectRgba: return LABEL_TOOL_RECT;
+        case ModuleToolKind::TableNumber: return LABEL_TOOL_NUMBER;
         case ModuleToolKind::None:
         default:
             return "";
@@ -1185,6 +1187,7 @@ static const ToolMenuItem kToolMenuItems[] = {
     { CANVAS_ACT_MENU_TOOL_MOUSE, LABEL_TOOL_MOUSE, ModuleToolKind::MouseListener },
     { CANVAS_ACT_MENU_TOOL_STACK, LABEL_TOOL_STACK, ModuleToolKind::StackDisplay },
     { CANVAS_ACT_MENU_TOOL_RECT, LABEL_TOOL_RECT, ModuleToolKind::RectRgba },
+    { CANVAS_ACT_MENU_TOOL_NUMBER, LABEL_TOOL_NUMBER, ModuleToolKind::TableNumber },
 };
 
 struct ToolMenuLayout {
@@ -1306,6 +1309,7 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MOUSE, CANVAS_ACT_MENU_TOOL_MOUSE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_STACK, CANVAS_ACT_MENU_TOOL_STACK },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_RECT, CANVAS_ACT_MENU_TOOL_RECT },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_NUMBER, CANVAS_ACT_MENU_TOOL_NUMBER },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_ARG, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_TABLE, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
@@ -1610,6 +1614,9 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 break;
             case CANVAS_ACT_MENU_TOOL_RECT:
                 canvas_push_tool_to_focused(c, ModuleToolKind::RectRgba);
+                break;
+            case CANVAS_ACT_MENU_TOOL_NUMBER:
+                canvas_push_tool_to_focused(c, ModuleToolKind::TableNumber);
                 break;
             default:
                 break;
@@ -2013,6 +2020,19 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         cell.text[len] = '\0';
     };
 
+    auto fill_counter_cell = [](GP_TableCell &cell, int value, const char* label) {
+        cell.kind = GP_TABLE_CELL_COUNTER;
+        cell.value = static_cast<float>(std::max(0, value));
+        cell.flags = 0;
+        if (label && label[0] != '\0') {
+            size_t len = std::min<std::size_t>(std::strlen(label), sizeof(cell.text) - 1);
+            std::memcpy(cell.text, label, len);
+            cell.text[len] = '\0';
+        } else {
+            cell.text[0] = '\0';
+        }
+    };
+
     auto fill_led_cell = [](GP_TableCell &cell, int count, uint32_t on_mask, uint32_t active_mask) {
         cell.kind = GP_TABLE_CELL_LEDS_ARG;
         int clamped = std::clamp(count, 1, 32);
@@ -2026,7 +2046,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     std::vector<ModuleIORow> row_meta;
     row_meta.reserve(static_cast<size_t>(total_rows));
 
-    auto append_row = [&](const char* label, ModuleRowKind kind, int contact_idx, int attachment_count, ModuleToolKind tool_kind, int row_h, bool left_active, bool right_active) {
+    auto append_row = [&](const char* label, ModuleRowKind kind, int contact_idx, int attachment_count, int tool_value, ModuleToolKind tool_kind, int row_h, bool left_active, bool right_active) {
         GP_TableRow r{};
         memset(&r, 0, sizeof(r));
         r.kind = (kind == ModuleRowKind::Tool) ? GP_TABLE_ROW_HEADER : GP_TABLE_ROW_DEVICE;
@@ -2039,7 +2059,11 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         uint32_t left_mask = left_active ? mask : 0u;
         uint32_t right_mask = right_active ? mask : 0u;
         fill_led_cell(r.cells[kModuleColLeftLed], std::max(1, left_active ? attachment_count : kModuleLedPerSide), left_mask, left_mask);
-        fill_text_cell(r.cells[kModuleColText], label);
+        if (kind == ModuleRowKind::Tool && tool_kind == ModuleToolKind::TableNumber) {
+            fill_counter_cell(r.cells[kModuleColText], tool_value, label);
+        } else {
+            fill_text_cell(r.cells[kModuleColText], label);
+        }
         fill_led_cell(r.cells[kModuleColRightLed], std::max(1, right_active ? attachment_count : kModuleLedPerSide), right_mask, right_mask);
         r.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
         rows.push_back(r);
@@ -2060,7 +2084,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         fill_led_cell(header.cells[kModuleColRightLed], kModuleLedPerSide, 0u, 0u);
         header.cells[kModuleColScroll].kind = GP_TABLE_CELL_SCROLL;
         rows.push_back(header);
-        row_meta.push_back({ModuleRowKind::Tool, -1, ModuleToolKind::StackDisplay, 0});
+        row_meta.push_back({ModuleRowKind::Tool, logical_row_idx, ModuleToolKind::StackDisplay, 0});
 
         const std::vector<float>* snapshot = nullptr;
         if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_stack_snapshots.size())) {
@@ -2099,7 +2123,9 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         if (row.tool == ModuleToolKind::StackDisplay) {
             append_stack_display_rows(static_cast<int>(row_idx));
         } else {
-            append_row(tool_label(row.tool), ModuleRowKind::Tool, -1, kModuleLedPerSide, row.tool, tool_row_h, false, false);
+            int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : kModuleLedPerSide;
+            int tool_value = (row.tool == ModuleToolKind::TableNumber) ? std::max(0, row.attachment_count) : 0;
+            append_row(tool_label(row.tool), ModuleRowKind::Tool, static_cast<int>(row_idx), kModuleLedPerSide, tool_value, row.tool, tool_row_h, false, false);
         }
     }
 
@@ -2109,7 +2135,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             int remaining = std::clamp(row.attachment_count, 1, 32);
             while (remaining > 0) {
                 int attachments = std::min(kModuleLedPerSide, remaining);
-                append_row(LABEL_IO_INPUT, ModuleRowKind::Input, input_contact, attachments, ModuleToolKind::None, base_row_h, true, false);
+                append_row(LABEL_IO_INPUT, ModuleRowKind::Input, input_contact, attachments, attachments, ModuleToolKind::None, base_row_h, true, false);
                 input_contact += attachments;
                 remaining -= attachments;
             }
@@ -2117,7 +2143,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             int remaining = std::clamp(row.attachment_count, 1, 32);
             while (remaining > 0) {
                 int attachments = std::min(kModuleLedPerSide, remaining);
-                append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, in_count + output_contact, attachments, ModuleToolKind::None, base_row_h, false, true);
+                append_row(LABEL_IO_OUTPUT, ModuleRowKind::Output, in_count + output_contact, attachments, attachments, ModuleToolKind::None, base_row_h, false, true);
                 output_contact += attachments;
                 remaining -= attachments;
             }
@@ -2186,7 +2212,7 @@ static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKin
         row.kind = ModuleRowKind::Tool;
         row.contact_idx = -1;
         row.tool = tool;
-        row.attachment_count = 0;
+        row.attachment_count = (tool == ModuleToolKind::TableNumber) ? 1 : 0;
         rows.insert(rows.begin() + static_cast<ptrdiff_t>(idx), row);
     };
     if (tool == ModuleToolKind::KeyboardListener) {
@@ -2196,7 +2222,7 @@ static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKin
         if (it != rows.end()) {
             insert_tool_row(static_cast<size_t>(std::distance(rows.begin(), it) + 1));
         } else {
-            rows.push_back({ModuleRowKind::Tool, -1, tool, 0});
+            rows.push_back({ModuleRowKind::Tool, -1, tool, (tool == ModuleToolKind::TableNumber) ? 1 : 0});
         }
     } else if (tool == ModuleToolKind::MouseListener) {
         auto it = std::find_if(rows.begin(), rows.end(), [](const ModuleIORow &r) {
@@ -2205,10 +2231,10 @@ static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKin
         if (it != rows.end()) {
             insert_tool_row(static_cast<size_t>(std::distance(rows.begin(), it)));
         } else {
-            rows.push_back({ModuleRowKind::Tool, -1, tool, 0});
+            rows.push_back({ModuleRowKind::Tool, -1, tool, (tool == ModuleToolKind::TableNumber) ? 1 : 0});
         }
     } else {
-        rows.push_back({ModuleRowKind::Tool, -1, tool, 0});
+        rows.push_back({ModuleRowKind::Tool, -1, tool, (tool == ModuleToolKind::TableNumber) ? 1 : 0});
     }
     auto &tools = ctx->module_tool_stack[focused];
     tools.clear();
@@ -2219,6 +2245,25 @@ static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKin
     update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
     ctx->tool_menu_open = false;
     ctx->selected_tool_table = 0;
+}
+
+static int canvas_handle_module_counter_hit(GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& found) {
+    if (!ctx) return 0;
+    if (found.part != GP_TABLE_HIT_COUNTER_DEC && found.part != GP_TABLE_HIT_COUNTER_INC) return 0;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_table_rows.size())) return 0;
+    const auto &rows = ctx->module_table_rows[module_idx];
+    if (found.row_idx < 0 || found.row_idx >= static_cast<int>(rows.size())) return 0;
+    const auto &meta = rows[found.row_idx];
+    if (meta.kind != ModuleRowKind::Tool || meta.tool != ModuleToolKind::TableNumber) return 0;
+    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) return 0;
+    int tool_row_idx = meta.contact_idx;
+    if (tool_row_idx < 0 || tool_row_idx >= static_cast<int>(ctx->module_io_rows[module_idx].size())) return 0;
+    auto &row = ctx->module_io_rows[module_idx][tool_row_idx];
+    if (row.kind != ModuleRowKind::Tool || row.tool != ModuleToolKind::TableNumber) return 0;
+    int delta = (found.part == GP_TABLE_HIT_COUNTER_INC) ? 1 : -1;
+    row.attachment_count = std::clamp(row.attachment_count + delta, 0, 99);
+    sync_module_table_io_layout(ctx, module_idx);
+    return 1;
 }
 
 static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& found) {
@@ -2662,6 +2707,10 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     }
                     if (found_any) {
                         c->dispatch_module_idx = mi;
+                        if (canvas_handle_module_counter_hit(c, mi, found)) {
+                            c->dispatch_module_idx = -1;
+                            return 1;
+                        }
                         int handled = canvas_dispatch_root_hit(c, found);
                         c->dispatch_module_idx = -1;
                         if (handled) return 1;
