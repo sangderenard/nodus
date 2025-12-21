@@ -2800,7 +2800,7 @@ extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
         int ny = world_y - ds.offy;
         c->modules[ds.module].x = nx;
         c->modules[ds.module].y = ny;
-        printf("gp_canvas_on_mouse_move: canvas=%p module=%d -> %d,%d\n", (void*)c, ds.module, nx, ny);
+        //printf("gp_canvas_on_mouse_move: canvas=%p module=%d -> %d,%d\n", (void*)c, ds.module, nx, ny);
         handled = true;
     }
     if (handled) {
