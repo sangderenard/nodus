@@ -423,6 +423,8 @@ struct GP_CanvasContextImpl {
     int edge_order_tool_active = 0;
     // table tool group: 0 = neutral, 1 = select, 2 = menu
     int selected_tool_table = 0;
+    // kpn tool group: 0..2 (K, P, N), -1 = none
+    int selected_tool_kpn = -1;
     bool tool_menu_open = false;
     int io_attachment_count = 1;
     int table_tool_number = 1;
@@ -445,7 +447,7 @@ struct GP_CanvasContextImpl {
     };
     std::vector<NodeContract> nodes;
     // UI control bar height (in canvas-local pixels)
-    int control_bar_h = 28;
+    int control_bar_h = 56;
     // viewport offset (world origin visible at (0,0) in screen space)
     int offset_x = 0;
     int offset_y = 0;
@@ -459,6 +461,9 @@ struct GP_CanvasContextImpl {
     std::string autosave_path;
     double autosave_interval_s = 0.0;
     double autosave_accum_s = 0.0;
+    bool thread_mgr_paused = true;
+    int thread_mgr_delay_ms = 0;
+    double thread_mgr_delay_accum_s = 0.0;
     std::unique_ptr<ThreadManager> thread_mgr;
     GP_CanvasContextImpl(int w, int h): width(w), height(h) {}
 };
@@ -913,6 +918,12 @@ enum CanvasActionId {
     CANVAS_ACT_TABLE_TOOL_NUM_DEC = 2044,
     CANVAS_ACT_TABLE_TOOL_NUM_INC = 2045,
     CANVAS_ACT_MODULE_LED = 2050,
+    CANVAS_ACT_TOOL_KPN_0 = 2060,
+    CANVAS_ACT_TOOL_KPN_1 = 2061,
+    CANVAS_ACT_TOOL_KPN_2 = 2062,
+    CANVAS_ACT_THREAD_TOGGLE = 2070,
+    CANVAS_ACT_THREAD_DELAY_DEC = 2071,
+    CANVAS_ACT_THREAD_DELAY_INC = 2072,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
     CANVAS_ACT_MENU_TOOL_SUB = 2102,
     CANVAS_ACT_MENU_TOOL_MUL = 2103,
@@ -1303,6 +1314,12 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_IO_PRODUCER_ADD, CANVAS_ACT_IO_PRODUCER_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TABLE_TOOL_NUM_DEC, CANVAS_ACT_TABLE_TOOL_NUM_DEC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TABLE_TOOL_NUM_INC, CANVAS_ACT_TABLE_TOOL_NUM_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_KPN_0, CANVAS_ACT_TOOL_KPN_0 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_KPN_1, CANVAS_ACT_TOOL_KPN_1 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_KPN_2, CANVAS_ACT_TOOL_KPN_2 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_TOGGLE, CANVAS_ACT_THREAD_TOGGLE },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_DELAY_DEC, CANVAS_ACT_THREAD_DELAY_DEC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_DELAY_INC, CANVAS_ACT_THREAD_DELAY_INC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
@@ -1585,6 +1602,31 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 int delta = (action_id == CANVAS_ACT_TABLE_TOOL_NUM_INC) ? 1 : -1;
                 c->table_tool_number = std::clamp(c->table_tool_number + delta, 0, 99);
                 printf("gp_canvas_on_click: table_tool_number -> %d\n", c->table_tool_number);
+                break;
+            }
+            case CANVAS_ACT_TOOL_KPN_0:
+            case CANVAS_ACT_TOOL_KPN_1:
+            case CANVAS_ACT_TOOL_KPN_2: {
+                int tool = static_cast<int>(action_id - CANVAS_ACT_TOOL_KPN_0);
+                if (c->selected_tool_kpn == tool) c->selected_tool_kpn = -1; else c->selected_tool_kpn = tool;
+                printf("gp_canvas_on_click: kpn tool %d toggled -> selected_tool_kpn=%d\n", tool, c->selected_tool_kpn);
+                break;
+            }
+            case CANVAS_ACT_THREAD_TOGGLE: {
+                c->thread_mgr_paused = !c->thread_mgr_paused;
+                if (c->thread_mgr_paused) {
+                    c->thread_mgr_delay_accum_s = 0.0;
+                } else {
+                    c->thread_mgr_delay_accum_s = static_cast<double>(std::max(0, c->thread_mgr_delay_ms)) / 1000.0;
+                }
+                printf("gp_canvas_on_click: thread_mgr_paused -> %d\n", c->thread_mgr_paused ? 1 : 0);
+                break;
+            }
+            case CANVAS_ACT_THREAD_DELAY_DEC:
+            case CANVAS_ACT_THREAD_DELAY_INC: {
+                int delta = (action_id == CANVAS_ACT_THREAD_DELAY_INC) ? 10 : -10;
+                c->thread_mgr_delay_ms = std::clamp(c->thread_mgr_delay_ms + delta, 0, 2000);
+                printf("gp_canvas_on_click: thread_mgr_delay_ms -> %d\n", c->thread_mgr_delay_ms);
                 break;
             }
             case CANVAS_ACT_MODULE_LED:
@@ -2545,16 +2587,21 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         const int edge_btn_count = 4;
         const int save_btn_count = 2;
         const int table_btn_count = 3;
+        const int kpn_btn_count = 3;
         const int spacing = 8;
-        int by = c->rope_bar_h + 4;
-        int bh = std::max(4, c->control_bar_h - 8);
+        int inner_h = std::max(0, c->control_bar_h - 8);
+        int row_gap = 4;
+        int row_h = std::max(4, (inner_h - row_gap) / 2);
+        int by0 = c->rope_bar_h + 4;
+        int by1 = by0 + row_h + row_gap;
+        int bh = row_h;
         int bw = bh; // square buttons
         // left canvas group
         int bx = 8;
         int canvas_group_w = canvas_btn_count * (bw + spacing) - spacing;
         for (int bi = 0; bi < canvas_btn_count; ++bi) {
             int bx_i = bx + bi * (bw + spacing);
-            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by0 && view_y < by0 + bh) {
                 int action_id = CANVAS_ACT_TOOL_CANVAS_0 + bi;
                 if (canvas_dispatch_root_action(c, action_id)) return 1;
             }
@@ -2562,7 +2609,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int bx_edge = bx + canvas_group_w + spacing * 2;
         for (int bi = 0; bi < edge_btn_count; ++bi) {
             int bx_i = bx_edge + bi * (bw + spacing);
-            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by0 && view_y < by0 + bh) {
                 int action_id = CANVAS_ACT_TOOL_EDGE_0 + bi;
                 if (canvas_dispatch_root_action(c, action_id)) return 1;
             }
@@ -2573,7 +2620,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int bx_save = bx_r - save_group_w - spacing * 2;
         for (int bi = 0; bi < save_btn_count; ++bi) {
             int bx_i = bx_save + bi * (bw + spacing);
-            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by0 && view_y < by0 + bh) {
                 int action_id = (bi == 0) ? CANVAS_ACT_SAVE : CANVAS_ACT_CLEAR;
                 if (canvas_dispatch_root_action(c, action_id)) return 1;
             }
@@ -2581,7 +2628,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         // right table group
         for (int bi = 0; bi < table_btn_count; ++bi) {
             int bx_i = bx_r + bi * (bw + spacing);
-            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by0 && view_y < by0 + bh) {
                 int action_id = CANVAS_ACT_TOOL_TABLE_0 + bi;
                 if (canvas_dispatch_root_action(c, action_id)) return 1;
             }
@@ -2601,7 +2648,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int pair_left_x = io_base_x - counter_total_w - action_gap - pair_total_w;
         int bx_consumer = pair_left_x;
         int bx_producer = bx_consumer + nbw + pair_gap;
-        if (view_y >= by && view_y < by + bh) {
+        if (view_y >= by0 && view_y < by0 + bh) {
             if (view_x >= bx_consumer && view_x < bx_consumer + nbw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_CONSUMER_ADD)) return 1;
             }
@@ -2609,7 +2656,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_PRODUCER_ADD)) return 1;
             }
         }
-        if (view_y >= by && view_y < by + bh) {
+        if (view_y >= by0 && view_y < by0 + bh) {
             int bx_down = order_left_x;
             int bx_num = bx_down + nbw + gap;
             int bx_up = bx_num + order_num_w + gap;
@@ -2628,12 +2675,39 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int bx_minus = io_base_x - (nbw + gap + num_w + gap + nbw);
         int bx_num = bx_minus + nbw + gap;
         int bx_plus = bx_num + num_w + gap;
-        if (view_y >= by && view_y < by + bh) {
+        if (view_y >= by0 && view_y < by0 + bh) {
             if (view_x >= bx_minus && view_x < bx_minus + nbw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_COUNT_DEC)) return 1;
             }
             if (view_x >= bx_plus && view_x < bx_plus + nbw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_IO_COUNT_INC)) return 1;
+            }
+        }
+        // second row: kpn tools and thread manager controls
+        int bx_kpn = 8;
+        for (int bi = 0; bi < kpn_btn_count; ++bi) {
+            int bx_i = bx_kpn + bi * (bw + spacing);
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by1 && view_y < by1 + bh) {
+                int action_id = CANVAS_ACT_TOOL_KPN_0 + bi;
+                if (canvas_dispatch_root_action(c, action_id)) return 1;
+            }
+        }
+        int delay_num_w = std::max(24, nbw * 2);
+        int delay_gap = 10;
+        int delay_total_w = nbw + delay_gap + delay_num_w + delay_gap + nbw;
+        int play_gap = 12;
+        int bx_play = c->width - 8 - bw;
+        int bx_delay_plus = bx_play - play_gap;
+        int bx_delay_minus = bx_delay_plus - delay_total_w;
+        if (view_y >= by1 && view_y < by1 + bh) {
+            if (view_x >= bx_play && view_x < bx_play + bw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_TOGGLE)) return 1;
+            }
+            if (view_x >= bx_delay_minus && view_x < bx_delay_minus + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_DELAY_DEC)) return 1;
+            }
+            if (view_x >= bx_delay_plus && view_x < bx_delay_plus + nbw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_DELAY_INC)) return 1;
             }
         }
     }
@@ -3187,69 +3261,83 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
             }
         }
     }
-    if (c->thread_mgr) {
-        ThreadManager::TickRequest req;
-        req.dt = static_cast<double>(dt);
-        req.root_table = canvas_ensure_root_table(c);
-        req.modules.reserve(c->modules.size());
-        for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
-            ThreadManager::ModuleContract mod{};
-            mod.module_idx = mi;
-            mod.table = (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) ? c->module_tables[mi] : nullptr;
-            mod.in_count = (mi >= 0 && mi < static_cast<int>(c->module_io_in_count.size())) ? c->module_io_in_count[mi] : 0;
-            mod.out_count = (mi >= 0 && mi < static_cast<int>(c->module_io_out_count.size())) ? c->module_io_out_count[mi] : 0;
-            req.modules.push_back(mod);
-        }
-        req.edges.reserve(c->edges.size());
-        for (size_t ei = 0; ei < c->edges.size(); ++ei) {
-            ThreadManager::EdgeContract e{};
-            e.edge_idx = static_cast<int32_t>(ei);
-            e.type_id = c->edges[ei].type_id;
-            e.a_module = c->edges[ei].desc.a_module;
-            e.a_contact_idx = c->edges[ei].desc.a_contact_idx;
-            e.b_module = c->edges[ei].desc.b_module;
-            e.b_contact_idx = c->edges[ei].desc.b_contact_idx;
-            req.edges.push_back(e);
-        }
-        // Populate stage tasks so ThreadManager can run stage work before table steps.
-        req.stages.reserve(c->module_stages.size());
-        for (int mi = 0; mi < static_cast<int>(c->module_stages.size()); ++mi) {
-            GP_StageContext* st = c->module_stages[mi];
-            if (!st) continue;
-            ThreadManager::StageContract sc{};
-            sc.module_idx = mi;
-            sc.stage = reinterpret_cast<void*>(st);
-            sc.table = (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) ? c->module_tables[mi] : nullptr;
-            // Ensure cache buffer is allocated to the stage size; UI rendering will read this.
-            int w = std::max(1, c->modules[mi].w);
-            int h = std::max(1, c->modules[mi].h);
-            int pitch = w * 4;
-            if (mi >= static_cast<int>(c->module_stage_cache_rgba.size())) {
-                // should not happen, but guard
-                c->module_stage_cache_rgba.resize(mi + 1);
-                c->module_stage_cache_w.resize(mi + 1);
-                c->module_stage_cache_h.resize(mi + 1);
-                c->module_stage_cache_pitch.resize(mi + 1);
-                c->module_stage_cache_mu.emplace_back(std::make_unique<std::mutex>());
+    if (c->thread_mgr && !c->thread_mgr_paused) {
+        const double delay_s = static_cast<double>(std::max(0, c->thread_mgr_delay_ms)) / 1000.0;
+        bool should_submit = true;
+        if (delay_s <= 0.0) {
+            c->thread_mgr_delay_accum_s = 0.0;
+        } else {
+            c->thread_mgr_delay_accum_s += static_cast<double>(dt);
+            if (c->thread_mgr_delay_accum_s + 1e-9 < delay_s) {
+                should_submit = false;
+            } else {
+                c->thread_mgr_delay_accum_s = std::max(0.0, c->thread_mgr_delay_accum_s - delay_s);
             }
-            {
-                std::lock_guard<std::mutex> lk(*c->module_stage_cache_mu[mi]);
-                if (c->module_stage_cache_w[mi] != w || c->module_stage_cache_h[mi] != h || c->module_stage_cache_pitch[mi] != pitch) {
-                    c->module_stage_cache_w[mi] = w;
-                    c->module_stage_cache_h[mi] = h;
-                    c->module_stage_cache_pitch[mi] = pitch;
-                    c->module_stage_cache_rgba[mi].assign(static_cast<size_t>(pitch) * static_cast<size_t>(h), 0u);
+        }
+        if (should_submit) {
+            ThreadManager::TickRequest req;
+            req.dt = static_cast<double>(dt);
+            req.root_table = canvas_ensure_root_table(c);
+            req.modules.reserve(c->modules.size());
+            for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
+                ThreadManager::ModuleContract mod{};
+                mod.module_idx = mi;
+                mod.table = (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) ? c->module_tables[mi] : nullptr;
+                mod.in_count = (mi >= 0 && mi < static_cast<int>(c->module_io_in_count.size())) ? c->module_io_in_count[mi] : 0;
+                mod.out_count = (mi >= 0 && mi < static_cast<int>(c->module_io_out_count.size())) ? c->module_io_out_count[mi] : 0;
+                req.modules.push_back(mod);
+            }
+            req.edges.reserve(c->edges.size());
+            for (size_t ei = 0; ei < c->edges.size(); ++ei) {
+                ThreadManager::EdgeContract e{};
+                e.edge_idx = static_cast<int32_t>(ei);
+                e.type_id = c->edges[ei].type_id;
+                e.a_module = c->edges[ei].desc.a_module;
+                e.a_contact_idx = c->edges[ei].desc.a_contact_idx;
+                e.b_module = c->edges[ei].desc.b_module;
+                e.b_contact_idx = c->edges[ei].desc.b_contact_idx;
+                req.edges.push_back(e);
+            }
+            // Populate stage tasks so ThreadManager can run stage work before table steps.
+            req.stages.reserve(c->module_stages.size());
+            for (int mi = 0; mi < static_cast<int>(c->module_stages.size()); ++mi) {
+                GP_StageContext* st = c->module_stages[mi];
+                if (!st) continue;
+                ThreadManager::StageContract sc{};
+                sc.module_idx = mi;
+                sc.stage = reinterpret_cast<void*>(st);
+                sc.table = (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) ? c->module_tables[mi] : nullptr;
+                // Ensure cache buffer is allocated to the stage size; UI rendering will read this.
+                int w = std::max(1, c->modules[mi].w);
+                int h = std::max(1, c->modules[mi].h);
+                int pitch = w * 4;
+                if (mi >= static_cast<int>(c->module_stage_cache_rgba.size())) {
+                    // should not happen, but guard
+                    c->module_stage_cache_rgba.resize(mi + 1);
+                    c->module_stage_cache_w.resize(mi + 1);
+                    c->module_stage_cache_h.resize(mi + 1);
+                    c->module_stage_cache_pitch.resize(mi + 1);
+                    c->module_stage_cache_mu.emplace_back(std::make_unique<std::mutex>());
                 }
+                {
+                    std::lock_guard<std::mutex> lk(*c->module_stage_cache_mu[mi]);
+                    if (c->module_stage_cache_w[mi] != w || c->module_stage_cache_h[mi] != h || c->module_stage_cache_pitch[mi] != pitch) {
+                        c->module_stage_cache_w[mi] = w;
+                        c->module_stage_cache_h[mi] = h;
+                        c->module_stage_cache_pitch[mi] = pitch;
+                        c->module_stage_cache_rgba[mi].assign(static_cast<size_t>(pitch) * static_cast<size_t>(h), 0u);
+                    }
+                }
+                sc.out_rgba = c->module_stage_cache_rgba[mi].empty() ? nullptr : c->module_stage_cache_rgba[mi].data();
+                sc.out_pitch = c->module_stage_cache_pitch[mi];
+                sc.width = c->module_stage_cache_w[mi];
+                sc.height = c->module_stage_cache_h[mi];
+                sc.cache_mu = c->module_stage_cache_mu[mi].get();
+                req.stages.push_back(sc);
             }
-            sc.out_rgba = c->module_stage_cache_rgba[mi].empty() ? nullptr : c->module_stage_cache_rgba[mi].data();
-            sc.out_pitch = c->module_stage_cache_pitch[mi];
-            sc.width = c->module_stage_cache_w[mi];
-            sc.height = c->module_stage_cache_h[mi];
-            sc.cache_mu = c->module_stage_cache_mu[mi].get();
-            req.stages.push_back(sc);
+            // Submit asynchronously so the UI thread is not blocked by stage/table work.
+            c->thread_mgr->submit_tick(std::move(req), /*wait=*/false);
         }
-        // Submit asynchronously so the UI thread is not blocked by stage/table work.
-        c->thread_mgr->submit_tick(std::move(req), /*wait=*/false);
     }
     // autosave: accumulate dt and write canvas file when interval reached
     if (!c->autosave_path.empty() && c->autosave_interval_s > 0.0) {
@@ -4233,7 +4321,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     canvas_clear_workspace(c);
     c->width = file_w;
     c->height = file_h;
-    c->control_bar_h = file_cbh;
+    c->control_bar_h = std::max(file_cbh, 56);
     c->offset_x = file_offx;
     c->offset_y = file_offy;
 
@@ -4445,11 +4533,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         const int edge_btn_count = 4;
         const int save_btn_count = 2;
         const int table_btn_count = 3;
+        const int kpn_btn_count = 3;
         const int spacing = 8;
-        int bh = std::max(4, cbh - 8);
+        int inner_h = std::max(0, cbh - 8);
+        int row_gap = 4;
+        int row_h = std::max(4, (inner_h - row_gap) / 2);
+        int by0 = rb + 4;
+        int by1 = by0 + row_h + row_gap;
+        int bh = row_h;
         int bw = bh; // square buttons
         // left (canvas) group
-        int bx = 8; int by = rb + 4;
+        int bx = 8; int by = by0;
         int canvas_group_w = canvas_btn_count * (bw + spacing) - spacing;
         for (int bi = 0; bi < canvas_btn_count; ++bi) {
             int bx_i = bx + bi * (bw + spacing);
@@ -4882,6 +4976,128 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         draw_edge_order_group(order_left_x, io_by, ctx->edge_order_value, ctx->edge_order_tool_active != 0);
         draw_io_action_pair(pair_left_x, io_by, LABEL_IO_CONSUMER_SHORT, LABEL_IO_PRODUCER_SHORT);
         draw_io_group(io_base_x, io_by, counter_value, LABEL_IO_COUNT_SHORT);
+
+        // second row: KPN tools + thread manager controls
+        int kpn_by = by1;
+        int bx_kpn = 8;
+        for (int bi = 0; bi < kpn_btn_count; ++bi) {
+            int bx_i = bx_kpn + bi * (bw + spacing);
+            bool selected = (ctx->selected_tool_kpn == bi);
+            Color fill = selected ? Color{80,90,110,255} : Color{52,58,70,255};
+            memset_rect(out_rgba, w, h, pitch, bx_i, kpn_by, bw, bh, fill);
+            for (int oy = 0; oy < bh; ++oy) {
+                int y = kpn_by + oy; if (y < 0 || y >= h) continue;
+                int left_x = bx_i; int right_x = bx_i + bw - 1;
+                uint8_t* pleft = out_rgba + y * pitch + left_x * 4;
+                uint8_t* pright = out_rgba + y * pitch + right_x * 4;
+                pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
+                pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
+            }
+            const char* kpn_labels[3] = {
+                LABEL_KPN_TOOL_K,
+                LABEL_KPN_TOOL_P,
+                LABEL_KPN_TOOL_N
+            };
+            const char* kpn_short[3] = {
+                LABEL_KPN_TOOL_SHORT_K,
+                LABEL_KPN_TOOL_SHORT_P,
+                LABEL_KPN_TOOL_SHORT_N
+            };
+            auto lbm = render_text_to_rgba(kpn_labels[bi], 0.8f, {220,228,240,255});
+            if (!lbm.pixels.empty()) {
+                int tx = bx_i + (bw - lbm.width) / 2;
+                int ty = kpn_by + (bh - lbm.height) / 2;
+                for (int yy = 0; yy < lbm.height; ++yy) {
+                    int dst_y = ty + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < lbm.width; ++xx) {
+                        int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &lbm.pixels[(yy * lbm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+            auto small = render_text_to_rgba(kpn_short[bi], 1.0f, {235,238,245,255});
+            if (!small.pixels.empty()) {
+                int txs = bx_i + (bw - small.width) / 2;
+                int tys = kpn_by + (bh - small.height) / 2;
+                for (int yy = 0; yy < small.height; ++yy) {
+                    int dst_y = tys + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < small.width; ++xx) {
+                        int dst_x = txs + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &small.pixels[(yy * small.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        int delay_num_w = std::max(24, nbw * 2);
+        int play_gap = 12;
+        int bx_play = w - 8 - bw;
+        int bx_delay_plus = bx_play - play_gap;
+        draw_io_group(bx_delay_plus, kpn_by, std::max(0, ctx->thread_mgr_delay_ms), LABEL_THREAD_DELAY_SHORT);
+
+        Color play_fill = ctx->thread_mgr_paused ? Color{70,60,70,255} : Color{60,80,60,255};
+        memset_rect(out_rgba, w, h, pitch, bx_play, kpn_by, bw, bh, play_fill);
+        for (int oy = 0; oy < bh; ++oy) {
+            int y = kpn_by + oy; if (y < 0 || y >= h) continue;
+            int left_x = bx_play; int right_x = bx_play + bw - 1;
+            uint8_t* pleft = out_rgba + y * pitch + left_x * 4;
+            uint8_t* pright = out_rgba + y * pitch + right_x * 4;
+            pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
+            pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
+        }
+        const char* play_label = ctx->thread_mgr_paused ? LABEL_THREAD_PLAY : LABEL_THREAD_PAUSE;
+        const char* play_short = ctx->thread_mgr_paused ? LABEL_THREAD_PLAY_SHORT : LABEL_THREAD_PAUSE_SHORT;
+        auto play_text = render_text_to_rgba(play_label, 0.75f, {230,230,230,255});
+        if (!play_text.pixels.empty()) {
+            int tx = bx_play + (bw - play_text.width) / 2;
+            int ty = kpn_by + (bh - play_text.height) / 2;
+            for (int yy = 0; yy < play_text.height; ++yy) {
+                int dst_y = ty + yy; if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < play_text.width; ++xx) {
+                    int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &play_text.pixels[(yy * play_text.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        }
+        auto play_short_text = render_text_to_rgba(play_short, 1.0f, {240,240,240,255});
+        if (!play_short_text.pixels.empty()) {
+            int txs = bx_play + (bw - play_short_text.width) / 2;
+            int tys = kpn_by + (bh - play_short_text.height) / 2;
+            for (int yy = 0; yy < play_short_text.height; ++yy) {
+                int dst_y = tys + yy; if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < play_short_text.width; ++xx) {
+                    int dst_x = txs + xx; if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &play_short_text.pixels[(yy * play_short_text.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        }
     }
 
     // Prepare storage for per-module table hitboxes discovered during table rendering.
