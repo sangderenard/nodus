@@ -31,6 +31,10 @@
 # Generated project dirs
 build-*/
 
+# Local build presets
+/build_test/
+/build_real/
+
 # Python
 __pycache__/
 *.pyc
