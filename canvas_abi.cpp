@@ -43,6 +43,17 @@ struct ContactLight {
 
 struct KeyRecorderState;
 
+// Canvas bounds used for scroll/clamping calculations
+struct CanvasBounds {
+    int min_x = 0;
+    int max_x = 0;
+    int min_y = 0;
+    int max_y = 0;
+    bool has_any = false;
+};
+
+// forward declaration will be placed after `GP_CanvasContextImpl` is defined
+
 static inline void blend_pixel(uint8_t* dst, uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa) {
     if (!dst) return;
     float a = sa / 255.0f;
@@ -627,6 +638,9 @@ struct GP_CanvasContextImpl {
 
 static GP_CanvasContextImpl* g_canvas_context_singleton = nullptr;
 
+// forward declaration: update scroll/clamp state (defined later in this file)
+static CanvasBounds update_canvas_scroll_state(GP_CanvasContextImpl* ctx, bool pull_from_container);
+
 // forward declaration: write the tail values into a module's stack snapshot
 static void module_stack_tail_write(GP_CanvasContextImpl* ctx, int module_idx, const float* values, int count);
 
@@ -1077,14 +1091,6 @@ static int resolve_side_contact_index(const GP_CanvasContextImpl* ctx, int modul
     int offset = std::max(0, ctx->module_io_in_count[module_idx]);
     return contact_idx - offset;
 }
-
-struct CanvasBounds {
-    int min_x = 0;
-    int max_x = 0;
-    int min_y = 0;
-    int max_y = 0;
-    bool has_any = false;
-};
 
 struct ModuleLayout {
     int top_h = 0;
