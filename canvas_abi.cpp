@@ -578,8 +578,8 @@ struct GP_CanvasContextImpl {
     int selected_tool_table = 0;
     // kpn tool group: 0..2 (K, P, N), -1 = none
     int selected_tool_kpn = -1;
-    // fifo policy subgroup selector: 0..kSubgroupBinCount-1, -1 = none
-    int selected_tool_subgroup = -1;
+    // fifo policy subgroup selector: bitmask of enabled subgroup flags
+    uint32_t selected_tool_subgroup_flags = 0u;
     bool tool_menu_open = false;
     int io_attachment_count = 1;
     int table_tool_number = 1;
@@ -2112,8 +2112,10 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
             case CANVAS_ACT_TOOL_SUBGROUP_7: {
                 int tool = static_cast<int>(action_id - CANVAS_ACT_TOOL_SUBGROUP_0);
                 if (tool >= kSubgroupBinCount) break;
-                if (c->selected_tool_subgroup == tool) c->selected_tool_subgroup = -1; else c->selected_tool_subgroup = tool;
-                printf("gp_canvas_on_click: subgroup tool %d toggled -> selected_tool_subgroup=%d\n", tool, c->selected_tool_subgroup);
+                uint32_t bit = subgroup_mask_for_index(tool);
+                if (c->selected_tool_subgroup_flags & bit) c->selected_tool_subgroup_flags &= ~bit;
+                else c->selected_tool_subgroup_flags |= bit;
+                printf("gp_canvas_on_click: subgroup tool %d toggled -> selected_tool_subgroup_flags=0x%08x\n", tool, c->selected_tool_subgroup_flags);
                 break;
             }
             case CANVAS_ACT_THREAD_TOGGLE: {
@@ -2885,11 +2887,11 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
             return 1;
         }
     }
-    if (ctx->selected_tool_subgroup >= 0) {
+    if (ctx->selected_tool_subgroup_flags != 0u) {
         std::vector<int> edge_indices;
         canvas_collect_edges_for_contact(ctx, module_idx, contact_idx, edge_indices);
         if (!edge_indices.empty()) {
-            uint32_t flags = subgroup_mask_for_index(ctx->selected_tool_subgroup);
+            uint32_t flags = ctx->selected_tool_subgroup_flags;
             for (int idx : edge_indices) {
                 canvas_apply_subgroup_to_edge_idx(ctx, idx, flags);
             }
@@ -3405,10 +3407,10 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             return 1;
         }
     }
-    if (c->selected_tool_subgroup >= 0) {
+    if (c->selected_tool_subgroup_flags != 0u) {
         int edge_idx = canvas_pick_edge_by_rope(c, world_x, world_y, static_cast<float>(pick_r));
         if (edge_idx >= 0 && edge_idx < static_cast<int>(c->edges.size())) {
-            uint32_t flags = subgroup_mask_for_index(c->selected_tool_subgroup);
+            uint32_t flags = c->selected_tool_subgroup_flags;
             canvas_apply_subgroup_to_edge_idx(c, edge_idx, flags);
             return 1;
         }
@@ -4743,13 +4745,14 @@ extern "C" int gp_canvas_get_module_node_id(GP_CanvasContext* ctx_, int module_i
 
 // Persist canvas state to a simple line-based file format. This is intentionally
 // lightweight and human readable so it's easy to edit by hand during development.
-// Format (V2):
-// CANVAS V2
+// Format (V3):
+// CANVAS V3
 // WIDTH HEIGHT CONTROL_BAR_H
 // OFFSET offx offy
 // MODULE x y w h in_count out_count is_stage bg_mode label
 // ROWS module_idx row_count [kind tool attachment_count]...
-// EDGE a_module a_contact_idx b_module b_contact_idx type_id
+// EDGE a_module a_contact_idx b_module b_contact_idx type_id subgroup_flags
+// FRAMELED module_idx row_idx led_idx flags reserved0
 // NODE node_id module_idx input_count [inputs...] output_count [outputs...]
 // Lines may appear in any order; loader will reconstruct internal vectors.
 extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) {
@@ -4757,7 +4760,7 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     std::ofstream ofs(path);
     if (!ofs.good()) return 0;
-    ofs << "CANVAS V2\n";
+    ofs << "CANVAS V3\n";
     ofs << c->width << " " << c->height << " " << c->control_bar_h << "\n";
     ofs << "OFFSET " << c->offset_x << " " << c->offset_y << "\n";
     // modules
@@ -4794,7 +4797,18 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     // edges
     for (const auto &ei : c->edges) {
         const auto &e = ei.desc;
-        ofs << "EDGE " << e.a_module << " " << e.a_contact_idx << " " << e.b_module << " " << e.b_contact_idx << " " << ei.type_id << "\n";
+        ofs << "EDGE " << e.a_module << " " << e.a_contact_idx << " " << e.b_module << " " << e.b_contact_idx << " "
+            << ei.type_id << " " << ei.subgroup_flags << "\n";
+    }
+    for (size_t mi = 0; mi < c->module_frame_leds.size(); ++mi) {
+        const auto &group = c->module_frame_leds[mi];
+        for (int row = 0; row < kModuleExtraLedRows; ++row) {
+            for (int idx = 0; idx < kModuleExtraLedCount; ++idx) {
+                const GP_TableCell &cell = group.cells[static_cast<size_t>(row)][static_cast<size_t>(idx)];
+                if (cell.flags == 0u && cell.reserved0 == 0) continue;
+                ofs << "FRAMELED " << mi << " " << row << " " << idx << " " << cell.flags << " " << cell.reserved0 << "\n";
+            }
+        }
     }
     // nodes/contracts
     for (const auto &n : c->nodes) {
@@ -4827,10 +4841,18 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     struct EdgeSnapshot {
         GP_CanvasEdgeDesc desc{};
         int type_id = 0;
+        uint32_t subgroup_flags = 0u;
     };
     struct RowSnapshot {
         int module_idx = -1;
         std::vector<ModuleIORow> rows;
+    };
+    struct FrameLedSnapshot {
+        int module_idx = -1;
+        int row = 0;
+        int idx = 0;
+        uint32_t flags = 0u;
+        int reserved0 = 0;
     };
 
     int version = 1;
@@ -4842,6 +4864,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     std::vector<ModuleSnapshot> modules;
     std::vector<EdgeSnapshot> edges;
     std::vector<RowSnapshot> row_sets;
+    std::vector<FrameLedSnapshot> frame_leds;
     std::vector<GP_CanvasContextImpl::NodeContract> nodes;
 
     std::string line;
@@ -4854,6 +4877,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             std::string version_token;
             header >> canvas_token >> version_token;
             if (version_token == "V2") version = 2;
+            else if (version_token == "V3") version = 3;
             if (!std::getline(ifs, line)) return 0;
             std::istringstream sh(line);
             sh >> file_w >> file_h >> file_cbh;
@@ -4911,7 +4935,17 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         } else if (tag == "EDGE") {
             EdgeSnapshot es{};
             ss >> es.desc.a_module >> es.desc.a_contact_idx >> es.desc.b_module >> es.desc.b_contact_idx >> es.type_id;
+            if (version >= 3) {
+                ss >> es.subgroup_flags;
+            } else if (ss.good()) {
+                uint32_t maybe_flags = 0u;
+                if (ss >> maybe_flags) es.subgroup_flags = maybe_flags;
+            }
             edges.push_back(std::move(es));
+        } else if (tag == "FRAMELED") {
+            FrameLedSnapshot fs{};
+            ss >> fs.module_idx >> fs.row >> fs.idx >> fs.flags >> fs.reserved0;
+            frame_leds.push_back(std::move(fs));
         } else if (tag == "NODE") {
             GP_CanvasContextImpl::NodeContract nc{};
             ss >> nc.node_id >> nc.module_idx;
@@ -4965,6 +4999,16 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         }
     }
 
+    for (const auto &fs : frame_leds) {
+        if (fs.module_idx < 0 || fs.module_idx >= static_cast<int>(c->modules.size())) continue;
+        if (fs.row < 0 || fs.row >= kModuleExtraLedRows) continue;
+        if (fs.idx < 0 || fs.idx >= kModuleExtraLedCount) continue;
+        GP_TableCell* cell = module_frame_led_cell(c, fs.module_idx, fs.row, fs.idx);
+        if (!cell) continue;
+        cell->flags = fs.flags;
+        cell->reserved0 = fs.reserved0;
+    }
+
     c->nodes.clear();
     c->module_node_id.assign(c->modules.size(), -1);
     int max_node_id = 0;
@@ -4991,7 +5035,10 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     c->next_node_id = std::max(max_node_id + 1, max_window_node + 1);
 
     for (const auto &es : edges) {
-        gp_canvas_add_edge_with_type(ctx_, &es.desc, es.type_id);
+        int edge_idx = gp_canvas_add_edge_with_type(ctx_, &es.desc, es.type_id);
+        if (edge_idx >= 0 && es.subgroup_flags != 0u) {
+            canvas_apply_subgroup_to_edge_idx(c, edge_idx, es.subgroup_flags);
+        }
     }
 
     update_canvas_scroll_state(c, /*pull_from_container=*/false);
@@ -5669,7 +5716,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             int bx_i = subgroup_left + bi * (bw + spacing);
             uint32_t flags = subgroup_mask_for_index(bi);
             Color fill = subgroup_flags_to_color(flags, 255);
-            bool selected = (ctx->selected_tool_subgroup == bi);
+            bool selected = (ctx->selected_tool_subgroup_flags & subgroup_mask_for_index(bi)) != 0u;
             if (!selected) {
                 fill.r = static_cast<uint8_t>(std::lround(fill.r * 0.75f));
                 fill.g = static_cast<uint8_t>(std::lround(fill.g * 0.75f));
@@ -6318,8 +6365,8 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 int jacket_px = ctx->jacket_px;
                 int jacket_border = ctx->jacket_border;
                 int samples_per_segment = 3;
-                if (ctx->selected_tool_subgroup >= 0) {
-                    uint32_t flags = subgroup_mask_for_index(ctx->selected_tool_subgroup);
+                if (ctx->selected_tool_subgroup_flags != 0u) {
+                    uint32_t flags = ctx->selected_tool_subgroup_flags;
                     float hue = subgroup_flags_to_hue(flags);
                     float hue_vals[1] = { hue };
                     table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, samples_per_segment, 0.55f);

@@ -3184,6 +3184,41 @@ static void draw_rope_jacket_overlay(uint8_t* img, int w, int h, int pitch,
     }
 }
 
+static void draw_rope_core_gradient(uint8_t* img, int w, int h, int pitch,
+                                    const std::vector<std::pair<float,float>>& samples,
+                                    const std::vector<std::pair<float,float>>& tangents,
+                                    int jacket_px,
+                                    int jacket_border,
+                                    Color col_a,
+                                    Color col_b,
+                                    float intensity) {
+    if (!img || samples.size() < 2 || samples.size() != tangents.size()) return;
+    int core_r = std::max(1, jacket_px - jacket_border - 0);
+    float base_alpha = 255.0f * std::clamp(intensity, 0.0f, 1.0f) * 0.18f;
+    auto lerp_color = [&](const Color &a, const Color &b, float t) {
+        float tt = std::clamp(t, 0.0f, 1.0f);
+        Color out;
+        out.r = static_cast<uint8_t>(std::lround(float(a.r) * (1.0f - tt) + float(b.r) * tt));
+        out.g = static_cast<uint8_t>(std::lround(float(a.g) * (1.0f - tt) + float(b.g) * tt));
+        out.b = static_cast<uint8_t>(std::lround(float(a.b) * (1.0f - tt) + float(b.b) * tt));
+        out.a = 0;
+        return out;
+    };
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        float u = (samples.size() > 1) ? static_cast<float>(i) / static_cast<float>(samples.size() - 1) : 0.0f;
+        float alpha_mix = (1.0f - u) * float(col_a.a) + u * float(col_b.a);
+        uint8_t alpha = static_cast<uint8_t>(std::lround(base_alpha * std::clamp(alpha_mix / 255.0f, 0.0f, 1.0f)));
+        if (alpha == 0) continue;
+        Color core_col = lerp_color(col_a, col_b, u);
+        core_col.a = alpha;
+        auto &a = samples[i];
+        auto &b = samples[i+1];
+        auto &ta = tangents[i];
+        auto &tb = tangents[i+1];
+        draw_segment_parametric_sdf(img, w, h, pitch, a.first, a.second, b.first, b.second, ta.first, ta.second, tb.first, tb.second, core_r, core_col, 1.0f);
+    }
+}
+
 // Convert HSV (h in 0..1, s 0..1, v 0..1) to Color (alpha=255)
 static inline Color hsv_to_color(float h, float s, float v, uint8_t a=255) {
     h = h - std::floor(h);
@@ -5191,9 +5226,6 @@ int32_t gp_table_render_rgba_with_state(
                 }
             }
             bool reverse_phases = info_b.is_output && !info_a.is_output;
-            Color core_col = rope_light_col;
-            float core_alpha_scale = ctx->st.cable_fifo_light_mode ? std::clamp(fifo_core_intensity, 0.0f, 1.0f) : ev;
-            core_col.a = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(float(core_col.a) * ctx->st.cable_core_alpha * core_alpha_scale)), 0, 255));
             int rope_idx = ctx->rope_sim_idx[ei];
             if (rope_idx < 0) continue;
             int vc = rope_sim_get_vertex_count(ctx->rope_sim, rope_idx);
@@ -5206,11 +5238,25 @@ int32_t gp_table_render_rgba_with_state(
             float min_z = 0.0f, max_z = 0.0f;
             project_rope_vertices_ortho(verts3.data(), got, ctx->st.cable_tilt_x, ctx->st.cable_tilt_y, proj_xy, proj_z, min_z, max_z);
             // draw smooth spline curve along simulator vertices; overlay LED light falloff
-            int samples_per_segment = std::max(2, ctx->st.cable_segments / std::max(1, got - 1));
             float dominant_glow = std::max(glow_a_eff, glow_b_eff);
-            draw_rope_curve_blend(out_rgba, w_local, h_local, pitch_local, proj_xy.data(), got, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, core_col, samples_per_segment);
+            std::vector<std::pair<float,float>> jacket_samples;
+            std::vector<std::pair<float,float>> jacket_tangents;
+            build_rope_samples_with_tangents(proj_xy.data(), got, ctx->st.cable_jacket_px, jacket_samples, jacket_tangents);
+            int jacket_segments = std::max(1, got - 1);
+            std::vector<Color> base_jacket_colors(static_cast<size_t>(jacket_segments), Color{200, 200, 200, 13});
+            draw_rope_jacket_overlay(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, base_jacket_colors);
+            auto make_led_color = [&](const LedContactInfo &info, float glow) {
+                Color c = (info.on || info.active) ? ctx->st.led_on : ctx->st.led_off;
+                c.a = static_cast<uint8_t>(std::lround(255.0f * std::clamp(glow, 0.0f, 1.0f)));
+                return c;
+            };
+            Color core_a = make_led_color(info_a, glow_a_eff);
+            Color core_b = make_led_color(info_b, glow_b_eff);
+            float core_intensity = (ctx->st.cable_fifo_light_mode ? std::clamp(fifo_core_intensity, 0.0f, 1.0f) : ev)
+                                   * std::clamp(ctx->st.cable_core_alpha, 0.0f, 1.0f);
+            draw_rope_core_gradient(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, core_a, core_b, core_intensity);
             if (ctx->st.cable_fifo_light_mode && fifo_has_state) {
-                int fifo_segments = std::max(1, got - 1);
+                int fifo_segments = jacket_segments;
                 std::vector<Color> jacket_colors(static_cast<size_t>(fifo_segments), Color{0, 0, 0, 0});
                 auto normalize_phase = [&](float p) {
                     float v = p - std::floor(p);
@@ -5243,10 +5289,9 @@ int32_t gp_table_render_rgba_with_state(
                 float read_phase = orient_phase(fifo_read_phase);
                 int write_idx = std::clamp(static_cast<int>(std::floor(write_phase * fifo_segments)), 0, fifo_segments - 1);
                 int read_idx = std::clamp(static_cast<int>(std::floor(read_phase * fifo_segments)), 0, fifo_segments - 1);
-                Color led_col = rope_light_col;
-                led_col.a = 255;
-                Color write_col = tint_color_hue(led_col, ctx->st.cable_fifo_friction_tint, 1.0f);
-                Color read_col = tint_color_hue(led_col, -ctx->st.cable_fifo_friction_tint, 1.0f);
+                Color fill_col{40, 120, 255, 255};
+                Color write_col{255, 80, 80, 255};
+                Color read_col{80, 255, 120, 255};
                 for (int si = 0; si < fifo_segments; ++si) {
                     float seg_phase = (static_cast<float>(si) + 0.5f) / static_cast<float>(fifo_segments);
                     float fill_local = (fill_strength > 0.0f && phase_in_arc(seg_phase, tail_phase, head_phase)) ? fill_strength : 0.0f;
@@ -5272,14 +5317,11 @@ int32_t gp_table_render_rgba_with_state(
                         out = lerp_color(out, t, strength);
                         out.a = std::max(out.a, t.a);
                     };
-                    apply_tint(led_col, fill_local, 170);
+                    apply_tint(fill_col, fill_local, 170);
                     apply_tint(write_col, write_local, 200);
                     apply_tint(read_col, read_local, 200);
                     jacket_colors[static_cast<size_t>(si)] = out;
                 }
-                std::vector<std::pair<float,float>> jacket_samples;
-                std::vector<std::pair<float,float>> jacket_tangents;
-                build_rope_samples_with_tangents(proj_xy.data(), got, ctx->st.cable_jacket_px, jacket_samples, jacket_tangents);
                 draw_rope_jacket_overlay(out_rgba, w_local, h_local, pitch_local, jacket_samples, jacket_tangents, ctx->st.cable_jacket_px, jacket_colors);
             }
             if (dominant_glow > 0.0f) {
