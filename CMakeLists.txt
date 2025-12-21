@@ -7,6 +7,7 @@ endif()
 
 add_library(canvas_tables SHARED
     canvas_abi.cpp
+    module_preview.cpp
     table_abi.cpp
     table_node_groups.cpp
     menu_waveform.cpp
