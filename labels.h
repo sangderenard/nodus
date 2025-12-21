@@ -36,6 +36,21 @@
 
 #define LABEL_EDGE_ORDER_TOOL "Order"
 
+// KPN tool labels
+#define LABEL_KPN_TOOL_K "KPN K"
+#define LABEL_KPN_TOOL_P "KPN P"
+#define LABEL_KPN_TOOL_N "KPN N"
+#define LABEL_KPN_TOOL_SHORT_K "K"
+#define LABEL_KPN_TOOL_SHORT_P "P"
+#define LABEL_KPN_TOOL_SHORT_N "N"
+
+// Thread manager labels
+#define LABEL_THREAD_PLAY "Play"
+#define LABEL_THREAD_PAUSE "Pause"
+#define LABEL_THREAD_PLAY_SHORT ">"
+#define LABEL_THREAD_PAUSE_SHORT "||"
+#define LABEL_THREAD_DELAY_SHORT "ms"
+
 // Rope bar labels
 #define LABEL_ROPE_SEGS_DEC "Seg -"
 #define LABEL_ROPE_SEGS_INC "Seg +"
