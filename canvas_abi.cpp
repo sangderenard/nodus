@@ -2692,6 +2692,9 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 if (canvas_dispatch_root_action(c, action_id)) return 1;
             }
         }
+        int delay_num_w = std::max(24, nbw * 2);
+        int delay_gap = 10;
+        int delay_total_w = nbw + delay_gap + delay_num_w + delay_gap + nbw;
         int play_gap = 12;
         int bx_play = c->width - 8 - bw;
         int bx_delay_plus = bx_play - play_gap;
