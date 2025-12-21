@@ -81,6 +81,63 @@ static void memset_rect(uint8_t* img, int w, int h, int pitch, int x0, int y0, i
     }
 }
 
+static constexpr int kSubgroupBinCount = 8;
+static constexpr float kColorWheelPi = 3.14159265358979323846f;
+
+static inline Color hsv_to_color(float h, float s, float v, uint8_t a=255) {
+    h = std::fmod(h, 1.0f);
+    if (h < 0.0f) h += 1.0f;
+    s = std::clamp(s, 0.0f, 1.0f);
+    v = std::clamp(v, 0.0f, 1.0f);
+    float c = v * s;
+    float hp = h * 6.0f;
+    float x = c * (1.0f - std::fabs(std::fmod(hp, 2.0f) - 1.0f));
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    if (hp < 1.0f) { r = c; g = x; }
+    else if (hp < 2.0f) { r = x; g = c; }
+    else if (hp < 3.0f) { g = c; b = x; }
+    else if (hp < 4.0f) { g = x; b = c; }
+    else if (hp < 5.0f) { r = x; b = c; }
+    else { r = c; b = x; }
+    float m = v - c;
+    return Color{
+        static_cast<uint8_t>(std::lround((r + m) * 255.0f)),
+        static_cast<uint8_t>(std::lround((g + m) * 255.0f)),
+        static_cast<uint8_t>(std::lround((b + m) * 255.0f)),
+        a
+    };
+}
+
+static inline uint32_t subgroup_mask_for_index(int idx) {
+    if (idx < 0 || idx >= kSubgroupBinCount) return 0u;
+    return 1u << static_cast<uint32_t>(idx);
+}
+
+static float subgroup_flags_to_hue(uint32_t flags) {
+    if (flags == 0u) return 0.0f;
+    double sx = 0.0;
+    double sy = 0.0;
+    for (int i = 0; i < kSubgroupBinCount; ++i) {
+        uint32_t bit = 1u << static_cast<uint32_t>(i);
+        if ((flags & bit) == 0u) continue;
+        double angle = (2.0 * kColorWheelPi * static_cast<double>(i)) / static_cast<double>(kSubgroupBinCount);
+        sx += std::cos(angle);
+        sy += std::sin(angle);
+    }
+    if (sx == 0.0 && sy == 0.0) return 0.0f;
+    double angle = std::atan2(sy, sx);
+    if (angle < 0.0) angle += 2.0 * kColorWheelPi;
+    return static_cast<float>(angle / (2.0 * kColorWheelPi));
+}
+
+static Color subgroup_flags_to_color(uint32_t flags, uint8_t alpha=255) {
+    if (flags == 0u) return Color{120, 120, 130, alpha};
+    float hue = subgroup_flags_to_hue(flags);
+    return hsv_to_color(hue, 0.9f, 0.95f, alpha);
+}
+
 static void draw_circle(uint8_t* img, int w, int h, int pitch, int cx, int cy, int r, Color c) {
     if (!img) return;
     const int r2 = r * r;
@@ -421,6 +478,7 @@ struct GP_CanvasContextImpl {
         GP_CanvasEdgeDesc desc;
         int rope_idx = -1;
         int type_id = 0; // 0 == wildcard / untyped
+        uint32_t subgroup_flags = 0;
         std::vector<float> hues;
         float hue_intensity = 0.0f;
     };
@@ -520,6 +578,8 @@ struct GP_CanvasContextImpl {
     int selected_tool_table = 0;
     // kpn tool group: 0..2 (K, P, N), -1 = none
     int selected_tool_kpn = -1;
+    // fifo policy subgroup selector: 0..kSubgroupBinCount-1, -1 = none
+    int selected_tool_subgroup = -1;
     bool tool_menu_open = false;
     int io_attachment_count = 1;
     int table_tool_number = 1;
@@ -1338,6 +1398,14 @@ enum CanvasActionId {
     CANVAS_ACT_THREAD_TOGGLE = 2070,
     CANVAS_ACT_THREAD_DELAY_DEC = 2071,
     CANVAS_ACT_THREAD_DELAY_INC = 2072,
+    CANVAS_ACT_TOOL_SUBGROUP_0 = 2080,
+    CANVAS_ACT_TOOL_SUBGROUP_1 = 2081,
+    CANVAS_ACT_TOOL_SUBGROUP_2 = 2082,
+    CANVAS_ACT_TOOL_SUBGROUP_3 = 2083,
+    CANVAS_ACT_TOOL_SUBGROUP_4 = 2084,
+    CANVAS_ACT_TOOL_SUBGROUP_5 = 2085,
+    CANVAS_ACT_TOOL_SUBGROUP_6 = 2086,
+    CANVAS_ACT_TOOL_SUBGROUP_7 = 2087,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
     CANVAS_ACT_MENU_TOOL_SUB = 2102,
     CANVAS_ACT_MENU_TOOL_MUL = 2103,
@@ -1734,6 +1802,14 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_TOGGLE, CANVAS_ACT_THREAD_TOGGLE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_DELAY_DEC, CANVAS_ACT_THREAD_DELAY_DEC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_DELAY_INC, CANVAS_ACT_THREAD_DELAY_INC },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_0, CANVAS_ACT_TOOL_SUBGROUP_0 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_1, CANVAS_ACT_TOOL_SUBGROUP_1 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_2, CANVAS_ACT_TOOL_SUBGROUP_2 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_3, CANVAS_ACT_TOOL_SUBGROUP_3 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_4, CANVAS_ACT_TOOL_SUBGROUP_4 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_5, CANVAS_ACT_TOOL_SUBGROUP_5 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_6, CANVAS_ACT_TOOL_SUBGROUP_6 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_7, CANVAS_ACT_TOOL_SUBGROUP_7 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
@@ -2026,6 +2102,20 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 printf("gp_canvas_on_click: kpn tool %d toggled -> selected_tool_kpn=%d\n", tool, c->selected_tool_kpn);
                 break;
             }
+            case CANVAS_ACT_TOOL_SUBGROUP_0:
+            case CANVAS_ACT_TOOL_SUBGROUP_1:
+            case CANVAS_ACT_TOOL_SUBGROUP_2:
+            case CANVAS_ACT_TOOL_SUBGROUP_3:
+            case CANVAS_ACT_TOOL_SUBGROUP_4:
+            case CANVAS_ACT_TOOL_SUBGROUP_5:
+            case CANVAS_ACT_TOOL_SUBGROUP_6:
+            case CANVAS_ACT_TOOL_SUBGROUP_7: {
+                int tool = static_cast<int>(action_id - CANVAS_ACT_TOOL_SUBGROUP_0);
+                if (tool >= kSubgroupBinCount) break;
+                if (c->selected_tool_subgroup == tool) c->selected_tool_subgroup = -1; else c->selected_tool_subgroup = tool;
+                printf("gp_canvas_on_click: subgroup tool %d toggled -> selected_tool_subgroup=%d\n", tool, c->selected_tool_subgroup);
+                break;
+            }
             case CANVAS_ACT_THREAD_TOGGLE: {
                 c->thread_mgr_paused = !c->thread_mgr_paused;
                 if (c->thread_mgr_paused) {
@@ -2218,6 +2308,26 @@ static void canvas_set_order_mode_for_edge(GP_CanvasContextImpl* ctx, const GP_C
     } else if (gp_table_edge_index_for_pair(root, kb, ka, &edge_idx)) {
         gp_table_edge_set_order_mode(root, edge_idx, order_mode);
     }
+}
+
+static void canvas_set_subgroup_flags_for_edge(GP_CanvasContextImpl* ctx, const GP_CanvasEdgeDesc &desc, uint32_t flags) {
+    if (!ctx) return;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (!root) return;
+    uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+    uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+    int edge_idx = -1;
+    if (gp_table_edge_index_for_pair(root, ka, kb, &edge_idx)) {
+        gp_table_edge_set_subgroup_flags(root, edge_idx, flags);
+    } else if (gp_table_edge_index_for_pair(root, kb, ka, &edge_idx)) {
+        gp_table_edge_set_subgroup_flags(root, edge_idx, flags);
+    }
+}
+
+static void canvas_apply_subgroup_to_edge_idx(GP_CanvasContextImpl* ctx, int edge_idx, uint32_t flags) {
+    if (!ctx || edge_idx < 0 || edge_idx >= static_cast<int>(ctx->edges.size())) return;
+    ctx->edges[static_cast<size_t>(edge_idx)].subgroup_flags = flags;
+    canvas_set_subgroup_flags_for_edge(ctx, ctx->edges[static_cast<size_t>(edge_idx)].desc, flags);
 }
 
 static void canvas_remove_edge_at(GP_CanvasContextImpl* ctx, int edge_idx) {
@@ -2775,6 +2885,19 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
             return 1;
         }
     }
+    if (ctx->selected_tool_subgroup >= 0) {
+        std::vector<int> edge_indices;
+        canvas_collect_edges_for_contact(ctx, module_idx, contact_idx, edge_indices);
+        if (!edge_indices.empty()) {
+            uint32_t flags = subgroup_mask_for_index(ctx->selected_tool_subgroup);
+            for (int idx : edge_indices) {
+                canvas_apply_subgroup_to_edge_idx(ctx, idx, flags);
+            }
+            ctx->selected.module = -1; ctx->selected.contact_idx = -1; ctx->selected.left = -1; ctx->selected.anchor_x = -1; ctx->selected.anchor_y = -1;
+            if (ctx->prospective_rope_idx >= 0) ctx->prospective_rope_idx = -1;
+            return 1;
+        }
+    }
     // Determine producer/consumer using row metadata when available.
     bool is_producer = false;
     bool resolved_role = false;
@@ -3125,6 +3248,23 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int bx_play = c->width - 8 - bw;
         int bx_delay_plus = bx_play - play_gap;
         int bx_delay_minus = bx_delay_plus - delay_total_w;
+        int kpn_group_w = kpn_btn_count * (bw + spacing) - spacing;
+        int kpn_right = bx_kpn + kpn_group_w;
+        int subgroup_btn_count = kSubgroupBinCount;
+        int subgroup_group_w = subgroup_btn_count * (bw + spacing) - spacing;
+        int subgroup_left = kpn_right + spacing * 2;
+        int delay_left = bx_delay_minus;
+        int available = delay_left - subgroup_left;
+        if (available < subgroup_group_w) {
+            subgroup_left = std::max(kpn_right + spacing, delay_left - subgroup_group_w);
+        }
+        for (int bi = 0; bi < subgroup_btn_count; ++bi) {
+            int bx_i = subgroup_left + bi * (bw + spacing);
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by1 && view_y < by1 + bh) {
+                int action_id = CANVAS_ACT_TOOL_SUBGROUP_0 + bi;
+                if (canvas_dispatch_root_action(c, action_id)) return 1;
+            }
+        }
         if (view_y >= by1 && view_y < by1 + bh) {
             if (view_x >= bx_play && view_x < bx_play + bw) {
                 if (canvas_dispatch_root_action(c, CANVAS_ACT_THREAD_TOGGLE)) return 1;
@@ -3262,6 +3402,14 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int edge_idx = canvas_pick_edge_by_rope(c, world_x, world_y, static_cast<float>(pick_r));
         if (edge_idx >= 0 && edge_idx < static_cast<int>(c->edges.size())) {
             canvas_set_order_mode_for_edge(c, c->edges[static_cast<size_t>(edge_idx)].desc, c->edge_order_value);
+            return 1;
+        }
+    }
+    if (c->selected_tool_subgroup >= 0) {
+        int edge_idx = canvas_pick_edge_by_rope(c, world_x, world_y, static_cast<float>(pick_r));
+        if (edge_idx >= 0 && edge_idx < static_cast<int>(c->edges.size())) {
+            uint32_t flags = subgroup_mask_for_index(c->selected_tool_subgroup);
+            canvas_apply_subgroup_to_edge_idx(c, edge_idx, flags);
             return 1;
         }
     }
@@ -4506,7 +4654,7 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
         }
     }
 
-    GP_CanvasContextImpl::EdgeInfo ei;
+    GP_CanvasContextImpl::EdgeInfo ei{};
     ei.desc = *desc;
     ei.type_id = type_id;
     // copy canvas-level default hues into edge if available
@@ -5501,10 +5649,58 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
             }
         }
+        int kpn_group_w = kpn_btn_count * (bw + spacing) - spacing;
+        int kpn_right = bx_kpn + kpn_group_w;
         int delay_num_w = std::max(24, nbw * 2);
+        int delay_gap = 10;
+        int delay_total_w = nbw + delay_gap + delay_num_w + delay_gap + nbw;
         int play_gap = 12;
         int bx_play = w - 8 - bw;
         int bx_delay_plus = bx_play - play_gap;
+        int delay_left = bx_delay_plus - delay_total_w;
+        int subgroup_btn_count = kSubgroupBinCount;
+        int subgroup_group_w = subgroup_btn_count * (bw + spacing) - spacing;
+        int subgroup_left = kpn_right + spacing * 2;
+        int available = delay_left - subgroup_left;
+        if (available < subgroup_group_w) {
+            subgroup_left = std::max(kpn_right + spacing, delay_left - subgroup_group_w);
+        }
+        for (int bi = 0; bi < subgroup_btn_count; ++bi) {
+            int bx_i = subgroup_left + bi * (bw + spacing);
+            uint32_t flags = subgroup_mask_for_index(bi);
+            Color fill = subgroup_flags_to_color(flags, 255);
+            bool selected = (ctx->selected_tool_subgroup == bi);
+            if (!selected) {
+                fill.r = static_cast<uint8_t>(std::lround(fill.r * 0.75f));
+                fill.g = static_cast<uint8_t>(std::lround(fill.g * 0.75f));
+                fill.b = static_cast<uint8_t>(std::lround(fill.b * 0.75f));
+            }
+            memset_rect(out_rgba, w, h, pitch, bx_i, kpn_by, bw, bh, fill);
+            for (int oy = 0; oy < bh; ++oy) {
+                int y = kpn_by + oy; if (y < 0 || y >= h) continue;
+                int left_x = bx_i; int right_x = bx_i + bw - 1;
+                uint8_t* pleft = out_rgba + y * pitch + left_x * 4;
+                uint8_t* pright = out_rgba + y * pitch + right_x * 4;
+                pleft[0]=selected ? 240 : 40; pleft[1]=selected ? 240 : 40; pleft[2]=selected ? 240 : 44; pleft[3]=255;
+                pright[0]=selected ? 240 : 40; pright[1]=selected ? 240 : 40; pright[2]=selected ? 240 : 44; pright[3]=255;
+            }
+            if (selected) {
+                int y_top = kpn_by;
+                int y_bot = kpn_by + bh - 1;
+                for (int xx = 0; xx < bw; ++xx) {
+                    int xh = bx_i + xx;
+                    if (xh < 0 || xh >= w) continue;
+                    if (y_top >= 0 && y_top < h) {
+                        uint8_t* pt = out_rgba + y_top * pitch + xh * 4;
+                        pt[0]=240; pt[1]=240; pt[2]=240; pt[3]=255;
+                    }
+                    if (y_bot >= 0 && y_bot < h) {
+                        uint8_t* pb = out_rgba + y_bot * pitch + xh * 4;
+                        pb[0]=240; pb[1]=240; pb[2]=240; pb[3]=255;
+                    }
+                }
+            }
+        }
         draw_io_group(bx_delay_plus, kpn_by, std::max(0, ctx->thread_mgr_delay_ms), LABEL_THREAD_DELAY_SHORT);
 
         Color play_fill = ctx->thread_mgr_paused ? Color{70,60,70,255} : Color{60,80,60,255};
@@ -5564,6 +5760,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     std::vector<std::unordered_map<int, ContactLight>> module_contact_lights(ctx->modules.size());
     std::vector<std::unordered_map<int, bool>> module_frame_roles(ctx->modules.size());
     std::vector<std::vector<uint8_t>> module_tables(ctx->modules.size());
+    std::vector<std::unordered_map<int, uint32_t>> module_contact_subgroups(ctx->modules.size());
+
+    for (const auto &edge : ctx->edges) {
+        if (edge.subgroup_flags == 0u) continue;
+        if (edge.desc.a_module >= 0 && edge.desc.a_module < static_cast<int>(module_contact_subgroups.size())) {
+            module_contact_subgroups[edge.desc.a_module][edge.desc.a_contact_idx] |= edge.subgroup_flags;
+        }
+        if (edge.desc.b_module >= 0 && edge.desc.b_module < static_cast<int>(module_contact_subgroups.size())) {
+            module_contact_subgroups[edge.desc.b_module][edge.desc.b_contact_idx] |= edge.subgroup_flags;
+        }
+    }
 
     // First pass: render tables and gather hitboxes/light info (no drawing yet).
     for (int mi = 0; mi < static_cast<int>(ctx->modules.size()); ++mi) {
@@ -5677,7 +5884,12 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 if (is_output && lit) glow = std::min(1.0f, glow * 1.25f + 0.15f);
                 if (glow > 0.0f) {
                     ContactLight cl;
-                    cl.col = led_on;
+                    uint32_t subgroup_flags = 0u;
+                    if (mi < static_cast<int>(module_contact_subgroups.size())) {
+                        auto it = module_contact_subgroups[mi].find(contact_idx);
+                        if (it != module_contact_subgroups[mi].end()) subgroup_flags = it->second;
+                    }
+                    cl.col = (subgroup_flags != 0u) ? subgroup_flags_to_color(subgroup_flags, led_on.a) : led_on;
                     cl.intensity = glow;
                     cl.valid = true;
                     light_map[contact_idx] = cl;
@@ -6077,7 +6289,14 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             }
             int jacket_px = ctx->jacket_px;
             int jacket_border = ctx->jacket_border;
-            table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, 3);
+            uint32_t subgroup_flags = ctx->edges[ei].subgroup_flags;
+            if (subgroup_flags != 0u) {
+                float hue = subgroup_flags_to_hue(subgroup_flags);
+                float hue_vals[1] = { hue };
+                table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, 3, 0.65f);
+            } else {
+                table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, 3);
+            }
             int glow_r = std::max(2, jacket_px * 2);
             draw_rope_light_falloff(out_rgba, w, h, pitch, verts_view.data(), got, edge_light_a[ei], edge_light_b[ei], rope_decay, glow_r);
         }
@@ -6098,14 +6317,15 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
                 int jacket_px = ctx->jacket_px;
                 int jacket_border = ctx->jacket_border;
-                const float* hues_ptr = ctx->hues.empty() ? nullptr : ctx->hues.data();
-                int hue_count = static_cast<int>(ctx->hues.size());
-                float hue_intensity = ctx->hue_intensity;
                 int samples_per_segment = 3;
-                (void)hues_ptr;
-                (void)hue_count;
-                (void)hue_intensity;
-                table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, samples_per_segment);
+                if (ctx->selected_tool_subgroup >= 0) {
+                    uint32_t flags = subgroup_mask_for_index(ctx->selected_tool_subgroup);
+                    float hue = subgroup_flags_to_hue(flags);
+                    float hue_vals[1] = { hue };
+                    table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, samples_per_segment, 0.55f);
+                } else {
+                    table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, samples_per_segment);
+                }
             }
         }
     }
