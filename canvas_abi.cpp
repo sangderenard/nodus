@@ -5,6 +5,7 @@
 #include "stage_abi.h"
 #include "text_render_helper.h"
 #include "thread_manager.h"
+#include "module_library.h"
 #include "labels.h"
 #include "module_preview.h"
 
@@ -19,6 +20,7 @@
 #include <stdio.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <array>
 #include <atomic>
 #include <fstream>
@@ -5250,6 +5252,64 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
 
     update_canvas_scroll_state(c, /*pull_from_container=*/false);
     return 1;
+}
+
+static std::string canvas_module_label(const GP_CanvasModuleDesc& desc) {
+    std::string label(desc.label, desc.label + sizeof(desc.label));
+    size_t null_pos = label.find('\0');
+    if (null_pos != std::string::npos) label.resize(null_pos);
+    return label;
+}
+
+extern "C" int gp_canvas_export_module_library(GP_CanvasContext* ctx_, const char* path) {
+    if (!ctx_ || !path) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+
+    GP_ModuleLibrary library{};
+    library.root_dir = gp_module_library_default_root();
+
+    std::map<int, GP_ModuleLibraryTool> tool_registry_by_kind;
+
+    for (size_t i = 0; i < c->modules.size(); ++i) {
+        const auto &mod = c->modules[i];
+        GP_ModuleLibraryModule module{};
+        module.module_idx = static_cast<int>(i);
+        module.id = gp_module_library_module_id(module.module_idx);
+        module.label = canvas_module_label(mod);
+        module.serialized_path = gp_module_library_module_serialized_path(library.root_dir, module.id);
+        module.source_path = gp_module_library_module_source_path(library.root_dir, module.id);
+
+        if (i < c->module_io_rows.size()) {
+            const auto &rows = c->module_io_rows[i];
+            for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
+                const auto &row = rows[row_idx];
+                if (row.kind != ModuleRowKind::Tool) continue;
+                ModuleToolKind tool_kind = row.tool;
+                if (tool_kind == ModuleToolKind::None) continue;
+                auto tool_it = tool_registry_by_kind.find(static_cast<int>(tool_kind));
+                if (tool_it == tool_registry_by_kind.end()) {
+                    GP_ModuleLibraryTool tool{};
+                    tool.kind = tool_kind;
+                    tool.id = gp_module_library_tool_id(tool_kind);
+                    tool.name = gp_module_tool_kind_name(tool_kind);
+                    tool.source_path = gp_module_library_tool_source_path(library.root_dir, tool.id);
+                    tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
+                }
+                GP_ModuleToolInstance instance{};
+                instance.row_idx = static_cast<int>(row_idx);
+                instance.attachment_count = row.attachment_count;
+                instance.tool_id = gp_module_library_tool_id(tool_kind);
+                module.tool_instances.push_back(std::move(instance));
+            }
+        }
+        library.modules.push_back(std::move(module));
+    }
+
+    for (auto &entry : tool_registry_by_kind) {
+        library.tool_registry.push_back(std::move(entry.second));
+    }
+
+    return gp_module_library_write_to_file(library, path);
 }
 
 extern "C" int gp_canvas_set_cable_style(GP_CanvasContext* ctx_, int jacket_px, int jacket_border) {
