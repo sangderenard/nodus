@@ -2956,6 +2956,9 @@ static void draw_rope_fiber_overlay(uint8_t* img, int w, int h, int pitch, const
     }
 }
 
+// forward declaration: color interpolation used by several rope/rope-glow helpers
+static inline Color lerp_color(Color a, Color b, float t);
+
 static float draw_rope_diffused_glow(
     uint8_t* img,
     int w,
