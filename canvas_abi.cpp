@@ -3233,7 +3233,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                             c->dispatch_module_idx = -1;
                             return 1;
                         }
-                        int handled = canvas_dispatch_root_hit(c, found);
+                        int handled = canvas_dispatch_root_hit(c, adjusted);
                         c->dispatch_module_idx = -1;
                         if (handled) return 1;
                         // If LED hit, handle canvas-level connection flow. In
