@@ -31,6 +31,7 @@ enum class ModuleToolKind : int8_t {
     StackDisplay = 8,
     RectRgba = 9,
     TableNumber = 10,
+    Clone = 11,
 };
 
 struct ModuleIORow {
@@ -72,6 +73,8 @@ inline ToolStackSpec module_tool_stack_spec(ModuleToolKind tool) {
             return {12, 1};
         case ModuleToolKind::TableNumber:
             return {0, 1};
+        case ModuleToolKind::Clone:
+            return {2, 0};
         case ModuleToolKind::None:
         default:
             return {0, 0};

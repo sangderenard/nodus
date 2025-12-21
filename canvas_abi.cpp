@@ -921,8 +921,9 @@ enum CanvasActionId {
     CANVAS_ACT_MENU_TOOL_KEYBOARD = 2106,
     CANVAS_ACT_MENU_TOOL_MOUSE = 2107,
     CANVAS_ACT_MENU_TOOL_STACK = 2108,
-    CANVAS_ACT_MENU_TOOL_RECT = 2109,
-    CANVAS_ACT_MENU_TOOL_NUMBER = 2110,
+    CANVAS_ACT_MENU_TOOL_CLONE = 2109,
+    CANVAS_ACT_MENU_TOOL_RECT = 2110,
+    CANVAS_ACT_MENU_TOOL_NUMBER = 2111,
 };
 
 struct InputRayLight {
@@ -1163,6 +1164,7 @@ static const char* tool_label(ModuleToolKind tool) {
         case ModuleToolKind::KeyboardListener: return LABEL_TOOL_KEYBOARD;
         case ModuleToolKind::MouseListener: return LABEL_TOOL_MOUSE;
         case ModuleToolKind::StackDisplay: return LABEL_TOOL_STACK;
+        case ModuleToolKind::Clone: return LABEL_TOOL_CLONE;
         case ModuleToolKind::RectRgba: return LABEL_TOOL_RECT;
         case ModuleToolKind::TableNumber: return LABEL_TOOL_NUMBER;
         case ModuleToolKind::None:
@@ -1186,6 +1188,7 @@ static const ToolMenuItem kToolMenuItems[] = {
     { CANVAS_ACT_MENU_TOOL_KEYBOARD, LABEL_TOOL_KEYBOARD, ModuleToolKind::KeyboardListener },
     { CANVAS_ACT_MENU_TOOL_MOUSE, LABEL_TOOL_MOUSE, ModuleToolKind::MouseListener },
     { CANVAS_ACT_MENU_TOOL_STACK, LABEL_TOOL_STACK, ModuleToolKind::StackDisplay },
+    { CANVAS_ACT_MENU_TOOL_CLONE, LABEL_TOOL_CLONE, ModuleToolKind::Clone },
     { CANVAS_ACT_MENU_TOOL_RECT, LABEL_TOOL_RECT, ModuleToolKind::RectRgba },
     { CANVAS_ACT_MENU_TOOL_NUMBER, LABEL_TOOL_NUMBER, ModuleToolKind::TableNumber },
 };
@@ -1308,6 +1311,7 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_KEYBOARD, CANVAS_ACT_MENU_TOOL_KEYBOARD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MOUSE, CANVAS_ACT_MENU_TOOL_MOUSE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_STACK, CANVAS_ACT_MENU_TOOL_STACK },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_CLONE, CANVAS_ACT_MENU_TOOL_CLONE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_RECT, CANVAS_ACT_MENU_TOOL_RECT },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_NUMBER, CANVAS_ACT_MENU_TOOL_NUMBER },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
@@ -1611,6 +1615,9 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 break;
             case CANVAS_ACT_MENU_TOOL_STACK:
                 canvas_push_tool_to_focused(c, ModuleToolKind::StackDisplay);
+                break;
+            case CANVAS_ACT_MENU_TOOL_CLONE:
+                canvas_push_tool_to_focused(c, ModuleToolKind::Clone);
                 break;
             case CANVAS_ACT_MENU_TOOL_RECT:
                 canvas_push_tool_to_focused(c, ModuleToolKind::RectRgba);
