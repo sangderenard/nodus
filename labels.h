@@ -73,6 +73,7 @@
 #define LABEL_TOOL_KEYBOARD "Keyboard"
 #define LABEL_TOOL_MOUSE "Mouse"
 #define LABEL_TOOL_STACK "Stack"
+#define LABEL_TOOL_CLONE "Clone"
 #define LABEL_TOOL_RECT "RectRGBA"
 #define LABEL_TOOL_NUMBER "Number"
 
