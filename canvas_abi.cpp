@@ -9,6 +9,7 @@
 #include "module_library_actualizer.h"
 #include "labels.h"
 #include "module_preview.h"
+#include "plugin_manager.h"
 
 #include <vector>
 #include <string>
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <fstream>
 #include <sstream>
+#include <iostream>
 #include <filesystem>
 #include <Eigen/Dense>
 #include <chrono>
@@ -1300,8 +1302,8 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
     draw_button(pause_x, btn_y, pause_w, control_h, Color{44,52,60,255}, pause_label, 1.0f);
     draw_button(menu_x, btn_y, menu_w, control_h, Color{50,50,62,255}, LABEL_MODULE_MENU, 0.85f);
 
-    // Module action buttons: Clone / Clear / Destroy / Export (right-aligned)
-    int module_btn_count = 4;
+    // Module action buttons: Clone / Clear / Destroy / Commit / Export (right-aligned)
+    int module_btn_count = 5;
     int module_btn_w = nbw;
     int module_gap = 6;
     int btns_total_w = module_btn_count * (module_btn_w + module_gap) - module_gap;
@@ -1311,6 +1313,7 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_CLONE_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_CLEAR_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_DESTROY_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
+    draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{48,48,56,255}, "CMT", 0.9f); bx_btn += module_btn_w + module_gap;
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{44,60,48,255}, "EXP", 0.9f);
 
     cursor_y += kModuleControlRowH + kModuleTopGap;
@@ -1584,6 +1587,7 @@ enum CanvasActionId {
     CANVAS_ACT_MODULE_CLEAR = 2074,
     CANVAS_ACT_MODULE_DESTROY = 2075,
     CANVAS_ACT_MODULE_EXPORT = 2076,
+    CANVAS_ACT_MODULE_COMMIT = 2077,
     CANVAS_ACT_TOOL_SUBGROUP_0 = 2080,
     CANVAS_ACT_TOOL_SUBGROUP_1 = 2081,
     CANVAS_ACT_TOOL_SUBGROUP_2 = 2082,
@@ -1903,6 +1907,9 @@ static std::vector<ModuleToolKind> discover_compiled_plugin_tools() {
         if (path.extension() != ".cpp") continue;
         tool_ids.push_back(path.stem().string());
     }
+    std::cerr << "DEBUG: discover_compiled_plugin_tools: found tool source ids: ";
+    for (const auto &tid : tool_ids) std::cerr << tid << ",";
+    std::cerr << "\n";
     if (tool_ids.empty()) return out;
 
     std::vector<std::string> shared_libs;
@@ -1923,6 +1930,7 @@ static std::vector<ModuleToolKind> discover_compiled_plugin_tools() {
                 break;
             }
         }
+            if (compiled) std::cerr << "DEBUG: discover_compiled_plugin_tools: tool_id='" << tool_id << "' matched on-disk filename\n";
         if (compiled) out.push_back(kind);
     }
 
@@ -2117,6 +2125,7 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_CLONE, CANVAS_ACT_MODULE_CLONE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_CLEAR, CANVAS_ACT_MODULE_CLEAR },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_DESTROY, CANVAS_ACT_MODULE_DESTROY },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_COMMIT, CANVAS_ACT_MODULE_COMMIT },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MODULE_EXPORT, CANVAS_ACT_MODULE_EXPORT },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_0, CANVAS_ACT_TOOL_SUBGROUP_0 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_1, CANVAS_ACT_TOOL_SUBGROUP_1 },
@@ -2475,6 +2484,57 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 }
                 break;
             }
+            case CANVAS_ACT_MODULE_COMMIT: {
+                int focused = c->focused_module;
+                if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
+                    // Export module sources to the module library root, actualize it as a tool, then perform a per-module scratch build
+                    gp_canvas_export_module_to_root(reinterpret_cast<GP_CanvasContext*>(c), focused, nullptr);
+                    // Ensure the exported module is actualized as a tool (generate full tool source including create_tool)
+                    GP_ModuleLibrary lib{};
+                    lib.root_dir = gp_module_library_default_root();
+                    GP_ModuleLibraryModule mod{};
+                    mod.module_idx = focused;
+                    mod.id = gp_module_library_module_id(focused);
+                    mod.source_path = gp_module_library_module_source_path(std::string(), mod.id);
+                    mod.convert_to_tool = true;
+                    lib.modules.push_back(std::move(mod));
+                    gp_module_library_actualize_sources(lib, lib.root_dir.c_str());
+
+                    std::string module_id = gp_module_library_module_id(focused);
+                    std::string dest = gp_module_library_default_root();
+                    // find the newest generated versioned tool source for this module in the tools dir
+                    std::filesystem::path tools_dir = std::filesystem::path(dest) / "source" / "tools";
+                    std::string prefix = ("tool_" + module_id) + std::string("_ver_");
+                    std::filesystem::path chosen;
+                    std::filesystem::file_time_type latest;
+                    if (std::filesystem::exists(tools_dir)) {
+                        for (auto &ent : std::filesystem::directory_iterator(tools_dir)) {
+                            if (!ent.is_regular_file()) continue;
+                            std::string name = ent.path().filename().string();
+                            if (name.rfind(prefix, 0) != 0) continue;
+                            auto ftime = std::filesystem::last_write_time(ent.path());
+                            if (chosen.empty() || ftime > latest) {
+                                latest = ftime;
+                                chosen = ent.path();
+                            }
+                        }
+                    }
+                    std::string module_src;
+                    if (!chosen.empty()) module_src = chosen.generic_string();
+                    else module_src = std::filesystem::path(gp_module_library_module_source_path(std::string(), module_id)).generic_string();
+                    char out_id[256];
+                    int ok = gp_plugin_build_module_and_load(module_src.c_str(), ".", dest.c_str(), nullptr, out_id, static_cast<int>(sizeof(out_id)));
+                    if (ok) {
+                        printf("module commit: scratch-built+loaded id=%s (module=%s src=%s)\n", out_id, module_id.c_str(), module_src.c_str());
+                        // Refresh the in-memory plugin tool list so the UI reflects the newly loaded plugin
+                        canvas_refresh_plugin_tools(c);
+                    } else {
+                        printf("module commit: build+load failed for module=%s\n", module_id.c_str());
+                    }
+                }
+                break;
+            }
+
             case CANVAS_ACT_MODULE_EXPORT: {
                 int focused = c->focused_module;
                 if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
@@ -3877,7 +3937,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     int pause_w = std::max(42, control_h * 2);
                     int menu_x = right_x - menu_w;
                     int pause_x = menu_x - gap - pause_w;
-                    int module_btn_count = 4;
+                    int module_btn_count = 5;
                     int module_btn_w = nbw;
                     int module_gap = 6;
                     int btns_total_w = module_btn_count * (module_btn_w + module_gap) - module_gap;
@@ -3898,6 +3958,11 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         // Destroy
                         if (world_x >= bx && world_x < bx + module_btn_w) {
                             if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_DESTROY)) return 1;
+                        }
+                        bx += module_btn_w + module_gap;
+                        // Commit (build+load)
+                        if (world_x >= bx && world_x < bx + module_btn_w) {
+                            if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_COMMIT)) return 1;
                         }
                         bx += module_btn_w + module_gap;
                         // Export

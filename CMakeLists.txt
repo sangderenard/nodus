@@ -10,6 +10,8 @@ add_library(canvas_tables SHARED
     module_preview.cpp
     module_library.cpp
     module_library_actualizer.cpp
+    plugin_loader.cpp
+    plugin_manager.cpp
     table_abi.cpp
     table_node_groups.cpp
     menu_waveform.cpp
@@ -29,6 +31,12 @@ add_executable(modlib_actualize tools/modlib_actualize_main.cpp)
 target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(modlib_actualize PRIVATE canvas_tables)
 target_compile_features(modlib_actualize PUBLIC cxx_std_17)
+
+# Small helper to build/load modules at runtime for development
+add_executable(modloader tools/modloader_main.cpp)
+target_include_directories(modloader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(modloader PRIVATE canvas_tables)
+target_compile_features(modloader PUBLIC cxx_std_17)
 
 find_package(Eigen3 REQUIRED)
 

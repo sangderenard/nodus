@@ -1,4 +1,5 @@
 #include "tool_registry.h"
+#include <iostream>
 
 ToolRegistry& tool_registry_global() {
     static ToolRegistry registry;
@@ -7,7 +8,21 @@ ToolRegistry& tool_registry_global() {
 
 bool ToolRegistry::register_tool(Entry entry) {
     if (entry.id.empty() || !entry.factory) return false;
-    return entries_.emplace(entry.id, std::move(entry)).second;
+    bool inserted = entries_.emplace(entry.id, std::move(entry)).second;
+    if (inserted) {
+        std::cerr << "DEBUG: ToolRegistry registered tool id='" << entries_.find(entry.id)->second.id << "'" << " name='" << entries_.find(entry.id)->second.name << "'\n";
+    } else {
+        std::cerr << "DEBUG: ToolRegistry failed to register tool id='" << entry.id << "' (already exists?)\n";
+    }
+    return inserted;
+}
+
+bool ToolRegistry::unregister_tool(const std::string& id) {
+    auto it = entries_.find(id);
+    if (it == entries_.end()) return false;
+    std::cerr << "DEBUG: ToolRegistry unregistering tool id='" << id << "'\n";
+    entries_.erase(it);
+    return true;
 }
 
 const ToolRegistry::Entry* ToolRegistry::find(const std::string& id) const {
@@ -16,7 +31,7 @@ const ToolRegistry::Entry* ToolRegistry::find(const std::string& id) const {
     return &it->second;
 }
 
-std::unique_ptr<ITool> ToolRegistry::create(const std::string& id) const {
+std::unique_ptr<ITool, std::function<void(ITool*)>> ToolRegistry::create(const std::string& id) const {
     auto* entry = find(id);
     if (!entry) return nullptr;
     return entry->factory();

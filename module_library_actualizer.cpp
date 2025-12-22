@@ -372,6 +372,31 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
     ss << "    return new " << class_name << "();\n";
     ss << "}\n";
 
+    ss << "#if defined(_WIN32)\n";
+    ss << "extern \"C\" __declspec(dllexport) void destroy_tool(ITool* t) {\n";
+    ss << "#else\n";
+    ss << "extern \"C\" void destroy_tool(ITool* t) {\n";
+    ss << "#endif\n";
+    ss << "    delete t;\n";
+    ss << "}\n\n";
+
+    // optional lifecycle hooks
+    ss << "#if defined(_WIN32)\n";
+    ss << "extern \"C\" __declspec(dllexport) int plugin_init(HostAPI* host) {\n";
+    ss << "#else\n";
+    ss << "extern \"C\" int plugin_init(HostAPI* host) {\n";
+    ss << "#endif\n";
+    ss << "    (void)host;\n";
+    ss << "    return 1;\n";
+    ss << "}\n\n";
+
+    ss << "#if defined(_WIN32)\n";
+    ss << "extern \"C\" __declspec(dllexport) void plugin_shutdown() {\n";
+    ss << "#else\n";
+    ss << "extern \"C\" void plugin_shutdown() {\n";
+    ss << "#endif\n";
+    ss << "}\n";
+
     return ss.str();
 }
 
@@ -405,7 +430,7 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
 
     for (const auto& tool : library.tool_registry) {
         std::filesystem::path tool_path = tool.source_path.empty()
-            ? std::filesystem::path(gp_module_library_tool_source_path(root.string(), tool.id))
+            ? std::filesystem::path(gp_module_library_tool_source_path(std::string(), tool.id))
             : std::filesystem::path(tool.source_path);
         if (!tool_path.is_absolute()) tool_path = root / tool_path;
         std::string contents;
@@ -429,7 +454,7 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
     for (const auto& module : library.modules) {
         if (module.convert_to_tool) {
             std::string tool_id = module.tool_id.empty() ? ("tool_" + module.id) : module.tool_id;
-            std::filesystem::path tool_path = gp_module_library_tool_source_path(root.string(), tool_id);
+            std::filesystem::path tool_path = gp_module_library_tool_source_path(std::string(), tool_id);
             if (!tool_path.is_absolute()) tool_path = root / tool_path;
 
             std::vector<GP_ModuleToolInstance> sorted_tools = module.tool_instances;
@@ -454,13 +479,47 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
                 steps.push_back(ToolStep{kind, instance.attachment_count});
             }
             std::string contents = generate_tool_source(module, tool_id, tool_name, plan, steps);
-            if (!write_placeholder_if_missing(tool_path, contents, err)) {
-                std::cerr << "error writing tool source '" << tool_path.string() << "': " << err << "\n";
+            try {
+                // create a deterministic, versioned filename: <tool_id>_ver_<YYYYMMDD_HHMMSS>.cpp
+                auto now = std::chrono::system_clock::now();
+                std::time_t t = std::chrono::system_clock::to_time_t(now);
+                char buf[64];
+#ifdef _WIN32
+                std::tm tm; localtime_s(&tm, &t);
+#else
+                std::tm tm; localtime_r(&t, &tm);
+#endif
+                std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+                std::string ts(buf);
+                std::filesystem::path dir = tool_path.parent_path();
+                std::string base = tool_id + std::string("_ver_") + ts;
+                std::filesystem::create_directories(dir);
+                std::filesystem::path outpath;
+                int suffix = 0;
+                do {
+                    std::ostringstream name;
+                    name << base;
+                    if (suffix > 0) name << "_" << suffix;
+                    name << ".cpp";
+                    outpath = dir / name.str();
+                    ++suffix;
+                } while (std::filesystem::exists(outpath));
+                std::ofstream ofs(outpath, std::ios::binary | std::ios::trunc);
+                if (!ofs.good()) {
+                    std::cerr << "error writing tool source '" << outpath.string() << "'\n";
+                    ok = false;
+                } else {
+                    std::cerr << "writing generated tool source to: " << outpath.generic_string() << "\n";
+                    ofs << contents;
+                    ofs.close();
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "exception writing tool source: " << e.what() << "\n";
                 ok = false;
             }
         } else {
             std::filesystem::path module_path = module.source_path.empty()
-                ? std::filesystem::path(gp_module_library_module_source_path(root.string(), module.id))
+                ? std::filesystem::path(gp_module_library_module_source_path(std::string(), module.id))
                 : std::filesystem::path(module.source_path);
             if (!module_path.is_absolute()) module_path = root / module_path;
             std::string contents = "// Placeholder module source for " + module.id + "\n";

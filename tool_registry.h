@@ -10,7 +10,7 @@
 
 class ToolRegistry {
 public:
-    using Factory = std::function<std::unique_ptr<ITool>()>;
+    using Factory = std::function<std::unique_ptr<ITool, std::function<void(ITool*)>>()>;
 
     struct Entry {
         std::string id;
@@ -21,8 +21,10 @@ public:
 
     bool register_tool(Entry entry);
     const Entry* find(const std::string& id) const;
-    std::unique_ptr<ITool> create(const std::string& id) const;
+    std::unique_ptr<ITool, std::function<void(ITool*)>> create(const std::string& id) const;
     std::vector<Entry> entries() const;
+
+    bool unregister_tool(const std::string& id);
 
 private:
     std::unordered_map<std::string, Entry> entries_;
@@ -37,6 +39,6 @@ public:
 
 #define REGISTER_TOOL(CLASS, ID, NAME, CAPS) \
     static ToolRegistrar g_tool_registrar_##CLASS(ID, NAME, CAPS, [] { \
-        return std::make_unique<CLASS>(); \
+        return std::unique_ptr<ITool, std::function<void(ITool*)>>(new CLASS(), [](ITool* p){ delete p; }); \
     })
 
