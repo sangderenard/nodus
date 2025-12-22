@@ -41,6 +41,38 @@ static const char* kCanvasDefaultWorkspacePath = "canvas_workspace.txt";
 // local minimal Color and draw helpers (self-contained)
 struct Color { uint8_t r=0,g=0,b=0,a=255; };
 
+static inline uint32_t pack_rgba(Color c) {
+    return static_cast<uint32_t>(c.r)
+        | (static_cast<uint32_t>(c.g) << 8)
+        | (static_cast<uint32_t>(c.b) << 16)
+        | (static_cast<uint32_t>(c.a) << 24);
+}
+
+static inline Color unpack_rgba(uint32_t v) {
+    return Color{
+        static_cast<uint8_t>(v & 0xFFu),
+        static_cast<uint8_t>((v >> 8) & 0xFFu),
+        static_cast<uint8_t>((v >> 16) & 0xFFu),
+        static_cast<uint8_t>((v >> 24) & 0xFFu)
+    };
+}
+
+static inline uint8_t normalize_color_channel(float v) {
+    if (!std::isfinite(v)) return 0;
+    float scaled = (v <= 1.0f) ? (v * 255.0f) : v;
+    return static_cast<uint8_t>(std::lround(std::clamp(scaled, 0.0f, 255.0f)));
+}
+
+static inline Color rgba_from_floats(const float* rgba) {
+    if (!rgba) return Color{0, 0, 0, 255};
+    return Color{
+        normalize_color_channel(rgba[0]),
+        normalize_color_channel(rgba[1]),
+        normalize_color_channel(rgba[2]),
+        normalize_color_channel(rgba[3])
+    };
+}
+
 struct ContactLight {
     Color col{0,0,0,0};
     float intensity = 0.0f;
@@ -127,32 +159,35 @@ static inline Color hsv_to_color(float h, float s, float v, uint8_t a=255) {
     };
 }
 
+static inline float rgb_to_hue(const Color &c) {
+    const float r = c.r / 255.0f;
+    const float g = c.g / 255.0f;
+    const float b = c.b / 255.0f;
+    const float maxc = std::max({r, g, b});
+    const float minc = std::min({r, g, b});
+    const float delta = maxc - minc;
+    if (delta <= 1e-6f) return 0.0f;
+    float hue;
+    if (maxc == r) {
+        hue = std::fmod((g - b) / delta, 6.0f);
+    } else if (maxc == g) {
+        hue = ((b - r) / delta) + 2.0f;
+    } else {
+        hue = ((r - g) / delta) + 4.0f;
+    }
+    hue /= 6.0f;
+    if (hue < 0.0f) hue += 1.0f;
+    return hue;
+}
+
 static inline uint32_t subgroup_mask_for_index(int idx) {
     if (idx < 0 || idx >= kSubgroupBinCount) return 0u;
     return 1u << static_cast<uint32_t>(idx);
 }
 
-static float subgroup_flags_to_hue(uint32_t flags) {
-    if (flags == 0u) return 0.0f;
-    double sx = 0.0;
-    double sy = 0.0;
-    for (int i = 0; i < kSubgroupBinCount; ++i) {
-        uint32_t bit = 1u << static_cast<uint32_t>(i);
-        if ((flags & bit) == 0u) continue;
-        double angle = (2.0 * kColorWheelPi * static_cast<double>(i)) / static_cast<double>(kSubgroupBinCount);
-        sx += std::cos(angle);
-        sy += std::sin(angle);
-    }
-    if (sx == 0.0 && sy == 0.0) return 0.0f;
-    double angle = std::atan2(sy, sx);
-    if (angle < 0.0) angle += 2.0 * kColorWheelPi;
-    return static_cast<float>(angle / (2.0 * kColorWheelPi));
-}
-
-static Color subgroup_flags_to_color(uint32_t flags, uint8_t alpha=255) {
-    if (flags == 0u) return Color{120, 120, 130, alpha};
-    float hue = subgroup_flags_to_hue(flags);
-    return hsv_to_color(hue, 0.9f, 0.95f, alpha);
+static inline uint32_t subgroup_palette_index(uint32_t flags) {
+    uint32_t mask = (kSubgroupBinCount >= 32) ? 0xFFFFFFFFu : ((1u << kSubgroupBinCount) - 1u);
+    return flags & mask;
 }
 
 static void draw_circle(uint8_t* img, int w, int h, int pitch, int cx, int cy, int r, Color c) {
@@ -597,6 +632,11 @@ struct GP_CanvasContextImpl {
     int selected_tool_kpn = -1;
     // fifo policy subgroup selector: bitmask of enabled subgroup flags
     uint32_t selected_tool_subgroup_flags = 0u;
+    std::array<std::array<float, 4>, kSubgroupBinCount> subgroup_base_rgba{};
+    std::array<Color, kSubgroupBinCount> subgroup_base_colors{};
+    std::array<std::atomic<uint32_t>, kSubgroupBinCount> subgroup_target_rgba{};
+    std::array<Color, 1 << kSubgroupBinCount> subgroup_palette{};
+    std::array<float, 1 << kSubgroupBinCount> subgroup_palette_hue{};
     bool tool_menu_open = false;
     bool plugin_menu_open = false;
     int plugin_menu_module_idx = -1;
@@ -646,6 +686,95 @@ struct GP_CanvasContextImpl {
 // (global drag map removed; each canvas has its own DragState member)
 
 static GP_CanvasContextImpl* g_canvas_context_singleton = nullptr;
+
+static void canvas_recompute_subgroup_palette(GP_CanvasContextImpl* ctx) {
+    if (!ctx) return;
+    constexpr int kPaletteSize = 1 << kSubgroupBinCount;
+    for (int mask = 0; mask < kPaletteSize; ++mask) {
+        if (mask == 0) {
+            Color neutral{120, 120, 130, 255};
+            ctx->subgroup_palette[0] = neutral;
+            ctx->subgroup_palette_hue[0] = 0.0f;
+            continue;
+        }
+        float sum_r = 0.0f;
+        float sum_g = 0.0f;
+        float sum_b = 0.0f;
+        float sum_a = 0.0f;
+        int count = 0;
+        for (int i = 0; i < kSubgroupBinCount; ++i) {
+            if ((mask & (1 << i)) == 0) continue;
+            const Color base = ctx->subgroup_base_colors[static_cast<size_t>(i)];
+            sum_r += static_cast<float>(base.r);
+            sum_g += static_cast<float>(base.g);
+            sum_b += static_cast<float>(base.b);
+            sum_a += static_cast<float>(base.a);
+            ++count;
+        }
+        if (count <= 0) count = 1;
+        float inv = 1.0f / static_cast<float>(count);
+        Color mixed{
+            static_cast<uint8_t>(std::lround(std::clamp(sum_r * inv, 0.0f, 255.0f))),
+            static_cast<uint8_t>(std::lround(std::clamp(sum_g * inv, 0.0f, 255.0f))),
+            static_cast<uint8_t>(std::lround(std::clamp(sum_b * inv, 0.0f, 255.0f))),
+            static_cast<uint8_t>(std::lround(std::clamp(sum_a * inv, 0.0f, 255.0f)))
+        };
+        ctx->subgroup_palette[static_cast<size_t>(mask)] = mixed;
+        ctx->subgroup_palette_hue[static_cast<size_t>(mask)] = rgb_to_hue(mixed);
+    }
+}
+
+static void canvas_init_subgroup_palette(GP_CanvasContextImpl* ctx) {
+    if (!ctx) return;
+    for (int i = 0; i < kSubgroupBinCount; ++i) {
+        float hue = static_cast<float>(i) / static_cast<float>(kSubgroupBinCount);
+        Color base = hsv_to_color(hue, 0.9f, 0.95f, 255);
+        ctx->subgroup_base_rgba[static_cast<size_t>(i)] = {float(base.r), float(base.g), float(base.b), float(base.a)};
+        ctx->subgroup_base_colors[static_cast<size_t>(i)] = base;
+        ctx->subgroup_target_rgba[static_cast<size_t>(i)].store(pack_rgba(base), std::memory_order_relaxed);
+    }
+    canvas_recompute_subgroup_palette(ctx);
+}
+
+static void canvas_update_subgroup_palette(GP_CanvasContextImpl* ctx) {
+    if (!ctx) return;
+    constexpr float kApproach = 0.18f;
+    for (int i = 0; i < kSubgroupBinCount; ++i) {
+        const uint32_t packed = ctx->subgroup_target_rgba[static_cast<size_t>(i)].load(std::memory_order_acquire);
+        const Color target = unpack_rgba(packed);
+        auto &base = ctx->subgroup_base_rgba[static_cast<size_t>(i)];
+        const float target_vals[4] = {float(target.r), float(target.g), float(target.b), float(target.a)};
+        for (int c = 0; c < 4; ++c) {
+            float delta = target_vals[c] - base[static_cast<size_t>(c)];
+            if (std::fabs(delta) < 0.5f) {
+                base[static_cast<size_t>(c)] = target_vals[c];
+            } else {
+                base[static_cast<size_t>(c)] += delta * kApproach;
+            }
+        }
+        ctx->subgroup_base_colors[static_cast<size_t>(i)] = Color{
+            static_cast<uint8_t>(std::lround(std::clamp(base[0], 0.0f, 255.0f))),
+            static_cast<uint8_t>(std::lround(std::clamp(base[1], 0.0f, 255.0f))),
+            static_cast<uint8_t>(std::lround(std::clamp(base[2], 0.0f, 255.0f))),
+            static_cast<uint8_t>(std::lround(std::clamp(base[3], 0.0f, 255.0f)))
+        };
+    }
+    canvas_recompute_subgroup_palette(ctx);
+}
+
+static float subgroup_flags_to_hue(const GP_CanvasContextImpl* ctx, uint32_t flags) {
+    if (!ctx) return 0.0f;
+    uint32_t idx = subgroup_palette_index(flags);
+    return ctx->subgroup_palette_hue[static_cast<size_t>(idx)];
+}
+
+static Color subgroup_flags_to_color(const GP_CanvasContextImpl* ctx, uint32_t flags, uint8_t alpha=255) {
+    if (!ctx) return Color{120, 120, 130, alpha};
+    uint32_t idx = subgroup_palette_index(flags);
+    Color out = ctx->subgroup_palette[static_cast<size_t>(idx)];
+    out.a = alpha;
+    return out;
+}
 
 // forward declaration: update scroll/clamp state (defined later in this file)
 static CanvasBounds update_canvas_scroll_state(GP_CanvasContextImpl* ctx, bool pull_from_container);
@@ -3392,6 +3521,7 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
 extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     GP_CanvasContextImpl* c = new GP_CanvasContextImpl(width, height);
     if (!g_canvas_context_singleton) g_canvas_context_singleton = c;
+    canvas_init_subgroup_palette(c);
     canvas_ensure_root_table(c);
     c->thread_mgr = std::make_unique<ThreadManager>();
     c->thread_mgr->set_mode(ThreadManager::Mode::Scheduled);
@@ -5732,6 +5862,18 @@ extern "C" int gp_canvas_set_edge_hues(GP_CanvasContext* ctx_, const float* hues
     return 1;
 }
 
+extern "C" int gp_canvas_set_subgroup_toolbar_rgba(GP_CanvasContext* ctx_, const float* rgba, int value_count) {
+    if (!ctx_) return 0;
+    if (!rgba || value_count <= 0) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    int color_count = std::min(kSubgroupBinCount, value_count / 4);
+    for (int i = 0; i < color_count; ++i) {
+        const Color col = rgba_from_floats(rgba + i * 4);
+        c->subgroup_target_rgba[static_cast<size_t>(i)].store(pack_rgba(col), std::memory_order_release);
+    }
+    return 1;
+}
+
 extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, int32_t out_len_bytes) {
     if (!ctx_ || !out_rgba) return 0;
     auto *ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
@@ -5741,6 +5883,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     if (out_len_bytes < w * h * 4) return 0;
 
     update_canvas_scroll_state(ctx, /*pull_from_container=*/true);
+    canvas_update_subgroup_palette(ctx);
 
     // clear
     memset(out_rgba, 0, static_cast<size_t>(w) * h * 4);
@@ -6412,7 +6555,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         for (int bi = 0; bi < subgroup_btn_count; ++bi) {
             int bx_i = subgroup_left + bi * (bw + spacing);
             uint32_t flags = subgroup_mask_for_index(bi);
-            Color fill = subgroup_flags_to_color(flags, 255);
+            Color fill = subgroup_flags_to_color(ctx, flags, 255);
             bool selected = (ctx->selected_tool_subgroup_flags & subgroup_mask_for_index(bi)) != 0u;
             if (!selected) {
                 fill.r = static_cast<uint8_t>(std::lround(fill.r * 0.75f));
@@ -6428,6 +6571,12 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 pleft[0]=selected ? 240 : 40; pleft[1]=selected ? 240 : 40; pleft[2]=selected ? 240 : 44; pleft[3]=255;
                 pright[0]=selected ? 240 : 40; pright[1]=selected ? 240 : 40; pright[2]=selected ? 240 : 44; pright[3]=255;
             }
+            Color led_target = unpack_rgba(ctx->subgroup_target_rgba[static_cast<size_t>(bi)].load(std::memory_order_acquire));
+            int led_r = std::max(2, bw / 6);
+            int led_cx = bx_i + bw - led_r - 2;
+            int led_cy = kpn_by + bh / 2;
+            draw_circle(out_rgba, w, h, pitch, led_cx, led_cy, led_r + 1, Color{20,20,28,255});
+            draw_circle(out_rgba, w, h, pitch, led_cx, led_cy, led_r, led_target);
             if (selected) {
                 int y_top = kpn_by;
                 int y_bot = kpn_by + bh - 1;
@@ -6640,7 +6789,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                         auto it = module_contact_subgroups[mi].find(contact_idx);
                         if (it != module_contact_subgroups[mi].end()) subgroup_flags = it->second;
                     }
-                    cl.col = (subgroup_flags != 0u) ? subgroup_flags_to_color(subgroup_flags, led_on.a) : led_on;
+                    cl.col = (subgroup_flags != 0u) ? subgroup_flags_to_color(ctx, subgroup_flags, led_on.a) : led_on;
                     cl.intensity = glow;
                     cl.valid = true;
                     light_map[contact_idx] = cl;
@@ -7042,7 +7191,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             int jacket_border = ctx->jacket_border;
             uint32_t subgroup_flags = ctx->edges[ei].subgroup_flags;
             if (subgroup_flags != 0u) {
-                float hue = subgroup_flags_to_hue(subgroup_flags);
+                float hue = subgroup_flags_to_hue(ctx, subgroup_flags);
                 float hue_vals[1] = { hue };
                 table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, 3, 0.65f);
             } else {
@@ -7071,7 +7220,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 int samples_per_segment = 3;
                 if (ctx->selected_tool_subgroup_flags != 0u) {
                     uint32_t flags = ctx->selected_tool_subgroup_flags;
-                    float hue = subgroup_flags_to_hue(flags);
+                    float hue = subgroup_flags_to_hue(ctx, flags);
                     float hue_vals[1] = { hue };
                     table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, samples_per_segment, 0.55f);
                 } else {

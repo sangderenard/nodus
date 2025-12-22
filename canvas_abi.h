@@ -49,6 +49,9 @@ int gp_canvas_set_cable_style(GP_CanvasContext* ctx, int jacket_px, int jacket_b
 // The function copies the hue data internally. Passing nullptr clears hues.
 int gp_canvas_set_edge_hues(GP_CanvasContext* ctx, const float* hues, int hue_count, float hue_intensity);
 
+// Update subgroup toolbar LED colors. `rgba` is a float array in stride-of-4 RGBA values.
+int gp_canvas_set_subgroup_toolbar_rgba(GP_CanvasContext* ctx, const float* rgba, int value_count);
+
 // Forward a mouse click (canvas-local coords). Returns 1 if handled.
 int gp_canvas_on_click(GP_CanvasContext* ctx, int x, int y);
 
