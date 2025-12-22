@@ -87,6 +87,8 @@
 #define LABEL_MENU_TABLE_NUMBER "Table Number"
 #define LABEL_MENU_TABLE_NUMBER_SHORT "n"
 #define LABEL_MODULE_MENU "Menu"
+#define LABEL_PLUGIN_MENU_TITLE "Plugin Tools"
+#define LABEL_PLUGIN_MENU_EMPTY "No plugin tools"
 
 // Tool labels
 #define LABEL_TOOL_ADD "Add"
