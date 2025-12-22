@@ -34,11 +34,17 @@ enum class ModuleToolKind : int8_t {
     Clone = 11,
 };
 
+enum class ModuleToolOrigin : int8_t {
+    Builtin = 0,
+    Plugin = 1,
+};
+
 struct ModuleIORow {
     ModuleRowKind kind = ModuleRowKind::Tool;
     int contact_idx = 0;
     ModuleToolKind tool = ModuleToolKind::None;
     int attachment_count = 1;
+    ModuleToolOrigin tool_origin = ModuleToolOrigin::Builtin;
 };
 
 struct ModuleInputState {
