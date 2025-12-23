@@ -1,5 +1,14 @@
 #include "table_abi.h"
+#include "canvas_abi.h"
+#include <cstdlib>
 #include "menu_waveform_abi.h"
+// Local copy of LassoConfig layout (kept here to avoid cross-translation-unit
+// include path issues). The public header forward-declares `LassoConfig`.
+typedef struct LassoConfig {
+    uint32_t flags;
+    uint8_t widget_type;
+    uint8_t reserved[3];
+} LassoConfig;
 
 #include <algorithm>
 #include <atomic>
@@ -15,6 +24,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <chrono>
+#include <thread>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -27,11 +37,69 @@
 
 namespace {
 
+// Forward declarations for static helpers used earlier in the file.
+
+
 struct Color {
     uint8_t r = 0, g = 0, b = 0, a = 255;
 };
 
 constexpr float kPi = 3.14159265358979323846f;
+
+// Edge sample type and consumer policy flags
+// These provide a small, discoverable place to extend the per-edge
+// metadata (e.g. `GP_TableContext::edge_subgroup_flags`) with a
+// contract between producers and consumers. Values here are intentionally
+// simple so we can iterate on a negotiator later.
+enum EdgeSampleType : uint32_t {
+    EDGE_SAMPLE_FLOAT = 0u,
+    EDGE_SAMPLE_POINTER = 1u,
+};
+
+enum EdgeConsumePolicy : uint32_t {
+    EDGE_POLICY_PEEK = 0u,      // consumer may peek without consuming
+    EDGE_POLICY_CONSUME = 1u,   // consumer consumes and advances
+    EDGE_POLICY_CONDITIONAL = 2u// consumer decides based on additional metadata
+};
+
+// Subgroup / color flags stored per-edge in `GP_TableContext::edge_subgroup_flags`.
+// Reserve a few low bits for up to 5 color hues and one BYREF marker.
+static constexpr uint32_t EDGE_SUBGROUP_COLOR0 = (1u << 0);
+static constexpr uint32_t EDGE_SUBGROUP_COLOR1 = (1u << 1);
+static constexpr uint32_t EDGE_SUBGROUP_COLOR2 = (1u << 2);
+static constexpr uint32_t EDGE_SUBGROUP_COLOR3 = (1u << 3);
+static constexpr uint32_t EDGE_SUBGROUP_COLOR4 = (1u << 4);
+// Per-edge BYREF flag (separate from subgroup colors). Keep this distinct
+// so users can either set the BYREF bit directly or map subgroup colors to
+// imply BYREF behavior via `gp_table_set_subgroup_color_mapping`.
+static constexpr uint32_t EDGE_SUBGROUP_BYREF  = (1u << 8); // by-ref flag forces pointer semantics
+
+// Configurable mapping from subgroup color index (0..4) to FIFO flags.
+// Users can call `gp_table_set_subgroup_color_mapping` to change these at
+// runtime before applying subgroup colors to edges.
+static uint32_t g_subgroup_color_to_fifo_flags[5] = {0,0,0,0,0};
+
+// Helper to determine whether a given subgroup `flags` value implies BYREF
+// semantics, either directly (BYREF bit) or via a mapped color->flag entry.
+static bool flags_imply_byref(uint32_t flags) {
+    if (flags & EDGE_SUBGROUP_BYREF) return true;
+    // check color bits (0..4)
+    for (int i = 0; i < 5; ++i) {
+        uint32_t color_bit = (1u << i);
+        if ((flags & color_bit) != 0) {
+            if ((g_subgroup_color_to_fifo_flags[i] & EDGE_SUBGROUP_BYREF) != 0) return true;
+        }
+    }
+    return false;
+}
+
+// Box used to carry non-pointer samples by-reference when an edge is marked BYREF.
+struct BoxedSample {
+    uint32_t magic; // simple tag to recognize boxed samples
+    int32_t sample_len; // number of floats
+    // followed by sample_len * sizeof(float) bytes
+};
+static constexpr uint32_t BOXED_SAMPLE_MAGIC = 0xB0B5A55Au; // arbitrary unique tag
 
 // Global template library directory (can be set by gp_table_set_library_dir).
 static std::string g_template_library_dir;
@@ -78,6 +146,12 @@ int32_t gp_table_save_template(GP_TableContext* ctx, const char* dir, const char
     } catch (...) {
         return 0;
     }
+    return 1;
+}
+
+extern "C" int32_t gp_table_set_subgroup_color_mapping(int32_t color_idx, uint32_t fifo_flags) {
+    if (color_idx < 0 || color_idx >= 5) return 0;
+    g_subgroup_color_to_fifo_flags[static_cast<size_t>(color_idx)] = fifo_flags;
     return 1;
 }
 
@@ -1413,7 +1487,8 @@ struct EdgeTensorFifo {
         std::atomic<uint64_t> write_seq{0}; // next sequence to write
         std::atomic<uint64_t> writer{0};    // bound writer key (0 => unbound)
         std::unique_ptr<std::atomic<uint64_t>[]> slot_seq; // published tag per slot (seq+1), 0 => empty
-        std::unique_ptr<float[]> storage;                  // slots * stride floats
+        std::unique_ptr<uint8_t[]> storage_bytes;          // raw bytes: slots * stride * sizeof(float)
+        float* storage_f = nullptr;                        // typed view for float samples
         std::unique_ptr<ReaderEntry[]> readers;
         size_t stride = 1;
         size_t slots = 1;
@@ -1475,9 +1550,10 @@ struct EdgeTensorFifo {
         order_history_count = 0;
         order_history_cursor = 0;
 
-        impl->storage.reset(new float[impl->stride * impl->slots]);
+        impl->storage_bytes.reset(new uint8_t[impl->stride * impl->slots * sizeof(float)]);
+        impl->storage_f = reinterpret_cast<float*>(impl->storage_bytes.get());
         impl->slot_seq.reset(new std::atomic<uint64_t>[impl->slots]);
-        for (size_t i = 0; i < impl->stride * impl->slots; ++i) impl->storage[i] = 0.0f;
+        std::memset(impl->storage_bytes.get(), 0, static_cast<size_t>(impl->stride * impl->slots * sizeof(float)));
         for (size_t i = 0; i < impl->slots; ++i) impl->slot_seq[i].store(0, std::memory_order_relaxed);
         impl->write_seq.store(0, std::memory_order_relaxed);
         impl->writer.store(0, std::memory_order_relaxed);
@@ -1774,7 +1850,7 @@ struct EdgeTensorFifo {
         }
 
         size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
-        float* dst = impl->storage.get() + slot * impl->stride;
+        float* dst = impl->storage_f + slot * impl->stride;
         std::memcpy(dst, effective_sample, impl->stride * sizeof(float));
         impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
         impl->write_seq.store(seq + 1, std::memory_order_release);
@@ -1794,6 +1870,106 @@ struct EdgeTensorFifo {
         return true;
     }
 
+    // Pointer-mode push: publish opaque pointer values into FIFO slots.
+    bool push_ptr(uint64_t edge_id, uint64_t writer_id, void* ptr, bool* out_dropped) {
+        if (!impl || !impl->configured) return false;
+        uint64_t bound = impl->writer.load(std::memory_order_relaxed);
+        if (bound == 0) {
+            (void)impl->writer.compare_exchange_strong(bound, writer_id, std::memory_order_relaxed);
+        }
+        bound = impl->writer.load(std::memory_order_relaxed);
+        if (bound != 0 && bound != writer_id) return false;
+
+        uint64_t seq = impl->write_seq.load(std::memory_order_relaxed);
+        bool dropped = false;
+        if (!ensure_space_for_write(seq, &dropped, edge_id)) {
+            if (out_dropped) *out_dropped = 1;
+            return false;
+        }
+
+        size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
+        // Write the pointer bytes into the slot's byte storage so pointers travel
+        // through the same stride-based FIFO storage as float samples. The
+        // consumer is expected to interpret the slot according to the edge
+        // metadata (pointer vs float).
+        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * sizeof(float);
+        // Zero the slot first to avoid leaving stale bytes in trailing area
+        std::memset(base, 0, impl->stride * sizeof(float));
+        std::memcpy(base, &ptr, std::min<size_t>(sizeof(void*), impl->stride * sizeof(float)));
+        impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
+        impl->write_seq.store(seq + 1, std::memory_order_release);
+        note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
+        impl->cv.notify_all();
+        if (out_dropped) *out_dropped = dropped ? 1 : 0;
+        return true;
+    }
+
+    bool pop_ptr(uint64_t reader_id, void** out_ptr) {
+        if (!impl || !impl->configured) return false;
+        if (!out_ptr) return false;
+        ReaderEntry* r = find_reader(reader_id);
+        if (!r) return false;
+
+        uint64_t rseq = r->seq.load(std::memory_order_relaxed);
+        size_t slot = static_cast<size_t>(rseq % static_cast<uint64_t>(impl->slots));
+        uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
+        if (observed != (rseq + 1)) return false;
+
+        // Read pointer bytes from the slot's storage and return as opaque pointer.
+        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * sizeof(float);
+        void* p = nullptr;
+        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * sizeof(float)));
+        *out_ptr = p;
+        r->seq.store(rseq + 1, std::memory_order_relaxed);
+        note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
+        impl->cv.notify_all();
+        return true;
+    }
+
+    // Non-destructive peek for pointer slots: read opaque pointer bytes
+    // without advancing the reader sequence. Returns true if a pointer
+    // was available and copied into out_ptr.
+    bool peek_ptr(uint64_t reader_id, void** out_ptr) {
+        if (!impl || !impl->configured) return false;
+        if (!out_ptr) return false;
+        ReaderEntry* r = find_reader(reader_id);
+        if (!r) return false;
+
+        uint64_t rseq = r->seq.load(std::memory_order_relaxed);
+        size_t slot = static_cast<size_t>(rseq % static_cast<uint64_t>(impl->slots));
+        uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
+        if (observed != (rseq + 1)) return false;
+
+        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * sizeof(float);
+        void* p = nullptr;
+        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * sizeof(float)));
+        *out_ptr = p;
+        return true;
+    }
+
+    // Blocking pointer pop: wait until a pointer entry is available then
+    // read and advance the reader. Returns true on success.
+    bool pop_ptr_blocking(uint64_t reader_id, void** out_ptr, int timeout_ms) {
+        if (!impl || !impl->configured) return false;
+        if (!find_reader(reader_id)) return false;
+        if (!out_ptr) return false;
+        if (timeout_ms == 0) return pop_ptr(reader_id, out_ptr);
+        using clock = std::chrono::steady_clock;
+        auto deadline = (timeout_ms < 0) ? clock::time_point::max() : (clock::now() + std::chrono::milliseconds(timeout_ms));
+        std::unique_lock<std::mutex> lk(impl->cv_mu);
+        while (true) {
+            lk.unlock();
+            bool ok = pop_ptr(reader_id, out_ptr);
+            lk.lock();
+            if (ok) return true;
+            if (timeout_ms < 0) {
+                impl->cv.wait(lk);
+            } else {
+                if (impl->cv.wait_until(lk, deadline) == std::cv_status::timeout) return false;
+            }
+        }
+    }
+
     bool pop(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written) {
         out_written = 0;
         if (!impl || !impl->configured) return false;
@@ -1806,11 +1982,34 @@ struct EdgeTensorFifo {
         uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
         if (observed != (rseq + 1)) return false;
 
-        const float* src = impl->storage.get() + slot * impl->stride;
+        const float* src = impl->storage_f + slot * impl->stride;
         std::memcpy(out_sample, src, impl->stride * sizeof(float));
         r->seq.store(rseq + 1, std::memory_order_relaxed);
         note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
         impl->cv.notify_all();
+        out_written = impl->stride;
+        return true;
+    }
+
+    // Non-destructive peek: copy the next available sample for `reader_id`
+    // into `out_sample` without advancing the reader sequence. Returns true
+    // if a sample was available and copied. Contract matches `pop` with the
+    // requirement that out_cap >= impl->stride.
+    bool peek(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written) {
+        out_written = 0;
+        if (!impl || !impl->configured) return false;
+        ReaderEntry* r = find_reader(reader_id);
+        if (!r) return false;
+        if (!out_sample || out_cap < impl->stride) return false;
+
+        uint64_t rseq = r->seq.load(std::memory_order_relaxed);
+        size_t slot = static_cast<size_t>(rseq % static_cast<uint64_t>(impl->slots));
+        uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
+        if (observed != (rseq + 1)) return false;
+
+        const float* src = impl->storage_f + slot * impl->stride;
+        std::memcpy(out_sample, src, impl->stride * sizeof(float));
+        // Note: do NOT advance r->seq and do NOT call note_activity / notify.
         out_written = impl->stride;
         return true;
     }
@@ -1837,6 +2036,43 @@ struct EdgeTensorFifo {
                 if (impl->cv.wait_until(lk, deadline) == std::cv_status::timeout) return false;
             }
         }
+    }
+
+    // Ensure the FIFO stride (in bytes) can accomodate at least `min_bytes` per-slot.
+    // If the current stride is too small we grow the stride and re-layout existing
+    // per-slot contents into the new stride. This attempts to preserve outstanding
+    // samples so FIFOs can be reconfigured (e.g. when an edge becomes by-ref)
+    // without destroying the FIFO object.
+    bool ensure_stride_for_bytes(size_t min_bytes) {
+        if (!impl || !impl->configured) return false;
+        size_t cur_bytes = impl->stride * sizeof(float);
+        if (cur_bytes >= min_bytes) return true;
+        size_t needed_floats = (min_bytes + sizeof(float) - 1) / sizeof(float);
+        size_t new_stride = std::max(impl->stride, needed_floats);
+
+        // allocate new storage
+        std::unique_ptr<uint8_t[]> new_bytes(new uint8_t[new_stride * impl->slots * sizeof(float)]);
+        std::memset(new_bytes.get(), 0, new_stride * impl->slots * sizeof(float));
+
+        // copy per-slot existing float bytes into the new layout (preserve min region)
+        for (size_t s = 0; s < impl->slots; ++s) {
+            uint8_t* src = impl->storage_bytes.get() + s * impl->stride * sizeof(float);
+            uint8_t* dst = new_bytes.get() + s * new_stride * sizeof(float);
+            size_t copy_bytes = impl->stride * sizeof(float);
+            std::memcpy(dst, src, copy_bytes);
+        }
+
+        // swap in new storage and update typed view
+        impl->storage_bytes.swap(new_bytes);
+        impl->storage_f = reinterpret_cast<float*>(impl->storage_bytes.get());
+        impl->stride = new_stride;
+
+        // update our cached scratch/last_sample sizes to match new stride
+        last_sample.assign(impl->stride, 0.0f);
+        scratch.assign(impl->stride, 0.0f);
+        order_history.assign(static_cast<size_t>(kMaxOrder) * impl->stride, 0.0f);
+        order_integrator.assign(static_cast<size_t>(kMaxOrder) * impl->stride, 0.0f);
+        return true;
     }
 
     bool pop_blocking(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written, int timeout_ms) {
@@ -1958,6 +2194,20 @@ struct GP_TableContext {
     // Optional keyboard callback
     GP_TableKeyFn key_callback = nullptr;
     void* key_user = nullptr;
+    // meta-groups created by tools (opaque internal storage)
+    struct RingEntry {
+        int ring_id = -1; // rope_sim ring id
+        uint64_t key = 0; // caller-provided key for identification
+        EdgeTensorFifo fifo;
+        GP_TableEdgeBatchMetadata batch_metadata{};
+        uint32_t subgroup_flags = 0;
+        uint64_t uid = 0;
+    };
+    std::vector<RingEntry> rings;
+    uint64_t next_ring_uid = 1;
+    std::vector<std::unordered_map<uint64_t,int>> ring_subscriber_slots; // per-ring subscriber -> slot
+    struct GP_MetaGroupInternal;
+    std::vector<std::unique_ptr<GP_MetaGroupInternal>> meta_groups;
     // Pending operations enqueued by UI threads to be applied by the manager.
     enum PendingOpType {
         PENDING_OP_ADD_EDGE = 1,
@@ -1982,6 +2232,541 @@ struct GP_TableContext {
     std::vector<PendingOp> pending_ops;
     std::mutex pending_ops_mu;
 };
+
+// Internal representation of a meta-group. Exposed to C callers as an
+// opaque `GP_MetaGroup*` pointer (allocated here and stored in the
+// table's `meta_groups` vector to keep lifetime management consistent).
+struct GP_MetaGroup {
+    std::vector<std::pair<int,int>> vertices; // (rope_idx, vertex_idx)
+    float confinement = 1.0f; // tightness/pressure
+    int sim_group_idx = -1; // index into RopeSim meta_groups if registered
+    uint64_t id = 0; // debug id
+    LassoConfig lasso_config; // configuration flags and widget type for this meta-group
+    int dangling_widget_id = -1; // RopeSim widget id if created
+    // optional anchor override used by helpers (e.g., dangling widget attach)
+    int anchor_rope = -1;
+    int anchor_vert = -1;
+    // optional FIFO and subgroup flags so meta-groups can behave like edges
+    EdgeTensorFifo fifo;
+    uint32_t subgroup_flags = 0;
+    // if a dangling short-rope + widget was created, remember rope id and vertex
+    int dangling_widget_rope = -1;
+    int dangling_widget_rope_vid = -1;
+    float dangling_hang_len = 0.0f;
+    // ring topology mode: 0=ribbon (chain), 1=closed loop, 2=dense cross-links
+    int ring_mode = 0;
+};
+
+// Thin adaptor type used to store meta-groups in the context vector.
+struct GP_TableContext::GP_MetaGroupInternal : public GP_MetaGroup {};
+
+extern "C" GP_MetaGroup* gp_table_meta_create(GP_TableContext* ctx) {
+    if (!ctx) return nullptr;
+    auto mg = std::make_unique<GP_TableContext::GP_MetaGroupInternal>();
+    static uint64_t next_mg_id = 1;
+    mg->id = next_mg_id++;
+    GP_MetaGroup* ptr = mg.get();
+    ctx->meta_groups.push_back(std::move(mg));
+    printf("gp_table_meta_create: created mg=%p id=%llu on ctx=%p\n", (void*)ptr, (unsigned long long)ptr->id, (void*)ctx);
+    return ptr;
+}
+
+// Removed: gp_table_sim_toggle_meta_group_mode_for_rope
+
+extern "C" int32_t gp_table_meta_get_ring_mode(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_mode) {
+    if (!ctx || !mg || !out_mode) return 0;
+    *out_mode = mg->ring_mode;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_destroy(GP_TableContext* ctx, GP_MetaGroup* mg) {
+    if (!ctx || !mg) return 0;
+    for (size_t i = 0; i < ctx->meta_groups.size(); ++i) {
+        if (ctx->meta_groups[i].get() == mg) {
+            // If the table has a sim attached and the meta-group registered
+            // a sim_group_idx, ensure sim-side resources (springs, meta-group)
+            // are cleaned up before removing the meta-group record.
+            RopeSim* sim = ctx->rope_sim;
+            int sim_idx = mg->sim_group_idx;
+            if (sim && sim_idx >= 0) {
+                // disable any edge-springs associated with this meta-group
+                rope_sim_meta_group_disable_edge_springs(sim, sim_idx);
+                rope_sim_destroy_meta_group(sim, sim_idx);
+            }
+            ctx->meta_groups.erase(ctx->meta_groups.begin() + static_cast<ptrdiff_t>(i));
+            return 1;
+        }
+    }
+    return 0;
+}
+
+extern "C" int32_t gp_table_meta_enable_edge_springs(GP_TableContext* ctx, GP_MetaGroup* mg, float min_rest, float reduce_rate) {
+    if (!ctx || !mg) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim || mg->sim_group_idx < 0) return 0;
+    int res = rope_sim_meta_group_enable_edge_springs(sim, mg->sim_group_idx, min_rest, reduce_rate);
+    if (!res) return 0;
+    // Additionally, schedule per-rope rest-length adjustments so ropes are
+    // briefly let out and then gradually shortened to simulate trimming/tensioning.
+    float extend_amount = 5.0f; // increase rest length immediately
+    float shorten_factor = 0.6f; // target = current * factor
+    float shorten_rate = 1.0f; // units per second
+    float shorten_delay = 0.5f; // seconds before shortening begins
+    std::unordered_set<int> handled;
+    for (const auto &p : mg->vertices) {
+        int r = p.first;
+        if (handled.find(r) != handled.end()) continue;
+        handled.insert(r);
+        rope_sim_modify_rest_length(sim, r, extend_amount);
+        float cur = 0.0f;
+        if (rope_sim_get_rope_rest_length(sim, r, &cur)) {
+            float target = std::max(0.0001f, cur * shorten_factor);
+            rope_sim_set_rope_rest_target(sim, r, target, shorten_rate, shorten_delay);
+            printf("gp_table_meta_enable_edge_springs: rope %d rest increased by %.2f then scheduled target %.2f (delay=%.2f rate=%.2f)\n", r, extend_amount, target, shorten_delay, shorten_rate);
+        }
+    }
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_disable_edge_springs(GP_TableContext* ctx, GP_MetaGroup* mg) {
+    if (!ctx || !mg) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim || mg->sim_group_idx < 0) return 0;
+    return rope_sim_meta_group_disable_edge_springs(sim, mg->sim_group_idx);
+}
+
+extern "C" int32_t gp_table_rope_modify_rest_length(GP_TableContext* ctx, int32_t rope_idx, float delta) {
+    if (!ctx) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_modify_rest_length(sim, static_cast<int>(rope_idx), delta);
+}
+
+extern "C" int32_t gp_table_rope_set_rest_target(GP_TableContext* ctx, int32_t rope_idx, float target_rest, float rate, float delay) {
+    if (!ctx) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_set_rope_rest_target(sim, static_cast<int>(rope_idx), target_rest, rate, delay);
+}
+
+extern "C" int32_t gp_table_rope_get_rest_length(GP_TableContext* ctx, int32_t rope_idx, float* out_rest) {
+    if (!ctx || !out_rest) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_get_rope_rest_length(sim, static_cast<int>(rope_idx), out_rest);
+}
+
+extern "C" int32_t gp_table_rope_set_radius(GP_TableContext* ctx, int32_t rope_idx, float radius) {
+    if (!ctx) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_set_rope_radius(sim, static_cast<int>(rope_idx), radius);
+}
+
+extern "C" int32_t gp_table_rope_get_radius(GP_TableContext* ctx, int32_t rope_idx, float* out_radius) {
+    if (!ctx || !out_radius) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_get_rope_radius(sim, static_cast<int>(rope_idx), out_radius);
+}
+
+extern "C" int32_t gp_table_rope_insert_vertex(GP_TableContext* ctx, int32_t rope_idx, int32_t seg_index, float t) {
+    if (!ctx) return -1;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return -1;
+    return rope_sim_insert_vertex(sim, static_cast<int>(rope_idx), static_cast<int>(seg_index), t);
+}
+extern "C" int32_t gp_table_sim_add_meta_group_for_rope(GP_TableContext* ctx, int32_t rope_idx) {
+    if (!ctx) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    int vc = rope_sim_get_vertex_count(sim, static_cast<int>(rope_idx));
+    if (vc <= 1) return 0;
+    int sg = rope_sim_create_meta_group(sim, 1.0f);
+    if (sg < 0) return 0;
+    // add first and last vertex as members so edge-springs can be created
+    rope_sim_meta_group_add(sim, sg, static_cast<int>(rope_idx), 0);
+    rope_sim_meta_group_add(sim, sg, static_cast<int>(rope_idx), vc - 1);
+    rope_sim_meta_group_set_mode(sim, sg, 0);
+    int res = rope_sim_meta_group_enable_edge_springs(sim, sg, 2.0f, 50.0f);
+    printf("gp_table_sim_add_meta_group_for_rope: created sg=%d for rope=%d res=%d\n", sg, rope_idx, res);
+    return res ? 1 : 0;
+}
+
+extern "C" int32_t gp_table_create_ring(GP_TableContext* ctx, int32_t rope_idx, float u) {
+    if (!ctx) return -1;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return -1;
+    // Create a ring at parameter u (no insertion into the main rope). Then
+    // create a short T-off rope centered at the ring's world position and
+    // attach a heavy widget to its center. The T-off center is joined into
+    // the meta-group next to the existing anchor vertex so forces transmit.
+    int vc = rope_sim_get_vertex_count(sim, static_cast<int>(rope_idx));
+    if (vc <= 1) {
+        return rope_sim_create_ring(sim, static_cast<int>(rope_idx), u);
+    }
+    // sample world position along rope at param u
+    std::vector<float> verts3(static_cast<size_t>(vc) * 3);
+    int got = rope_sim_get_vertices3(sim, static_cast<int>(rope_idx), verts3.data(), static_cast<int>(verts3.size()));
+    if (got <= 1) return rope_sim_create_ring(sim, static_cast<int>(rope_idx), u);
+    float fidx = u * static_cast<float>(vc - 1);
+    int i0 = static_cast<int>(std::floor(fidx));
+    if (i0 < 0) i0 = 0; if (i0 >= vc-1) i0 = vc-2;
+    int i1 = i0 + 1;
+    float local_t = fidx - static_cast<float>(i0);
+    float ax = verts3[3*i0+0]; float ay = verts3[3*i0+1]; float az = verts3[3*i0+2];
+    float bx = verts3[3*i1+0]; float by = verts3[3*i1+1]; float bz = verts3[3*i1+2];
+    float px = ax + (bx - ax) * local_t;
+    float py = ay + (by - ay) * local_t;
+    float pz = az + (bz - az) * local_t;
+    // create ring at u
+    int ring_id = rope_sim_create_ring(sim, static_cast<int>(rope_idx), u);
+
+    // Build T-off: compute perpendicular to tangent (using local segment)
+    float tx = bx - ax; float ty = by - ay; float tz = bz - az;
+    float tlen = std::sqrt(tx*tx + ty*ty + tz*tz);
+    float pxp = 0.0f, pyp = 1.0f; // default perp
+    if (tlen > 1e-6f) {
+        tx /= tlen; ty /= tlen; tz /= tlen;
+        // 2D perp in XY plane
+        pxp = -ty; pyp = tx;
+    }
+    float half = 12.0f; // half-length of T-off
+    float e1x = px + pxp * half;
+    float e1y = py + pyp * half;
+    float e1z = pz;
+    float e2x = px - pxp * half;
+    float e2y = py - pyp * half;
+    float e2z = pz;
+    int to_segs = 2;
+    int to_rope = rope_sim_add_rope3(sim, e1x, e1y, e1z, e2x, e2y, e2z, to_segs, 0.0f);
+    if (to_rope < 0) return ring_id;
+
+    // Create a custom canvas overlay rectangle for the short T-off endpoints
+    // and register two overlay LED keys. Also attach the created rope to the
+    // overlay so canvas-level rendering and interaction can bind to it.
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    if (cvs) {
+        unsigned long long key_a = 0ull, key_b = 0ull;
+        if (gp_canvas_create_overlay_with_leds(cvs, e1x, e1y, e2x, e2y, &key_a, &key_b)) {
+            // Attach rope to overlay so canvas edges render and can be interacted with
+            int edge_idx = gp_canvas_attach_rope_to_overlay(cvs, key_a, key_b, to_rope);
+            printf("gp_table: attached rope %d to overlay keys (%llu,%llu) edge_idx=%d\n", to_rope, (unsigned long long)key_a, (unsigned long long)key_b, edge_idx);
+        }
+    }
+
+    // For every meta-group anchored to this rope, insert the T-off center vertex
+    // into the group's ordering adjacent to the anchor so the T-off is joined
+    // to the existing ring bindings (transmits forces). Attach a heavy widget
+    // to the T-off center (vertex index 1) and increase its mass.
+    for (size_t mgi = 0; mgi < ctx->meta_groups.size(); ++mgi) {
+        auto &mgptr = ctx->meta_groups[mgi];
+        if (!mgptr) continue;
+        GP_MetaGroup* mg = mgptr.get();
+        if (!mg) continue;
+        if (mg->anchor_rope != rope_idx) continue;
+        if (mg->sim_group_idx < 0) {
+            int sg = rope_sim_create_meta_group(sim, mg->confinement);
+            if (sg >= 0) mg->sim_group_idx = sg;
+        }
+            if (mg->sim_group_idx >= 0) {
+            // add T-off center to the table-level meta-group record so it's a
+            // genuine member visible to APIs and rendering
+            gp_table_meta_add_vertex(ctx, mg, static_cast<int32_t>(to_rope), 1);
+            // insert T-off center (vertex 1) after the anchor vertex in sim ordering
+            rope_sim_meta_group_insert(sim, mg->sim_group_idx, mg->anchor_rope, mg->anchor_vert, to_rope, 1);
+            // if there is a dangling widget rope, insert it after the T-off so it's connected
+            if (mg->dangling_widget_rope >= 0) {
+                rope_sim_meta_group_insert(sim, mg->sim_group_idx, to_rope, 1, mg->dangling_widget_rope, 0);
+            }
+            rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
+            // create heavy widget on center of T-off
+            int wid = rope_sim_create_dangling_widget(sim, to_rope, 1, static_cast<unsigned int>(mg->lasso_config.widget_type));
+            if (wid >= 0) {
+                rope_sim_set_widget_mass(sim, wid, 50.0f);
+            }
+            // record dangling widget/rope on meta-group so rendering and
+            // queries will reference the real hanging rope and widget.
+            if (wid >= 0) {
+                mg->dangling_widget_id = wid;
+                mg->dangling_widget_rope = to_rope;
+                mg->dangling_widget_rope_vid = 1;
+                mg->dangling_hang_len = half;
+            }
+        }
+    }
+
+    return ring_id;
+}
+
+extern "C" int32_t gp_table_destroy_ring(GP_TableContext* ctx, int32_t ring_id) {
+    if (!ctx) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_destroy_ring(sim, static_cast<int>(ring_id));
+}
+
+extern "C" int32_t gp_table_set_ring_target(GP_TableContext* ctx, int32_t ring_id, float target_u, float speed) {
+    if (!ctx) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_set_ring_target(sim, static_cast<int>(ring_id), target_u, speed);
+}
+
+extern "C" int32_t gp_table_get_ring_u(GP_TableContext* ctx, int32_t ring_id, float* out_u) {
+    if (!ctx || !out_u) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_get_ring_u(sim, static_cast<int>(ring_id), out_u);
+}
+
+extern "C" int32_t gp_table_meta_add_vertex(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx) {
+    if (!ctx || !mg) return 0;
+    mg->vertices.emplace_back(static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
+    printf("gp_table_meta_add_vertex: mg=%p add (rope=%d,vert=%d)\n", (void*)mg, rope_idx, vertex_idx);
+    // If the table owns or is attached to a RopeSim, ensure a sim-level
+    // meta group exists and register the vertex there so confinement
+    // forces are applied during simulation.
+    RopeSim* sim = ctx->rope_sim;
+    if (sim) {
+        if (mg->sim_group_idx < 0) {
+            int sg = rope_sim_create_meta_group(sim, mg->confinement);
+            if (sg >= 0) mg->sim_group_idx = sg;
+        }
+        if (mg->sim_group_idx >= 0) {
+            rope_sim_meta_group_add(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
+            // update pressure in sim if different
+            rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
+        }
+    }
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_set_anchor(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx) {
+    if (!ctx || !mg) return 0;
+    mg->anchor_rope = rope_idx;
+    mg->anchor_vert = vertex_idx;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_anchor(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_rope_idx, int32_t* out_vertex_idx) {
+    if (!ctx || !mg) return 0;
+    if (out_rope_idx) *out_rope_idx = mg->anchor_rope;
+    if (out_vertex_idx) *out_vertex_idx = mg->anchor_vert;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_vertex_count(GP_TableContext* ctx, GP_MetaGroup* mg) {
+    if (!ctx || !mg) return 0;
+    return static_cast<int32_t>(mg->vertices.size());
+}
+
+extern "C" int32_t gp_table_get_meta_group_count(const GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    return static_cast<int32_t>(ctx->meta_groups.size());
+}
+
+extern "C" GP_MetaGroup* gp_table_get_meta_group(GP_TableContext* ctx, int32_t idx) {
+    if (!ctx) return nullptr;
+    if (idx < 0 || static_cast<size_t>(idx) >= ctx->meta_groups.size()) return nullptr;
+    return ctx->meta_groups[static_cast<size_t>(idx)].get();
+}
+
+extern "C" int32_t gp_table_meta_get_vertex(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t idx, int32_t* out_rope_idx, int32_t* out_vertex_idx) {
+    if (!ctx || !mg) return 0;
+    if (idx < 0 || static_cast<size_t>(idx) >= mg->vertices.size()) return 0;
+    auto &p = mg->vertices[static_cast<size_t>(idx)];
+    if (out_rope_idx) *out_rope_idx = p.first;
+    if (out_vertex_idx) *out_vertex_idx = p.second;
+    return 1;
+}
+
+extern "C" int32_t gp_table_get_widget_position(GP_TableContext* ctx, int32_t widget_id, float* out_xyz) {
+    if (!ctx || !out_xyz) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    return rope_sim_get_widget_position(sim, static_cast<int>(widget_id), out_xyz);
+}
+
+extern "C" int32_t gp_table_meta_get_dangling_widget_id(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_widget_id) {
+    if (!ctx || !mg || !out_widget_id) return 0;
+    *out_widget_id = mg->dangling_widget_id;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_set_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, const LassoConfig* cfg) {
+    if (!ctx || !mg) return 0;
+    if (cfg) {
+        mg->lasso_config.flags = cfg->flags;
+        mg->lasso_config.widget_type = cfg->widget_type;
+    } else {
+        mg->lasso_config.flags = 0;
+        mg->lasso_config.widget_type = 0;
+    }
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, LassoConfig* out_cfg) {
+    if (!ctx || !mg || !out_cfg) return 0;
+    out_cfg->flags = mg->lasso_config.flags;
+    out_cfg->widget_type = mg->lasso_config.widget_type;
+    out_cfg->reserved[0] = mg->lasso_config.reserved[0];
+    out_cfg->reserved[1] = mg->lasso_config.reserved[1];
+    out_cfg->reserved[2] = mg->lasso_config.reserved[2];
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_subgroup_flags(GP_TableContext* ctx, GP_MetaGroup* mg, uint32_t* out_flags) {
+    if (!ctx || !mg || !out_flags) return 0;
+    // Prefer explicit subgroup_flags stored on the meta-group, otherwise fall
+    // back to any lasso-config flags the creator supplied.
+    if (mg->subgroup_flags != 0u) {
+        *out_flags = mg->subgroup_flags;
+        return 1;
+    }
+    *out_flags = mg->lasso_config.flags;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_dangling_rope_info(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_rope_idx, int32_t* out_vertex_idx) {
+    if (!ctx || !mg || !out_rope_idx || !out_vertex_idx) return 0;
+    *out_rope_idx = mg->dangling_widget_rope;
+    *out_vertex_idx = mg->dangling_widget_rope_vid;
+    return 1;
+}
+
+int32_t gp_table_meta_get_sim_group_index(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_sim_idx) {
+    if (!ctx || !mg || !out_sim_idx) return 0;
+    *out_sim_idx = mg->sim_group_idx;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_create_widget(GP_TableContext* ctx, GP_MetaGroup* mg) {
+    if (!ctx || !mg) return 0;
+    // Quick runtime toggle to disable creating the hanging widget/rope for testing.
+    const char* disable_env = std::getenv("NODUS_DISABLE_WIDGET_HANG");
+    if (disable_env && disable_env[0] != '\0') {
+        printf("gp_table_meta_create_widget: disabled via NODUS_DISABLE_WIDGET_HANG\n");
+        return 0;
+    }
+    if (mg->dangling_widget_id >= 0) return 1; // already created
+    if (mg->vertices.empty()) return 0;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    // Prefer creating a short hanging rope anchored to the meta-group, then
+    // attach the widget to the rope's lower vertex so it can hang freely.
+    // prefer explicit anchor if set on the meta-group
+    int anchor_rope = mg->anchor_rope >= 0 ? mg->anchor_rope : mg->vertices[0].first;
+    int anchor_vert = mg->anchor_vert >= 0 ? mg->anchor_vert : mg->vertices[0].second;
+    // Query 3D vertex positions for anchor
+    int vc = rope_sim_get_vertex_count(sim, anchor_rope);
+    if (vc <= 0) return 0;
+    std::vector<float> verts3(static_cast<size_t>(vc) * 3);
+    int got = rope_sim_get_vertices3(sim, anchor_rope, verts3.data(), static_cast<int>(verts3.size()));
+    if (got <= anchor_vert) {
+        // fallback: attach widget directly to the existing vertex
+        int wid = rope_sim_create_dangling_widget(sim, anchor_rope, anchor_vert, static_cast<unsigned int>(mg->lasso_config.widget_type));
+        if (wid < 0) return 0;
+        mg->dangling_widget_id = wid;
+        return 1;
+    }
+    float ax = verts3[anchor_vert * 3 + 0];
+    float ay = verts3[anchor_vert * 3 + 1];
+    float az = verts3[anchor_vert * 3 + 2];
+    // Create a short T-off rope anchored near the anchor vertex so the
+    // hanging endpoints are genuine rope vertices (this lets rings/connectors
+    // slide and bind to the rope correctly). We create a small horizontal
+    // T-off centered at the anchor, create an overlay with two LED keys at
+    // the endpoints, attach the rope to that overlay, and create a heavy
+    // dangling widget attached to the center vertex (vid=1).
+    float hang_len = 48.0f;
+    // choose neighbor to compute tangent
+    int neighbor = (anchor_vert + 1 < got) ? (anchor_vert + 1) : (anchor_vert - 1);
+    if (neighbor < 0) neighbor = anchor_vert;
+    float bx = verts3[neighbor * 3 + 0];
+    float by = verts3[neighbor * 3 + 1];
+    float bz = verts3[neighbor * 3 + 2];
+    float tx = bx - ax; float ty = by - ay; float tz = bz - az;
+    float tlen = std::sqrt(tx*tx + ty*ty + tz*tz);
+    if (tlen > 1e-6f) { tx /= tlen; ty /= tlen; tz /= tlen; }
+    float pxp = -ty; float pyp = tx; // 2D perp
+    float half = hang_len * 0.5f;
+    float e1x = ax + pxp * half;
+    float e1y = ay + pyp * half;
+    float e1z = az;
+    float e2x = ax - pxp * half;
+    float e2y = ay - pyp * half;
+    float e2z = az;
+    int to_segs = 2;
+    int to_rope = rope_sim_add_rope3(sim, e1x, e1y, e1z, e2x, e2y, e2z, to_segs, 0.0f);
+    if (to_rope < 0) {
+        // fallback: create widget attached to anchor vertex
+        int wid_fb = rope_sim_create_dangling_widget(sim, anchor_rope, anchor_vert, static_cast<unsigned int>(mg->lasso_config.widget_type));
+        if (wid_fb < 0) return 0;
+        mg->dangling_widget_id = wid_fb;
+        mg->dangling_widget_rope = anchor_rope;
+        mg->dangling_widget_rope_vid = anchor_vert;
+        mg->dangling_hang_len = hang_len;
+        return 1;
+    }
+
+    // create overlay for the T-off endpoints and attach the rope to the overlay
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    if (cvs) {
+        unsigned long long key_a = 0ull, key_b = 0ull;
+        if (gp_canvas_create_overlay_with_leds(cvs, e1x, e1y, e2x, e2y, &key_a, &key_b)) {
+            gp_canvas_attach_rope_to_overlay(cvs, key_a, key_b, to_rope);
+        }
+    }
+
+    // ensure meta-group sim registration
+    if (mg->sim_group_idx < 0) {
+        int sg = rope_sim_create_meta_group(sim, mg->confinement);
+        if (sg >= 0) mg->sim_group_idx = sg;
+    }
+    try { mg->fifo.configure_default(); } catch(...) {}
+    mg->subgroup_flags = mg->lasso_config.flags;
+
+    if (mg->sim_group_idx >= 0) {
+        // add the T-off center (vid=1) into the meta-group so forces transmit
+        gp_table_meta_add_vertex(ctx, mg, static_cast<int32_t>(to_rope), 1);
+        rope_sim_meta_group_insert(sim, mg->sim_group_idx, mg->anchor_rope, mg->anchor_vert, to_rope, 1);
+        if (mg->dangling_widget_rope >= 0) {
+            rope_sim_meta_group_insert(sim, mg->sim_group_idx, to_rope, 1, mg->dangling_widget_rope, 0);
+        }
+        rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
+    }
+
+    // create heavy widget attached to T-off center
+    int wid = rope_sim_create_dangling_widget(sim, to_rope, 1, static_cast<unsigned int>(mg->lasso_config.widget_type));
+    if (wid >= 0) rope_sim_set_widget_mass(sim, wid, 8.0f);
+    if (wid < 0) {
+        // fallback to attach to anchor
+        int fallback_wid = rope_sim_create_dangling_widget(sim, anchor_rope, anchor_vert, static_cast<unsigned int>(mg->lasso_config.widget_type));
+        if (fallback_wid < 0) return 0;
+        mg->dangling_widget_id = fallback_wid;
+        mg->dangling_widget_rope = anchor_rope;
+        mg->dangling_widget_rope_vid = anchor_vert;
+        mg->dangling_hang_len = hang_len;
+        return 1;
+    }
+
+    mg->dangling_widget_id = wid;
+    mg->dangling_widget_rope = to_rope;
+    mg->dangling_widget_rope_vid = 1;
+    mg->dangling_hang_len = hang_len;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_destroy_widget(GP_TableContext* ctx, GP_MetaGroup* mg) {
+    if (!ctx || !mg) return 0;
+    if (mg->dangling_widget_id < 0) return 1;
+    RopeSim* sim = ctx->rope_sim;
+    if (!sim) return 0;
+    int res = rope_sim_destroy_dangling_widget(sim, mg->dangling_widget_id);
+    mg->dangling_widget_id = -1;
+    return res;
+}
 
 // Attach/detach an external RopeSim instance to the table context.
 // If `sim` is non-null the table will use that simulator for all rope
@@ -2057,6 +2842,28 @@ int32_t gp_table_enqueue_bind_stage_port(GP_TableContext* ctx, unsigned long lon
     op.is_output = is_output;
     op.channel = channel;
     ctx->pending_ops.push_back(op);
+    return 1;
+}
+
+// Set/Get per-edge subgroup flags (color hues, BYREF bit, etc.). Caller should
+// call `gp_table_apply_pending_ops` or similar manager-side sync to have
+// reconfiguration take effect; this function updates the context and triggers
+// an immediate FIFO sync for that edge.
+// Forward declare file-scope sync helper so earlier callers can invoke it.
+static void sync_edge_tensor_for_idx(GP_TableContext* ctx, size_t ei);
+int32_t gp_table_set_edge_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t flags) {
+    if (!ctx) return 0;
+    if (edge_idx < 0 || static_cast<size_t>(edge_idx) >= ctx->edges.size()) return 0;
+    ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)] = flags;
+    // forward declaration may be below; ensure symbol visible by declaring prototype above in file
+    sync_edge_tensor_for_idx(ctx, static_cast<size_t>(edge_idx));
+    return 1;
+}
+
+int32_t gp_table_get_edge_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t* out_flags) {
+    if (!ctx || !out_flags) return 0;
+    if (edge_idx < 0 || static_cast<size_t>(edge_idx) >= ctx->edges.size()) return 0;
+    *out_flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
     return 1;
 }
 
@@ -2309,6 +3116,18 @@ static void sync_edge_tensor_for_idx(GP_TableContext* ctx, size_t ei) {
     };
     bind_one(edge.first);
     bind_one(edge.second);
+
+    // If edge has BYREF subgroup flag, ensure FIFO stride can carry pointer-sized
+    // payloads. We do this in-place so the FIFO object does not need to be
+    // destroyed and re-created; existing samples are preserved where possible.
+    if (ei < ctx->edge_subgroup_flags.size()) {
+        uint32_t f = ctx->edge_subgroup_flags[ei];
+        if (flags_imply_byref(f)) {
+            // ensure stride can hold a pointer
+            EdgeTensorFifo &ef = ctx->edge_fifos[ei];
+            ef.ensure_stride_for_bytes(sizeof(void*));
+        }
+    }
 }
 
 static void sync_edge_tensors_for_key(GP_TableContext* ctx, uint64_t key) {
@@ -2881,6 +3700,39 @@ static void project_rope_vertices_ortho(const float* verts3, int count, float ti
     if (out_min_z > out_max_z) {
         out_min_z = out_max_z = 0.0f;
     }
+}
+
+// C API wrapper: return projected 2D verts for a rope known to this table.
+extern "C" int32_t gp_table_get_projected_rope_vertices(GP_TableContext* ctx, int32_t rope_idx, float* out_xy, int32_t max_count) {
+    if (!ctx || !out_xy) return 0;
+    RopeSim* sim = gp_table_get_rope_sim(ctx);
+    if (!sim) return 0;
+    if (rope_idx < 0) return 0;
+    int vc = rope_sim_get_vertex_count(sim, rope_idx);
+    if (vc <= 0) return 0;
+    if (max_count < 2 * vc) return 0;
+
+    std::vector<float> verts3(static_cast<size_t>(vc) * 3);
+    int got = rope_sim_get_vertices3(sim, rope_idx, verts3.data(), static_cast<int>(verts3.size()));
+    if (got != vc) return 0;
+
+    std::vector<float> proj_xy;
+    std::vector<float> proj_z;
+    float min_z = 0.0f, max_z = 0.0f;
+    project_rope_vertices_ortho(verts3.data(), got, ctx->st.cable_tilt_x, ctx->st.cable_tilt_y, proj_xy, proj_z, min_z, max_z);
+
+    // copy into out_xy interleaved
+    for (int i = 0; i < vc; ++i) {
+        out_xy[2*i+0] = proj_xy[2*i+0];
+        out_xy[2*i+1] = proj_xy[2*i+1];
+    }
+    return vc;
+}
+
+extern "C" int32_t gp_table_set_prospective_rope_index(GP_TableContext* ctx, int32_t rope_idx) {
+    if (!ctx) return 0;
+    ctx->prospective_rope_idx = rope_idx;
+    return 1;
 }
 
 // Build Catmull-Rom samples for a rope and optionally depth samples aligned with them.
@@ -3743,6 +4595,7 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
 int32_t gp_table_clear_edges(GP_TableContext* ctx) {
     if (!ctx) return 0;
     ctx->edges.clear();
+    ctx->rings.clear();
     ctx->edge_uids.clear();
     ctx->next_edge_uid = 1;
     ctx->relax_value.clear();
@@ -3762,6 +4615,172 @@ int32_t gp_table_clear_edges(GP_TableContext* ctx) {
         // if rope_sim is external or null, leave it alone; indices already cleared
     }
     return 1;
+}
+
+extern "C" int32_t gp_table_register_ring_edge(GP_TableContext* ctx, int32_t ring_id, unsigned long long ring_key) {
+    if (!ctx) return -1;
+    GP_TableContext::RingEntry re;
+    re.ring_id = ring_id;
+    re.key = ring_key;
+    re.fifo.configure_default();
+    re.uid = ctx->next_ring_uid++;
+    ctx->rings.push_back(std::move(re));
+    return static_cast<int32_t>(ctx->rings.size() - 1);
+}
+
+extern "C" int32_t gp_table_unregister_ring_edge(GP_TableContext* ctx, int32_t ring_entry_idx) {
+    if (!ctx) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    ctx->rings.erase(ctx->rings.begin() + ring_entry_idx);
+    return 1;
+}
+
+extern "C" int32_t gp_table_get_ring_edge_count(const GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    return static_cast<int32_t>(ctx->rings.size());
+}
+
+extern "C" int32_t gp_table_get_ring_edge(const GP_TableContext* ctx, int32_t idx, int32_t* out_ring_id, unsigned long long* out_key) {
+    if (!ctx || !out_ring_id || !out_key) return 0;
+    if (idx < 0 || idx >= static_cast<int>(ctx->rings.size())) return 0;
+    const auto &re = ctx->rings[static_cast<size_t>(idx)];
+    *out_ring_id = re.ring_id;
+    *out_key = re.key;
+    return 1;
+}
+
+extern "C" int32_t gp_table_ring_set_subgroup_flags(GP_TableContext* ctx, int32_t ring_entry_idx, uint32_t flags) {
+    if (!ctx) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    ctx->rings[static_cast<size_t>(ring_entry_idx)].subgroup_flags = flags;
+    return 1;
+}
+
+extern "C" int32_t gp_table_ring_get_subgroup_flags(GP_TableContext* ctx, int32_t ring_entry_idx, uint32_t* out_flags) {
+    if (!ctx || !out_flags) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    *out_flags = ctx->rings[static_cast<size_t>(ring_entry_idx)].subgroup_flags;
+    return 1;
+}
+
+extern "C" int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, const GP_TableEdgeTensorSpec* spec) {
+    if (!ctx || !spec) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
+    // Mirror gp_table_edge_set_tensor_spec behavior: disallow reconfigure after writes
+    if (re.fifo.impl && re.fifo.impl->write_seq.load(std::memory_order_relaxed) != 0) return 0;
+    std::vector<int32_t> dims;
+    int dc = std::max(0, std::min(8, spec->dim_count));
+    dims.reserve(static_cast<size_t>(dc));
+    for (int i = 0; i < dc; ++i) {
+        int32_t d = spec->dims[i];
+        if (d < 1) d = 1;
+        dims.push_back(d);
+    }
+    size_t slots = spec->slots > 0 ? static_cast<size_t>(spec->slots) : size_t(1);
+    size_t topk = spec->top_k > 0 ? static_cast<size_t>(spec->top_k) : size_t(0);
+    re.fifo.configure(dims, slots, topk);
+    re.batch_metadata = GP_TableEdgeBatchMetadata();
+    return 1;
+}
+
+extern "C" int32_t gp_table_ring_get_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, GP_TableEdgeTensorSpec* out_spec) {
+    if (!ctx || !out_spec) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    *out_spec = ctx->rings[static_cast<size_t>(ring_entry_idx)].fifo.to_spec();
+    return 1;
+}
+
+extern "C" int32_t gp_table_ring_subscribe(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key) {
+    if (!ctx) return 0;
+    return gp_table_ring_subscribe_ex(ctx, ring_entry_idx, subscriber_key, /*start_at_head=*/1);
+}
+
+extern "C" int32_t gp_table_ring_subscribe_ex(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key, int32_t start_at_head) {
+    if (!ctx) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
+    bool ok = re.fifo.subscribe(subscriber_key, start_at_head != 0);
+    if (!ok) return 0;
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        if (static_cast<size_t>(ring_entry_idx) >= ctx->ring_subscriber_slots.size()) ctx->ring_subscriber_slots.resize(ctx->rings.size());
+        auto &map = ctx->ring_subscriber_slots[static_cast<size_t>(ring_entry_idx)];
+        if (map.find(subscriber_key) == map.end()) {
+            uint64_t rid = re.uid;
+            int slot = tm->register_reader_for_edge(rid);
+            if (slot > 0) map[subscriber_key] = slot;
+            auto *r = re.fifo.find_reader(subscriber_key);
+            if (r && slot > 0) {
+                uint64_t seq = r->seq.load(std::memory_order_relaxed);
+                tm->update_reader_seq(slot, seq);
+            }
+        }
+    }
+    return 1;
+}
+
+extern "C" int32_t gp_table_ring_unsubscribe(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key) {
+    if (!ctx) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
+    re.fifo.unsubscribe(subscriber_key);
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        if (static_cast<size_t>(ring_entry_idx) < ctx->ring_subscriber_slots.size()) {
+            auto &m = ctx->ring_subscriber_slots[static_cast<size_t>(ring_entry_idx)];
+            auto it = m.find(subscriber_key);
+            if (it != m.end()) {
+                int slot = it->second;
+                if (slot > 0) tm->unregister_reader_slot(slot);
+                m.erase(it);
+            }
+        }
+    }
+    return 1;
+}
+
+extern "C" int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped) {
+    if (out_dropped) *out_dropped = 0;
+    if (!ctx || !sample || sample_len < 0) return 0;
+    if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
+    auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
+    bool dropped = false;
+    uint64_t rid = re.uid;
+    uint32_t flags = re.subgroup_flags;
+    bool ok = false;
+    if (flags_imply_byref(flags)) {
+        size_t sample_bytes = static_cast<size_t>(sample_len) * sizeof(float);
+        size_t alloc_sz = sizeof(BoxedSample) + sample_bytes;
+        uint8_t* buf = static_cast<uint8_t*>(std::malloc(alloc_sz));
+        if (!buf) { if (out_dropped) *out_dropped = 1; return 0; }
+        BoxedSample* box = reinterpret_cast<BoxedSample*>(buf);
+        box->magic = BOXED_SAMPLE_MAGIC;
+        box->sample_len = sample_len;
+        uint8_t* payload = buf + sizeof(BoxedSample);
+        std::memcpy(payload, sample, sample_bytes);
+        ok = re.fifo.push_ptr(rid, writer_key, static_cast<void*>(box), &dropped);
+    } else {
+        ok = re.fifo.push(rid, writer_key, sample, static_cast<size_t>(sample_len), &dropped);
+    }
+    if (out_dropped && dropped) *out_dropped = 1;
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        if (static_cast<size_t>(ring_entry_idx) < ctx->ring_subscriber_slots.size()) {
+            auto &m = ctx->ring_subscriber_slots[static_cast<size_t>(ring_entry_idx)];
+            std::vector<std::pair<uint64_t,int>> subs; subs.reserve(m.size());
+            for (const auto &kv : m) subs.emplace_back(kv.first, kv.second);
+            for (const auto &kv : subs) {
+                uint64_t subscriber_key = kv.first; int slot = kv.second;
+                if (slot <= 0) continue;
+                auto *r = re.fifo.find_reader(subscriber_key);
+                if (!r) continue;
+                uint64_t seq = r->seq.load(std::memory_order_relaxed);
+                tm->update_reader_seq(slot, seq);
+            }
+        }
+    }
+    return ok ? 1 : 0;
 }
 
 int32_t gp_table_get_edge_count(const GP_TableContext* ctx) {
@@ -3886,7 +4905,29 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     bool dropped = false;
     uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
-    bool ok = fifo.push(edge_id, writer_key, sample, static_cast<size_t>(sample_len), &dropped);
+
+    // Inspect edge subgroup flags to determine publish behavior. We use a
+    // simple switch so future policies can be tacked on easily.
+    uint32_t flags = 0;
+    if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
+    bool ok = false;
+    if (flags_imply_byref(flags)) {
+        // BYREF: box the float sample and publish its pointer instead so
+        // consumers receive by-reference payloads. Box format: [BoxedSample][float data]
+        size_t sample_bytes = static_cast<size_t>(sample_len) * sizeof(float);
+        size_t alloc_sz = sizeof(BoxedSample) + sample_bytes;
+        uint8_t* buf = static_cast<uint8_t*>(std::malloc(alloc_sz));
+        if (!buf) { if (out_dropped) *out_dropped = 1; return 0; }
+        BoxedSample* box = reinterpret_cast<BoxedSample*>(buf);
+        box->magic = BOXED_SAMPLE_MAGIC;
+        box->sample_len = sample_len;
+        uint8_t* payload = buf + sizeof(BoxedSample);
+        std::memcpy(payload, sample, sample_bytes);
+        ok = fifo.push_ptr(edge_id, writer_key, static_cast<void*>(box), &dropped);
+    } else {
+        // Normal float path
+        ok = fifo.push(edge_id, writer_key, sample, static_cast<size_t>(sample_len), &dropped);
+    }
     if (out_dropped && dropped) *out_dropped = 1;
     // After a publish, the FIFO implementation may have advanced reader sequences
     // (e.g., during top-k trimming). Ensure the ThreadManager has up-to-date
@@ -3942,14 +4983,129 @@ int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, u
     return 1;
 }
 
+// Pointer-oriented publish: publish an opaque pointer into the edge FIFO.
+int32_t gp_table_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void* ptr, int32_t* out_dropped) {
+    if (out_dropped) *out_dropped = 0;
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    bool dropped = false;
+    uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+    bool ok = fifo.push_ptr(edge_id, writer_key, ptr, &dropped);
+    if (out_dropped && dropped) *out_dropped = 1;
+    // Sync ThreadManager reader sequences similar to float publish.
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        std::vector<std::pair<uint64_t,int>> subs;
+        subs.reserve(m.size());
+        for (const auto &kv : m) subs.emplace_back(kv.first, kv.second);
+        for (const auto &kv : subs) {
+            uint64_t subscriber_key = kv.first;
+            int slot = kv.second;
+            if (slot <= 0) continue;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (!r) continue;
+            uint64_t seq = r->seq.load(std::memory_order_relaxed);
+            tm->update_reader_seq(slot, seq);
+        }
+    }
+    return ok ? 1 : 0;
+}
+
+// Generic wrappers to provide a neutral edge API surface. These forward to
+// the table-specific implementations so callers outside the table system can
+// use a stable `gp_edge_*` API while we evolve internals.
+int32_t gp_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped) {
+    return gp_table_edge_publish(ctx, edge_idx, writer_key, sample, sample_len, out_dropped);
+}
+int32_t gp_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms) {
+    return gp_table_edge_publish_blocking(ctx, edge_idx, writer_key, sample, sample_len, out_dropped, timeout_ms);
+}
+int32_t gp_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void* ptr, int32_t* out_dropped) {
+    return gp_table_edge_publish_ptr(ctx, edge_idx, writer_key, ptr, out_dropped);
+}
+int32_t gp_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr) {
+    return gp_table_edge_consume_ptr(ctx, edge_idx, subscriber_key, out_ptr);
+}
+
+int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr) {
+    if (out_ptr) *out_ptr = nullptr;
+    if (!ctx || !out_ptr) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    void* p = nullptr;
+    bool ok = fifo.pop_ptr(subscriber_key, &p);
+    if (!ok) return 0;
+    if (out_ptr) *out_ptr = p;
+    // Notify ThreadManager of read advancement
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        auto it = m.find(subscriber_key);
+        if (it != m.end()) {
+            int slot = it->second;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (r && slot > 0) {
+                uint64_t seq = r->seq.load(std::memory_order_relaxed);
+                tm->update_reader_seq(slot, seq);
+            }
+        }
+    }
+    return 1;
+}
+
 int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written) {
     if (out_written) *out_written = 0;
     if (!ctx || !out_sample || out_len < 0) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    // If the edge is configured BYREF, the FIFO carries pointers to boxed
+    // float samples. In that case, consume via pop_ptr and transparently
+    // unbox into the caller-provided float buffer and free the boxed memory.
     size_t wrote = 0;
-    bool ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+    uint32_t flags = 0;
+    if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
+    bool ok = false;
+    if (flags_imply_byref(flags)) {
+        // Peek first: if there's a pointer and it's a boxed sample, then
+        // consume it; if it's a non-boxed pointer (e.g., EventPayload)
+        // do not advance the reader here — let pointer-oriented APIs
+        // (`gp_table_edge_consume_ptr`) handle it.
+        void* ppeek = nullptr;
+        if (fifo.peek_ptr(subscriber_key, &ppeek)) {
+            if (!ppeek) return 0;
+            BoxedSample* boxpeek = reinterpret_cast<BoxedSample*>(ppeek);
+            if (boxpeek->magic == BOXED_SAMPLE_MAGIC) {
+                // Now actually pop the pointer and unbox.
+                void* p = nullptr;
+                if (!fifo.pop_ptr(subscriber_key, &p)) return 0;
+                if (!p) return 0;
+                BoxedSample* box = reinterpret_cast<BoxedSample*>(p);
+                int need = box->sample_len;
+                if (out_len < need) {
+                    std::free(box);
+                    return 0;
+                }
+                float* payload = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample));
+                std::memcpy(out_sample, payload, static_cast<size_t>(need) * sizeof(float));
+                std::free(box);
+                wrote = static_cast<size_t>(need);
+                ok = true;
+            } else {
+                // A raw pointer was delivered; do not consume here.
+                return 0;
+            }
+        } else {
+            // No pointer available — try float path.
+            ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+        }
+    } else {
+        ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+    }
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
     // Notify ThreadManager of reader advancement, if registered.
@@ -3969,6 +5125,37 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     return 1;
 }
 
+int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written) {
+    if (out_written) *out_written = 0;
+    if (!ctx || !out_sample || out_len < 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    size_t wrote = 0;
+    uint32_t flags = 0;
+    if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
+    bool ok = false;
+    if (flags_imply_byref(flags)) {
+        void* p = nullptr;
+        if (!fifo.peek_ptr(subscriber_key, &p)) return 0;
+        if (!p) return 0;
+        BoxedSample* box = reinterpret_cast<BoxedSample*>(p);
+        if (box->magic != BOXED_SAMPLE_MAGIC) return 0;
+        int need = box->sample_len;
+        if (out_len < need) return 0;
+        float* payload = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample));
+        std::memcpy(out_sample, payload, static_cast<size_t>(need) * sizeof(float));
+        wrote = static_cast<size_t>(need);
+        ok = true;
+    } else {
+        ok = fifo.peek(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+    }
+    if (out_written) *out_written = static_cast<int32_t>(wrote);
+    if (!ok) return 0;
+    // Do NOT notify ThreadManager because we didn't advance the reader.
+    return 1;
+}
+
 int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written, int32_t timeout_ms) {
     if (out_written) *out_written = 0;
     if (!ctx || !out_sample || out_len < 0) return 0;
@@ -3976,7 +5163,56 @@ int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, u
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     size_t wrote = 0;
-    bool ok = fifo.pop_blocking(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote, timeout_ms);
+    uint32_t flags = 0;
+    if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
+    bool ok = false;
+    if (flags_imply_byref(flags)) {
+        // Wait for either a boxed pointer or a float sample. We'll loop until
+        // the timeout expires. To avoid busy-waiting we sleep in short
+        // intervals while checking for availability.
+        using clock = std::chrono::steady_clock;
+        auto start = clock::now();
+        auto deadline = (timeout_ms < 0) ? clock::time_point::max() : (start + std::chrono::milliseconds(timeout_ms));
+        while (true) {
+            void* ppeek = nullptr;
+            if (fifo.peek_ptr(subscriber_key, &ppeek)) {
+                if (!ppeek) return 0;
+                BoxedSample* boxpeek = reinterpret_cast<BoxedSample*>(ppeek);
+                if (boxpeek->magic == BOXED_SAMPLE_MAGIC) {
+                    // consume boxed sample
+                    void* p = nullptr;
+                    if (!fifo.pop_ptr(subscriber_key, &p)) return 0;
+                    if (!p) return 0;
+                    BoxedSample* box = reinterpret_cast<BoxedSample*>(p);
+                    int need = box->sample_len;
+                    if (out_len < need) { std::free(box); return 0; }
+                    float* payload = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample));
+                    std::memcpy(out_sample, payload, static_cast<size_t>(need) * sizeof(float));
+                    std::free(box);
+                    wrote = static_cast<size_t>(need);
+                    ok = true;
+                    break;
+                } else {
+                    // raw pointer delivered; don't consume here
+                    return 0;
+                }
+            }
+            // Try to pop a float sample with the remaining timeout
+            if (timeout_ms == 0) break;
+            auto now = clock::now();
+            if (now >= deadline) break;
+            int remaining_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+            if (remaining_ms <= 0) break;
+            if (fifo.pop_blocking(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote, remaining_ms)) {
+                ok = true;
+                break;
+            }
+            // brief sleep to yield CPU before re-checking
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    } else {
+        ok = fifo.pop_blocking(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote, timeout_ms);
+    }
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
     ThreadManager* tm = ThreadManager::global();
@@ -4025,6 +5261,13 @@ int32_t gp_table_edge_set_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx,
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_subgroup_flags.size())) return 0;
     ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)] = flags;
+    return 1;
+}
+
+extern "C" int32_t gp_table_get_edge_rope_index(const GP_TableContext* ctx, int32_t edge_idx, int32_t* out_rope_idx) {
+    if (!ctx || !out_rope_idx) return 0;
+    if (edge_idx < 0 || edge_idx >= static_cast<int>(ctx->rope_sim_idx.size())) { *out_rope_idx = -1; return 0; }
+    *out_rope_idx = ctx->rope_sim_idx[static_cast<size_t>(edge_idx)];
     return 1;
 }
 
@@ -4971,6 +6214,23 @@ int32_t gp_table_render_rgba_with_state(
         uint32_t r_orig = static_cast<uint32_t>(key >> 32);
         uint32_t c_idx = static_cast<uint32_t>((key >> 16) & 0xFFFFu);
         uint32_t led = static_cast<uint32_t>(key & 0xFFFFu);
+        // First: allow canonical root keys mapped to overlays to resolve to overlay coords
+        GP_CanvasContext* canvas = gp_canvas_get_singleton();
+        if (canvas) {
+            int ox = -1, oy = -1;
+            if (gp_canvas_resolve_canonical_key(canvas, key, &ox, &oy)) {
+                out.x = ox; out.y = oy; out.is_input = out.is_output = false;
+                return true;
+            }
+        }
+        // Overlay sentinel keys: module id 0xFFFFFFFF indicates a canvas overlay
+        if (r_orig == 0xFFFFFFFFu) {
+            int ox = -1, oy = -1;
+            if (!canvas) return false;
+            if (!gp_canvas_resolve_overlay_key(canvas, key, &ox, &oy)) return false;
+            out.x = ox; out.y = oy; out.is_input = out.is_output = false;
+            return true;
+        }
         int vis_idx = find_visible_row(r_orig);
         if (vis_idx < 0 || vis_idx >= static_cast<int>(vis_rows.size())) return false;
         if (c_idx >= ctx->cols.size() || c_idx >= 8) return false;
@@ -5219,6 +6479,11 @@ int32_t gp_table_render_rgba_with_state(
             }
         }
 
+        // no-op here: dangling ropes should be integrated into meta-group
+        // ordering so the sim connects them via edge-springs. Avoid moving
+        // endpoints at render-time; use insertion into the sim meta-group
+        // to make the short rope participate in ring physics.
+
         // Step the simulator for this frame: allow more whip (lower damping) but more constraint iterations to settle
         float gravity = 800.0f;
         int constraint_iters = 8;
@@ -5296,6 +6561,14 @@ int32_t gp_table_render_rgba_with_state(
             int rope_idx = ctx->rope_sim_idx[ei];
             if (rope_idx < 0) continue;
             int vc = rope_sim_get_vertex_count(ctx->rope_sim, rope_idx);
+            if (getenv("NODUS_DEBUG_EDGE") != nullptr) {
+                uint32_t flags = 0u;
+                if (ei < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[ei];
+                int colored = (flags != 0u) ? 1 : 0;
+                printf("[EDGE_DEBUG] ei=%llu rope=%d vc=%d subgroup=0x%08x colored=%d fifo_has_state=%d fifo_core=%.2f\n",
+                    static_cast<unsigned long long>(ei), rope_idx, vc, flags, colored, fifo_has_state ? 1 : 0, fifo_core_intensity);
+                fflush(stdout);
+            }
             if (vc < 2) continue;
             std::vector<float> verts3(static_cast<size_t>(vc) * 3);
             int got = rope_sim_get_vertices3(ctx->rope_sim, rope_idx, verts3.data(), static_cast<int>(verts3.size()));

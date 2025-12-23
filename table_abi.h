@@ -6,6 +6,10 @@
 // does not render text; callers can overlay text separately using their text system.
 
 #include <stdint.h>
+// Forward-declare LassoConfig (defined in lasso_config.h). We avoid including
+// the header here to keep this file friendly to C/C++ consumers and
+// to prevent requiring the header search path at compile time for all units.
+typedef struct LassoConfig LassoConfig;
 
 #ifdef __cplusplus
 extern "C" {
@@ -186,6 +190,12 @@ typedef struct GP_TableRenderState {
 // Opaque stateful table context. Holds style/columns/rows so callers can update incrementally
 // and render repeatedly without repassing everything.
 typedef struct GP_TableContext GP_TableContext;
+typedef struct GP_MetaGroup GP_MetaGroup;
+
+// Ring topology selection for meta-groups
+#define GP_META_RING_RIBBON 0 // simple chain between consecutive members
+#define GP_META_RING_CLOSED 1 // chain + close last->first
+#define GP_META_RING_DENSE 2  // closed + additional cross-links for small groups
 
 // Calculate output size; returns 1 on success.
 int32_t gp_table_calc_size(const GP_TableStyle* style, int32_t row_count, int32_t col_count, GP_TableGeom* out_geom);
@@ -256,6 +266,52 @@ int32_t gp_table_render_rgba_with_state(
     int32_t* hitboxes_written);
 
 // Interaction and state helpers ------------------------------------------------
+
+// Get projected 2D rope vertices for the specified rope index in table-local
+// coordinates. Projection uses the table's internal cable tilt (orthographic
+// tilt) so callers can test against the same coordinates the renderer uses.
+// `out_xy` should be a float array sized >= 2 * vertex_count. Returns vertex
+// count on success, or 0 on failure.
+int32_t gp_table_get_projected_rope_vertices(GP_TableContext* ctx, int32_t rope_idx, float* out_xy, int32_t max_count);
+
+// Meta-group enumeration/accessors
+int32_t gp_table_get_meta_group_count(const GP_TableContext* ctx);
+GP_MetaGroup* gp_table_get_meta_group(GP_TableContext* ctx, int32_t idx);
+int32_t gp_table_meta_get_vertex(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t idx, int32_t* out_rope_idx, int32_t* out_vertex_idx);
+int32_t gp_table_meta_get_vertex_count(GP_TableContext* ctx, GP_MetaGroup* mg);
+int32_t gp_table_meta_get_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, LassoConfig* out_cfg);
+int32_t gp_table_meta_get_subgroup_flags(GP_TableContext* ctx, GP_MetaGroup* mg, uint32_t* out_flags);
+// If the meta-group has a dangling widget rope, return its rope index and vertex index.
+int32_t gp_table_meta_get_dangling_rope_info(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_rope_idx, int32_t* out_vertex_idx);
+// If the meta-group is registered with a RopeSim, return its sim group index.
+// Returns 1 on success and sets out_sim_idx, 0 on failure.
+int32_t gp_table_meta_get_sim_group_index(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_sim_idx);
+
+// Widget helpers
+int32_t gp_table_get_widget_position(GP_TableContext* ctx, int32_t widget_id, float* out_xyz);
+int32_t gp_table_meta_get_dangling_widget_id(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_widget_id);
+
+// Set or clear the table's prospective rope index used for rendering a
+// temporary rope while the user is interacting. Pass -1 to clear.
+int32_t gp_table_set_prospective_rope_index(GP_TableContext* ctx, int32_t rope_idx);
+
+// Insert a vertex into the simulator rope at segment `seg_index` and param t (0..1).
+// Returns new vertex id >=0 on success or -1 on failure.
+int32_t gp_table_rope_insert_vertex(GP_TableContext* ctx, int32_t rope_idx, int32_t seg_index, float t);
+
+// Create/destroy a sliding ring attached to a rope. `u` is parametric 0..1
+// along the rope. Returns ring id >=0 on success or -1 on failure.
+int32_t gp_table_create_ring(GP_TableContext* ctx, int32_t rope_idx, float u);
+int32_t gp_table_destroy_ring(GP_TableContext* ctx, int32_t ring_id);
+// Move a ring towards `target_u` at `speed` (parametric units per second).
+int32_t gp_table_set_ring_target(GP_TableContext* ctx, int32_t ring_id, float target_u, float speed);
+// Query current ring u parameter. Returns 1 on success.
+int32_t gp_table_get_ring_u(GP_TableContext* ctx, int32_t ring_id, float* out_u);
+
+// Register a ring id created in the simulator with the table so it will be
+// enumerated and rendered like an edge. Returns ring entry index or -1 on error.
+int32_t gp_table_register_ring_edge(GP_TableContext* ctx, int32_t ring_id, unsigned long long ring_key);
+
 
 // Deliver a click (table-local pixel coords) to the context. If a hit was
 // found and processed, fills `out_hit` (if non-null) with the hit info (row/col
@@ -358,6 +414,15 @@ int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, u
 // Consume the next available tensor sample for a subscriber. Returns 1 if a
 // sample was written to `out_sample` (length must match the tensor stride).
 int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written);
+// Non-destructive peek: copy the next available sample into out_sample without
+// advancing the subscriber head. Returns 1 on success and sets out_written.
+int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written);
+
+// Pointer-oriented edge publish/consume helpers.
+// These mirror the float-based APIs but carry opaque pointers across the
+// per-edge FIFO. The FIFO retains the same sequencing/reader semantics.
+int32_t gp_table_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void* ptr, int32_t* out_dropped);
+int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr);
 // Blocking consume with optional timeout (ms). timeout_ms < 0 waits forever.
 // Returns 1 on success, 0 on failure/timeout.
 int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written, int32_t timeout_ms);
@@ -368,6 +433,8 @@ int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx,
 // Set/get policy subgroup flags for a specific edge. These flags are used to
 // derive color wheel hues for rendering and policy grouping.
 int32_t gp_table_edge_set_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t flags);
+// Query the RopeSim index associated with an edge, or -1 if none.
+int32_t gp_table_get_edge_rope_index(const GP_TableContext* ctx, int32_t edge_idx, int32_t* out_rope_idx);
 int32_t gp_table_edge_get_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t* out_flags);
 int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx);
 int32_t gp_table_edge_index_for_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b, int32_t* out_edge_idx);
@@ -375,6 +442,23 @@ int32_t gp_table_edge_set_delta_mode(GP_TableContext* ctx, int32_t edge_idx, int
 int32_t gp_table_edge_set_order_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t order_mode);
 int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx);
 int32_t gp_table_remove_edge_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b);
+
+// Ring-as-edge API: register a simulated ring (created by rope_sim_create_ring)
+// as a drawable/inspectable element with its own FIFO/color metadata. Returns
+// a ring_entry index >=0 on success, or -1 on failure.
+int32_t gp_table_register_ring_edge(GP_TableContext* ctx, int32_t ring_id, unsigned long long ring_key);
+int32_t gp_table_unregister_ring_edge(GP_TableContext* ctx, int32_t ring_entry_idx);
+int32_t gp_table_get_ring_edge_count(const GP_TableContext* ctx);
+int32_t gp_table_get_ring_edge(const GP_TableContext* ctx, int32_t idx, int32_t* out_ring_id, unsigned long long* out_key);
+int32_t gp_table_ring_set_subgroup_flags(GP_TableContext* ctx, int32_t ring_entry_idx, uint32_t flags);
+int32_t gp_table_ring_get_subgroup_flags(GP_TableContext* ctx, int32_t ring_entry_idx, uint32_t* out_flags);
+int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, const GP_TableEdgeTensorSpec* spec);
+// Ring FIFO publish/subscribe APIs (mirror per-edge APIs)
+int32_t gp_table_ring_subscribe(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key);
+int32_t gp_table_ring_subscribe_ex(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key, int32_t start_at_head);
+int32_t gp_table_ring_unsubscribe(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key);
+int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped);
+int32_t gp_table_ring_get_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, GP_TableEdgeTensorSpec* out_spec);
 
 // Queued UI operations: enqueue structural edits from UI threads to be applied
 // by the manager thread. These mirror immediate APIs but defer application.
@@ -461,6 +545,57 @@ int32_t gp_table_relax_set_params(GP_TableContext* ctx, float stiffness, float d
 int32_t gp_table_relax_step(GP_TableContext* ctx, float dt);
 int32_t gp_table_relax_update(GP_TableContext* ctx); // uses wall time internally
 int32_t gp_table_relax_run_until_stable(GP_TableContext* ctx);
+
+// Meta-group API: groups of simulated rope vertices used by the Meta-Edge Lasso
+// tool. A meta-group owns a list of (rope_idx, vertex_idx) bindings and a
+// confinement parameter. These APIs are lightweight: groups are created and
+// owned by the caller (the table retains a record for runtime queries).
+GP_MetaGroup* gp_table_meta_create(GP_TableContext* ctx);
+int32_t gp_table_meta_destroy(GP_TableContext* ctx, GP_MetaGroup* mg);
+int32_t gp_table_meta_add_vertex(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx);
+int32_t gp_table_meta_get_vertex_count(GP_TableContext* ctx, GP_MetaGroup* mg);
+
+// Set/get a preferred anchor for a meta-group so helpers (widgets) attach
+// to the specified `(rope_idx, vertex_idx)`. Returns 1 on success.
+int32_t gp_table_meta_set_anchor(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx);
+int32_t gp_table_meta_get_anchor(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_rope_idx, int32_t* out_vertex_idx);
+
+// Configure lasso meta-group behavior. `cfg` may be NULL to clear and
+// resets to defaults. Returns 1 on success.
+int32_t gp_table_meta_set_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, const LassoConfig* cfg);
+int32_t gp_table_meta_get_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, LassoConfig* out_cfg);
+// Create a dangling widget attached to a meta-group. The widget is created
+// in the attached RopeSim (if any) and follows the first vertex in the
+// meta-group. Returns 1 on success.
+int32_t gp_table_meta_create_widget(GP_TableContext* ctx, GP_MetaGroup* mg);
+int32_t gp_table_meta_destroy_widget(GP_TableContext* ctx, GP_MetaGroup* mg);
+// Enable/disable edge-springs for a meta-group. Springs connect consecutive
+// vertices in the group's member list and will reduce their rest length
+// over time until `min_rest` at the given `reduce_rate` (units per second).
+int32_t gp_table_meta_enable_edge_springs(GP_TableContext* ctx, GP_MetaGroup* mg, float min_rest, float reduce_rate);
+int32_t gp_table_meta_disable_edge_springs(GP_TableContext* ctx, GP_MetaGroup* mg);
+// Set ring topology mode for an existing meta-group. Mode should be one of
+// `GP_META_RING_RIBBON`, `GP_META_RING_CLOSED`, or `GP_META_RING_DENSE`.
+// Removed table-side ring-mode API — use sim-only toggle instead.
+// NOTE: sim-only meta-group operations should be done via `rope_sim` APIs directly.
+// Retrieve the current ring mode for a meta-group (0=ribbon,1=closed,2=dense)
+int32_t gp_table_meta_get_ring_mode(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_mode);
+// Per-rope rest-length control wrappers
+int32_t gp_table_rope_modify_rest_length(GP_TableContext* ctx, int32_t rope_idx, float delta);
+int32_t gp_table_rope_set_rest_target(GP_TableContext* ctx, int32_t rope_idx, float target_rest, float rate, float delay);
+int32_t gp_table_rope_get_rest_length(GP_TableContext* ctx, int32_t rope_idx, float* out_rest);
+// Per-rope radius accessors
+int32_t gp_table_rope_set_radius(GP_TableContext* ctx, int32_t rope_idx, float radius);
+int32_t gp_table_rope_get_radius(GP_TableContext* ctx, int32_t rope_idx, float* out_radius);
+// Insert a vertex into a rope at fractional position along segment (seg_index,t).
+// Returns new vertex index or -1.
+int32_t gp_table_rope_insert_vertex(GP_TableContext* ctx, int32_t rope_idx, int32_t seg_index, float t);
+
+// Simulator-only helper: create a transient sim meta-group connecting the
+// endpoints of `rope_idx` and enable edge-springs so additional physics
+// edges are evaluated. Returns 1 on success, 0 on failure.
+int32_t gp_table_sim_add_meta_group_for_rope(GP_TableContext* ctx, int32_t rope_idx);
+
 
 // Attach or detach an external RopeSim instance to the table context.
 // If `sim` is non-null the table will use that simulator for all rope
@@ -549,6 +684,17 @@ int32_t gp_table_list_templates(const char* dir, char* out_buf, int32_t out_len)
 // template APIs. Passing NULL or empty string clears the library dir.
 int32_t gp_table_set_library_dir(const char* dir);
 int32_t gp_table_get_library_dir(char* out_buf, int32_t out_len);
+
+// Generic edge API wrappers (convenience). These forward to the table-specific
+// implementations so external callers can use a stable gp_edge_* surface.
+int32_t gp_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped);
+int32_t gp_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms);
+int32_t gp_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void* ptr, int32_t* out_dropped);
+int32_t gp_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr);
+
+// Configure mapping from subgroup color index (0..4) to FIFO flags.
+// This lets users map UI subgroup colors to edge FIFO behavior (e.g. BYREF).
+extern "C" int32_t gp_table_set_subgroup_color_mapping(int32_t color_idx, uint32_t fifo_flags);
 
 #ifdef __cplusplus
 }

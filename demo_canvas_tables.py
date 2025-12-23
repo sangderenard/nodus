@@ -45,8 +45,6 @@ class CanvasModuleDesc(ctypes.Structure):
         ("y", ctypes.c_int32),
         ("w", ctypes.c_int32),
         ("h", ctypes.c_int32),
-        ("left_contacts", ctypes.c_int32),
-        ("right_contacts", ctypes.c_int32),
         ("label", ctypes.c_char * 64),
     ]
 
@@ -189,8 +187,6 @@ def make_module(x, y, w, h, left, right, label: str) -> CanvasModuleDesc:
     m.y = int(y)
     m.w = int(w)
     m.h = int(h)
-    m.left_contacts = int(left)
-    m.right_contacts = int(right)
     b = label.encode("utf-8")[:63]
     padded = b + b"\0" * (64 - len(b))
     m.label = padded

@@ -32,16 +32,12 @@ struct RopeSim {
     std::vector<std::unique_ptr<Rope>> ropes;
 };
 
+// forward-declare internal augmented sim so creation can return the internal type
+struct RopeSim_internal;
+
 extern "C" {
 
-RopeSim* rope_sim_create(int max_ropes, int max_segments_per_rope) {
-    if (max_ropes <= 0 || max_segments_per_rope <= 0) return nullptr;
-    RopeSim* s = new RopeSim();
-    s->max_ropes = max_ropes;
-    s->max_segments_per_rope = max_segments_per_rope;
-    s->ropes.reserve(static_cast<std::size_t>(max_ropes));
-    return s;
-}
+RopeSim* rope_sim_create(int max_ropes, int max_segments_per_rope);
 
 void rope_sim_destroy(RopeSim* s) {
     if (!s) return;
@@ -110,143 +106,9 @@ static inline void verlet_step_point(float &x, float &y, float &z, float &px, fl
     x = nx; y = ny; z = nz;
 }
 
-int rope_sim_step(RopeSim* s, float dt, float gravity, int constraint_iters, float damping) {
-    if (!s) return 0;
-    if (dt <= 0.0f) return 0;
-    // acceleration per-step
-    const float gx = 0.0f;
-    const float gy = gravity >= 0.0f ? gravity : 0.0f;
-    const float gz = 0.0f; // neutral along depth; endpoints encode plug depth
-
-    // integrate all ropes (vertex-wise Verlet)
-    for (auto &rp : s->ropes) {
-        if (!rp) continue;
-        int verts = rp->segments + 1;
-        // endpoints are fixed (index 0 and verts-1)
-#ifdef EIGEN_SIM
-        // vectorized Verlet using Eigen maps
-        using namespace Eigen;
-        Map<VectorXf> px_map(rp->pos_x.data(), verts);
-        Map<VectorXf> py_map(rp->pos_y.data(), verts);
-        Map<VectorXf> pz_map(rp->pos_z.data(), verts);
-        Map<VectorXf> prevx_map(rp->prev_x.data(), verts);
-        Map<VectorXf> prevy_map(rp->prev_y.data(), verts);
-        Map<VectorXf> prevz_map(rp->prev_z.data(), verts);
-        if (verts > 2) {
-            VectorXf temp_x = px_map.segment(1, verts - 2);
-            VectorXf temp_y = py_map.segment(1, verts - 2);
-            VectorXf temp_z = pz_map.segment(1, verts - 2);
-            // vx = x - px
-            VectorXf vx = temp_x - prevx_map.segment(1, verts - 2);
-            VectorXf vy = temp_y - prevy_map.segment(1, verts - 2);
-            VectorXf vz = temp_z - prevz_map.segment(1, verts - 2);
-            temp_x = temp_x + vx * (1.0f - damping) + VectorXf::Constant(verts - 2, gx * dt * dt);
-            temp_y = temp_y + vy * (1.0f - damping) + VectorXf::Constant(verts - 2, gy * dt * dt);
-            temp_z = temp_z + vz * (1.0f - damping) + VectorXf::Constant(verts - 2, gz * dt * dt);
-            prevx_map.segment(1, verts - 2) = px_map.segment(1, verts - 2);
-            prevy_map.segment(1, verts - 2) = py_map.segment(1, verts - 2);
-            prevz_map.segment(1, verts - 2) = pz_map.segment(1, verts - 2);
-            px_map.segment(1, verts - 2) = temp_x;
-            py_map.segment(1, verts - 2) = temp_y;
-            pz_map.segment(1, verts - 2) = temp_z;
-        }
-#else
-        for (int vi = 1; vi < verts - 1; ++vi) {
-            float &x = rp->pos_x[vi];
-            float &y = rp->pos_y[vi];
-            float &z = rp->pos_z[vi];
-            float &px = rp->prev_x[vi];
-            float &py = rp->prev_y[vi];
-            float &pz = rp->prev_z[vi];
-            verlet_step_point(x, y, z, px, py, pz, dt, gx, gy, gz, damping);
-        }
-#endif
-    }
-
-    // constraints: keep segment lengths close to rest_len
-    for (int it = 0; it < std::max(1, constraint_iters); ++it) {
-        for (auto &rp : s->ropes) {
-            if (!rp) continue;
-            int verts = rp->segments + 1;
-            float rl = rp->rest_len;
-            // ensure endpoints fixed positions
-            if (verts <= 1) continue;
-#ifdef EIGEN_SIM
-            using namespace Eigen;
-            Map<VectorXf> px_map(rp->pos_x.data(), verts);
-            Map<VectorXf> py_map(rp->pos_y.data(), verts);
-            Map<VectorXf> pz_map(rp->pos_z.data(), verts);
-            // compute differences for segments: dx = x[i+1]-x[i]
-            VectorXf dx = px_map.segment(1, verts - 1) - px_map.segment(0, verts - 1);
-            VectorXf dy = py_map.segment(1, verts - 1) - py_map.segment(0, verts - 1);
-            VectorXf dz = pz_map.segment(1, verts - 1) - pz_map.segment(0, verts - 1);
-            VectorXf d = (dx.array().square() + dy.array().square() + dz.array().square()).sqrt();
-            // apply corrections segment-wise (avoid divide by zero)
-            for (int si = 0; si < rp->segments; ++si) {
-                float di = d[si];
-                if (di <= 1e-6f) continue;
-                float diff = (di - rl) / di;
-                float cx = dx[si] * 0.5f * diff;
-                float cy = dy[si] * 0.5f * diff;
-                float cz = dz[si] * 0.5f * diff;
-                px_map[si] += cx;
-                py_map[si] += cy;
-                pz_map[si] += cz;
-                px_map[si+1] -= cx;
-                py_map[si+1] -= cy;
-                pz_map[si+1] -= cz;
-            }
-            // enforce endpoints
-            px_map[0] = rp->ax; py_map[0] = rp->ay; pz_map[0] = rp->az;
-            px_map[verts-1] = rp->bx; py_map[verts-1] = rp->by; pz_map[verts-1] = rp->bz;
-#else
-            rp->pos_x[0] = rp->ax; rp->pos_y[0] = rp->ay; rp->pos_z[0] = rp->az;
-            rp->pos_x[verts-1] = rp->bx; rp->pos_y[verts-1] = rp->by; rp->pos_z[verts-1] = rp->bz;
-            for (int si = 0; si < rp->segments; ++si) {
-                int i0 = si;
-                int i1 = si + 1;
-                float x0 = rp->pos_x[i0];
-                float y0 = rp->pos_y[i0];
-                float z0 = rp->pos_z[i0];
-                float x1 = rp->pos_x[i1];
-                float y1 = rp->pos_y[i1];
-                float z1 = rp->pos_z[i1];
-                float dx = x1 - x0;
-                float dy = y1 - y0;
-                float dz = z1 - z0;
-                float d = std::sqrt(dx*dx + dy*dy + dz*dz);
-                if (d <= 1e-6f) continue;
-                float diff = (d - rl) / d;
-                bool a_fixed = (i0 == 0);
-                bool b_fixed = (i1 == verts - 1);
-                if (a_fixed && b_fixed) {
-                    continue;
-                } else if (a_fixed) {
-                    rp->pos_x[i1] = x1 - dx * diff;
-                    rp->pos_y[i1] = y1 - dy * diff;
-                    rp->pos_z[i1] = z1 - dz * diff;
-                } else if (b_fixed) {
-                    rp->pos_x[i0] = x0 + dx * diff;
-                    rp->pos_y[i0] = y0 + dy * diff;
-                    rp->pos_z[i0] = z0 + dz * diff;
-                } else {
-                    rp->pos_x[i0] = x0 + dx * 0.5f * diff;
-                    rp->pos_y[i0] = y0 + dy * 0.5f * diff;
-                    rp->pos_z[i0] = z0 + dz * 0.5f * diff;
-                    rp->pos_x[i1] = x1 - dx * 0.5f * diff;
-                    rp->pos_y[i1] = y1 - dy * 0.5f * diff;
-                    rp->pos_z[i1] = z1 - dz * 0.5f * diff;
-                }
-            }
-            // re-enforce endpoints
-            rp->pos_x[0] = rp->ax; rp->pos_y[0] = rp->ay; rp->pos_z[0] = rp->az;
-            rp->pos_x[verts-1] = rp->bx; rp->pos_y[verts-1] = rp->by; rp->pos_z[verts-1] = rp->bz;
-#endif
-        }
-    }
-
-    return 1;
-}
+// Note: the detailed step implementation is defined later and integrates
+// meta-group constraints. Remove earlier duplicate implementation to keep
+// a single `rope_sim_step` body (the later definition is used).
 
 int rope_sim_get_vertex_count(RopeSim* s, int rope_idx) {
     if (!s) return 0;
@@ -351,6 +213,769 @@ int rope_sim_get_vertices3(RopeSim* s, int rope_idx, float* out_xyz, int max_cou
         out_xyz[3*i+2] = r->pos_z[i];
     }
     return verts;
+}
+
+// --- Meta-group (lightweight) implementation ---------------------------
+
+// Each meta-group stores an ordered list of (rope_idx, vertex_idx) members
+// and optional edge-springs connecting members according to a selected mode.
+struct MetaGroup {
+    float pressure = 0.0f;
+    std::vector<std::pair<int,int>> members; // (rope_idx, vertex_idx)
+    int mode = 0; // 0=ribbon,1=closed,2=dense
+    bool edges_enabled = false;
+    float min_rest = 0.0f;
+    float reduce_rate = 0.0f;
+    // edges stored as pairs of member indices (ia, ib)
+    std::vector<std::pair<int,int>> edges;
+    // per-edge rest lengths (same order as `edges`)
+    std::vector<float> edge_rest;
+    // per-member parametric position along rope (0..1). Mirrors `members`.
+    std::vector<float> member_u;
+};
+
+// augment RopeSim with meta_groups container
+struct RopeSim_internal : public RopeSim {
+    std::vector<std::unique_ptr<MetaGroup>> meta_groups;
+    struct Ring { int rope_idx = -1; float u = 0.0f; float x=0.0f,y=0.0f,z=0.0f; float prev_x=0.0f, prev_y=0.0f, prev_z=0.0f; };
+    std::vector<std::unique_ptr<Ring>> rings;
+};
+
+// Helper to cast to internal
+static RopeSim_internal* to_internal(RopeSim* s) {
+    return reinterpret_cast<RopeSim_internal*>(s);
+}
+
+// Now that RopeSim_internal is defined, provide the real create implementation
+RopeSim* rope_sim_create(int max_ropes, int max_segments_per_rope) {
+    if (max_ropes <= 0 || max_segments_per_rope <= 0) return nullptr;
+    RopeSim_internal* si = new RopeSim_internal();
+    RopeSim* s = reinterpret_cast<RopeSim*>(si);
+    s->max_ropes = max_ropes;
+    s->max_segments_per_rope = max_segments_per_rope;
+    s->ropes.reserve(static_cast<std::size_t>(max_ropes));
+    return s;
+}
+
+int rope_sim_create_meta_group(RopeSim* s, float pressure) {
+    if (!s) return -1;
+    RopeSim_internal* si = to_internal(s);
+    auto mg = std::make_unique<MetaGroup>();
+    mg->pressure = pressure;
+    int idx = static_cast<int>(si->meta_groups.size());
+    si->meta_groups.push_back(std::move(mg));
+    printf("[rope_sim] create_meta_group %d pressure=%f\n", idx, pressure);
+    return idx;
+}
+
+int rope_sim_destroy_meta_group(RopeSim* s, int group_idx) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    si->meta_groups[static_cast<size_t>(group_idx)].reset();
+    return 1;
+}
+
+int rope_sim_meta_group_add(RopeSim* s, int group_idx, int rope_idx, int vertex_idx) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    mg->members.emplace_back(rope_idx, vertex_idx);
+    // initialize member param `u` from vertex index if possible
+    float u = 0.0f;
+    if (rope_idx >= 0 && rope_idx < static_cast<int>(si->ropes.size())) {
+        Rope* r = si->ropes[static_cast<size_t>(rope_idx)].get();
+        if (r) {
+            int verts = r->segments + 1;
+            if (verts > 1) u = static_cast<float>(vertex_idx) / static_cast<float>(verts - 1);
+        }
+    }
+    mg->member_u.push_back(u);
+    return 1;
+}
+
+int rope_sim_meta_group_insert(RopeSim* s, int group_idx, int after_rope_idx, int after_vertex_idx, int rope_idx, int vertex_idx) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    // find after pair
+    size_t pos = mg->members.size();
+    for (size_t i = 0; i < mg->members.size(); ++i) {
+        if (mg->members[i].first == after_rope_idx && mg->members[i].second == after_vertex_idx) {
+            pos = i + 1;
+            break;
+        }
+    }
+    mg->members.insert(mg->members.begin() + static_cast<ptrdiff_t>(pos), std::make_pair(rope_idx, vertex_idx));
+    // insert parametric u at same position
+    float u = 0.0f;
+    if (rope_idx >= 0 && rope_idx < static_cast<int>(si->ropes.size())) {
+        Rope* r = si->ropes[static_cast<size_t>(rope_idx)].get();
+        if (r) {
+            int verts = r->segments + 1;
+            if (verts > 1) u = static_cast<float>(vertex_idx) / static_cast<float>(verts - 1);
+        }
+    }
+    mg->member_u.insert(mg->member_u.begin() + static_cast<ptrdiff_t>(pos), u);
+    return 1;
+}
+
+int rope_sim_meta_group_set_pressure(RopeSim* s, int group_idx, float pressure) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    mg->pressure = pressure;
+    return 1;
+}
+
+int rope_sim_meta_group_set_mode(RopeSim* s, int group_idx, int mode) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    mg->mode = mode;
+    printf("[rope_sim] meta_group_set_mode: sim=%p group_idx=%d mode=%d\n", (void*)s, group_idx, mode);
+    return 1;
+}
+
+int rope_sim_meta_group_get_mode(RopeSim* s, int group_idx, int* out_mode) {
+    if (!s || !out_mode) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    *out_mode = mg->mode;
+    return 1;
+}
+
+int rope_sim_find_meta_group_with_rope(RopeSim* s, int rope_idx) {
+    if (!s) return -1;
+    RopeSim_internal* si = to_internal(s);
+    for (size_t gi = 0; gi < si->meta_groups.size(); ++gi) {
+        MetaGroup* mg = si->meta_groups[gi].get();
+        if (!mg) continue;
+        for (size_t mi = 0; mi < mg->members.size(); ++mi) {
+            if (mg->members[mi].first == rope_idx) return static_cast<int>(gi);
+        }
+    }
+    return -1;
+}
+
+// --- Ring implementation: allow rings to slide freely along ropes by
+// projecting a stored world position onto the updated rope geometry each step.
+int rope_sim_create_ring(RopeSim* s, int rope_idx, float u) {
+    if (!s) return -1;
+    RopeSim_internal* si = to_internal(s);
+    if (rope_idx < 0 || rope_idx >= static_cast<int>(si->ropes.size())) return -1;
+    Rope* r = si->ropes[static_cast<size_t>(rope_idx)].get();
+    if (!r) return -1;
+    int verts = r->segments + 1;
+    if (verts <= 0) return -1;
+    if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
+    auto ring = std::make_unique<RopeSim_internal::Ring>();
+    ring->rope_idx = rope_idx;
+    ring->u = u;
+    // compute initial world pos by interpolating rope vertices
+    float fidx = u * static_cast<float>(verts - 1);
+    int i0 = static_cast<int>(std::floor(fidx));
+    if (i0 < 0) i0 = 0; if (i0 >= verts-1) i0 = verts-2;
+    int i1 = i0 + 1;
+    float local_t = fidx - static_cast<float>(i0);
+    ring->x = r->pos_x[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_x[static_cast<size_t>(i1)] * local_t;
+    ring->y = r->pos_y[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_y[static_cast<size_t>(i1)] * local_t;
+    ring->z = r->pos_z[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_z[static_cast<size_t>(i1)] * local_t;
+    ring->prev_x = ring->x; ring->prev_y = ring->y; ring->prev_z = ring->z;
+    int id = static_cast<int>(si->rings.size());
+    si->rings.push_back(std::move(ring));
+    printf("[rope_sim] create_ring id=%d rope=%d u=%f\n", id, rope_idx, u);
+    return id;
+}
+
+int rope_sim_destroy_ring(RopeSim* s, int ring_id) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (ring_id < 0 || ring_id >= static_cast<int>(si->rings.size())) return 0;
+    si->rings[static_cast<size_t>(ring_id)].reset();
+    return 1;
+}
+
+int rope_sim_get_ring_u(RopeSim* s, int ring_id, float* out_u) {
+    if (!s || !out_u) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (ring_id < 0 || ring_id >= static_cast<int>(si->rings.size())) return 0;
+    auto *rg = si->rings[static_cast<size_t>(ring_id)].get();
+    if (!rg) return 0;
+    *out_u = rg->u;
+    return 1;
+}
+
+int rope_sim_get_ring_rope_index(RopeSim* s, int ring_id, int* out_rope_idx) {
+    if (!s || !out_rope_idx) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (ring_id < 0 || ring_id >= static_cast<int>(si->rings.size())) return 0;
+    auto *rg = si->rings[static_cast<size_t>(ring_id)].get();
+    if (!rg) return 0;
+    *out_rope_idx = rg->rope_idx;
+    return 1;
+}
+
+int rope_sim_set_ring_target(RopeSim* s, int ring_id, float target_u, float speed) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (ring_id < 0 || ring_id >= static_cast<int>(si->rings.size())) return 0;
+    auto *rg = si->rings[static_cast<size_t>(ring_id)].get();
+    if (!rg) return 0;
+    if (target_u < 0.0f) target_u = 0.0f; if (target_u > 1.0f) target_u = 1.0f;
+    rg->u = target_u;
+    // update world position immediately to match target
+    int rope_idx = rg->rope_idx;
+    if (rope_idx < 0 || rope_idx >= static_cast<int>(si->ropes.size())) return 1;
+    Rope* r = si->ropes[static_cast<size_t>(rope_idx)].get();
+    if (!r) return 1;
+    int verts = r->segments + 1;
+    if (verts < 2) return 1;
+    float fidx = rg->u * static_cast<float>(verts - 1);
+    int i0 = static_cast<int>(std::floor(fidx)); if (i0 < 0) i0 = 0; if (i0 >= verts-1) i0 = verts-2;
+    int i1 = i0 + 1; float local_t = fidx - static_cast<float>(i0);
+    rg->x = r->pos_x[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_x[static_cast<size_t>(i1)] * local_t;
+    rg->y = r->pos_y[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_y[static_cast<size_t>(i1)] * local_t;
+    rg->z = r->pos_z[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_z[static_cast<size_t>(i1)] * local_t;
+    (void)speed;
+    return 1;
+}
+
+int rope_sim_meta_group_enable_edge_springs(RopeSim* s, int group_idx, float min_rest, float reduce_rate) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    mg->edges.clear();
+    size_t n = mg->members.size();
+    if (n < 2) return 1; // nothing to connect
+    // chain connections
+    for (size_t i = 0; i + 1 < n; ++i) mg->edges.emplace_back(static_cast<int>(i), static_cast<int>(i+1));
+    if (mg->mode == 1) {
+        // closed loop: add last->first
+        mg->edges.emplace_back(static_cast<int>(n-1), 0);
+    } else if (mg->mode == 2) {
+        // dense: add all pairwise links
+        for (size_t i = 0; i < n; ++i) for (size_t j = i+1; j < n; ++j) mg->edges.emplace_back(static_cast<int>(i), static_cast<int>(j));
+    }
+    mg->edges_enabled = true;
+    mg->min_rest = min_rest;
+    mg->reduce_rate = reduce_rate;
+    mg->edge_rest.clear();
+    // print created springs for debug
+    for (const auto &e : mg->edges) {
+        int ia = e.first;
+        int ib = e.second;
+        if (ia < 0 || ib < 0) continue;
+        if (ia >= static_cast<int>(mg->members.size()) || ib >= static_cast<int>(mg->members.size())) continue;
+        auto a = mg->members[static_cast<size_t>(ia)];
+        auto b = mg->members[static_cast<size_t>(ib)];
+        float ax=0, ay=0, az=0, bx=0, by=0, bz=0;
+        // sample world positions using stored member_u where possible
+        if (a.first >= 0 && a.first < static_cast<int>(si->ropes.size())) {
+            Rope* ra = si->ropes[static_cast<size_t>(a.first)].get();
+            if (ra) {
+                int verts = ra->segments + 1;
+                float fu = 0.0f;
+                if (static_cast<size_t>(ia) < mg->member_u.size()) fu = mg->member_u[static_cast<size_t>(ia)];
+                float fidx = fu * static_cast<float>(std::max(1, verts - 1));
+                int i0 = static_cast<int>(std::floor(fidx)); if (i0 < 0) i0 = 0; if (i0 >= verts-1) i0 = verts-2;
+                int i1 = i0 + 1; float local_t = fidx - static_cast<float>(i0);
+                ax = ra->pos_x[static_cast<size_t>(i0)] * (1.0f - local_t) + ra->pos_x[static_cast<size_t>(i1)] * local_t;
+                ay = ra->pos_y[static_cast<size_t>(i0)] * (1.0f - local_t) + ra->pos_y[static_cast<size_t>(i1)] * local_t;
+                az = ra->pos_z[static_cast<size_t>(i0)] * (1.0f - local_t) + ra->pos_z[static_cast<size_t>(i1)] * local_t;
+            }
+        }
+        if (b.first >= 0 && b.first < static_cast<int>(si->ropes.size())) {
+            Rope* rb = si->ropes[static_cast<size_t>(b.first)].get();
+            if (rb) {
+                int verts = rb->segments + 1;
+                float fu = 0.0f;
+                if (static_cast<size_t>(ib) < mg->member_u.size()) fu = mg->member_u[static_cast<size_t>(ib)];
+                float fidx = fu * static_cast<float>(std::max(1, verts - 1));
+                int i0 = static_cast<int>(std::floor(fidx)); if (i0 < 0) i0 = 0; if (i0 >= verts-1) i0 = verts-2;
+                int i1 = i0 + 1; float local_t = fidx - static_cast<float>(i0);
+                bx = rb->pos_x[static_cast<size_t>(i0)] * (1.0f - local_t) + rb->pos_x[static_cast<size_t>(i1)] * local_t;
+                by = rb->pos_y[static_cast<size_t>(i0)] * (1.0f - local_t) + rb->pos_y[static_cast<size_t>(i1)] * local_t;
+                bz = rb->pos_z[static_cast<size_t>(i0)] * (1.0f - local_t) + rb->pos_z[static_cast<size_t>(i1)] * local_t;
+            }
+        }
+        float dx = bx - ax; float dy = by - ay; float dz = bz - az;
+        float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+        printf("[rope_sim] created spring: %d.%d -> %d.%d rest=%f\n", a.first, a.second, b.first, b.second, d);
+        mg->edge_rest.push_back(std::max(d, mg->min_rest));
+    }
+    return 1;
+}
+
+int rope_sim_meta_group_disable_edge_springs(RopeSim* s, int group_idx) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    mg->edges_enabled = false;
+    mg->edges.clear();
+    mg->edge_rest.clear();
+    return 1;
+}
+
+int rope_sim_meta_group_get_member_world_pos(RopeSim* s, int group_idx, int member_idx, float* out_xyz) {
+    if (!s || !out_xyz) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    if (member_idx < 0 || member_idx >= static_cast<int>(mg->members.size())) return 0;
+    auto m = mg->members[static_cast<size_t>(member_idx)];
+    int rope_idx = m.first;
+    int vert_idx = m.second;
+    if (rope_idx < 0 || rope_idx >= static_cast<int>(si->ropes.size())) return 0;
+    Rope* r = si->ropes[static_cast<size_t>(rope_idx)].get();
+    if (!r) return 0;
+    int verts = r->segments + 1;
+    if (verts < 2) return 0;
+    float u = 0.0f;
+    if (static_cast<size_t>(member_idx) < mg->member_u.size()) u = mg->member_u[static_cast<size_t>(member_idx)];
+    else { if (vert_idx >= 0 && vert_idx < verts) u = static_cast<float>(vert_idx) / static_cast<float>(verts - 1); }
+    if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
+    float fidx = u * static_cast<float>(verts - 1);
+    int i0 = static_cast<int>(std::floor(fidx)); if (i0 < 0) i0 = 0; if (i0 >= verts-1) i0 = verts-2;
+    int i1 = i0 + 1; float local_t = fidx - static_cast<float>(i0);
+    out_xyz[0] = r->pos_x[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_x[static_cast<size_t>(i1)] * local_t;
+    out_xyz[1] = r->pos_y[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_y[static_cast<size_t>(i1)] * local_t;
+    out_xyz[2] = r->pos_z[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_z[static_cast<size_t>(i1)] * local_t;
+    return 1;
+}
+
+// --- Minimal stubs for remaining APIs (to satisfy linking) ----------
+int rope_sim_insert_vertex(RopeSim* s, int rope_idx, int seg_index, float t) {
+    (void)s; (void)rope_idx; (void)seg_index; (void)t; return -1; // not implemented
+}
+
+int rope_sim_set_rope_radius(RopeSim* s, int rope_idx, float radius) {
+    (void)s; (void)rope_idx; (void)radius; return 1;
+}
+int rope_sim_get_rope_radius(RopeSim* s, int rope_idx, float* out_radius) {
+    if (!s || !out_radius) return 0; *out_radius = 0.0f; return 1;
+}
+
+int rope_sim_modify_rest_length(RopeSim* s, int rope_idx, float delta) {
+    (void)s; (void)rope_idx; (void)delta; return 0;
+}
+int rope_sim_set_rope_rest_target(RopeSim* s, int rope_idx, float target_rest, float rate, float delay) {
+    (void)s; (void)rope_idx; (void)target_rest; (void)rate; (void)delay; return 0;
+}
+int rope_sim_clear_rope_rest_target(RopeSim* s, int rope_idx) { (void)s; (void)rope_idx; return 0; }
+int rope_sim_get_rope_rest_length(RopeSim* s, int rope_idx, float* out_rest) { if (!s || !out_rest) return 0; *out_rest = 0.0f; return 1; }
+
+// ring stubs removed; real implementations are provided above
+
+int rope_sim_create_dangling_widget(RopeSim* s, int rope_idx, int vertex_idx, unsigned int widget_type) { (void)s; (void)rope_idx; (void)vertex_idx; (void)widget_type; return -1; }
+int rope_sim_destroy_dangling_widget(RopeSim* s, int widget_id) { (void)s; (void)widget_id; return 0; }
+int rope_sim_get_widget_position(RopeSim* s, int widget_id, float* out_xyz) { if (!out_xyz) return 0; out_xyz[0]=out_xyz[1]=out_xyz[2]=0.0f; return 0; }
+int rope_sim_set_widget_mass(RopeSim* s, int widget_id, float mass) { (void)s; (void)widget_id; (void)mass; return 0; }
+
+// Apply meta-group edge constraints after rope constraints pass
+// Simple distance constraints between member vertex positions
+static void apply_meta_group_edges(RopeSim_internal* si, float dt) {
+    if (!si) return;
+    for (size_t gi = 0; gi < si->meta_groups.size(); ++gi) {
+        MetaGroup* mg = si->meta_groups[gi].get();
+        if (!mg || !mg->edges_enabled) continue;
+        // decay rest lengths toward min_rest
+        if (mg->reduce_rate > 0.0f && dt > 0.0f) {
+            for (size_t ei = 0; ei < mg->edge_rest.size(); ++ei) {
+                float &r = mg->edge_rest[ei];
+                r = std::max(mg->min_rest, r - mg->reduce_rate * dt);
+            }
+        }
+
+        // helper: sample a rope world-position from parametric u and also
+        // return integer vertex indices and local t for distributing vertex deltas
+        auto sample_rope = [&](Rope* rr, float fu, float &outx, float &outy, float &outz,
+                               int &out_i0, int &out_i1, float &out_local_t) {
+            outx = outy = outz = 0.0f; out_i0 = out_i1 = 0; out_local_t = 0.0f;
+            if (!rr) return;
+            int verts = rr->segments + 1;
+            if (verts < 2) return;
+            if (fu < 0.0f) fu = 0.0f; if (fu > 1.0f) fu = 1.0f;
+            float fidx = fu * static_cast<float>(verts - 1);
+            int i0 = static_cast<int>(std::floor(fidx)); if (i0 < 0) i0 = 0; if (i0 >= verts-1) i0 = verts-2;
+            int i1 = i0 + 1; float local_t = fidx - static_cast<float>(i0);
+            out_i0 = i0; out_i1 = i1; out_local_t = local_t;
+            outx = rr->pos_x[static_cast<size_t>(i0)] * (1.0f - local_t) + rr->pos_x[static_cast<size_t>(i1)] * local_t;
+            outy = rr->pos_y[static_cast<size_t>(i0)] * (1.0f - local_t) + rr->pos_y[static_cast<size_t>(i1)] * local_t;
+            outz = rr->pos_z[static_cast<size_t>(i0)] * (1.0f - local_t) + rr->pos_z[static_cast<size_t>(i1)] * local_t;
+        };
+
+        // helper: compute a unit tangent at parametric u by sampling +/- small du
+        auto compute_tangent = [&](Rope* rr, float fu, float &tx, float &ty, float &tz) {
+            tx = ty = tz = 0.0f; if (!rr) return;
+            int verts = rr->segments + 1; if (verts < 2) return;
+            float du = 1.0f / static_cast<float>(std::max(1, verts - 1));
+            float a_fu = fu - 0.5f * du; float b_fu = fu + 0.5f * du;
+            if (a_fu < 0.0f) a_fu = 0.0f; if (b_fu > 1.0f) b_fu = 1.0f;
+            float ax,ay,az,bx,by,bz; int ia0,ia1,ib0,ib1; float lat, lbt;
+            sample_rope(rr, a_fu, ax, ay, az, ia0, ia1, lat);
+            sample_rope(rr, b_fu, bx, by, bz, ib0, ib1, lbt);
+            tx = bx - ax; ty = by - ay; tz = bz - az;
+            float llen = std::sqrt(tx*tx + ty*ty + tz*tz);
+            if (llen > 1e-6f) { tx /= llen; ty /= llen; tz /= llen; } else { tx = ty = tz = 0.0f; }
+        };
+
+        // helper: project an arbitrary point onto the rope polyline and return
+        // parametric u (0..1) and the segment/local t it lies on.
+        auto project_point_onto_rope = [&](Rope* rr, float px, float py, float pz, float &out_u, int &out_i0, int &out_i1, float &out_local_t) {
+            out_u = 0.0f; out_i0 = out_i1 = 0; out_local_t = 0.0f; if (!rr) return;
+            int segs = rr->segments; if (segs < 1) return;
+            float best_d2 = 1e30f; int best_seg = 0; float best_t = 0.0f;
+            for (int si = 0; si < segs; ++si) {
+                // segment endpoints
+                float x0 = rr->pos_x[static_cast<size_t>(si)]; float y0 = rr->pos_y[static_cast<size_t>(si)]; float z0 = rr->pos_z[static_cast<size_t>(si)];
+                float x1 = rr->pos_x[static_cast<size_t>(si+1)]; float y1 = rr->pos_y[static_cast<size_t>(si+1)]; float z1 = rr->pos_z[static_cast<size_t>(si+1)];
+                float vx = x1 - x0; float vy = y1 - y0; float vz = z1 - z0;
+                float len2 = vx*vx + vy*vy + vz*vz;
+                float t = 0.0f;
+                if (len2 > 1e-12f) {
+                    t = ((px - x0)*vx + (py - y0)*vy + (pz - z0)*vz) / len2;
+                    if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+                }
+                float cx = x0 + vx * t; float cy = y0 + vy * t; float cz = z0 + vz * t;
+                float ddx = px - cx; float ddy = py - cy; float ddz = pz - cz;
+                float d2 = ddx*ddx + ddy*ddy + ddz*ddz;
+                if (d2 < best_d2) { best_d2 = d2; best_seg = si; best_t = t; }
+            }
+            out_i0 = best_seg; out_i1 = best_seg + 1; out_local_t = best_t;
+            out_u = (static_cast<float>(best_seg) + best_t) / static_cast<float>(segs);
+            if (out_u < 0.0f) out_u = 0.0f; if (out_u > 1.0f) out_u = 1.0f;
+        };
+
+        auto project_perp = [&](float cx_, float cy_, float cz_, float nx, float ny, float nz, float &outx, float &outy, float &outz) {
+            float dot = cx_*nx + cy_*ny + cz_*nz;
+            outx = cx_ - dot * nx; outy = cy_ - dot * ny; outz = cz_ - dot * nz;
+        };
+
+        for (size_t ei = 0; ei < mg->edges.size(); ++ei) {
+            const auto &e = mg->edges[ei];
+            int ia = e.first; int ib = e.second;
+            if (ia < 0 || ib < 0) continue;
+            if (ia >= static_cast<int>(mg->members.size()) || ib >= static_cast<int>(mg->members.size())) continue;
+            auto ma = mg->members[static_cast<size_t>(ia)];
+            auto mb = mg->members[static_cast<size_t>(ib)];
+            if (ma.first < 0 || mb.first < 0) continue;
+            if (ma.first >= static_cast<int>(si->ropes.size()) || mb.first >= static_cast<int>(si->ropes.size())) continue;
+            Rope* ra = si->ropes[static_cast<size_t>(ma.first)].get();
+            Rope* rb = si->ropes[static_cast<size_t>(mb.first)].get();
+            if (!ra || !rb) continue;
+
+            // use stored member_u when available; fall back to vertex index -> u
+            float fua = 0.0f; float fub = 0.0f;
+            if (static_cast<size_t>(ia) < mg->member_u.size()) fua = mg->member_u[static_cast<size_t>(ia)];
+            else { int va = ma.second; int verts = ra->segments + 1; if (verts > 1) fua = static_cast<float>(va) / static_cast<float>(verts - 1); }
+            if (static_cast<size_t>(ib) < mg->member_u.size()) fub = mg->member_u[static_cast<size_t>(ib)];
+            else { int vb = mb.second; int verts = rb->segments + 1; if (verts > 1) fub = static_cast<float>(vb) / static_cast<float>(verts - 1); }
+
+            float ax,ay,az,bx,by,bz; int ai0,ai1,bi0,bi1; float alocal,blocal;
+            sample_rope(ra, fua, ax, ay, az, ai0, ai1, alocal);
+            sample_rope(rb, fub, bx, by, bz, bi0, bi1, blocal);
+
+            float dx = bx - ax; float dy = by - ay; float dz = bz - az;
+            float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (d <= 1e-6f) continue;
+            float rest = (ei < mg->edge_rest.size()) ? mg->edge_rest[ei] : d;
+            float diff = (d - rest) / d;
+            // full correction vector from A->B
+            float cx = dx * diff; float cy = dy * diff; float cz = dz * diff;
+
+            // determine if endpoints are fixed (u at rope ends)
+            bool a_fixed = (fua <= 1e-6f) || (fua >= 1.0f - 1e-6f);
+            bool b_fixed = (fub <= 1e-6f) || (fub >= 1.0f - 1e-6f);
+            if (a_fixed && b_fixed) continue;
+
+            // compute local tangents at each member
+            float tax, tay, taz, tbx_, tby, tbz;
+            compute_tangent(ra, fua, tax, tay, taz);
+            compute_tangent(rb, fub, tbx_, tby, tbz);
+
+            if (a_fixed && !b_fixed) {
+                // move B only: remove tangential component along B's tangent
+                float px, py, pz; project_perp(-cx, -cy, -cz, tbx_, tby, tbz, px, py, pz);
+                // distribute perpendicular delta to rb vertices (bi0,bi1)
+                rb->pos_x[static_cast<size_t>(bi0)] += px * (1.0f - blocal);
+                rb->pos_y[static_cast<size_t>(bi0)] += py * (1.0f - blocal);
+                rb->pos_z[static_cast<size_t>(bi0)] += pz * (1.0f - blocal);
+                rb->pos_x[static_cast<size_t>(bi1)] += px * blocal;
+                rb->pos_y[static_cast<size_t>(bi1)] += py * blocal;
+                rb->pos_z[static_cast<size_t>(bi1)] += pz * blocal;
+                // Compute a target world position for B by applying the full
+                // correction and project that point back onto the rope to get
+                // a robust parametric `u`. This avoids relying on single-segment
+                // length division which can under-update across multiple segments.
+                float target_bx = bx + (-cx);
+                float target_by = by + (-cy);
+                float target_bz = bz + (-cz);
+                float proj_u = 0.0f; int p_i0 = 0, p_i1 = 0; float p_local = 0.0f;
+                project_point_onto_rope(rb, target_bx, target_by, target_bz, proj_u, p_i0, p_i1, p_local);
+                if (static_cast<size_t>(ib) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fub);
+                float oldu = mg->member_u[static_cast<size_t>(ib)];
+                mg->member_u[static_cast<size_t>(ib)] = proj_u;
+                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ib, oldu, proj_u);
+            } else if (b_fixed && !a_fixed) {
+                // move A only: remove tangential component along A's tangent
+                float px, py, pz; project_perp(cx, cy, cz, tax, tay, taz, px, py, pz);
+                ra->pos_x[static_cast<size_t>(ai0)] += px * (1.0f - alocal);
+                ra->pos_y[static_cast<size_t>(ai0)] += py * (1.0f - alocal);
+                ra->pos_z[static_cast<size_t>(ai0)] += pz * (1.0f - alocal);
+                ra->pos_x[static_cast<size_t>(ai1)] += px * alocal;
+                ra->pos_y[static_cast<size_t>(ai1)] += py * alocal;
+                ra->pos_z[static_cast<size_t>(ai1)] += pz * alocal;
+                float target_ax = ax + cx;
+                float target_ay = ay + cy;
+                float target_az = az + cz;
+                float proj_u_a = 0.0f; int pa0=0, pa1=0; float pa_local=0.0f;
+                project_point_onto_rope(ra, target_ax, target_ay, target_az, proj_u_a, pa0, pa1, pa_local);
+                if (static_cast<size_t>(ia) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fua);
+                float oldu_a = mg->member_u[static_cast<size_t>(ia)];
+                mg->member_u[static_cast<size_t>(ia)] = proj_u_a;
+                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ia, oldu_a, proj_u_a);
+            } else {
+                // move both: split correction and convert tangential parts into u deltas
+                float half_cx = 0.5f * cx; float half_cy = 0.5f * cy; float half_cz = 0.5f * cz;
+                float pax, pay, paz; project_perp(half_cx, half_cy, half_cz, tax, tay, taz, pax, pay, paz);
+                float pbx, pby, pbz; project_perp(-half_cx, -half_cy, -half_cz, tbx_, tby, tbz, pbx, pby, pbz);
+                ra->pos_x[static_cast<size_t>(ai0)] += pax * (1.0f - alocal);
+                ra->pos_y[static_cast<size_t>(ai0)] += pay * (1.0f - alocal);
+                ra->pos_z[static_cast<size_t>(ai0)] += paz * (1.0f - alocal);
+                ra->pos_x[static_cast<size_t>(ai1)] += pax * alocal;
+                ra->pos_y[static_cast<size_t>(ai1)] += pay * alocal;
+                ra->pos_z[static_cast<size_t>(ai1)] += paz * alocal;
+                rb->pos_x[static_cast<size_t>(bi0)] += pbx * (1.0f - blocal);
+                rb->pos_y[static_cast<size_t>(bi0)] += pby * (1.0f - blocal);
+                rb->pos_z[static_cast<size_t>(bi0)] += pbz * (1.0f - blocal);
+                rb->pos_x[static_cast<size_t>(bi1)] += pbx * blocal;
+                rb->pos_y[static_cast<size_t>(bi1)] += pby * blocal;
+                rb->pos_z[static_cast<size_t>(bi1)] += pbz * blocal;
+                // tangential conversion to delta-u for A
+                float dot_a = half_cx * tax + half_cy * tay + half_cz * taz;
+                float seg_len_a = std::sqrt(
+                    (ra->pos_x[static_cast<size_t>(ai1)] - ra->pos_x[static_cast<size_t>(ai0)]) * (ra->pos_x[static_cast<size_t>(ai1)] - ra->pos_x[static_cast<size_t>(ai0)]) +
+                    (ra->pos_y[static_cast<size_t>(ai1)] - ra->pos_y[static_cast<size_t>(ai0)]) * (ra->pos_y[static_cast<size_t>(ai1)] - ra->pos_y[static_cast<size_t>(ai0)]) +
+                    (ra->pos_z[static_cast<size_t>(ai1)] - ra->pos_z[static_cast<size_t>(ai0)]) * (ra->pos_z[static_cast<size_t>(ai1)] - ra->pos_z[static_cast<size_t>(ai0)])
+                );
+                // Project target point for A (half correction) to rope
+                float target_ax = ax + half_cx;
+                float target_ay = ay + half_cy;
+                float target_az = az + half_cz;
+                float proj_u_a = 0.0f; int pa0=0, pa1=0; float pa_local=0.0f;
+                project_point_onto_rope(ra, target_ax, target_ay, target_az, proj_u_a, pa0, pa1, pa_local);
+                if (static_cast<size_t>(ia) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fua);
+                float oldu_a = mg->member_u[static_cast<size_t>(ia)];
+                mg->member_u[static_cast<size_t>(ia)] = proj_u_a;
+                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ia, oldu_a, proj_u_a);
+                // tangential conversion to delta-u for B
+                float dot_b = -half_cx * tbx_ + -half_cy * tby + -half_cz * tbz;
+                float seg_len_b = std::sqrt(
+                    (rb->pos_x[static_cast<size_t>(bi1)] - rb->pos_x[static_cast<size_t>(bi0)]) * (rb->pos_x[static_cast<size_t>(bi1)] - rb->pos_x[static_cast<size_t>(bi0)]) +
+                    (rb->pos_y[static_cast<size_t>(bi1)] - rb->pos_y[static_cast<size_t>(bi0)]) * (rb->pos_y[static_cast<size_t>(bi1)] - rb->pos_y[static_cast<size_t>(bi0)]) +
+                    (rb->pos_z[static_cast<size_t>(bi1)] - rb->pos_z[static_cast<size_t>(bi0)]) * (rb->pos_z[static_cast<size_t>(bi1)] - rb->pos_z[static_cast<size_t>(bi0)])
+                );
+                // Project target point for B (half correction)
+                float target_bx = bx - half_cx;
+                float target_by = by - half_cy;
+                float target_bz = bz - half_cz;
+                float proj_u_b = 0.0f; int pb0=0, pb1=0; float pb_local=0.0f;
+                project_point_onto_rope(rb, target_bx, target_by, target_bz, proj_u_b, pb0, pb1, pb_local);
+                if (static_cast<size_t>(ib) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fub);
+                float oldu_b = mg->member_u[static_cast<size_t>(ib)];
+                mg->member_u[static_cast<size_t>(ib)] = proj_u_b;
+                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ib, oldu_b, proj_u_b);
+            }
+        }
+    }
+}
+
+// Wrap up: integrate meta-group enforcement into step. We call this at end of step.
+// Note: original RopeSim pointer layout is compatible with reinterpret_cast above
+int rope_sim_step(RopeSim* s, float dt, float gravity, int constraint_iters, float damping) {
+    // call existing implementation by reusing previous function body name: we duplicate logic here
+    if (!s) return 0;
+    if (dt <= 0.0f) return 0;
+    RopeSim_internal* si = to_internal(s);
+    // acceleration per-step
+    const float gx = 0.0f;
+    const float gy = gravity >= 0.0f ? gravity : 0.0f;
+    const float gz = 0.0f;
+
+    // integrate all ropes (vertex-wise Verlet)
+    for (auto &rp : si->ropes) {
+        if (!rp) continue;
+        int verts = rp->segments + 1;
+        for (int vi = 1; vi < verts - 1; ++vi) {
+            float &x = rp->pos_x[vi];
+            float &y = rp->pos_y[vi];
+            float &z = rp->pos_z[vi];
+            float &px = rp->prev_x[vi];
+            float &py = rp->prev_y[vi];
+            float &pz = rp->prev_z[vi];
+            verlet_step_point(x, y, z, px, py, pz, dt, gx, gy, gz, damping);
+        }
+    }
+
+    // constraints: keep segment lengths close to rest_len
+    for (int it = 0; it < std::max(1, constraint_iters); ++it) {
+        for (auto &rp : si->ropes) {
+            if (!rp) continue;
+            int verts = rp->segments + 1;
+            float rl = rp->rest_len;
+            if (verts <= 1) continue;
+            rp->pos_x[0] = rp->ax; rp->pos_y[0] = rp->ay; rp->pos_z[0] = rp->az;
+            rp->pos_x[verts-1] = rp->bx; rp->pos_y[verts-1] = rp->by; rp->pos_z[verts-1] = rp->bz;
+            for (int si_i = 0; si_i < rp->segments; ++si_i) {
+                int i0 = si_i;
+                int i1 = si_i + 1;
+                float x0 = rp->pos_x[i0];
+                float y0 = rp->pos_y[i0];
+                float z0 = rp->pos_z[i0];
+                float x1 = rp->pos_x[i1];
+                float y1 = rp->pos_y[i1];
+                float z1 = rp->pos_z[i1];
+                float dx = x1 - x0;
+                float dy = y1 - y0;
+                float dz = z1 - z0;
+                float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (d <= 1e-6f) continue;
+                float diff = (d - rl) / d;
+                bool a_fixed = (i0 == 0);
+                bool b_fixed = (i1 == verts - 1);
+                if (a_fixed && b_fixed) {
+                    continue;
+                } else if (a_fixed) {
+                    rp->pos_x[i1] = x1 - dx * diff;
+                    rp->pos_y[i1] = y1 - dy * diff;
+                    rp->pos_z[i1] = z1 - dz * diff;
+                } else if (b_fixed) {
+                    rp->pos_x[i0] = x0 + dx * diff;
+                    rp->pos_y[i0] = y0 + dy * diff;
+                    rp->pos_z[i0] = z0 + dz * diff;
+                } else {
+                    rp->pos_x[i0] = x0 + dx * 0.5f * diff;
+                    rp->pos_y[i0] = y0 + dy * 0.5f * diff;
+                    rp->pos_z[i0] = z0 + dz * 0.5f * diff;
+                    rp->pos_x[i1] = x1 - dx * 0.5f * diff;
+                    rp->pos_y[i1] = y1 - dy * 0.5f * diff;
+                    rp->pos_z[i1] = z1 - dz * 0.5f * diff;
+                }
+            }
+            rp->pos_x[0] = rp->ax; rp->pos_y[0] = rp->ay; rp->pos_z[0] = rp->az;
+            rp->pos_x[verts-1] = rp->bx; rp->pos_y[verts-1] = rp->by; rp->pos_z[verts-1] = rp->bz;
+        }
+    }
+
+    // apply meta-group edge constraints
+    apply_meta_group_edges(to_internal(s), dt);
+
+    // Update rings: project stored ring world-position onto the updated rope
+    for (size_t ri = 0; ri < si->rings.size(); ++ri) {
+        auto *rg = si->rings[ri].get();
+        if (!rg) continue;
+        int rope_idx = rg->rope_idx;
+        if (rope_idx < 0 || rope_idx >= static_cast<int>(si->ropes.size())) continue;
+        Rope* r = si->ropes[static_cast<size_t>(rope_idx)].get();
+        if (!r) continue;
+        int verts = r->segments + 1;
+        if (verts < 2) continue;
+        // find nearest point on rope to previous ring world pos (rg->x,y,z)
+        float best_d2 = std::numeric_limits<float>::infinity();
+        int best_seg = 0; float best_t = 0.0f;
+        for (int si_i = 0; si_i < verts - 1; ++si_i) {
+            float x0 = r->pos_x[si_i]; float y0 = r->pos_y[si_i]; float z0 = r->pos_z[si_i];
+            float x1 = r->pos_x[si_i+1]; float y1 = r->pos_y[si_i+1]; float z1 = r->pos_z[si_i+1];
+            float vx = x1 - x0; float vy = y1 - y0; float vz = z1 - z0;
+            float wx = rg->x - x0; float wy = rg->y - y0; float wz = rg->z - z0;
+            float len2 = vx*vx + vy*vy + vz*vz;
+            float t = 0.0f;
+            if (len2 > 1e-9f) t = (vx*wx + vy*wy + vz*wz) / len2;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+            float px = x0 + vx * t; float py = y0 + vy * t; float pz = z0 + vz * t;
+            float dx = rg->x - px; float dy = rg->y - py; float dz = rg->z - pz;
+            float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < best_d2) { best_d2 = d2; best_seg = si_i; best_t = t; }
+        }
+        float proj_u = (static_cast<float>(best_seg) + best_t) / static_cast<float>(verts - 1);
+        if (proj_u < 0.0f) proj_u = 0.0f; if (proj_u > 1.0f) proj_u = 1.0f;
+
+        // compute tangent and interpolated vertex velocity at the projected segment
+        int seg_i = best_seg;
+        int e0 = seg_i;
+        int e1 = seg_i + 1;
+        float x0 = r->pos_x[e0]; float y0 = r->pos_y[e0]; float z0 = r->pos_z[e0];
+        float x1 = r->pos_x[e1]; float y1 = r->pos_y[e1]; float z1 = r->pos_z[e1];
+        float vx0 = r->pos_x[static_cast<size_t>(e0)] - r->prev_x[static_cast<size_t>(e0)];
+        float vy0 = r->pos_y[static_cast<size_t>(e0)] - r->prev_y[static_cast<size_t>(e0)];
+        float vz0 = r->pos_z[static_cast<size_t>(e0)] - r->prev_z[static_cast<size_t>(e0)];
+        float vx1 = r->pos_x[static_cast<size_t>(e1)] - r->prev_x[static_cast<size_t>(e1)];
+        float vy1 = r->pos_y[static_cast<size_t>(e1)] - r->prev_y[static_cast<size_t>(e1)];
+        float vz1 = r->pos_z[static_cast<size_t>(e1)] - r->prev_z[static_cast<size_t>(e1)];
+        float interp_vx = vx0 * (1.0f - best_t) + vx1 * best_t;
+        float interp_vy = vy0 * (1.0f - best_t) + vy1 * best_t;
+        float interp_vz = vz0 * (1.0f - best_t) + vz1 * best_t;
+        float tx = x1 - x0; float ty = y1 - y0; float tz = z1 - z0;
+        float tlen = std::sqrt(tx*tx + ty*ty + tz*tz);
+
+        // ring world velocity (previous world pos -> current world pos) / dt
+        float old_rx = rg->x, old_ry = rg->y, old_rz = rg->z;
+        float world_vx = 0.0f, world_vy = 0.0f, world_vz = 0.0f;
+        if (dt > 1e-9f) {
+            world_vx = (old_rx - rg->prev_x) / dt;
+            world_vy = (old_ry - rg->prev_y) / dt;
+            world_vz = (old_rz - rg->prev_z) / dt;
+        }
+
+        // relative velocity of ring w.r.t. rope point
+        float rel_vx = world_vx - interp_vx;
+        float rel_vy = world_vy - interp_vy;
+        float rel_vz = world_vz - interp_vz;
+
+        float tangential_speed = 0.0f;
+        if (tlen > 1e-6f) {
+            tangential_speed = (rel_vx * tx + rel_vy * ty + rel_vz * tz) / tlen;
+        }
+
+         // free-u mode: set ring parameter directly to projection so `u` is a free axis
+         float old_u_val = rg->u;
+         float new_u = proj_u;
+         rg->u = new_u;
+
+         // debug log: show ring parameter changes so we can see `u` moving
+         printf("[rope_sim] ring %d rope=%d old_u=%f proj_u=%f new_u=%f seg=%d best_t=%f\n",
+             (int)ri, rope_idx, old_u_val, proj_u, new_u, best_seg, best_t);
+
+        // recompute world pos from rope at updated u
+        float fidx = rg->u * static_cast<float>(verts - 1);
+        int pi0 = static_cast<int>(std::floor(fidx)); if (pi0 < 0) pi0 = 0; if (pi0 >= verts-1) pi0 = verts-2;
+        int pi1 = pi0 + 1; float local_t2 = fidx - static_cast<float>(pi0);
+        float new_rx = r->pos_x[static_cast<size_t>(pi0)] * (1.0f - local_t2) + r->pos_x[static_cast<size_t>(pi1)] * local_t2;
+        float new_ry = r->pos_y[static_cast<size_t>(pi0)] * (1.0f - local_t2) + r->pos_y[static_cast<size_t>(pi1)] * local_t2;
+        float new_rz = r->pos_z[static_cast<size_t>(pi0)] * (1.0f - local_t2) + r->pos_z[static_cast<size_t>(pi1)] * local_t2;
+
+        // advance stored prev position and set new world pos
+        rg->prev_x = old_rx; rg->prev_y = old_ry; rg->prev_z = old_rz;
+        rg->x = new_rx; rg->y = new_ry; rg->z = new_rz;
+    }
+
+    return 1;
 }
 
 } // extern C

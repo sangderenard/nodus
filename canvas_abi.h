@@ -1,7 +1,15 @@
+#ifndef NODUS_CANVAS_ABI_H
+#define NODUS_CANVAS_ABI_H
 // Minimal canvas API for placing modules and drawing droopy rope edges between contacts
 #pragma once
 
 #include <stdint.h>
+
+// Expose module/frame constants used across compilation units.
+// Declarations only; definitions live in canvas_abi.cpp.
+extern const int kModuleExtraLedCount;
+extern const int kModuleExtraLedRows;
+extern const int kModuleFrameContactBase;
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,6 +20,29 @@ typedef struct GP_TableContext GP_TableContext; // forward from table_abi
 
 // Module background rasterizer hook.
 typedef void(*GP_CanvasModuleBgFn)(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
+
+// Lasso event callback: event_type is 1=start, 2=sample, 3=end (finalized).
+// `points` is a contiguous XY float array (2*count) in canvas/world coords.
+typedef void(*GP_CanvasLassoFn)(void* user, int event_type, const float* points, int count);
+
+// Click-drag event callback: event_type is 1=start, 2=move, 3=end.
+// `sx,sy` are the drag start in canvas/world coords, `ex,ey` are the current/end coords.
+typedef void(*GP_CanvasClickDragFn)(void* user, int event_type, float sx, float sy, float ex, float ey);
+
+// Overlay button callback: invoked when an overlay's mode button is clicked.
+// Returns 1 if the event was handled (no further action), 0 to let canvas
+// perform the default sim-only toggle. `button_id` identifies which button
+// inside the overlay was clicked (0 = mode 'R' button).
+typedef int(*GP_CanvasOverlayButtonFn)(void* user, unsigned long long overlay_key_a, unsigned long long overlay_key_b, int rope_idx, int button_id);
+
+// Register an overlay button callback for this canvas. Passing NULL clears.
+int gp_canvas_set_overlay_button_callback(GP_CanvasContext* ctx, GP_CanvasOverlayButtonFn cb, void* user);
+
+// Register a click-drag event callback for this canvas. Passing NULL clears.
+int gp_canvas_set_click_drag_callback(GP_CanvasContext* ctx, GP_CanvasClickDragFn cb, void* user);
+
+// Register a lasso event callback for this canvas. Passing NULL clears.
+int gp_canvas_set_lasso_callback(GP_CanvasContext* ctx, GP_CanvasLassoFn cb, void* user);
 
 // Module descriptor
 typedef struct {
@@ -51,6 +82,36 @@ int gp_canvas_set_edge_hues(GP_CanvasContext* ctx, const float* hues, int hue_co
 
 // Update subgroup toolbar LED colors. `rgba` is a float array in stride-of-4 RGBA values.
 int gp_canvas_set_subgroup_toolbar_rgba(GP_CanvasContext* ctx, const float* rgba, int value_count);
+// Set a single subgroup toolbar RGBA color at index `idx` (rgba = 4 floats)
+int gp_canvas_set_subgroup_toolbar_rgba_at(GP_CanvasContext* ctx, int idx, const float* rgba);
+
+// Click-listen mode: when enabled, root-table click actions will be captured
+// instead of acted upon. Use `gp_canvas_bind_pending_action_to_module` to
+// bind the retained action pointer into a module's frame receive slot.
+int gp_canvas_set_click_listen_mode(GP_CanvasContext* ctx, int enable);
+int gp_canvas_get_click_listen_mode(GP_CanvasContext* ctx, int* out_enabled);
+// Bind retained action (if any) to the most-left unused receive frame ptr of module.
+int gp_canvas_bind_pending_action_to_module(GP_CanvasContext* ctx, int module_idx);
+// Query a module frame ptr previously set via gp_canvas_set_module_frame_ptr.
+void* gp_canvas_get_module_frame_ptr(GP_CanvasContext* ctx, int module_idx, int is_send, int led_idx);
+// Return the bound module-frame pointer for a given module contact id.
+// `contact_idx` should be in the frame contact range (kModuleFrameContactBase..).
+void* gp_canvas_get_module_frame_ptr_for_contact(GP_CanvasContext* ctx, int module_idx, int contact_idx);
+// Free a pending action pointer that was previously created by click-listen
+// and bound into a module frame. Returns 1 on success.
+int gp_canvas_free_pending_action(GP_CanvasContext* ctx, void* pending_ptr);
+// Invoke a bound pending action pointer (as stored in module-frame ptrs).
+// The pointer should be a `GP_CanvasContextImpl::PendingAction*` previously
+// created by click-listen capture and bound into a module frame slot. This
+// function will execute the action semantics on the canvas (same as a root
+// table action). Returns 1 on success.
+int gp_canvas_invoke_pending_action(GP_CanvasContext* ctx, void* pending_ptr);
+
+// Return pointer to singleton canvas (may be null)
+GP_CanvasContext* gp_canvas_get_singleton();
+
+// Return the synthetic root-reflection module index, or -1 if none
+int gp_canvas_get_root_module_idx();
 
 // Forward a mouse click (canvas-local coords). Returns 1 if handled.
 int gp_canvas_on_click(GP_CanvasContext* ctx, int x, int y);
@@ -82,6 +143,22 @@ int gp_canvas_step(GP_CanvasContext* ctx, float dt);
 // Useful to attach table contexts to the shared simulator so tables defer
 // simulation to the root table. The returned pointer is an opaque `RopeSim*`.
 void* gp_canvas_get_rope_sim(GP_CanvasContext* ctx);
+
+// Create a custom overlay rectangle with two LED contact positions. Returns
+// two 64-bit keys in `out_key_a` and `out_key_b` that can be used with
+// canvas/edge APIs. Keys follow internal sentinel encoding and are valid for
+// the lifetime of the canvas. Returns 1 on success.
+int gp_canvas_create_overlay_with_leds(GP_CanvasContext* ctx, float x1, float y1, float x2, float y2, unsigned long long* out_key_a, unsigned long long* out_key_b);
+
+// Attach an existing rope index to an overlay by supplying the two overlay
+// keys and the rope index. This creates a canvas edge record that links the
+// rope to the overlay so rendering and interaction bind to the rope.
+int gp_canvas_attach_rope_to_overlay(GP_CanvasContext* ctx, unsigned long long key_a, unsigned long long key_b, int rope_idx);
+// Resolve an overlay key into canvas pixel coordinates. Returns 1 on success.
+int gp_canvas_resolve_overlay_key(GP_CanvasContext* ctx, unsigned long long key, int* out_x, int* out_y);
+// Resolve a canonical root key (packed as (module<<32)|(col<<16)|led) to
+// overlay pixel coords if it maps to an overlay. Returns 1 on success.
+int gp_canvas_resolve_canonical_key(GP_CanvasContext* ctx, unsigned long long key, int* out_x, int* out_y);
 
 // Attach a `GP_TableContext` to a canvas module so the canvas will render
 // the table inside the module rectangle and forward clicks. `take_ownership`
@@ -171,3 +248,5 @@ int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx, int* out_mode);
 #ifdef __cplusplus
 }
 #endif
+
+#endif // NODUS_CANVAS_ABI_H

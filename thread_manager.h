@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <string>
+#include <array>
 #include "table_abi.h"
 
 struct GP_TableContext;
@@ -45,6 +47,7 @@ struct ModuleIORow {
     ModuleToolKind tool = ModuleToolKind::None;
     int attachment_count = 1;
     ModuleToolOrigin tool_origin = ModuleToolOrigin::Builtin;
+    std::string plugin_id; // non-empty for plugin-origin rows to identify which plugin
 };
 
 struct ModuleInputState {
@@ -216,4 +219,11 @@ private:
     std::unordered_map<int, uint64_t> reader_slot_to_edge_;
     std::unordered_map<int, uint64_t> reader_slot_seq_;
     std::unordered_map<uint64_t, uint64_t> reader_min_seq_by_edge_;
+    // Last applied RGBA per toolbar subgroup (to avoid repeated reapplication when peeking)
+    std::unordered_map<int, std::array<float,4>> last_applied_rgba_subgroup_;
+    // Per-edge assembly buffer when producer emits stride<4 and color is encoded
+    // across multiple successive samples (e.g., stride==1 sends R,G,B,A as four samples).
+    std::unordered_map<int, std::vector<float>> edge_assemble_buf_;
+    // Cache of last-known stride per edge (0 = unknown)
+    std::unordered_map<int, int> edge_stride_cache_;
 };

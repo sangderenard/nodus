@@ -2,6 +2,8 @@
 
 #include "table_abi.h"
 #include "stage_abi.h"
+#include "canvas_abi.h"
+#include "tool_api.h"
 #include <chrono>
 #include "stage_abi.h"
 
@@ -9,11 +11,21 @@
 #include <cmath>
 #include <limits>
 
+// Payload wrapper for pointer-mode FIFO events. Carries the original
+// pending-action pointer and origin module/frame index so consumers can
+// clear the module-frame slot after handling the event.
+struct EventPayload {
+    void* pending;
+    int src_module;
+    int frame_idx; // 0..kModuleExtraLedCount-1
+};
+
 extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
 extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
 extern void canvas_clear_module_input_pulses(int module_idx);
 extern void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count);
 extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
+extern ITool* canvas_get_plugin_instance(int module_idx, int row_idx);
 
 // Scheduling helpers used inside run_scheduled_tick.
 namespace {
@@ -304,6 +316,146 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         }
     }
 
+        // Special-case: consume root-table FIFO samples targeted at the canvas
+        // synthetic root-reflection module and use them to update the canonical
+        // subgroup toolbar RGBA values. We expect producers to publish 4-float
+        // RGBA samples to the root-edge consuming the toolbar contact index.
+        if (req.root_table) {
+            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+            int root_mod = gp_canvas_get_root_module_idx();
+            if (canvas_single && root_mod >= 0) {
+                for (const auto &e : req.edges) {
+                    // consume samples for edges where either endpoint is the synthetic root module
+                    int edge_idx = e.edge_idx;
+                    int contact_idx = -1;
+                    if (e.b_module == root_mod) contact_idx = e.b_contact_idx;
+                    else if (e.a_module == root_mod) contact_idx = e.a_contact_idx;
+                    else continue;
+                    uint64_t reader_key = ((uint64_t)root_mod << 32) | ((uint64_t)static_cast<uint64_t>(contact_idx) << 16) | 0u;
+                    if (reader_key == 0) reader_key = 0x8000000000000000ull;
+                    gp_table_edge_subscribe_ex(req.root_table, edge_idx, reader_key, /*start_at_head=*/1);
+                    int32_t unread = 0;
+                    gp_table_edge_unread(req.root_table, edge_idx, reader_key, &unread);
+                            if (unread > 0) {
+                                // Determine edge stride (cache if available).
+                        int stride = 0;
+                        auto itc = edge_stride_cache_.find(edge_idx);
+                        if (itc != edge_stride_cache_.end()) stride = itc->second;
+                        else {
+                            GP_TableEdgeTensorSpec spec{};
+                            if (gp_table_edge_get_tensor_spec(req.root_table, edge_idx, &spec)) {
+                                stride = 1;
+                                for (int di = 0; di < spec.dim_count; ++di) stride *= std::max(1, spec.dims[di]);
+                            } else stride = 1;
+                            edge_stride_cache_[edge_idx] = stride;
+                        }
+
+                        int subgroup_idx = contact_idx;
+                        const int toolbar_base = kModuleFrameContactBase + kModuleExtraLedCount * kModuleExtraLedRows;
+                        if (contact_idx >= toolbar_base && contact_idx < toolbar_base + kModuleExtraLedCount) {
+                            subgroup_idx = contact_idx - toolbar_base;
+                        }
+
+                        auto almost_equal = [](float a, float b) {
+                            return std::fabs(a - b) <= 1e-6f;
+                        };
+
+                        if (stride == 4) {
+                            float sample[4] = {0.0f,0.0f,0.0f,0.0f};
+                            int32_t written = 0;
+                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample, 4, &written) && written >= 4) {
+                                float rgba[4];
+                                int32_t written2 = 0;
+                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, rgba, 4, &written2) && written2 >= 4) {
+                                    bool changed = false;
+                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
+                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
+                                    else {
+                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
+                                    }
+                                    if (changed) {
+                                        printf("ThreadManager: consumed full sample for edge %d contact=%d mapped_subgroup=%d\n", edge_idx, contact_idx, subgroup_idx);
+                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
+                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+                                    }
+                                }
+                            }
+                        } else if (stride == 1) {
+                            // Assemble RGBA from successive single-float samples.
+                            while (true) {
+                                // First check for pointer-mode events on stride-1 assembly pathway.
+                                void* maybe_p = nullptr;
+                                if (gp_table_edge_consume_ptr(req.root_table, edge_idx, reader_key, &maybe_p) && maybe_p) {
+                                    // consumed a pointer EventPayload
+                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                    void* pa = ep->pending;
+                                    if (canvas_single) {
+                                        // clear the originating frame ptrs (both send/receive)
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                        // invoke and free the pending action
+                                        gp_canvas_invoke_pending_action(canvas_single, pa);
+                                        gp_canvas_free_pending_action(canvas_single, pa);
+                                    }
+                                    delete ep;
+                                    continue; // continue consuming until FIFO empty
+                                }
+                                int32_t written = 0;
+                                float s[1] = {0.0f};
+                                if (!(gp_table_edge_consume(req.root_table, edge_idx, reader_key, s, 1, &written) && written == 1)) break;
+                                auto &buf = edge_assemble_buf_[edge_idx];
+                                buf.push_back(s[0]);
+                                if (buf.size() >= 4) {
+                                    float rgba[4] = {buf[0], buf[1], buf[2], buf[3]};
+                                    bool changed = false;
+                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
+                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
+                                    else {
+                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
+                                    }
+                                    if (changed) {
+                                        printf("ThreadManager: assembled RGBA from stride-1 for edge %d contact=%d mapped_subgroup=%d\n", edge_idx, contact_idx, subgroup_idx);
+                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
+                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+                                    }
+                                    // remove consumed values
+                                    if (buf.size() > 4) {
+                                        std::vector<float> leftover(buf.begin() + 4, buf.end());
+                                        buf.swap(leftover);
+                                    } else buf.clear();
+                                }
+                            }
+                        } else {
+                            // Fallback: attempt to read stride (if >4 we ignore extras) and apply first 4 components.
+                            int cap = std::max(1, std::min(4, stride));
+                            std::vector<float> sample(cap, 0.0f);
+                            int32_t written = 0;
+                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample.data(), cap, &written) && written > 0) {
+                                // consume only if we can read the full stride
+                                std::vector<float> consumed(stride, 0.0f);
+                                int32_t consumed_written = 0;
+                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, consumed.data(), stride, &consumed_written) && consumed_written == stride) {
+                                    float rgba[4] = {0.0f,0.0f,0.0f,1.0f};
+                                    for (int i = 0; i < std::min(4, stride); ++i) rgba[i] = consumed[i];
+                                    bool changed = false;
+                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
+                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
+                                    else {
+                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
+                                    }
+                                    if (changed) {
+                                        printf("ThreadManager: consumed stride-%d sample for edge %d contact=%d mapped_subgroup=%d\n", stride, edge_idx, contact_idx, subgroup_idx);
+                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
+                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
     // Prefer topological order when acyclic, otherwise use ASAP/ALAP slack heuristic.
     std::vector<int> order = topo_kahn(succ);
     if (order.empty()) {
@@ -367,7 +519,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         }
         int row_count = gp_table_get_row_count(mod.table);
         std::vector<float> stack;
-        stack.reserve(32);
+        stack.reserve(256);
         ModuleInputState input_state{};
         bool input_state_loaded = false;
         bool input_state_used = false;
@@ -419,10 +571,34 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
                         gp_table_edge_unread(fifo_table, edge_idx, reader_key, &unread);
                         if (unread > 0) {
-                            float sample[1] = {0.0f};
-                            int32_t written = 0;
-                            if (gp_table_edge_consume(fifo_table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
-                                val = sample[0];
+                            // Check for pointer-mode marker on this row: reserved0>0
+                            GP_TableRow tbl_row{};
+                            bool tried_row = false;
+                            if (fifo_table && gp_table_get_row(fifo_table, row, &tbl_row)) {
+                                tried_row = true;
+                            }
+                            if (tried_row && tbl_row.reserved0 > 0) {
+                                // Pointer mode: consume opaque EventPayload, clear origin frame ptrs,
+                                // invoke the pending action and free payload + action.
+                                void* maybe_p = nullptr;
+                                if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && maybe_p) {
+                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                    void* pa = ep->pending;
+                                    GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                                    if (canvas_single) {
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                        gp_canvas_invoke_pending_action(canvas_single, pa);
+                                        gp_canvas_free_pending_action(canvas_single, pa);
+                                    }
+                                    delete ep;
+                                }
+                            } else {
+                                float sample[1] = {0.0f};
+                                int32_t written = 0;
+                                if (gp_table_edge_consume(fifo_table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
+                                    val = sample[0];
+                                }
                             }
                         }
                     }
@@ -431,6 +607,41 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             }
             // Tool row: pass stack through (no-op for now)
             if (meta.kind == ModuleRowKind::Tool) {
+                // If this is a plugin-origin row, attempt to dispatch to the live plugin instance
+                if (meta.tool_origin == ModuleToolOrigin::Plugin) {
+                    ITool* inst = canvas_get_plugin_instance(mod_idx, row);
+                    if (inst) {
+                        ToolStackFrame frame{stack.empty() ? nullptr : stack.data(), static_cast<int>(stack.size()), static_cast<int>(stack.capacity())};
+                        ToolStackContext tctx;
+                        tctx.stack = frame;
+                        ToolInputState tinp;
+                        if (load_input_state()) {
+                            tinp.mouse_x = input_state.mouse_x;
+                            tinp.mouse_y = input_state.mouse_y;
+                            tinp.mouse_down = input_state.mouse_down;
+                            tinp.mouse_up = input_state.mouse_up;
+                            tinp.key = input_state.key;
+                            tinp.key_event = input_state.key_event;
+                            tctx.input = &tinp;
+                        } else {
+                            tctx.input = nullptr;
+                        }
+                        try {
+                            inst->execute_stack(tctx);
+                        } catch (...) {}
+                        // reflect any stack changes back into the std::vector
+                        if (frame.count >= 0) {
+                            size_t newsz = static_cast<size_t>(frame.count);
+                            if (newsz <= stack.capacity()) {
+                                stack.resize(newsz);
+                            } else {
+                                // clamp if plugin wrote out of bounds
+                                stack.resize(stack.capacity());
+                            }
+                        }
+                        continue; // plugin handled this row
+                    }
+                }
                 switch (meta.tool) {
                     case ModuleToolKind::KeyboardListener: {
                         float val = 0.0f;
@@ -571,8 +782,27 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     }
                     if (edge_idx >= 0 && fifo_table) {
                         int dropped = 0;
-                        float payload[1] = {val};
-                        gp_table_edge_publish(fifo_table, edge_idx, writer_key, payload, 1, &dropped);
+                        // If this output contact maps to a module-frame contact, publish the bound pointer instead of a float.
+                        const int frame_base = kModuleFrameContactBase;
+                        const int frame_end = frame_base + kModuleExtraLedCount * kModuleExtraLedRows;
+                        if (contact_idx >= frame_base && contact_idx < frame_end) {
+                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                            void* p = nullptr;
+                            if (canvas_single) p = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, contact_idx);
+                                if (p) {
+                                int local = contact_idx - frame_base;
+                                int frame_idx = local % kModuleExtraLedCount;
+                                // Wrap into EventPayload so consumers can clear the frame slot after handling
+                                EventPayload* ep = new EventPayload{p, mod_idx, frame_idx};
+                                gp_edge_publish_ptr(fifo_table, edge_idx, writer_key, reinterpret_cast<void*>(ep), &dropped);
+                            } else {
+                                float payload[1] = {val};
+                                gp_edge_publish(fifo_table, edge_idx, writer_key, payload, 1, &dropped);
+                            }
+                        } else {
+                            float payload[1] = {val};
+                            gp_edge_publish(fifo_table, edge_idx, writer_key, payload, 1, &dropped);
+                        }
                     }
                 }
             }
