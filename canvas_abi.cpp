@@ -1582,12 +1582,24 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->module_chat_ttl.clear();
     ctx->module_plugin_instances.clear();
     ctx->edges.clear();
+    ctx->overlays.clear();
+    ctx->overlay_port_uuid_map.clear();
+    ctx->overlay_key_map.clear();
+    ctx->pending_meta_snapshots.clear();
+    ctx->post_load_meta_pending.clear();
+    ctx->canonical_to_overlay.clear();
     ctx->nodes.clear();
     ctx->module_node_id.clear();
+    ctx->module_uuid_map.clear();
+    ctx->module_port_uuid_map.clear();
     ctx->selected = {};
     ctx->dispatch_module_idx = -1;
     ctx->focused_module = -1;
     ctx->prospective_rope_idx = -1;
+    ctx->rope_id_map.clear();
+    ctx->rope_map_dirty = false;
+    ctx->lasso_id_map.clear();
+    ctx->next_overlay_id = 1;
     ctx->tool_menu_open = false;
     int max_window_node = 0;
     for (const auto &entry : ctx->window_node_ids) {
