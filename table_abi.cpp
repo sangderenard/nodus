@@ -6073,13 +6073,14 @@ int32_t gp_table_get_editable(GP_TableContext* ctx, int32_t* out_editable) {
 // [8 bytes magic 'GPTBL001'][uint32_t version]
 // version 1: GP_TableStyle, cols, rows, edges, selected keys
 // version 2: same as v1, then int32 meta_group_count, followed by per-meta-group blob
+// version 4: adds RopeSim blob (int32 size + bytes) before meta-groups
 // Per-meta-group blob: int32 vertex_count, (int32 rope_idx,int32 vert_idx)*N, float confinement, int32 sim_group_idx,
 // uint64 id, LassoConfig (8 bytes), uint64 anchor_rope_uid, int32 anchor_vert, uint32 subgroup_flags, int32 channel_group,
 // int32 dangling_widget_rope, int32 dangling_widget_rope_vid, float dangling_hang_len, int32 ring_mode,
 // uint64 overlay_key_a, uint64 overlay_key_b
 int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len) {
     if (!ctx) return 0;
-    const uint32_t version = 3;
+    const uint32_t version = 4;
     const char magic[8] = {'G','P','T','B','L','0','0','1'};
     // Build a canonical UUID atlas covering all UUIDs referenced by this
     // table blob (edges, ropes, overlays, module/frame ports, rings,
@@ -6107,6 +6108,10 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
     int32_t row_count = static_cast<int32_t>(ctx->rows.size());
     int32_t edge_count = static_cast<int32_t>(ctx->edges.size());
     int32_t sel_count = static_cast<int32_t>(ctx->selected_leds.size());
+    int32_t rope_blob_len = 0;
+    if (ctx->rope_sim) {
+        rope_blob_len = rope_sim_serialized_size(ctx->rope_sim);
+    }
     int32_t need = 0;
     need += 8; // magic
     need += 4; // version
@@ -6131,6 +6136,9 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
     need += 4; // frame_port_count
     // each entry: row(int32), idx(int32), uuid(uint64)
     need += static_cast<int32_t>(ctx->frame_port_uuids.size()) * (4 + 4 + 8);
+    // RopeSim blob (version 4)
+    need += 4; // rope_blob_len
+    need += rope_blob_len;
     // meta-groups (version 2)
     int32_t mg_count = static_cast<int32_t>(ctx->meta_groups.size());
     need += 4; // mg_count
@@ -6234,6 +6242,14 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
         memcpy(p, &r, 4); p += 4;
         memcpy(p, &idx, 4); p += 4;
         memcpy(p, &pu, 8); p += 8;
+    }
+
+    // write RopeSim blob (version 4)
+    memcpy(p, &rope_blob_len, 4); p += 4;
+    if (rope_blob_len > 0) {
+        int wrote = rope_sim_serialize(ctx->rope_sim, p, rope_blob_len);
+        if (wrote != rope_blob_len) return 0;
+        p += rope_blob_len;
     }
 
     // write meta-groups (version 3)
@@ -6348,7 +6364,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     // Canvas singleton (may be null). Declare early so deserialization can
     // register persisted rope/module UUIDs with the canvas if available.
     GP_CanvasContext* cvs = gp_canvas_get_singleton();
-    if (version < 2 || version > 3) return 0;
+    if (version < 2 || version > 4) return 0;
     // read style
     GP_TableStyle style{};
     memcpy(&style, p, sizeof(GP_TableStyle)); p += sizeof(GP_TableStyle);
@@ -6418,6 +6434,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
 
     // version 3: read module UUID and frame-port entries
     uint64_t module_uuid = 0ull;
+    RopeSim* restored_sim = nullptr;
     if (version >= 3) {
         if (p + 8 > in_buf + in_len) return 0;
         memcpy(&module_uuid, p, 8); p += 8;
@@ -6445,6 +6462,21 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
             uint64_t pu = std::get<2>(ent);
             GP_TableContext::FramePortEntry fpe{}; fpe.row = r; fpe.idx = idx; fpe.uuid = pu;
             ctx->frame_port_uuids.push_back(fpe);
+        }
+    }
+
+    // version 4: read RopeSim blob
+    if (version >= 4) {
+        if (p + 4 > in_buf + in_len) return 0;
+        int32_t rope_blob_len = 0;
+        memcpy(&rope_blob_len, p, 4); p += 4;
+        if (rope_blob_len < 0 || p + rope_blob_len > in_buf + in_len) return 0;
+        if (rope_blob_len > 0) {
+            restored_sim = rope_sim_deserialize(p, rope_blob_len);
+            if (!restored_sim) {
+                printf("gp_table_deserialize: failed to deserialize RopeSim blob\n");
+            }
+            p += rope_blob_len;
         }
     }
 
@@ -6480,6 +6512,13 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     }
     ctx->selected_leds = std::move(selset);
     recompute_geom(ctx);
+    if (restored_sim) {
+        if (ctx->rope_sim && ctx->rope_sim_owned) {
+            rope_sim_destroy(ctx->rope_sim);
+        }
+        ctx->rope_sim = restored_sim;
+        ctx->rope_sim_owned = 1;
+    }
     // Parse and restore meta-groups (version 2)
     // ensure there's enough data remaining
     if (p + 4 > in_buf + in_len) return 1; // nothing more

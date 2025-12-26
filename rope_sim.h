@@ -95,4 +95,12 @@ int rope_sim_set_widget_mass(RopeSim* s, int widget_id, float mass);
 // Query world position of a meta-group member sampled from its parametric `u`.
 // out_xyz must point to 3 floats. Returns 1 on success, 0 on failure.
 int rope_sim_meta_group_get_member_world_pos(RopeSim* s, int group_idx, int member_idx, float* out_xyz);
+
+// Serialize/deserialize RopeSim state into a binary blob.
+// Returns size needed in bytes (or 0 if sim is null).
+int rope_sim_serialized_size(RopeSim* s);
+// Serialize into out_buf; returns bytes written or 0 on error.
+int rope_sim_serialize(RopeSim* s, char* out_buf, int out_len);
+// Deserialize from buffer; returns newly allocated RopeSim or nullptr on error.
+RopeSim* rope_sim_deserialize(const char* in_buf, int in_len);
 } // extern C
