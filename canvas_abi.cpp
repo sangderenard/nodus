@@ -7982,8 +7982,14 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
                 }
             }
         }
-        // Enqueue edge addition to be applied by the manager thread.
-        gp_table_enqueue_add_edge(root, ka, kb);
+        // Enqueue edge addition to be applied by the manager thread unless
+        // the restored root table already contains this edge.
+        int existing_edge_idx = -1;
+        if (!gp_table_edge_index_for_pair(root, ka, kb, &existing_edge_idx)) {
+            gp_table_enqueue_add_edge(root, ka, kb);
+        } else {
+            printf("gp_canvas_add_edge_with_type: root edge already present (edge_idx=%d)\n", existing_edge_idx);
+        }
     }
 
     c->edges.push_back(std::move(ei));
@@ -8811,6 +8817,17 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     printf("gp_canvas_load_from_file: restoring %zu META_GROUP snapshots, overlays.size=%zu\n", meta_group_snapshots.size(), c->overlays.size());
     for (const auto &ms : meta_group_snapshots) {
         GP_TableContext* t = nullptr;
+        auto find_meta_group_by_id = [&](GP_TableContext* tt, unsigned long long mgid) -> GP_MetaGroup* {
+            if (!tt || mgid == 0ull) return nullptr;
+            int mgcount = gp_table_get_meta_group_count(tt);
+            for (int mgi = 0; mgi < mgcount; ++mgi) {
+                GP_MetaGroup* mg2 = gp_table_get_meta_group(tt, mgi);
+                unsigned long long curid = 0ull;
+                gp_table_meta_get_id(tt, mg2, &curid);
+                if (curid == mgid) return mg2;
+            }
+            return nullptr;
+        };
         if (ms.module_idx >= 0 && ms.module_idx < static_cast<int>(c->module_tables.size())) {
             t = c->module_tables[static_cast<size_t>(ms.module_idx)];
         } else if (ms.module_idx < 0) {
@@ -8857,6 +8874,10 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                             sim = gp_table_get_rope_sim(t);
                         }
                         int rope_idx = -1;
+                        bool allow_overlay_rope = (find_meta_group_by_id(t, ms.mgid) == nullptr);
+                        if (t && gp_table_get_rope_id_count(t) > 0) {
+                            allow_overlay_rope = false;
+                        }
                         if (sim) {
                             float table_off_x = 0.0f, table_off_y = 0.0f;
                             int host_mod = -1;
@@ -8875,7 +8896,9 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                             float fy_local = oy2 - table_off_y;
                             float plug_z = -10.0f;
                             int segs = 2;
-                            rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
+                            if (allow_overlay_rope) {
+                                rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
+                            }
                         }
                         unsigned long long ka=0ull,kb=0ull;
                         // If saved overlay keys are present, prefer reusing/creating an
@@ -8939,6 +8962,10 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                             sim = gp_table_get_rope_sim(rt);
                         }
                         int rope_idx = -1;
+                        bool allow_overlay_rope = (find_meta_group_by_id(rt, ms.mgid) == nullptr);
+                        if (rt && gp_table_get_rope_id_count(rt) > 0) {
+                            allow_overlay_rope = false;
+                        }
                         if (sim) {
                             float table_off_x = 0.0f, table_off_y = 0.0f;
                             int host_mod = -1;
@@ -8957,7 +8984,9 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                             float fy_local = oy2 - table_off_y;
                             float plug_z = -10.0f;
                             int segs = 2;
-                            rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
+                            if (allow_overlay_rope) {
+                                rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
+                            }
                         }
                         unsigned long long ka=0ull,kb=0ull;
                         if (ms.overlay_a != 0ull || ms.overlay_b != 0ull) {
@@ -9000,13 +9029,30 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             }
         }
         if (!t) continue;
-        GP_MetaGroup* mg = gp_table_meta_create(t);
-        if (!mg) continue;
-        printf("gp_canvas_load_from_file: restoring canvas META_GROUP to table=%p mg=%p (module_idx=%d overlay_idx=%d)\n", (void*)t, (void*)mg, ms.module_idx, ms.meta_slot);
-        fflush(stdout);
-        gp_table_meta_set_confinement(t, mg, ms.confinement);
-        gp_table_meta_set_id(t, mg, ms.mgid);
-        gp_table_meta_set_lasso_fields(t, mg, ms.lasso_flags, ms.lasso_widget_type);
+        bool mg_exists = false;
+        GP_MetaGroup* mg = find_meta_group_by_id(t, ms.mgid);
+        if (mg) {
+            mg_exists = true;
+        } else {
+            mg = gp_table_meta_create(t);
+            if (!mg) continue;
+            printf("gp_canvas_load_from_file: restoring canvas META_GROUP to table=%p mg=%p (module_idx=%d overlay_idx=%d)\n", (void*)t, (void*)mg, ms.module_idx, ms.meta_slot);
+            fflush(stdout);
+            gp_table_meta_set_confinement(t, mg, ms.confinement);
+            gp_table_meta_set_id(t, mg, ms.mgid);
+            gp_table_meta_set_lasso_fields(t, mg, ms.lasso_flags, ms.lasso_widget_type);
+        }
+        if (mg_exists) {
+            gp_table_meta_set_overlay_keys(t, mg, ms.overlay_a, ms.overlay_b);
+            int overlay_rope = -1;
+            int overlay_vid = -1;
+            gp_table_meta_get_dangling_rope_info(t, mg, &overlay_rope, &overlay_vid);
+            if (overlay_rope >= 0 && (ms.overlay_a != 0ull || ms.overlay_b != 0ull)) {
+                gp_canvas_attach_rope_to_overlay(reinterpret_cast<GP_CanvasContext*>(c), ms.overlay_a, ms.overlay_b, overlay_rope);
+            }
+            gp_canvas_set_overlay_meta(reinterpret_cast<GP_CanvasContext*>(c), ms.overlay_a, ms.overlay_b, t, reinterpret_cast<void*>(mg));
+            continue;
+        }
         // Add vertices: prefer saved rope ids, but resolve when
         // ropes have changed. Emulate lasso behavior: ensure a RopeSim is
         // attached, map overlay->edge rope indices, insert vertices when
@@ -9131,7 +9177,12 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                     if (rootsim) gp_table_attach_rope_sim(t, rootsim, 0);
                     sim = gp_table_get_rope_sim(t);
                 }
-                if (sim) {
+                int existing_rope = -1;
+                int existing_vid = -1;
+                gp_table_meta_get_dangling_rope_info(t, mg, &existing_rope, &existing_vid);
+                if (existing_rope >= 0) {
+                    gp_canvas_attach_rope_to_overlay(reinterpret_cast<GP_CanvasContext*>(c), pov->key_a, pov->key_b, existing_rope);
+                } else if (sim && gp_table_get_rope_id_count(t) == 0) {
                     float table_off_x = 0.0f, table_off_y = 0.0f;
                     int host_mod = -1;
                     for (int mi = 0; mi < static_cast<int>(c->module_tables.size()); ++mi) {
@@ -9808,6 +9859,20 @@ extern "C" int gp_canvas_get_overlay_port_uuids(GP_CanvasContext* ctx_, unsigned
 extern "C" int gp_canvas_attach_rope_to_overlay(GP_CanvasContext* ctx_, unsigned long long key_a, unsigned long long key_b, int rope_idx) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    // If an edge is already bound to this overlay, reuse it.
+    for (size_t ei = 0; ei < c->edges.size(); ++ei) {
+        auto &edge = c->edges[ei];
+        bool match_a = (key_a != 0ull && (edge.overlay_key_a == key_a || edge.overlay_key_b == key_a));
+        bool match_b = (key_b != 0ull && (edge.overlay_key_a == key_b || edge.overlay_key_b == key_b));
+        if (match_a || match_b) {
+            edge.overlay_key_a = key_a;
+            edge.overlay_key_b = key_b;
+            edge.rope_idx = rope_idx;
+            printf("gp_canvas_attach_rope_to_overlay: reusing edge_idx=%zu for keys=%llu/%llu rope_idx=%d\n",
+                   ei, (unsigned long long)key_a, (unsigned long long)key_b, rope_idx);
+            return static_cast<int>(ei);
+        }
+    }
     // Ensure a root module exists to host canonical LED contacts for this overlay
     int root_mod = canvas_ensure_root_module(c);
     if (root_mod < 0) return 0;

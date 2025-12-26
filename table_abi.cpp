@@ -6578,11 +6578,28 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     ctx->rows = std::move(rows);
     // clear existing edges via API to keep rope_sim indices consistent
     gp_table_clear_edges(ctx);
-    for (auto &e : edges) gp_table_add_edge(ctx, e.first, e.second);
+    auto add_edge_without_rope = [&](uint64_t a, uint64_t b) {
+        ctx->edges.emplace_back(a, b);
+        uint64_t uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+        ctx->edge_ids.push_back(uid);
+        ctx->relax_value.push_back(0.0f);
+        ctx->relax_vel.push_back(0.0f);
+        ctx->prospective_initialized = false;
+        ensure_edge_fifos(ctx);
+        sync_edge_tensor_for_idx(ctx, ctx->edges.size() - 1);
+    };
+    bool suppress_edge_rope_creation = (restored_sim != nullptr) || !rope_ids_temp.empty();
+    for (auto &e : edges) {
+        if (suppress_edge_rope_creation) add_edge_without_rope(e.first, e.second);
+        else gp_table_add_edge(ctx, e.first, e.second);
+    }
     // if serialized per-rope uids were present, adopt them so runtime rope
     // indices map to the saved stable ids (this preserves stable mapping
     // for meta-group vertices which reference ropes by uid).
     if (!rope_ids_temp.empty()) {
+        if (rope_ids_temp.size() < ctx->edges.size()) {
+            rope_ids_temp.resize(ctx->edges.size(), 0ull);
+        }
         ctx->rope_ids = rope_ids_temp;
         // rebuild rope_id_to_sim_idx so canvas lookups resolve to the current
         // rope indices (edge order) using the persisted ids.
@@ -6766,24 +6783,32 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
             }
             gp_table_meta_add_vertex_with_id(ctx, mg, want_uid, resolved, vp.second);
         }
-        // If we registered an overlay earlier, attach the ropes referenced
-        // by this meta-group deterministically to that canonical overlay.
+        // If we registered an overlay earlier, attach a single rope (prefer
+        // the dangling widget rope) to that canonical overlay.
         if ((mg->overlay_key_a != 0ull || mg->overlay_key_b != 0ull) && cvs) {
-            std::unordered_set<uint64_t> seen_rope_ids;
-            for (const auto &vp : d.verts) {
-                uint64_t ru = vp.first;
-                if (ru == 0ull) continue;
-                if (seen_rope_ids.find(ru) != seen_rope_ids.end()) continue;
-                seen_rope_ids.insert(ru);
-                int resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, ru);
-                if (resolved < 0) {
+            int overlay_rope_idx = -1;
+            if (d.dang_rope >= 0) {
+                overlay_rope_idx = d.dang_rope;
+            } else if (d.anchor_uid != 0ull) {
+                overlay_rope_idx = gp_canvas_resolve_rope_id_to_index(cvs, ctx, d.anchor_uid);
+                if (overlay_rope_idx < 0) {
                     for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
-                        if (ctx->rope_ids[ri] == ru) { resolved = static_cast<int>(ri); break; }
+                        if (ctx->rope_ids[ri] == d.anchor_uid) { overlay_rope_idx = static_cast<int>(ri); break; }
                     }
                 }
-                if (resolved >= 0) {
-                    gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, resolved);
+            } else if (!d.verts.empty()) {
+                uint64_t ru = d.verts[0].first;
+                if (ru != 0ull) {
+                    overlay_rope_idx = gp_canvas_resolve_rope_id_to_index(cvs, ctx, ru);
+                    if (overlay_rope_idx < 0) {
+                        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
+                            if (ctx->rope_ids[ri] == ru) { overlay_rope_idx = static_cast<int>(ri); break; }
+                        }
+                    }
                 }
+            }
+            if (overlay_rope_idx >= 0) {
+                gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, overlay_rope_idx);
             }
             gp_canvas_set_overlay_meta(cvs, mg->overlay_key_a, mg->overlay_key_b, ctx, reinterpret_cast<void*>(mg));
         }
