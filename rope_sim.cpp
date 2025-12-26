@@ -4,6 +4,7 @@
 #include <cmath>
 #include <memory>
 #include <cstring>
+#include <cstddef>
 
 // Optional compile-time Eigen path: define EIGEN_SIM to enable Eigen-accelerated paths.
 #ifdef EIGEN_SIM
@@ -652,6 +653,276 @@ int rope_sim_create_dangling_widget(RopeSim* s, int rope_idx, int vertex_idx, un
 int rope_sim_destroy_dangling_widget(RopeSim* s, int widget_id) { (void)s; (void)widget_id; return 0; }
 int rope_sim_get_widget_position(RopeSim* s, int widget_id, float* out_xyz) { if (!out_xyz) return 0; out_xyz[0]=out_xyz[1]=out_xyz[2]=0.0f; return 0; }
 int rope_sim_set_widget_mass(RopeSim* s, int widget_id, float mass) { (void)s; (void)widget_id; (void)mass; return 0; }
+
+// --- RopeSim serialization -------------------------------------------------
+static bool rope_sim_read_bytes(const char* &p, const char* end, void* out, size_t len) {
+    if (!out || p + len > end) return false;
+    memcpy(out, p, len);
+    p += static_cast<ptrdiff_t>(len);
+    return true;
+}
+
+static bool rope_sim_write_bytes(char* &p, char* end, const void* src, size_t len) {
+    if (!src || p + len > end) return false;
+    memcpy(p, src, len);
+    p += static_cast<ptrdiff_t>(len);
+    return true;
+}
+
+int rope_sim_serialized_size(RopeSim* s) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    const int32_t rope_count = static_cast<int32_t>(s->ropes.size());
+    int32_t need = 0;
+    need += 8; // magic
+    need += 4; // version
+    need += 4; // max_ropes
+    need += 4; // max_segments_per_rope
+    need += 4; // rope_count
+    for (int32_t i = 0; i < rope_count; ++i) {
+        Rope* r = s->ropes[static_cast<size_t>(i)].get();
+        if (!r) return 0;
+        int32_t verts = r->segments + 1;
+        need += 4; // segments
+        need += 4; // slack
+        need += 4; // rest_len
+        need += 6 * 4; // endpoints
+        need += verts * 6 * 4; // pos_xyz + prev_xyz
+    }
+    int32_t mg_count = static_cast<int32_t>(si->meta_groups.size());
+    need += 4; // meta_group_count
+    for (int32_t gi = 0; gi < mg_count; ++gi) {
+        MetaGroup* mg = si->meta_groups[static_cast<size_t>(gi)].get();
+        need += 4; // present flag
+        if (!mg) continue;
+        int32_t member_count = static_cast<int32_t>(mg->members.size());
+        int32_t edge_count = static_cast<int32_t>(mg->edges.size());
+        need += 4; // pressure
+        need += 4; // mode
+        need += 4; // edges_enabled
+        need += 4; // min_rest
+        need += 4; // reduce_rate
+        need += 4; // dangling_rope
+        need += 4; // member_count
+        need += member_count * (4 + 4); // members
+        need += member_count * 4; // member_u
+        need += 4; // edge_count
+        need += edge_count * (4 + 4); // edges
+        need += edge_count * 4; // edge_rest
+        need += edge_count * 4; // edge_strength
+    }
+    return need;
+}
+
+int rope_sim_serialize(RopeSim* s, char* out_buf, int out_len) {
+    if (!s) return 0;
+    int32_t need = rope_sim_serialized_size(s);
+    if (!out_buf) return need;
+    if (out_len < need) return 0;
+    RopeSim_internal* si = to_internal(s);
+    char* p = out_buf;
+    char* end = out_buf + out_len;
+    const char magic[8] = {'R','P','S','I','M','0','0','1'};
+    const int32_t version = 1;
+    if (!rope_sim_write_bytes(p, end, magic, sizeof(magic))) return 0;
+    if (!rope_sim_write_bytes(p, end, &version, sizeof(version))) return 0;
+    int32_t max_ropes = s->max_ropes;
+    int32_t max_segments = s->max_segments_per_rope;
+    int32_t rope_count = static_cast<int32_t>(s->ropes.size());
+    if (!rope_sim_write_bytes(p, end, &max_ropes, sizeof(max_ropes))) return 0;
+    if (!rope_sim_write_bytes(p, end, &max_segments, sizeof(max_segments))) return 0;
+    if (!rope_sim_write_bytes(p, end, &rope_count, sizeof(rope_count))) return 0;
+    for (int32_t i = 0; i < rope_count; ++i) {
+        Rope* r = s->ropes[static_cast<size_t>(i)].get();
+        if (!r) return 0;
+        int32_t segments = r->segments;
+        if (!rope_sim_write_bytes(p, end, &segments, sizeof(segments))) return 0;
+        if (!rope_sim_write_bytes(p, end, &r->slack, sizeof(r->slack))) return 0;
+        if (!rope_sim_write_bytes(p, end, &r->rest_len, sizeof(r->rest_len))) return 0;
+        float endpoints[6] = {r->ax, r->ay, r->az, r->bx, r->by, r->bz};
+        if (!rope_sim_write_bytes(p, end, endpoints, sizeof(endpoints))) return 0;
+        int verts = r->segments + 1;
+        for (int vi = 0; vi < verts; ++vi) {
+            float vdata[6] = {r->pos_x[static_cast<size_t>(vi)], r->pos_y[static_cast<size_t>(vi)], r->pos_z[static_cast<size_t>(vi)],
+                              r->prev_x[static_cast<size_t>(vi)], r->prev_y[static_cast<size_t>(vi)], r->prev_z[static_cast<size_t>(vi)]};
+            if (!rope_sim_write_bytes(p, end, vdata, sizeof(vdata))) return 0;
+        }
+    }
+    int32_t mg_count = static_cast<int32_t>(si->meta_groups.size());
+    if (!rope_sim_write_bytes(p, end, &mg_count, sizeof(mg_count))) return 0;
+    for (int32_t gi = 0; gi < mg_count; ++gi) {
+        MetaGroup* mg = si->meta_groups[static_cast<size_t>(gi)].get();
+        int32_t present = mg ? 1 : 0;
+        if (!rope_sim_write_bytes(p, end, &present, sizeof(present))) return 0;
+        if (!mg) continue;
+        int32_t mode = mg->mode;
+        int32_t edges_enabled = mg->edges_enabled ? 1 : 0;
+        int32_t dangling_rope = mg->dangling_rope;
+        int32_t member_count = static_cast<int32_t>(mg->members.size());
+        int32_t edge_count = static_cast<int32_t>(mg->edges.size());
+        if (!rope_sim_write_bytes(p, end, &mg->pressure, sizeof(mg->pressure))) return 0;
+        if (!rope_sim_write_bytes(p, end, &mode, sizeof(mode))) return 0;
+        if (!rope_sim_write_bytes(p, end, &edges_enabled, sizeof(edges_enabled))) return 0;
+        if (!rope_sim_write_bytes(p, end, &mg->min_rest, sizeof(mg->min_rest))) return 0;
+        if (!rope_sim_write_bytes(p, end, &mg->reduce_rate, sizeof(mg->reduce_rate))) return 0;
+        if (!rope_sim_write_bytes(p, end, &dangling_rope, sizeof(dangling_rope))) return 0;
+        if (!rope_sim_write_bytes(p, end, &member_count, sizeof(member_count))) return 0;
+        for (int32_t mi = 0; mi < member_count; ++mi) {
+            int32_t rope_idx = mg->members[static_cast<size_t>(mi)].first;
+            int32_t vertex_idx = mg->members[static_cast<size_t>(mi)].second;
+            if (!rope_sim_write_bytes(p, end, &rope_idx, sizeof(rope_idx))) return 0;
+            if (!rope_sim_write_bytes(p, end, &vertex_idx, sizeof(vertex_idx))) return 0;
+        }
+        for (int32_t mi = 0; mi < member_count; ++mi) {
+            float u = (static_cast<size_t>(mi) < mg->member_u.size()) ? mg->member_u[static_cast<size_t>(mi)] : 0.0f;
+            if (!rope_sim_write_bytes(p, end, &u, sizeof(u))) return 0;
+        }
+        if (!rope_sim_write_bytes(p, end, &edge_count, sizeof(edge_count))) return 0;
+        for (int32_t ei = 0; ei < edge_count; ++ei) {
+            int32_t a = mg->edges[static_cast<size_t>(ei)].first;
+            int32_t b = mg->edges[static_cast<size_t>(ei)].second;
+            if (!rope_sim_write_bytes(p, end, &a, sizeof(a))) return 0;
+            if (!rope_sim_write_bytes(p, end, &b, sizeof(b))) return 0;
+        }
+        for (int32_t ei = 0; ei < edge_count; ++ei) {
+            float rest = (static_cast<size_t>(ei) < mg->edge_rest.size()) ? mg->edge_rest[static_cast<size_t>(ei)] : 0.0f;
+            if (!rope_sim_write_bytes(p, end, &rest, sizeof(rest))) return 0;
+        }
+        for (int32_t ei = 0; ei < edge_count; ++ei) {
+            float strength = (static_cast<size_t>(ei) < mg->edge_strength.size()) ? mg->edge_strength[static_cast<size_t>(ei)] : 0.0f;
+            if (!rope_sim_write_bytes(p, end, &strength, sizeof(strength))) return 0;
+        }
+    }
+    return need;
+}
+
+RopeSim* rope_sim_deserialize(const char* in_buf, int in_len) {
+    if (!in_buf || in_len <= 0) return nullptr;
+    const char* p = in_buf;
+    const char* end = in_buf + in_len;
+    char magic[8];
+    int32_t version = 0;
+    if (!rope_sim_read_bytes(p, end, magic, sizeof(magic))) return nullptr;
+    if (memcmp(magic, "RPSIM001", 8) != 0) return nullptr;
+    if (!rope_sim_read_bytes(p, end, &version, sizeof(version))) return nullptr;
+    if (version != 1) return nullptr;
+    int32_t max_ropes = 0;
+    int32_t max_segments = 0;
+    int32_t rope_count = 0;
+    if (!rope_sim_read_bytes(p, end, &max_ropes, sizeof(max_ropes))) return nullptr;
+    if (!rope_sim_read_bytes(p, end, &max_segments, sizeof(max_segments))) return nullptr;
+    if (!rope_sim_read_bytes(p, end, &rope_count, sizeof(rope_count))) return nullptr;
+    if (max_ropes <= 0 || max_segments <= 0 || rope_count < 0 || rope_count > max_ropes) return nullptr;
+    RopeSim* sim = rope_sim_create(max_ropes, max_segments);
+    if (!sim) return nullptr;
+    RopeSim_internal* si = to_internal(sim);
+    si->ropes.clear();
+    si->ropes.reserve(static_cast<size_t>(max_ropes));
+    for (int32_t i = 0; i < rope_count; ++i) {
+        int32_t segments = 0;
+        float slack = 0.0f;
+        float rest_len = 0.0f;
+        float endpoints[6] = {};
+        if (!rope_sim_read_bytes(p, end, &segments, sizeof(segments))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &slack, sizeof(slack))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &rest_len, sizeof(rest_len))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, endpoints, sizeof(endpoints))) { rope_sim_destroy(sim); return nullptr; }
+        if (segments < 1) segments = 1;
+        if (segments > max_segments) segments = max_segments;
+        auto r = std::make_unique<Rope>();
+        r->segments = segments;
+        r->slack = slack;
+        r->rest_len = rest_len;
+        r->ax = endpoints[0]; r->ay = endpoints[1]; r->az = endpoints[2];
+        r->bx = endpoints[3]; r->by = endpoints[4]; r->bz = endpoints[5];
+        int verts = segments + 1;
+        r->pos_x.resize(static_cast<size_t>(verts));
+        r->pos_y.resize(static_cast<size_t>(verts));
+        r->pos_z.resize(static_cast<size_t>(verts));
+        r->prev_x.resize(static_cast<size_t>(verts));
+        r->prev_y.resize(static_cast<size_t>(verts));
+        r->prev_z.resize(static_cast<size_t>(verts));
+        for (int vi = 0; vi < verts; ++vi) {
+            float vdata[6] = {};
+            if (!rope_sim_read_bytes(p, end, vdata, sizeof(vdata))) { rope_sim_destroy(sim); return nullptr; }
+            r->pos_x[static_cast<size_t>(vi)] = vdata[0];
+            r->pos_y[static_cast<size_t>(vi)] = vdata[1];
+            r->pos_z[static_cast<size_t>(vi)] = vdata[2];
+            r->prev_x[static_cast<size_t>(vi)] = vdata[3];
+            r->prev_y[static_cast<size_t>(vi)] = vdata[4];
+            r->prev_z[static_cast<size_t>(vi)] = vdata[5];
+        }
+        si->ropes.push_back(std::move(r));
+    }
+    int32_t mg_count = 0;
+    if (!rope_sim_read_bytes(p, end, &mg_count, sizeof(mg_count))) { rope_sim_destroy(sim); return nullptr; }
+    if (mg_count < 0) { rope_sim_destroy(sim); return nullptr; }
+    si->meta_groups.clear();
+    si->meta_groups.reserve(static_cast<size_t>(mg_count));
+    for (int32_t gi = 0; gi < mg_count; ++gi) {
+        int32_t present = 0;
+        if (!rope_sim_read_bytes(p, end, &present, sizeof(present))) { rope_sim_destroy(sim); return nullptr; }
+        if (!present) {
+            si->meta_groups.push_back(nullptr);
+            continue;
+        }
+        auto mg = std::make_unique<MetaGroup>();
+        int32_t mode = 0;
+        int32_t edges_enabled = 0;
+        int32_t dangling_rope = -1;
+        int32_t member_count = 0;
+        int32_t edge_count = 0;
+        if (!rope_sim_read_bytes(p, end, &mg->pressure, sizeof(mg->pressure))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &mode, sizeof(mode))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &edges_enabled, sizeof(edges_enabled))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &mg->min_rest, sizeof(mg->min_rest))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &mg->reduce_rate, sizeof(mg->reduce_rate))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &dangling_rope, sizeof(dangling_rope))) { rope_sim_destroy(sim); return nullptr; }
+        if (!rope_sim_read_bytes(p, end, &member_count, sizeof(member_count))) { rope_sim_destroy(sim); return nullptr; }
+        if (member_count < 0) { rope_sim_destroy(sim); return nullptr; }
+        mg->mode = mode;
+        mg->edges_enabled = edges_enabled != 0;
+        mg->dangling_rope = dangling_rope;
+        mg->members.resize(static_cast<size_t>(member_count));
+        for (int32_t mi = 0; mi < member_count; ++mi) {
+            int32_t rope_idx = -1;
+            int32_t vertex_idx = -1;
+            if (!rope_sim_read_bytes(p, end, &rope_idx, sizeof(rope_idx))) { rope_sim_destroy(sim); return nullptr; }
+            if (!rope_sim_read_bytes(p, end, &vertex_idx, sizeof(vertex_idx))) { rope_sim_destroy(sim); return nullptr; }
+            mg->members[static_cast<size_t>(mi)] = std::make_pair(rope_idx, vertex_idx);
+        }
+        mg->member_u.resize(static_cast<size_t>(member_count));
+        for (int32_t mi = 0; mi < member_count; ++mi) {
+            float u = 0.0f;
+            if (!rope_sim_read_bytes(p, end, &u, sizeof(u))) { rope_sim_destroy(sim); return nullptr; }
+            mg->member_u[static_cast<size_t>(mi)] = u;
+        }
+        if (!rope_sim_read_bytes(p, end, &edge_count, sizeof(edge_count))) { rope_sim_destroy(sim); return nullptr; }
+        if (edge_count < 0) { rope_sim_destroy(sim); return nullptr; }
+        mg->edges.resize(static_cast<size_t>(edge_count));
+        for (int32_t ei = 0; ei < edge_count; ++ei) {
+            int32_t a = 0;
+            int32_t b = 0;
+            if (!rope_sim_read_bytes(p, end, &a, sizeof(a))) { rope_sim_destroy(sim); return nullptr; }
+            if (!rope_sim_read_bytes(p, end, &b, sizeof(b))) { rope_sim_destroy(sim); return nullptr; }
+            mg->edges[static_cast<size_t>(ei)] = std::make_pair(a, b);
+        }
+        mg->edge_rest.resize(static_cast<size_t>(edge_count));
+        for (int32_t ei = 0; ei < edge_count; ++ei) {
+            float rest = 0.0f;
+            if (!rope_sim_read_bytes(p, end, &rest, sizeof(rest))) { rope_sim_destroy(sim); return nullptr; }
+            mg->edge_rest[static_cast<size_t>(ei)] = rest;
+        }
+        mg->edge_strength.resize(static_cast<size_t>(edge_count));
+        for (int32_t ei = 0; ei < edge_count; ++ei) {
+            float strength = 0.0f;
+            if (!rope_sim_read_bytes(p, end, &strength, sizeof(strength))) { rope_sim_destroy(sim); return nullptr; }
+            mg->edge_strength[static_cast<size_t>(ei)] = strength;
+        }
+        si->meta_groups.push_back(std::move(mg));
+    }
+    return sim;
+}
 
 // Apply meta-group edge constraints after rope constraints pass
 // Simple distance constraints between member vertex positions
