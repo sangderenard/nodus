@@ -9090,7 +9090,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                 }
                 if (!added) {
                     // Last resort: create a vertex-less placeholder (no-op)
-                    printf("gp_canvas_load_from_file: unable to map meta vertex (rope=%d,vid=%d) for mg=%p\n", saved_rope, saved_vid, (void*)mg);
+                    printf("gp_canvas_load_from_file: unable to map meta vertex (rope=%llu,vid=%d) for mg=%p\n", (unsigned long long)rope_uid, saved_vid, (void*)mg);
                 }
             }
         }
