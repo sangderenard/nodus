@@ -293,6 +293,8 @@ int gp_canvas_table_meta_add_vertex_by_id(GP_CanvasContext* ctx, GP_TableContext
 // Resolve a persisted rope id to the runtime rope index for a given table.
 // Returns >=0 rope index on success, -1 if not found.
 int gp_canvas_resolve_rope_id_to_index(GP_CanvasContext* ctx, GP_TableContext* table, uint64_t rope_id);
+// Mark the canvas rope-id map dirty so callers can trigger a re-resolution pass.
+void gp_canvas_mark_rope_map_dirty(GP_CanvasContext* ctx);
 // Find a persistent rope id for a runtime rope index on a table.
 // Lookup order: local table -> container/root -> breadth-first across modules.
 uint64_t gp_canvas_find_persistent_rope_id(GP_CanvasContext* ctx, GP_TableContext* table, int sim_idx);

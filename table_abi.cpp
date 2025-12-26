@@ -3239,6 +3239,9 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
             }
         }
     }
+    if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+        gp_canvas_mark_rope_map_dirty(cvs);
+    }
     return 1;
 }
 
@@ -5798,7 +5801,13 @@ extern "C" int gp_table_resolve_rope_id_to_sim_index(GP_TableContext* ctx, uint6
     // prior to serialization so exported blobs include canonical ids.
 extern "C" int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint64_t* ids, int count) {
     if (!ctx) return 0;
-    if (!ids || count <= 0) { ctx->rope_ids.clear(); return 1; }
+    if (!ids || count <= 0) {
+        ctx->rope_ids.clear();
+        if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+            gp_canvas_mark_rope_map_dirty(cvs);
+        }
+        return 1;
+    }
     ctx->rope_ids.assign(ids, ids + count);
     // rebuild the lookup map so callers can resolve sim indices from the
     // provided persistent ids.
@@ -5811,6 +5820,9 @@ extern "C" int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint
     uint64_t mx = 1;
     for (auto v : ctx->rope_ids) if (v >= mx) mx = v + 1;
     ctx->next_rope_id = mx;
+    if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+        gp_canvas_mark_rope_map_dirty(cvs);
+    }
     return 1;
     }
 
