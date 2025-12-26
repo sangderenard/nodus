@@ -97,8 +97,30 @@ public:
     }
 
     void execute_stack(ToolStackContext& ctx) override {
-        // Not a stack tool.
-        (void)ctx;
+        // Stack form: pop desired channel group (float -> int). For each
+        // meta-group on the container table whose `channel_group` equals
+        // the requested group, push a FIFO-metadata snapshot onto the
+        // tool stack as: <count> <v0> <v1> ... where <count> is the number
+        // of floats in the snapshot.
+        float chf = tool_stack_pop(ctx.stack);
+        int channel = static_cast<int>(chf);
+        GP_CanvasContext* cvs = gp_canvas_get_singleton();
+        if (!cvs) return;
+        GP_TableContext* tbl = gp_canvas_get_container_table(cvs);
+        if (!tbl) return;
+        int mgcount = gp_table_get_meta_group_count(tbl);
+        for (int mgi = 0; mgi < mgcount; ++mgi) {
+            GP_MetaGroup* mg = gp_table_get_meta_group(tbl, mgi);
+            if (!mg) continue;
+            int mg_ch = 0; gp_table_meta_get_channel_group(tbl, mg, &mg_ch);
+            if (mg_ch != channel) continue;
+            // snapshot
+            float buf[128]; int32_t wrote = gp_table_meta_get_fifo_snapshot(tbl, mg, buf, static_cast<int32_t>(sizeof(buf)/sizeof(buf[0])));
+            if (wrote <= 0) continue;
+            // push count then values (if room)
+            tool_stack_push(ctx.stack, static_cast<float>(wrote));
+            for (int i = 0; i < wrote; ++i) tool_stack_push(ctx.stack, buf[i]);
+        }
     }
 };
 

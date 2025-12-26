@@ -97,12 +97,15 @@ public:
         Scheduled = 1,
     };
 
-    struct ModuleContract {
-        int32_t module_idx = -1;
-        GP_TableContext* table = nullptr; // non-owning
-        int32_t in_count = 0;
-        int32_t out_count = 0;
-    };
+        struct ModuleContract {
+            int32_t module_idx = -1;
+            GP_TableContext* table = nullptr; // non-owning
+            int32_t in_count = 0;
+            int32_t out_count = 0;
+            int32_t sim_enabled = 1; // 1 = simulate, 0 = skip (rope sim enabled)
+            int32_t module_skip = 0; // 1 = skip entire module (no tool/table work)
+            int32_t exec_skip_count = 0; // number of frames to skip between executions (0 = every frame)
+        };
 
     struct EdgeContract {
         int32_t edge_idx = -1;
@@ -183,6 +186,7 @@ private:
         uint64_t last_tick_id = 0;
         double last_dt = 0.0;
         uint64_t tool_cycle = 0;
+        uint64_t exec_tick_counter = 0; // persistent counter used to implement exec cadence
     };
 
     void run_loop();

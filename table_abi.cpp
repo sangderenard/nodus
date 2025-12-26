@@ -8,6 +8,11 @@ typedef struct LassoConfig {
     uint32_t flags;
     uint8_t widget_type;
     uint8_t reserved[3];
+    // Edge-spring parameters recorded when a lasso/meta-group enables springs
+    float spring_min_rest;    // conservative rest length added when enabling springs
+    float spring_reduce_rate; // rate used to reduce rest back to normal
+    uint8_t spring_mode;      // reserved mode field for future behaviors
+    uint8_t spring_reserved[3];
 } LassoConfig;
 
 #include <algorithm>
@@ -155,7 +160,7 @@ extern "C" int32_t gp_table_set_subgroup_color_mapping(int32_t color_idx, uint32
     return 1;
 }
 
-int32_t gp_table_load_template(GP_TableContext* ctx, const char* dir, const char* name) {
+extern "C" int32_t gp_table_load_template(GP_TableContext* ctx, const char* dir, const char* name) {
     if (!ctx || !name) return 0;
     std::string path = make_template_filename(dir, name);
     try {
@@ -170,7 +175,7 @@ int32_t gp_table_load_template(GP_TableContext* ctx, const char* dir, const char
     }
 }
 
-int32_t gp_table_list_templates(const char* dir, char* out_buf, int32_t out_len) {
+extern "C" int32_t gp_table_list_templates(const char* dir, char* out_buf, int32_t out_len) {
     std::string d;
     if (dir && dir[0]) d = std::string(dir);
     else d = g_template_library_dir;
@@ -2141,8 +2146,8 @@ struct GP_TableContext {
     std::vector<GP_TableEdgeBatchMetadata> edge_batch_metadata;
     std::vector<uint32_t> edge_subgroup_flags;
     // per-edge persistent unique id used for ThreadManager registration
-    std::vector<uint64_t> edge_uids;
-    uint64_t next_edge_uid = 1;
+    std::vector<uint64_t> edge_ids;
+    uint64_t next_edge_id = 1;
     // per-edge subscriber_key -> reader_slot registered with ThreadManager
     std::vector<std::unordered_map<uint64_t,int>> edge_subscriber_slots;
     std::unordered_map<uint64_t, StagePortBinding> stage_ports; // LED key -> stage port binding
@@ -2155,10 +2160,23 @@ struct GP_TableContext {
     double relax_last_time = 0.0; // seconds since epoch
     std::vector<float> relax_value; // 0..1 value per edge (1.0 = relaxed)
     std::vector<float> relax_vel;   // velocity per edge
-    // rope simulator instance and per-edge rope indices
+    // rope simulator instance and per-rope sim index mapping
     RopeSim* rope_sim = nullptr;
     int rope_sim_owned = 0; // 1 if this context owns and should destroy the sim
-    std::vector<int> rope_sim_idx; // rope index per edge (same order as ctx->edges)
+    // mapping from persistent rope id -> rope_sim index. Using IDs
+    // avoids relying on edge/vector ordering and is resilient to reorders.
+    std::unordered_map<uint64_t,int> rope_id_to_sim_idx;
+    // per-rope persistent unique ids (indexed by created rope order). Used
+    // to map serialized vertices to runtime rope indices deterministically.
+    std::vector<uint64_t> rope_ids;
+    uint64_t next_rope_id = 1;
+    // flag set during gp_table_deserialize to indicate we're restoring
+    int restoring = 0;
+    // Optional module UUID embedded into serialized blobs (0 == unset)
+    uint64_t module_uuid = 0ull;
+    // Optional module-frame port UUIDs to serialize: entries are (row, idx, uuid)
+    struct FramePortEntry { int32_t row; int32_t idx; uint64_t uuid; };
+    std::vector<FramePortEntry> frame_port_uuids;
     // Prospective live-edge state (used when one node selected and mode enabled)
     int32_t prospective_mode = 0; // 0=off,1=on
     bool prospective_initialized = false;
@@ -2187,6 +2205,10 @@ struct GP_TableContext {
     // Optional step callback for node/table shims
     GP_TableStepFn step_callback = nullptr;
     void* step_user = nullptr;
+    // Whether table-side simulator stepping is enabled (1) or disabled (0).
+    // KPN or other managers can toggle this to pause heavy sim work per table.
+    int32_t sim_enabled = 1;
+    // (No per-table frame-skip; global frame-skip handled by table_abi global state)
     // Optional click-action dispatch
     std::vector<GP_TableAction> actions;
     GP_TableActionFn action_callback = nullptr;
@@ -2233,6 +2255,38 @@ struct GP_TableContext {
     std::mutex pending_ops_mu;
 };
 
+// Global sim frame-skip state (shared across all tables)
+static int g_global_sim_frame_skip_count = 0; // number of frames to skip between steps (0 = every frame)
+static uint64_t g_global_sim_frame_tick = 0; // incremented once per canvas frame
+
+static inline bool table_should_step_sim(GP_TableContext* ctx) {
+    if (!ctx) return false;
+    if (!ctx->sim_enabled) return false;
+    int count = std::max(0, g_global_sim_frame_skip_count);
+    if (count <= 0) return true;
+    // step once every (count+1) frames
+    return (g_global_sim_frame_tick % static_cast<uint64_t>(count + 1)) == 0ull;
+}
+
+int32_t gp_table_set_global_sim_frame_skip_count(int32_t count) {
+    g_global_sim_frame_skip_count = std::max(0, count);
+    return 1;
+}
+
+int32_t gp_table_get_global_sim_frame_skip_count(int32_t* out_count) {
+    if (!out_count) return 0;
+    *out_count = g_global_sim_frame_skip_count;
+    return 1;
+}
+
+void gp_table_advance_global_sim_tick() {
+    g_global_sim_frame_tick = (g_global_sim_frame_tick + 1) % 0xFFFFFFFFFFFFu;
+}
+
+int32_t gp_table_should_step_sim(GP_TableContext* ctx) {
+    return table_should_step_sim(ctx) ? 1 : 0;
+}
+
 // Internal representation of a meta-group. Exposed to C callers as an
 // opaque `GP_MetaGroup*` pointer (allocated here and stored in the
 // table's `meta_groups` vector to keep lifetime management consistent).
@@ -2246,9 +2300,14 @@ struct GP_MetaGroup {
     // optional anchor override used by helpers (e.g., dangling widget attach)
     int anchor_rope = -1;
     int anchor_vert = -1;
+    // optional overlay keys created by canvas-level helpers (0 == none)
+    unsigned long long overlay_key_a = 0ull;
+    unsigned long long overlay_key_b = 0ull;
     // optional FIFO and subgroup flags so meta-groups can behave like edges
     EdgeTensorFifo fifo;
     uint32_t subgroup_flags = 0;
+    // channel group id (user-tunable integer controlling grouping of FIFOs/edges)
+    int channel_group = 0;
     // if a dangling short-rope + widget was created, remember rope id and vertex
     int dangling_widget_rope = -1;
     int dangling_widget_rope_vid = -1;
@@ -2265,10 +2324,48 @@ extern "C" GP_MetaGroup* gp_table_meta_create(GP_TableContext* ctx) {
     auto mg = std::make_unique<GP_TableContext::GP_MetaGroupInternal>();
     static uint64_t next_mg_id = 1;
     mg->id = next_mg_id++;
+    // Initialize lasso_config to avoid uninitialized reads in canvas logic
+    mg->lasso_config.flags = 0;
+    mg->lasso_config.widget_type = 0;
+    mg->lasso_config.reserved[0] = 0;
+    mg->lasso_config.reserved[1] = 0;
+    mg->lasso_config.reserved[2] = 0;
+    mg->lasso_config.spring_min_rest = 0.0f;
+    mg->lasso_config.spring_reduce_rate = 0.0f;
+    mg->lasso_config.spring_mode = 0;
+    mg->lasso_config.spring_reserved[0] = 0;
+    mg->lasso_config.spring_reserved[1] = 0;
+    mg->lasso_config.spring_reserved[2] = 0;
     GP_MetaGroup* ptr = mg.get();
     ctx->meta_groups.push_back(std::move(mg));
     printf("gp_table_meta_create: created mg=%p id=%llu on ctx=%p\n", (void*)ptr, (unsigned long long)ptr->id, (void*)ctx);
     return ptr;
+}
+
+// Debug helper: print a meta-group's vertices and lasso config for diagnostics.
+extern "C" int32_t gp_table_debug_dump_meta_group(GP_TableContext* ctx, GP_MetaGroup* mg, const char* tag) {
+    if (!ctx || !mg) return 0;
+    if (!tag) tag = "dump";
+    printf("gp_table_debug_dump_meta_group: [%s] mg=%p id=%llu sim_group_idx=%d confinement=%.3f ring_mode=%d dangling_rope=%d dangling_vid=%d\n",
+           tag, (void*)mg, (unsigned long long)mg->id, mg->sim_group_idx, mg->confinement, mg->ring_mode, mg->dangling_widget_rope, mg->dangling_widget_rope_vid);
+    printf("  lasso_config: flags=0x%08x widget=%u spring_min_rest=%.2f spring_reduce_rate=%.2f spring_mode=%u\n",
+           mg->lasso_config.flags, static_cast<unsigned int>(mg->lasso_config.widget_type), mg->lasso_config.spring_min_rest, mg->lasso_config.spring_reduce_rate, static_cast<unsigned int>(mg->lasso_config.spring_mode));
+    int vcount = static_cast<int>(mg->vertices.size());
+    printf("  vertices.count=%d\n", vcount);
+    for (int vi = 0; vi < vcount; ++vi) {
+        int r = mg->vertices[static_cast<size_t>(vi)].first;
+        int v = mg->vertices[static_cast<size_t>(vi)].second;
+        uint64_t ru = 0ull;
+        if (r >= 0) {
+            // rope indices are transient sim indices; find the persistent UID that maps to this sim index
+            for (const auto &kv : ctx->rope_id_to_sim_idx) {
+                if (kv.second == r) { ru = kv.first; break; }
+            }
+        }
+        printf("    [%d] rope_idx=%d vert_idx=%d rope_id=%llu\n", vi, r, v, (unsigned long long)ru);
+    }
+    fflush(stdout);
+    return 1;
 }
 
 // Removed: gp_table_sim_toggle_meta_group_mode_for_rope
@@ -2276,6 +2373,58 @@ extern "C" GP_MetaGroup* gp_table_meta_create(GP_TableContext* ctx) {
 extern "C" int32_t gp_table_meta_get_ring_mode(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_mode) {
     if (!ctx || !mg || !out_mode) return 0;
     *out_mode = mg->ring_mode;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_confinement(const GP_TableContext* ctx, GP_MetaGroup* mg, float* out_conf) {
+    if (!ctx || !mg || !out_conf) return 0;
+    *out_conf = mg->confinement;
+    return 1;
+}
+extern "C" int32_t gp_table_meta_set_confinement(GP_TableContext* ctx, GP_MetaGroup* mg, float conf) {
+    if (!ctx || !mg) return 0;
+    mg->confinement = conf;
+    RopeSim* sim = ctx->rope_sim;
+    if (mg->sim_group_idx >= 0 && sim) {
+        rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, conf);
+    }
+    return 1;
+}
+extern "C" int32_t gp_table_meta_get_id(const GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long* out_id) {
+    if (!ctx || !mg || !out_id) return 0;
+    *out_id = mg->id;
+    return 1;
+}
+extern "C" int32_t gp_table_meta_set_id(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long id) {
+    if (!ctx || !mg) return 0;
+    mg->id = id;
+    return 1;
+}
+extern "C" int32_t gp_table_meta_get_dangling_hang_len(const GP_TableContext* ctx, GP_MetaGroup* mg, float* out_len) {
+    if (!ctx || !mg || !out_len) return 0;
+    *out_len = mg->dangling_hang_len;
+    return 1;
+}
+extern "C" int32_t gp_table_meta_set_dangling_hang_len(GP_TableContext* ctx, GP_MetaGroup* mg, float len) {
+    if (!ctx || !mg) return 0;
+    mg->dangling_hang_len = len;
+    return 1;
+}
+extern "C" int32_t gp_table_meta_get_lasso_fields(const GP_TableContext* ctx, GP_MetaGroup* mg, unsigned int* out_flags, int32_t* out_widget_type) {
+    if (!ctx || !mg || !out_flags || !out_widget_type) return 0;
+    *out_flags = mg->lasso_config.flags;
+    *out_widget_type = static_cast<int32_t>(mg->lasso_config.widget_type);
+    return 1;
+}
+extern "C" int32_t gp_table_meta_set_lasso_fields(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned int flags, int32_t widget_type) {
+    if (!ctx || !mg) return 0;
+    mg->lasso_config.flags = flags;
+    mg->lasso_config.widget_type = static_cast<uint8_t>(widget_type & 0xFF);
+    return 1;
+}
+extern "C" int32_t gp_table_meta_set_ring_mode(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t mode) {
+    if (!ctx || !mg) return 0;
+    mg->ring_mode = mode;
     return 1;
 }
 
@@ -2446,13 +2595,13 @@ extern "C" int32_t gp_table_create_ring(GP_TableContext* ctx, int32_t rope_idx, 
     // and register two overlay LED keys. Also attach the created rope to the
     // overlay so canvas-level rendering and interaction can bind to it.
     GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    unsigned long long t_off_overlay_a = 0ull, t_off_overlay_b = 0ull;
     if (cvs) {
-        unsigned long long key_a = 0ull, key_b = 0ull;
-        if (gp_canvas_create_overlay_with_leds(cvs, e1x, e1y, e2x, e2y, &key_a, &key_b)) {
-            // Attach rope to overlay so canvas edges render and can be interacted with
-            int edge_idx = gp_canvas_attach_rope_to_overlay(cvs, key_a, key_b, to_rope);
-            printf("gp_table: attached rope %d to overlay keys (%llu,%llu) edge_idx=%d\n", to_rope, (unsigned long long)key_a, (unsigned long long)key_b, edge_idx);
-        }
+        // If the meta-group already has persisted overlay keys, prefer them
+        // and attach the created T-off rope to the canonical overlay instead
+        // of creating a new overlay instance. This avoids duplicate overlays
+        // when restoring from persisted keys.
+        // Note: we'll attach per-meta-group below when iterating meta-groups.
     }
 
     // For every meta-group anchored to this rope, insert the T-off center vertex
@@ -2492,11 +2641,58 @@ extern "C" int32_t gp_table_create_ring(GP_TableContext* ctx, int32_t rope_idx, 
                 mg->dangling_widget_rope = to_rope;
                 mg->dangling_widget_rope_vid = 1;
                 mg->dangling_hang_len = half;
+                // inform RopeSim about the dangling/widget rope so it can
+                // give special rest-length and stiffness behavior on edges.
+                rope_sim_meta_group_set_dangling_rope(sim, mg->sim_group_idx, to_rope);
+            }
+            // If the meta-group already had persisted overlay keys, attach
+            // the created T-off rope to that canonical overlay. Otherwise,
+            // create a new overlay for the T-off endpoints as before.
+            if (cvs) {
+                if (mg->overlay_key_a != 0ull || mg->overlay_key_b != 0ull) {
+                    // ensure canonical overlay exists and attach rope
+                    gp_canvas_register_table_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, 0ull, 0ull);
+                    gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, to_rope);
+                    gp_canvas_set_overlay_meta(cvs, mg->overlay_key_a, mg->overlay_key_b, ctx, reinterpret_cast<void*>(mg));
+                } else {
+                    unsigned long long key_a = 0ull, key_b = 0ull;
+                    if (gp_canvas_create_overlay_with_leds(cvs, e1x, e1y, e2x, e2y, &key_a, &key_b)) {
+                        int edge_idx = gp_canvas_attach_rope_to_overlay(cvs, key_a, key_b, to_rope);
+                        printf("gp_table: attached rope %d to overlay keys (%llu,%llu) edge_idx=%d\n", to_rope, (unsigned long long)key_a, (unsigned long long)key_b, edge_idx);
+                        t_off_overlay_a = key_a;
+                        t_off_overlay_b = key_b;
+                        mg->overlay_key_a = t_off_overlay_a;
+                        mg->overlay_key_b = t_off_overlay_b;
+                        gp_canvas_set_overlay_meta(cvs, t_off_overlay_a, t_off_overlay_b, ctx, reinterpret_cast<void*>(mg));
+                    }
+                }
             }
         }
     }
 
     return ring_id;
+}
+
+// Create ring by persisted rope id. Resolve id to runtime rope index using
+// canvas mapping then table-local fallback, and call gp_table_create_ring.
+extern "C" int32_t gp_table_create_ring_by_id(GP_TableContext* ctx, uint64_t rope_id, float u) {
+    if (!ctx || rope_id == 0ull) return -1;
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    int resolved = -1;
+    if (cvs) resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, rope_id);
+    if (resolved < 0) {
+        // fallback to table-local id->sim mapping
+        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
+            if (ctx->rope_ids[ri] == rope_id) {
+                auto it = ctx->rope_id_to_sim_idx.find(rope_id);
+                if (it != ctx->rope_id_to_sim_idx.end()) resolved = it->second;
+                else resolved = -1;
+                break;
+            }
+        }
+    }
+    if (resolved < 0) return -2; // distinct code for id->index resolution failure
+    return gp_table_create_ring(ctx, resolved, u);
 }
 
 extern "C" int32_t gp_table_destroy_ring(GP_TableContext* ctx, int32_t ring_id) {
@@ -2523,11 +2719,11 @@ extern "C" int32_t gp_table_get_ring_u(GP_TableContext* ctx, int32_t ring_id, fl
 extern "C" int32_t gp_table_meta_add_vertex(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx) {
     if (!ctx || !mg) return 0;
     mg->vertices.emplace_back(static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
-    printf("gp_table_meta_add_vertex: mg=%p add (rope=%d,vert=%d)\n", (void*)mg, rope_idx, vertex_idx);
+    RopeSim* sim = ctx->rope_sim;
+    printf("gp_table_meta_add_vertex: mg=%p add (rope=%d,vert=%d) sim=%p sim_group_idx=%d\n", (void*)mg, rope_idx, vertex_idx, (void*)sim, mg->sim_group_idx);
     // If the table owns or is attached to a RopeSim, ensure a sim-level
     // meta group exists and register the vertex there so confinement
     // forces are applied during simulation.
-    RopeSim* sim = ctx->rope_sim;
     if (sim) {
         if (mg->sim_group_idx < 0) {
             int sg = rope_sim_create_meta_group(sim, mg->confinement);
@@ -2599,6 +2795,9 @@ extern "C" int32_t gp_table_meta_set_lasso_config(GP_TableContext* ctx, GP_MetaG
     if (cfg) {
         mg->lasso_config.flags = cfg->flags;
         mg->lasso_config.widget_type = cfg->widget_type;
+        mg->lasso_config.spring_min_rest = cfg->spring_min_rest;
+        mg->lasso_config.spring_reduce_rate = cfg->spring_reduce_rate;
+        mg->lasso_config.spring_mode = cfg->spring_mode;
     } else {
         mg->lasso_config.flags = 0;
         mg->lasso_config.widget_type = 0;
@@ -2613,6 +2812,20 @@ extern "C" int32_t gp_table_meta_get_lasso_config(GP_TableContext* ctx, GP_MetaG
     out_cfg->reserved[0] = mg->lasso_config.reserved[0];
     out_cfg->reserved[1] = mg->lasso_config.reserved[1];
     out_cfg->reserved[2] = mg->lasso_config.reserved[2];
+    out_cfg->spring_min_rest = mg->lasso_config.spring_min_rest;
+    out_cfg->spring_reduce_rate = mg->lasso_config.spring_reduce_rate;
+    out_cfg->spring_mode = mg->lasso_config.spring_mode;
+    out_cfg->spring_reserved[0] = mg->lasso_config.spring_reserved[0];
+    out_cfg->spring_reserved[1] = mg->lasso_config.spring_reserved[1];
+    out_cfg->spring_reserved[2] = mg->lasso_config.spring_reserved[2];
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_set_edge_spring_params(GP_TableContext* ctx, GP_MetaGroup* mg, float min_rest, float reduce_rate, int32_t mode) {
+    if (!ctx || !mg) return 0;
+    mg->lasso_config.spring_min_rest = min_rest;
+    mg->lasso_config.spring_reduce_rate = reduce_rate;
+    mg->lasso_config.spring_mode = static_cast<uint8_t>(mode & 0xFF);
     return 1;
 }
 
@@ -2633,6 +2846,71 @@ extern "C" int32_t gp_table_meta_get_dangling_rope_info(GP_TableContext* ctx, GP
     *out_rope_idx = mg->dangling_widget_rope;
     *out_vertex_idx = mg->dangling_widget_rope_vid;
     return 1;
+}
+
+extern "C" int32_t gp_table_meta_set_channel_group(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t channel_group) {
+    if (!ctx || !mg) return 0;
+    mg->channel_group = channel_group;
+    (void)ctx; (void)mg; (void)channel_group;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_channel_group(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_channel_group) {
+    if (!ctx || !mg || !out_channel_group) return 0;
+    *out_channel_group = mg->channel_group;
+    (void)ctx; (void)mg; (void)out_channel_group;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_fifo_snapshot(GP_TableContext* ctx, GP_MetaGroup* mg, float* out_buf, int32_t out_len) {
+    if (!ctx || !mg || !out_buf || out_len <= 0) return 0;
+    // Collect a simple float-based snapshot of key fifo fields.
+    int32_t pos = 0;
+    auto pushf = [&](float v)->bool { if (pos >= out_len) return false; out_buf[pos++] = v; return true; };
+    // id, vertex count, channel_group
+    pushf(static_cast<float>(static_cast<double>(mg->id)));
+    pushf(static_cast<float>(static_cast<int>(mg->vertices.size())));
+    pushf(static_cast<float>(mg->channel_group));
+    // FIFO internals (best-effort atomic reads)
+    if (!mg) return pos;
+    EdgeTensorFifo &ef = mg->fifo;
+    size_t stride = ef.impl ? ef.impl->stride : 0;
+    size_t slots = ef.impl ? ef.impl->slots : 0;
+    size_t topk = ef.impl ? ef.impl->top_k : 0;
+    uint64_t write_seq = ef.impl ? ef.impl->write_seq.load(std::memory_order_relaxed) : 0ull;
+    uint64_t writer = ef.impl ? ef.impl->writer.load(std::memory_order_relaxed) : 0ull;
+    uint64_t last_write_seq = ef.impl ? ef.impl->last_write_seq.load(std::memory_order_relaxed) : 0ull;
+    uint64_t last_read_seq = ef.impl ? ef.impl->last_read_seq.load(std::memory_order_relaxed) : 0ull;
+    float write_friction = ef.impl ? ef.impl->write_friction.load(std::memory_order_relaxed) : 0.0f;
+    float read_friction = ef.impl ? ef.impl->read_friction.load(std::memory_order_relaxed) : 0.0f;
+    int32_t last_write_region = ef.impl ? ef.impl->last_write_region.load(std::memory_order_relaxed) : -1;
+    int32_t last_read_region = ef.impl ? ef.impl->last_read_region.load(std::memory_order_relaxed) : -1;
+    float write_phase = ef.impl ? ef.impl->write_phase.load(std::memory_order_relaxed) : 0.0f;
+    float read_phase = ef.impl ? ef.impl->read_phase.load(std::memory_order_relaxed) : 0.0f;
+    int32_t friction_regions = ef.impl ? ef.impl->friction_regions.load(std::memory_order_relaxed) : 0;
+    bool configured = ef.impl ? ef.impl->configured : false;
+    pushf(static_cast<float>(stride));
+    pushf(static_cast<float>(slots));
+    pushf(static_cast<float>(topk));
+    // sequence numbers may exceed float precision; low 32 bits are kept.
+    pushf(static_cast<float>(static_cast<uint32_t>(write_seq & 0xFFFFFFFFu)));
+    pushf(static_cast<float>(static_cast<uint32_t>(writer & 0xFFFFFFFFu)));
+    pushf(static_cast<float>(static_cast<uint32_t>(last_write_seq & 0xFFFFFFFFu)));
+    pushf(static_cast<float>(static_cast<uint32_t>(last_read_seq & 0xFFFFFFFFu)));
+    pushf(write_friction);
+    pushf(read_friction);
+    pushf(static_cast<float>(last_write_region));
+    pushf(static_cast<float>(last_read_region));
+    pushf(write_phase);
+    pushf(read_phase);
+    pushf(static_cast<float>(friction_regions));
+    pushf(configured ? 1.0f : 0.0f);
+    // shape
+    pushf(static_cast<float>(static_cast<int>(ef.shape.size())));
+    for (size_t i = 0; i < ef.shape.size(); ++i) {
+        pushf(static_cast<float>(ef.shape[i]));
+    }
+    return pos;
 }
 
 int32_t gp_table_meta_get_sim_group_index(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_sim_idx) {
@@ -2716,6 +2994,10 @@ extern "C" int32_t gp_table_meta_create_widget(GP_TableContext* ctx, GP_MetaGrou
         unsigned long long key_a = 0ull, key_b = 0ull;
         if (gp_canvas_create_overlay_with_leds(cvs, e1x, e1y, e2x, e2y, &key_a, &key_b)) {
             gp_canvas_attach_rope_to_overlay(cvs, key_a, key_b, to_rope);
+            // ensure this initial overlay is also bound to the meta-group
+            gp_canvas_set_overlay_meta(cvs, key_a, key_b, ctx, mg);
+            mg->overlay_key_a = key_a;
+            mg->overlay_key_b = key_b;
         }
     }
 
@@ -2755,6 +3037,88 @@ extern "C" int32_t gp_table_meta_create_widget(GP_TableContext* ctx, GP_MetaGrou
     mg->dangling_widget_rope = to_rope;
     mg->dangling_widget_rope_vid = 1;
     mg->dangling_hang_len = hang_len;
+    // Create three small overlays (minus/number/plus) centered on the widget
+    // so control regions are allocated at creation time and attached to the
+    // widget rope. These overlays provide clickable regions the canvas will
+    // route through the existing overlay click handling logic.
+    try {
+        GP_CanvasContext* cvs = gp_canvas_get_singleton();
+        if (cvs) {
+            float wpos[3] = {0.0f,0.0f,0.0f};
+            // Try to obtain the widget world position; if unavailable (sim
+            // provides stubs), fall back to the T-off center computed earlier.
+            if (!gp_table_get_widget_position(ctx, mg->dangling_widget_id, wpos)) {
+                wpos[0] = (e1x + e2x) * 0.5f;
+                wpos[1] = (e1y + e2y) * 0.5f;
+                wpos[2] = 0.0f;
+            }
+            float ox = wpos[0]; float oy = wpos[1];
+            unsigned long long ka=0ull,kb=0ull;
+            if (gp_canvas_create_overlay_with_leds(cvs, ox - 18.0f, oy - 10.0f, ox + 18.0f, oy + 10.0f, &ka, &kb)) {
+                gp_canvas_attach_rope_to_overlay(cvs, ka, kb, mg->dangling_widget_rope);
+                printf("gp_table_meta_create_widget: created center overlays for mg=%p wid=%d rope=%d ox=%.1f oy=%.1f ka=%llu kb=%llu\n",
+                    (void*)mg, mg->dangling_widget_id, mg->dangling_widget_rope, ox, oy, ka, kb);
+                {
+                    int oxa=0, oya=0, oxb=0, oyb=0;
+                    if (gp_canvas_resolve_overlay_key(cvs, ka, &oxa, &oya)) {
+                        printf("  resolved ka -> %d,%d\n", oxa, oya);
+                    }
+                    if (gp_canvas_resolve_overlay_key(cvs, kb, &oxb, &oyb)) {
+                        printf("  resolved kb -> %d,%d\n", oxb, oyb);
+                    }
+                }
+            } else {
+                printf("gp_table_meta_create_widget: failed to create center overlay for mg=%p wid=%d ox=%.1f oy=%.1f\n",
+                    (void*)mg, mg->dangling_widget_id, ox, oy);
+            }
+                // populate overlay meta binding so the canvas can dispatch clicks
+                if (ka || kb) {
+                    gp_canvas_set_overlay_meta(cvs, ka, kb, ctx, mg);
+                    mg->overlay_key_a = ka;
+                    mg->overlay_key_b = kb;
+                }
+            unsigned long long la=0ull,lb=0ull;
+            if (gp_canvas_create_overlay_with_leds(cvs, ox - 52.0f, oy - 10.0f, ox - 22.0f, oy + 10.0f, &la, &lb)) {
+                gp_canvas_attach_rope_to_overlay(cvs, la, lb, mg->dangling_widget_rope);
+                printf("gp_table_meta_create_widget: created left overlay for mg=%p wid=%d rope=%d la=%llu lb=%llu\n",
+                    (void*)mg, mg->dangling_widget_id, mg->dangling_widget_rope, la, lb);
+                {
+                    int lxa=0, lya=0, lxb=0, lyb=0;
+                    if (gp_canvas_resolve_overlay_key(cvs, la, &lxa, &lya)) printf("  resolved la -> %d,%d\n", lxa, lya);
+                    if (gp_canvas_resolve_overlay_key(cvs, lb, &lxb, &lyb)) printf("  resolved lb -> %d,%d\n", lxb, lyb);
+                }
+            } else {
+                printf("gp_table_meta_create_widget: failed to create left overlay for mg=%p wid=%d\n", (void*)mg, mg->dangling_widget_id);
+            }
+                if (la || lb) {
+                    gp_canvas_set_overlay_meta(cvs, la, lb, ctx, mg);
+                    if (mg->overlay_key_a == 0ull && mg->overlay_key_b == 0ull) {
+                        mg->overlay_key_a = la;
+                        mg->overlay_key_b = lb;
+                    }
+                }
+            unsigned long long ra=0ull,rb=0ull;
+            if (gp_canvas_create_overlay_with_leds(cvs, ox + 22.0f, oy - 10.0f, ox + 52.0f, oy + 10.0f, &ra, &rb)) {
+                gp_canvas_attach_rope_to_overlay(cvs, ra, rb, mg->dangling_widget_rope);
+                printf("gp_table_meta_create_widget: created right overlay for mg=%p wid=%d rope=%d ra=%llu rb=%llu\n",
+                    (void*)mg, mg->dangling_widget_id, mg->dangling_widget_rope, ra, rb);
+                {
+                    int rxa=0, rya=0, rxb=0, ryb=0;
+                    if (gp_canvas_resolve_overlay_key(cvs, ra, &rxa, &rya)) printf("  resolved ra -> %d,%d\n", rxa, rya);
+                    if (gp_canvas_resolve_overlay_key(cvs, rb, &rxb, &ryb)) printf("  resolved rb -> %d,%d\n", rxb, ryb);
+                }
+            } else {
+                printf("gp_table_meta_create_widget: failed to create right overlay for mg=%p wid=%d\n", (void*)mg, mg->dangling_widget_id);
+            }
+                if (ra || rb) {
+                    gp_canvas_set_overlay_meta(cvs, ra, rb, ctx, mg);
+                    if (mg->overlay_key_a == 0ull && mg->overlay_key_b == 0ull) {
+                        mg->overlay_key_a = ra;
+                        mg->overlay_key_b = rb;
+                    }
+                }
+        }
+    } catch(...) {}
     return 1;
 }
 
@@ -2766,6 +3130,20 @@ extern "C" int32_t gp_table_meta_destroy_widget(GP_TableContext* ctx, GP_MetaGro
     int res = rope_sim_destroy_dangling_widget(sim, mg->dangling_widget_id);
     mg->dangling_widget_id = -1;
     return res;
+}
+
+extern "C" int32_t gp_table_meta_set_overlay_keys(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long key_a, unsigned long long key_b) {
+    if (!ctx || !mg) return 0;
+    mg->overlay_key_a = key_a;
+    mg->overlay_key_b = key_b;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_overlay_keys(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long* out_key_a, unsigned long long* out_key_b) {
+    if (!ctx || !mg || (!out_key_a && !out_key_b)) return 0;
+    if (out_key_a) *out_key_a = mg->overlay_key_a;
+    if (out_key_b) *out_key_b = mg->overlay_key_b;
+    return 1;
 }
 
 // Attach/detach an external RopeSim instance to the table context.
@@ -2783,8 +3161,84 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
     }
     ctx->rope_sim = sim;
     ctx->rope_sim_owned = (sim != nullptr) ? (take_ownership ? 1 : 0) : 0;
-    // reset indices so edges will create ropes in the new sim when next rendered
-    ctx->rope_sim_idx.clear();
+    // reset mapping so edges will create ropes in the new sim when next rendered
+    ctx->rope_id_to_sim_idx.clear();
+    // If attaching a simulator, create rope entries for any existing edges
+    // that lack sim indices or persistent uids so we have stable mapping.
+    if (ctx->rope_sim) {
+        // Prepare row layout helpers
+        std::vector<int> row_y0;
+        std::vector<int> row_h;
+        compute_row_layout(ctx->rows.data(), static_cast<int>(ctx->rows.size()), ctx->st, ctx->geom.height_px, row_y0, row_h);
+        auto compute_center_local = [&](uint64_t key, int &outx, int &outy) {
+            outx = -1; outy = -1;
+            uint32_t r_orig = static_cast<uint32_t>(key >> 32);
+            uint32_t c_idx = static_cast<uint32_t>((key >> 16) & 0xFFFFu);
+            uint32_t led = static_cast<uint32_t>(key & 0xFFFFu);
+            if (r_orig >= ctx->rows.size()) return;
+            const GP_TableRow &row = ctx->rows[static_cast<size_t>(r_orig)];
+            if (static_cast<int>(c_idx) < 0 || static_cast<int>(c_idx) >= row.cell_count) return;
+            int col_x0[8] = {0}; int col_w[8] = {0};
+            compute_columns(ctx->cols.data(), static_cast<int>(ctx->cols.size()), ctx->st.w, ctx->st.name_w, col_x0, col_w);
+            const GP_TableCell &cell = row.cells[static_cast<int>(c_idx)];
+            int x0 = col_x0[static_cast<int>(c_idx)];
+            int cw = col_w[static_cast<int>(c_idx)];
+            int y0 = (r_orig < row_y0.size()) ? row_y0[static_cast<size_t>(r_orig)] : (static_cast<int>(r_orig) * ctx->st.row_h);
+            int rh = (r_orig < row_h.size()) ? row_h[static_cast<size_t>(r_orig)] : ctx->st.row_h;
+            int led_count = 9;
+            if (cell.kind == GP_TABLE_CELL_LEDS_ARG) {
+                int count = std::max(0, std::min(32, static_cast<int>(cell.value)));
+                if (count == 0) count = (cell.flags & 0xFF);
+                if (count == 0) count = 12;
+                led_count = count;
+            } else if (cell.kind == GP_TABLE_CELL_LEDS_TABLE) {
+                led_count = 8;
+            }
+            int eff_w = std::max(1, cw - 4);
+            int radius = 4;
+            int led_spacing = std::max(radius * 2 + 2, eff_w / std::max(1, led_count + 1));
+            int cx0 = x0 + 2 + led_spacing;
+            if (static_cast<int>(led) >= 0 && static_cast<int>(led) < led_count) {
+                outx = cx0 + static_cast<int>(led) * led_spacing;
+                const bool is_image_row = row_find_image_cell(row, nullptr);
+                int band_h = is_image_row ? std::min(rh, row_image_header_h(ctx->st, row)) : rh;
+                outy = y0 + band_h / 2;
+            }
+        };
+
+        // Ensure rope_ids vector matches edge count
+        if (ctx->rope_ids.size() < ctx->edges.size()) ctx->rope_ids.resize(ctx->edges.size(), 0ull);
+
+        for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+            uint64_t existing_id = (ei < ctx->rope_ids.size()) ? ctx->rope_ids[ei] : 0ull;
+            if (existing_id != 0ull && ctx->rope_id_to_sim_idx.find(existing_id) != ctx->rope_id_to_sim_idx.end()) continue; // already has rope mapped
+            unsigned long long a = ctx->edges[ei].first;
+            unsigned long long b = ctx->edges[ei].second;
+            int ax = 0, ay = 0, bx = 0, by = 0;
+            compute_center_local(a, ax, ay);
+            compute_center_local(b, bx, by);
+            int segs = std::max(4, ctx->st.cable_segments);
+            float slack = 0.0f;
+            float plug_z = -ctx->st.cable_plug_depth;
+            int idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
+            uint64_t rid = 0ull;
+            if (existing_id != 0ull) {
+                rid = existing_id;
+            } else {
+                rid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+            }
+            ctx->rope_ids[ei] = rid;
+            ctx->rope_id_to_sim_idx[rid] = idx;
+            printf("gp_table_attach_rope_sim: ctx=%p backfilled rope idx=%d id=%llu\n", (void*)ctx, idx, (unsigned long long)rid);
+            {
+                GP_CanvasContext* cvs2 = gp_canvas_get_singleton();
+                if (cvs2) {
+                    uint64_t tmp2 = rid;
+                    gp_canvas_register_table_rope_ids_from_array(cvs2, ctx, &tmp2, 1);
+                }
+            }
+        }
+    }
     return 1;
 }
 
@@ -2877,6 +3331,18 @@ int32_t gp_table_enqueue_unbind_stage_port(GP_TableContext* ctx, unsigned long l
     return 1;
 }
 
+int32_t gp_table_set_sim_enabled(GP_TableContext* ctx, int32_t enabled) {
+    if (!ctx) return 0;
+    ctx->sim_enabled = (enabled ? 1 : 0);
+    return 1;
+}
+
+int32_t gp_table_get_sim_enabled(GP_TableContext* ctx, int32_t* out_enabled) {
+    if (!ctx || !out_enabled) return 0;
+    *out_enabled = ctx->sim_enabled;
+    return 1;
+}
+
 // Apply pending ops (manager thread should call this before scheduling)
 int32_t gp_table_apply_pending_ops(GP_TableContext* ctx) {
     if (!ctx) return 0;
@@ -2925,8 +3391,8 @@ int32_t gp_table_snapshot_network_size(GP_TableContext* ctx, int32_t* out_node_c
     }
     *out_node_count = static_cast<int32_t>(keys.size());
     *out_edge_count = static_cast<int32_t>(ctx->edges.size());
-    // Stamp: simple generation combining edge count and next_edge_uid to detect changes
-    uint64_t stamp = (static_cast<uint64_t>(ctx->edges.size()) << 32) ^ (ctx->next_edge_uid & 0xffffffffull);
+    // Stamp: simple generation combining edge count and next_edge_id to detect changes
+    uint64_t stamp = (static_cast<uint64_t>(ctx->edges.size()) << 32) ^ (ctx->next_edge_id & 0xffffffffull);
     *out_stamp = stamp;
     return 1;
 }
@@ -2934,7 +3400,7 @@ int32_t gp_table_snapshot_network_size(GP_TableContext* ctx, int32_t* out_node_c
 int32_t gp_table_snapshot_network_fill(GP_TableContext* ctx, uint64_t* node_buf, int32_t node_buf_len, GP_TableEdgeSnapshot* edge_buf, int32_t edge_buf_len, uint64_t expected_stamp) {
     if (!ctx || !node_buf || !edge_buf) return 0;
     // Recompute stamp
-    uint64_t stamp = (static_cast<uint64_t>(ctx->edges.size()) << 32) ^ (ctx->next_edge_uid & 0xffffffffull);
+    uint64_t stamp = (static_cast<uint64_t>(ctx->edges.size()) << 32) ^ (ctx->next_edge_id & 0xffffffffull);
     if (expected_stamp != stamp) return 0; // caller should retry size/fill
 
     // Build a node index map in caller-visible order: insert as discovered while scanning edges
@@ -2965,7 +3431,7 @@ int32_t gp_table_snapshot_network_fill(GP_TableContext* ctx, uint64_t* node_buf,
         if (it_a == idx.end() || it_b == idx.end()) return 0; // should not happen
         edge_buf[i].a_idx = it_a->second;
         edge_buf[i].b_idx = it_b->second;
-        edge_buf[i].edge_uid = (i < ctx->edge_uids.size()) ? ctx->edge_uids[i] : 0ull;
+        edge_buf[i].edge_uid = (i < ctx->edge_ids.size()) ? ctx->edge_ids[i] : 0ull;
     }
     return 1;
 }
@@ -4317,7 +4783,7 @@ GP_TableContext* gp_table_create(const GP_TableStyle* style) {
     int max_segs = std::max(4, ctx->st.cable_segments);
     ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
     ctx->rope_sim_owned = 1;
-    ctx->rope_sim_idx.clear();
+    ctx->rope_id_to_sim_idx.clear();
     return ctx.release();
 }
 
@@ -4522,9 +4988,9 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
     ensure_edge_fifos(ctx);
     ctx->edges.emplace_back(a, b);
     // create and record a persistent unique id for this edge
-    uint64_t uid = ctx->next_edge_uid++;
-    if (uid == 0) uid = ctx->next_edge_uid++; // avoid zero
-    ctx->edge_uids.push_back(uid);
+    uint64_t uid = 0ull;
+    uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+    ctx->edge_ids.push_back(uid);
     // ensure relax arrays stay in sync
     // start unrelaxed so the cable animates into place
     ctx->relax_value.push_back(0.0f);
@@ -4583,9 +5049,29 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
         float slack = 0.0f;
         float plug_z = -ctx->st.cable_plug_depth;
         int idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
-        ctx->rope_sim_idx.push_back(idx);
+        uint64_t rid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+        ctx->rope_ids.push_back(rid);
+        printf("gp_table_add_edge: ctx=%p rope_ids_count=%zu after push id=%llu\n", (void*)ctx, ctx->rope_ids.size(), (unsigned long long)rid);
+        ctx->rope_id_to_sim_idx[rid] = idx;
+        printf("gp_table_add_edge: ctx=%p added rope idx=%d id=%llu\n", (void*)ctx, idx, (unsigned long long)rid);
+        {
+            GP_CanvasContext* cvs = gp_canvas_get_singleton();
+            if (cvs) {
+                uint64_t tmp = rid;
+                gp_canvas_register_table_rope_ids_from_array(cvs, ctx, &tmp, 1);
+            }
+        }
     } else {
-        ctx->rope_sim_idx.push_back(-1);
+        uint64_t rid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+        ctx->rope_ids.push_back(rid);
+        printf("gp_table_add_edge: ctx=%p queued edge id=%llu (no sim)\n", (void*)ctx, (unsigned long long)rid);
+        {
+            GP_CanvasContext* cvs = gp_canvas_get_singleton();
+            if (cvs) {
+                uint64_t tmp = rid;
+                gp_canvas_register_table_rope_ids_from_array(cvs, ctx, &tmp, 1);
+            }
+        }
     }
     sync_edge_tensor_for_idx(ctx, ctx->edges.size() - 1);
     int32_t edge_idx = static_cast<int32_t>(ctx->edges.size() - 1);
@@ -4596,16 +5082,19 @@ int32_t gp_table_clear_edges(GP_TableContext* ctx) {
     if (!ctx) return 0;
     ctx->edges.clear();
     ctx->rings.clear();
-    ctx->edge_uids.clear();
-    ctx->next_edge_uid = 1;
+    ctx->edge_ids.clear();
+    ctx->next_edge_id = 1;
     ctx->relax_value.clear();
     ctx->relax_vel.clear();
     ctx->edge_fifos.clear();
     ctx->edge_batch_metadata.clear();
     ctx->edge_subgroup_flags.clear();
     ctx->edge_subscriber_slots.clear();
-    // reset rope simulator indices and recreate sim to free resources
-    ctx->rope_sim_idx.clear();
+    // reset rope simulator mapping and recreate sim to free resources
+    ctx->rope_id_to_sim_idx.clear();
+    if (!ctx->rope_ids.empty()) printf("gp_table_clear_edges: ctx=%p clearing %zu rope_ids\n", (void*)ctx, ctx->rope_ids.size());
+    ctx->rope_ids.clear();
+    ctx->next_rope_id = 1;
     if (ctx->rope_sim && ctx->rope_sim_owned) {
         rope_sim_destroy(ctx->rope_sim);
         int max_ropes = 1024;
@@ -4623,7 +5112,7 @@ extern "C" int32_t gp_table_register_ring_edge(GP_TableContext* ctx, int32_t rin
     re.ring_id = ring_id;
     re.key = ring_key;
     re.fifo.configure_default();
-    re.uid = ctx->next_ring_uid++;
+    re.uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
     ctx->rings.push_back(std::move(re));
     return static_cast<int32_t>(ctx->rings.size() - 1);
 }
@@ -4865,7 +5354,7 @@ int32_t gp_table_edge_subscribe_ex(GP_TableContext* ctx, int32_t edge_idx, unsig
     if (tm) {
         auto &map = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         if (map.find(subscriber_key) == map.end()) {
-            uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+            uint64_t edge_id = ctx->edge_ids[static_cast<size_t>(edge_idx)];
             int slot = tm->register_reader_for_edge(edge_id);
             if (slot > 0) map[subscriber_key] = slot;
             // Notify manager of the starting sequence for this reader (if available).
@@ -4904,7 +5393,7 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     bool dropped = false;
-    uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+    uint64_t edge_id = ctx->edge_ids[static_cast<size_t>(edge_idx)];
 
     // Inspect edge subgroup flags to determine publish behavior. We use a
     // simple switch so future policies can be tacked on easily.
@@ -4960,7 +5449,7 @@ int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, u
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     bool dropped = false;
-    uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+    uint64_t edge_id = ctx->edge_ids[static_cast<size_t>(edge_idx)];
     bool ok = fifo.push_blocking(edge_id, writer_key, sample, static_cast<size_t>(sample_len), &dropped, timeout_ms);
     if (out_dropped && dropped) *out_dropped = 1;
     if (!ok) return 0;
@@ -4991,7 +5480,7 @@ int32_t gp_table_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     bool dropped = false;
-    uint64_t edge_id = ctx->edge_uids[static_cast<size_t>(edge_idx)];
+    uint64_t edge_id = ctx->edge_ids[static_cast<size_t>(edge_idx)];
     bool ok = fifo.push_ptr(edge_id, writer_key, ptr, &dropped);
     if (out_dropped && dropped) *out_dropped = 1;
     // Sync ThreadManager reader sequences similar to float publish.
@@ -5266,8 +5755,12 @@ int32_t gp_table_edge_set_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx,
 
 extern "C" int32_t gp_table_get_edge_rope_index(const GP_TableContext* ctx, int32_t edge_idx, int32_t* out_rope_idx) {
     if (!ctx || !out_rope_idx) return 0;
-    if (edge_idx < 0 || edge_idx >= static_cast<int>(ctx->rope_sim_idx.size())) { *out_rope_idx = -1; return 0; }
-    *out_rope_idx = ctx->rope_sim_idx[static_cast<size_t>(edge_idx)];
+    if (edge_idx < 0 || edge_idx >= static_cast<int>(ctx->rope_ids.size())) { *out_rope_idx = -1; return 0; }
+    uint64_t id = ctx->rope_ids[static_cast<size_t>(edge_idx)];
+    if (id == 0ull) { *out_rope_idx = -1; return 1; }
+    auto it = ctx->rope_id_to_sim_idx.find(id);
+    if (it == ctx->rope_id_to_sim_idx.end()) { *out_rope_idx = -1; return 1; }
+    *out_rope_idx = it->second;
     return 1;
 }
 
@@ -5291,6 +5784,35 @@ int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led
     }
     return 0;
 }
+
+// Resolve a persistent rope id to the attached RopeSim index for this table.
+// Returns -1 if not present.
+extern "C" int gp_table_resolve_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t id) {
+    if (!ctx) return -1;
+    if (id == 0ull) return -1;
+    auto it = ctx->rope_id_to_sim_idx.find(id);
+    if (it == ctx->rope_id_to_sim_idx.end()) return -1;
+    return it->second;
+}
+    // Allow external code (canvas) to set the table's persistent rope id list
+    // prior to serialization so exported blobs include canonical ids.
+extern "C" int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint64_t* ids, int count) {
+    if (!ctx) return 0;
+    if (!ids || count <= 0) { ctx->rope_ids.clear(); return 1; }
+    ctx->rope_ids.assign(ids, ids + count);
+    // rebuild the lookup map so callers can resolve sim indices from the
+    // provided persistent ids.
+    ctx->rope_id_to_sim_idx.clear();
+    for (int i = 0; i < count; ++i) {
+        uint64_t uid = ids[static_cast<size_t>(i)];
+        if (uid != 0ull) ctx->rope_id_to_sim_idx[uid] = i;
+    }
+    // set next_rope_id to one past maximum to avoid collisions
+    uint64_t mx = 1;
+    for (auto v : ctx->rope_ids) if (v >= mx) mx = v + 1;
+    ctx->next_rope_id = mx;
+    return 1;
+    }
 
 int32_t gp_table_edge_index_for_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b, int32_t* out_edge_idx) {
     if (!ctx || !out_edge_idx) return 0;
@@ -5339,15 +5861,19 @@ int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx) {
             vec.erase(vec.begin() + edge_idx);
         }
     };
+    // capture id for removed edge so we can remove mapping entries
+    uint64_t removed_id = 0ull;
+    if (edge_idx >= 0 && edge_idx < static_cast<int32_t>(ctx->rope_ids.size())) removed_id = ctx->rope_ids[static_cast<size_t>(edge_idx)];
     erase_at(ctx->edges);
     erase_at(ctx->edge_fifos);
     erase_at(ctx->edge_batch_metadata);
     erase_at(ctx->edge_subgroup_flags);
-    erase_at(ctx->edge_uids);
+    erase_at(ctx->edge_ids);
     erase_at(ctx->edge_subscriber_slots);
     erase_at(ctx->relax_value);
     erase_at(ctx->relax_vel);
-    erase_at(ctx->rope_sim_idx);
+    // remove any id->sim mapping for the removed edge id
+    if (removed_id != 0ull) ctx->rope_id_to_sim_idx.erase(removed_id);
     return 1;
 }
 
@@ -5532,12 +6058,39 @@ int32_t gp_table_get_editable(GP_TableContext* ctx, int32_t* out_editable) {
 }
 
 // Serialization format (simple binary):
-// [8 bytes magic 'GPTBL001'][uint32_t version=1]
-// then GP_TableStyle (raw), int32 col_count, cols[], int32 row_count, rows[], int32 edge_count, edges (u64,u64)..., int32 sel_count, sel_keys...
+// [8 bytes magic 'GPTBL001'][uint32_t version]
+// version 1: GP_TableStyle, cols, rows, edges, selected keys
+// version 2: same as v1, then int32 meta_group_count, followed by per-meta-group blob
+// Per-meta-group blob: int32 vertex_count, (int32 rope_idx,int32 vert_idx)*N, float confinement, int32 sim_group_idx,
+// uint64 id, LassoConfig (8 bytes), uint64 anchor_rope_uid, int32 anchor_vert, uint32 subgroup_flags, int32 channel_group,
+// int32 dangling_widget_rope, int32 dangling_widget_rope_vid, float dangling_hang_len, int32 ring_mode,
+// uint64 overlay_key_a, uint64 overlay_key_b
 int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len) {
     if (!ctx) return 0;
-    const uint32_t version = 1;
+    const uint32_t version = 3;
     const char magic[8] = {'G','P','T','B','L','0','0','1'};
+    // Build a canonical UUID atlas covering all UUIDs referenced by this
+    // table blob (edges, ropes, overlays, module/frame ports, rings,
+    // meta-group ids). The atlas will be written immediately after the
+    // version so loaders can read it first and reserve/register any
+    // required identities before reconstructing dependent structures.
+    std::unordered_set<uint64_t> _atlas_set;
+    if (ctx->module_uuid != 0ull) _atlas_set.insert(ctx->module_uuid);
+    for (const auto &fpe : ctx->frame_port_uuids) if (fpe.uuid != 0ull) _atlas_set.insert(fpe.uuid);
+    for (auto ru : ctx->rope_ids) if (ru != 0ull) _atlas_set.insert(ru);
+    for (const auto &e : ctx->edges) { if (e.first != 0ull) _atlas_set.insert(e.first); if (e.second != 0ull) _atlas_set.insert(e.second); }
+    for (const auto &re : ctx->rings) if (re.key != 0ull) _atlas_set.insert(re.key);
+    for (size_t mi = 0; mi < ctx->meta_groups.size(); ++mi) {
+        GP_MetaGroup* mg = ctx->meta_groups[mi].get();
+        if (!mg) continue;
+        if (mg->overlay_key_a != 0ull) _atlas_set.insert(mg->overlay_key_a);
+        if (mg->overlay_key_b != 0ull) _atlas_set.insert(mg->overlay_key_b);
+        if (mg->id != 0ull) _atlas_set.insert(mg->id);
+        if (mg->anchor_rope >= 0 && static_cast<size_t>(mg->anchor_rope) < ctx->rope_ids.size()) _atlas_set.insert(ctx->rope_ids[static_cast<size_t>(mg->anchor_rope)]);
+    }
+    std::vector<uint64_t> atlas;
+    atlas.reserve(_atlas_set.size());
+    for (auto v : _atlas_set) atlas.push_back(v);
     int32_t col_count = static_cast<int32_t>(ctx->cols.size());
     int32_t row_count = static_cast<int32_t>(ctx->rows.size());
     int32_t edge_count = static_cast<int32_t>(ctx->edges.size());
@@ -5545,6 +6098,9 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
     int32_t need = 0;
     need += 8; // magic
     need += 4; // version
+    // atlas count + entries (written immediately after version)
+    need += 4; // atlas_count
+    need += static_cast<int32_t>(atlas.size()) * static_cast<int32_t>(sizeof(uint64_t));
     need += static_cast<int32_t>(sizeof(GP_TableStyle));
     need += 4; // col_count
     need += col_count * static_cast<int32_t>(sizeof(GP_TableColumn));
@@ -5552,8 +6108,54 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
     need += row_count * static_cast<int32_t>(sizeof(GP_TableRow));
     need += 4; // edge_count
     need += edge_count * static_cast<int32_t>(sizeof(uint64_t) * 2);
+    // per-rope persistent uids (one per edge/rope created)
+    need += 4; // rope_uid_count
+    need += edge_count * static_cast<int32_t>(sizeof(uint64_t));
     need += 4; // sel_count
     need += sel_count * static_cast<int32_t>(sizeof(uint64_t));
+    // module uuid + frame-port entries (version 3)
+    need += 8; // module_uuid
+    // frame port count + entries
+    need += 4; // frame_port_count
+    // each entry: row(int32), idx(int32), uuid(uint64)
+    need += static_cast<int32_t>(ctx->frame_port_uuids.size()) * (4 + 4 + 8);
+    // meta-groups (version 2)
+    int32_t mg_count = static_cast<int32_t>(ctx->meta_groups.size());
+    need += 4; // mg_count
+    for (int i = 0; i < mg_count; ++i) {
+        GP_MetaGroup* mg = ctx->meta_groups[static_cast<size_t>(i)].get();
+        int32_t vcount = static_cast<int32_t>(mg ? mg->vertices.size() : 0);
+        need += 4; // vcount
+        need += vcount * (8 + 4); // rope_uid,uint64 + vertex_idx,int32
+        need += 4; // confinement (stored as float)
+        need += 4; // sim_group_idx
+        need += 8; // id (uint64)
+        need += static_cast<int32_t>(sizeof(LassoConfig)); // lasso_config
+        need += 8; // anchor_rope_uid (uint64)
+        need += 4; // anchor_vert
+        need += 4; // subgroup_flags (uint32)
+        need += 4; // channel_group
+        need += 4; // dangling_widget_rope
+        need += 4; // dangling_widget_rope_vid
+        need += 4; // dangling_hang_len (float)
+        need += 4; // ring_mode
+        need += 4; // ring_u (float)
+        need += 8; // overlay_key_a
+        need += 8; // overlay_key_b
+        need += 8; // overlay port_uuid_a
+        need += 8; // overlay port_uuid_b
+    }
+
+    // Log meta-group count and total size needed when serializing (helps
+    // troubleshooting when saved modules appear to lack meta-groups).
+    printf("gp_table_serialize: ctx=%p mg_count=%d need=%d\n", (void*)ctx, mg_count, need);
+    if (!ctx->rope_ids.empty()) {
+        printf("gp_table_serialize: rope_ids:");
+        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) printf(" %llu", (unsigned long long)ctx->rope_ids[ri]);
+        printf("\n");
+    } else {
+        printf("gp_table_serialize: rope_ids: <empty>\n");
+    }
 
     if (!out_buf) return need;
     if (out_len < need) return 0;
@@ -5563,6 +6165,10 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
     memcpy(p, magic, 8); p += 8;
     // write version
     memcpy(p, &version, 4); p += 4;
+    // write atlas: count + entries
+    int32_t atlas_count = static_cast<int32_t>(atlas.size());
+    memcpy(p, &atlas_count, 4); p += 4;
+    for (int ai = 0; ai < atlas_count; ++ai) { uint64_t u = atlas[static_cast<size_t>(ai)]; memcpy(p, &u, sizeof(uint64_t)); p += sizeof(uint64_t); }
     // write style_raw
     memcpy(p, &ctx->style_raw, sizeof(GP_TableStyle)); p += sizeof(GP_TableStyle);
     // write cols
@@ -5590,11 +6196,112 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
         memcpy(p, &a, sizeof(uint64_t)); p += sizeof(uint64_t);
         memcpy(p, &b, sizeof(uint64_t)); p += sizeof(uint64_t);
     }
+    // write per-rope ids (one per edge/rope)
+    int32_t rope_id_count = static_cast<int32_t>(ctx->rope_ids.size());
+    memcpy(p, &rope_id_count, 4); p += 4;
+    for (int i = 0; i < rope_id_count; ++i) {
+        uint64_t ru = ctx->rope_ids[static_cast<size_t>(i)];
+        memcpy(p, &ru, sizeof(uint64_t)); p += sizeof(uint64_t);
+    }
     // write selected keys
     memcpy(p, &sel_count, 4); p += 4;
     for (auto k : ctx->selected_leds) {
         uint64_t key = k;
         memcpy(p, &key, sizeof(uint64_t)); p += sizeof(uint64_t);
+    }
+
+    // write module uuid and frame-port entries (version 3)
+    uint64_t module_uuid = ctx->module_uuid;
+    memcpy(p, &module_uuid, 8); p += 8;
+    int32_t fpcount = static_cast<int32_t>(ctx->frame_port_uuids.size());
+    memcpy(p, &fpcount, 4); p += 4;
+    for (int i = 0; i < fpcount; ++i) {
+        int32_t r = ctx->frame_port_uuids[static_cast<size_t>(i)].row;
+        int32_t idx = ctx->frame_port_uuids[static_cast<size_t>(i)].idx;
+        uint64_t pu = ctx->frame_port_uuids[static_cast<size_t>(i)].uuid;
+        memcpy(p, &r, 4); p += 4;
+        memcpy(p, &idx, 4); p += 4;
+        memcpy(p, &pu, 8); p += 8;
+    }
+
+    // write meta-groups (version 3)
+    memcpy(p, &mg_count, 4); p += 4;
+    for (int i = 0; i < mg_count; ++i) {
+        GP_MetaGroup* mg = ctx->meta_groups[static_cast<size_t>(i)].get();
+        if (mg) {
+            LassoConfig lc = mg->lasso_config;
+            printf("gp_table_serialize: mg id=%llu vcount=%d sim_idx=%d lasso.spring_min_rest=%.2f spring_reduce_rate=%.2f spring_mode=%u\n",
+                   (unsigned long long)mg->id, (int)mg->vertices.size(), mg->sim_group_idx, lc.spring_min_rest, lc.spring_reduce_rate, (unsigned)lc.spring_mode);
+            // Dump full meta-group for diagnostics
+            gp_table_debug_dump_meta_group(ctx, mg, "serialize");
+        } else {
+            printf("gp_table_serialize: mg <null>\n");
+        }
+        int32_t vcount = static_cast<int32_t>(mg ? mg->vertices.size() : 0);
+        memcpy(p, &vcount, 4); p += 4;
+        for (int vi = 0; vi < vcount; ++vi) {
+            int32_t rope_idx = mg->vertices[static_cast<size_t>(vi)].first;
+            int32_t vert_idx = mg->vertices[static_cast<size_t>(vi)].second;
+            uint64_t rope_id = 0ull;
+            if (rope_idx >= 0 && static_cast<size_t>(rope_idx) < ctx->rope_ids.size()) rope_id = ctx->rope_ids[static_cast<size_t>(rope_idx)];
+            memcpy(p, &rope_id, 8); p += 8;
+            memcpy(p, &vert_idx, 4); p += 4;
+        }
+        float conf = mg ? mg->confinement : 1.0f;
+        memcpy(p, &conf, 4); p += 4;
+        int32_t sim_idx = mg ? mg->sim_group_idx : -1;
+        memcpy(p, &sim_idx, 4); p += 4;
+        uint64_t mgid = mg ? mg->id : 0ull;
+        memcpy(p, &mgid, 8); p += 8;
+        LassoConfig lc{};
+        if (mg) lc = mg->lasso_config;
+        memcpy(p, &lc, sizeof(LassoConfig)); p += sizeof(LassoConfig);
+        // write anchor as a persistent rope id (0 == none)
+        uint64_t anchor_rope_id = 0ull;
+        int32_t anchor_v = -1;
+        if (mg) {
+            anchor_v = mg->anchor_vert;
+            if (mg->anchor_rope >= 0 && static_cast<size_t>(mg->anchor_rope) < ctx->rope_ids.size()) anchor_rope_id = ctx->rope_ids[static_cast<size_t>(mg->anchor_rope)];
+        }
+        memcpy(p, &anchor_rope_id, 8); p += 8;
+        memcpy(p, &anchor_v, 4); p += 4;
+        uint32_t sgflags = mg ? mg->subgroup_flags : 0u;
+        memcpy(p, &sgflags, 4); p += 4;
+        int32_t channel_group = mg ? mg->channel_group : 0;
+        memcpy(p, &channel_group, 4); p += 4;
+        int32_t dang_rope = mg ? mg->dangling_widget_rope : -1;
+        int32_t dang_vid = mg ? mg->dangling_widget_rope_vid : -1;
+        memcpy(p, &dang_rope, 4); p += 4;
+        memcpy(p, &dang_vid, 4); p += 4;
+        float dang_len = mg ? mg->dangling_hang_len : 0.0f;
+        memcpy(p, &dang_len, 4); p += 4;
+        int32_t ring_mode = mg ? mg->ring_mode : 0;
+        memcpy(p, &ring_mode, 4); p += 4;
+        float ring_u = 0.0f;
+        if (mg) {
+            // attempt to find a ring registered for this meta-group by id
+            for (size_t ri = 0; ri < ctx->rings.size(); ++ri) {
+                const auto &re = ctx->rings[ri];
+                if (re.key == mg->id) {
+                    int ring_id = re.ring_id;
+                    gp_table_get_ring_u(ctx, ring_id, &ring_u);
+                    break;
+                }
+            }
+        }
+        memcpy(p, &ring_u, 4); p += 4;
+        uint64_t oka = mg ? mg->overlay_key_a : 0ull;
+        uint64_t okb = mg ? mg->overlay_key_b : 0ull;
+        memcpy(p, &oka, 8); p += 8;
+        memcpy(p, &okb, 8); p += 8;
+        // persist overlay per-port UUIDs so restore can re-establish exact port identities
+        uint64_t pu_a = 0ull, pu_b = 0ull;
+        GP_CanvasContext* cvs = gp_canvas_get_singleton();
+        if (cvs && (oka || okb)) {
+            gp_canvas_get_overlay_port_uuids(cvs, oka, okb, &pu_a, &pu_b);
+        }
+        memcpy(p, &pu_a, 8); p += 8;
+        memcpy(p, &pu_b, 8); p += 8;
     }
 
     return need;
@@ -5609,7 +6316,27 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     p += 8;
     uint32_t version = 0;
     memcpy(&version, p, 4); p += 4;
-    if (version != 1) return 0;
+    // Read UUID atlas (written immediately after version).
+    std::vector<uint64_t> atlas;
+    if (p + 4 > in_buf + in_len) return 0;
+    int32_t atlas_count = 0;
+    memcpy(&atlas_count, p, 4); p += 4;
+    if (atlas_count < 0) return 0;
+    atlas.reserve(static_cast<size_t>(atlas_count));
+    for (int i = 0; i < atlas_count; ++i) {
+        if (p + 8 > in_buf + in_len) return 0;
+        uint64_t u = 0ull; memcpy(&u, p, 8); p += 8;
+        atlas.push_back(u);
+    }
+    printf("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
+    printf("gp_table_deserialize: canvas singleton=%p\n", (void*)gp_canvas_get_singleton());
+    printf("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
+    // trace: report deserialize invocation
+    printf("gp_table_deserialize: ctx=%p len=%d version=%u\n", (void*)ctx, in_len, (unsigned)version);
+    // Canvas singleton (may be null). Declare early so deserialization can
+    // register persisted rope/module UUIDs with the canvas if available.
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    if (version < 2 || version > 3) return 0;
     // read style
     GP_TableStyle style{};
     memcpy(&style, p, sizeof(GP_TableStyle)); p += sizeof(GP_TableStyle);
@@ -5648,6 +6375,24 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         memcpy(&b, p, sizeof(uint64_t)); p += sizeof(uint64_t);
         edges.emplace_back(a,b);
     }
+    // read per-rope uids
+    int32_t rope_uid_count = 0;
+    if (p + 4 > in_buf + in_len) return 0;
+    memcpy(&rope_uid_count, p, 4); p += 4;
+    std::vector<uint64_t> rope_ids_temp;
+    rope_ids_temp.reserve(static_cast<size_t>(std::max(0, rope_uid_count)));
+    for (int i = 0; i < rope_uid_count; ++i) {
+        uint64_t ru = 0ull;
+        if (p + 8 > in_buf + in_len) return 0;
+        memcpy(&ru, p, sizeof(uint64_t)); p += sizeof(uint64_t);
+        rope_ids_temp.push_back(ru);
+    }
+    printf("gp_table_deserialize: rope_uid_count=%d\n", rope_uid_count);
+    if (!rope_ids_temp.empty()) {
+        printf("gp_table_deserialize: rope_ids:");
+        for (size_t ri = 0; ri < rope_ids_temp.size(); ++ri) printf(" %llu", (unsigned long long)rope_ids_temp[ri]);
+        printf("\n");
+    }
     // selected keys
     int32_t sel_count = 0;
     memcpy(&sel_count, p, 4); p += 4;
@@ -5659,6 +6404,38 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         selset.insert(key);
     }
 
+    // version 3: read module UUID and frame-port entries
+    uint64_t module_uuid = 0ull;
+    if (version >= 3) {
+        if (p + 8 > in_buf + in_len) return 0;
+        memcpy(&module_uuid, p, 8); p += 8;
+        int32_t fpcount = 0;
+        if (p + 4 > in_buf + in_len) return 0;
+        memcpy(&fpcount, p, 4); p += 4;
+        if (fpcount < 0) return 0;
+        std::vector<std::tuple<int32_t,int32_t,uint64_t>> fp_entries;
+        fp_entries.reserve(static_cast<size_t>(fpcount));
+        for (int i = 0; i < fpcount; ++i) {
+            if (p + 4 + 4 + 8 > in_buf + in_len) return 0;
+            int32_t r=0, idx=0; uint64_t pu=0ull;
+            memcpy(&r, p, 4); p += 4;
+            memcpy(&idx, p, 4); p += 4;
+            memcpy(&pu, p, 8); p += 8;
+            fp_entries.emplace_back(r, idx, pu);
+        }
+        // attach module_uuid and frame-port entries to ctx so callers (canvas)
+        // can read them when needed. We store into ctx fields for later use.
+        ctx->module_uuid = module_uuid;
+        ctx->frame_port_uuids.clear();
+        for (auto &ent : fp_entries) {
+            int32_t r = std::get<0>(ent);
+            int32_t idx = std::get<1>(ent);
+            uint64_t pu = std::get<2>(ent);
+            GP_TableContext::FramePortEntry fpe{}; fpe.row = r; fpe.idx = idx; fpe.uuid = pu;
+            ctx->frame_port_uuids.push_back(fpe);
+        }
+    }
+
     // Commit to ctx: replace style, cols, rows, edges, selected set
     ctx->style_raw = style;
     ctx->st = load_style(&ctx->style_raw);
@@ -5667,8 +6444,266 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     // clear existing edges via API to keep rope_sim indices consistent
     gp_table_clear_edges(ctx);
     for (auto &e : edges) gp_table_add_edge(ctx, e.first, e.second);
+    // if serialized per-rope uids were present, adopt them so runtime rope
+    // indices map to the saved stable ids (this preserves stable mapping
+    // for meta-group vertices which reference ropes by uid).
+    if (!rope_ids_temp.empty()) {
+        ctx->rope_ids = rope_ids_temp;
+        // rebuild rope_id_to_sim_idx so canvas lookups resolve to the current
+        // rope indices (edge order) using the persisted ids.
+        ctx->rope_id_to_sim_idx.clear();
+        for (size_t i = 0; i < ctx->rope_ids.size(); ++i) {
+            uint64_t uid = ctx->rope_ids[i];
+            if (uid != 0ull) ctx->rope_id_to_sim_idx[uid] = static_cast<int>(i);
+        }
+        // set next_rope_id to one past the max saved id
+        uint64_t mx = 1;
+        for (auto ru : rope_ids_temp) if (ru >= mx) mx = ru + 1;
+        ctx->next_rope_id = mx;
+        // inform canvas of this table's persisted rope IDs so the canvas
+        // can build a canonical mapping for deterministic restoration.
+        if (cvs) {
+            gp_canvas_register_table_rope_ids_from_array(cvs, ctx, ctx->rope_ids.data(), static_cast<int>(ctx->rope_ids.size()));
+        }
+    }
     ctx->selected_leds = std::move(selset);
     recompute_geom(ctx);
+    // Parse and restore meta-groups (version 2)
+    // ensure there's enough data remaining
+    if (p + 4 > in_buf + in_len) return 1; // nothing more
+    int32_t mg_count = 0;
+    memcpy(&mg_count, p, 4); p += 4;
+    printf("gp_table_deserialize: meta-group count=%d\n", mg_count);
+    if (mg_count < 0) return 1;
+    struct MGData { std::vector<std::pair<uint64_t,int>> verts; float confinement; int32_t sim_idx; uint64_t id; LassoConfig lc; uint64_t anchor_uid; int32_t anchor_v; uint32_t subgroup_flags; int32_t channel_group; int32_t dang_rope; int32_t dang_vid; float dang_len; int32_t ring_mode; float ring_u; uint64_t oka; uint64_t okb; uint64_t port_a; uint64_t port_b; };
+    std::vector<MGData> mgds;
+    mgds.reserve(static_cast<size_t>(mg_count));
+    for (int m = 0; m < mg_count; ++m) {
+        if (p + 4 > in_buf + in_len) return 1;
+        int32_t vcount = 0;
+        memcpy(&vcount, p, 4); p += 4;
+        MGData d; d.verts.reserve(static_cast<size_t>(std::max(0, vcount)));
+        for (int vi = 0; vi < vcount; ++vi) {
+            uint64_t ru = 0ull; int32_t vid = 0;
+            if (p + 8 > in_buf + in_len) return 1;
+            memcpy(&ru, p, 8); p += 8;
+            memcpy(&vid, p, 4); p += 4;
+            d.verts.emplace_back(ru, vid);
+        }
+        memcpy(&d.confinement, p, 4); p += 4;
+        memcpy(&d.sim_idx, p, 4); p += 4;
+        memcpy(&d.id, p, 8); p += 8;
+        memcpy(&d.lc, p, sizeof(LassoConfig)); p += sizeof(LassoConfig);
+        uint64_t anchor_uid = 0ull;
+        memcpy(&anchor_uid, p, 8); p += 8;
+        memcpy(&d.anchor_v, p, 4); p += 4;
+        d.anchor_uid = anchor_uid;
+        memcpy(&d.subgroup_flags, p, 4); p += 4;
+        memcpy(&d.channel_group, p, 4); p += 4;
+        memcpy(&d.dang_rope, p, 4); p += 4;
+        memcpy(&d.dang_vid, p, 4); p += 4;
+        memcpy(&d.dang_len, p, 4); p += 4;
+        memcpy(&d.ring_mode, p, 4); p += 4;
+        memcpy(&d.ring_u, p, 4); p += 4;
+        memcpy(&d.oka, p, 8); p += 8;
+        memcpy(&d.okb, p, 8); p += 8;
+        // read persisted per-port UUIDs (may be zero)
+        memcpy(&d.port_a, p, 8); p += 8;
+        memcpy(&d.port_b, p, 8); p += 8;
+        mgds.push_back(std::move(d));
+    }
+
+    // Recreate meta-groups in the context
+    for (auto &d : mgds) {
+        GP_MetaGroup* mg = gp_table_meta_create(ctx);
+        if (!mg) continue;
+        printf("gp_table_deserialize: creating meta-group ctx=%p mg=%p id=%llu oka=%llu okb=%llu verts=%zu sim_idx=%d\n",
+               (void*)ctx, (void*)mg, static_cast<unsigned long long>(d.id), static_cast<unsigned long long>(d.oka), static_cast<unsigned long long>(d.okb), d.verts.size(), d.sim_idx);
+        // restore simple fields
+        mg->confinement = d.confinement;
+        // Do NOT blindly restore the serialized sim_group_idx value: rope-sim
+        // meta-group indices are not stable across process runs or when the
+        // RopeSim instance is (re)attached. Leave sim_group_idx unset so
+        // that `gp_table_meta_add_vertex` will create a fresh sim meta-group
+        // in the current simulator and register members deterministically.
+        mg->sim_group_idx = -1;
+        mg->id = d.id;
+        mg->lasso_config = d.lc;
+        // resolve persisted anchor UID to runtime rope index (if present)
+        mg->anchor_rope = -1;
+        if (d.anchor_uid != 0ull) {
+            int resolved = -1;
+            if (cvs) resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, d.anchor_uid);
+            if (resolved < 0) {
+                for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
+                    if (ctx->rope_ids[ri] == d.anchor_uid) { resolved = static_cast<int>(ri); break; }
+                }
+            }
+            if (resolved >= 0) {
+                mg->anchor_rope = resolved;
+            } else {
+                printf("gp_table_deserialize: ERROR - could not resolve anchor rope id=%llu\n", (unsigned long long)d.anchor_uid);
+                return 2; // hard-fail: unresolved persisted anchor UID
+            }
+        }
+        mg->anchor_vert = d.anchor_v;
+        mg->subgroup_flags = d.subgroup_flags;
+        mg->channel_group = d.channel_group;
+        mg->dangling_widget_rope = d.dang_rope;
+        mg->dangling_widget_rope_vid = d.dang_vid;
+        mg->dangling_hang_len = d.dang_len;
+        mg->ring_mode = d.ring_mode;
+        // Register canonical overlay early so ring/T-off creation can attach
+        // to the persisted overlay keys instead of creating new overlays.
+        if (cvs && (d.oka != 0ull || d.okb != 0ull)) {
+            gp_canvas_register_table_overlay(cvs, d.oka, d.okb, d.port_a, d.port_b);
+            mg->overlay_key_a = d.oka;
+            mg->overlay_key_b = d.okb;
+        }
+        // If a ring parameter was serialized, prefer to defer ring creation
+        // to MetaCloud re-application when available. For now, recreate ring
+        // here the old way to preserve prior behavior.
+        if (d.ring_mode != 0) {
+            float ru = d.ring_u;
+            uint64_t target_uid = 0ull;
+            if (d.anchor_uid != 0ull) target_uid = d.anchor_uid;
+            else if (!d.verts.empty()) target_uid = d.verts[0].first;
+            if (target_uid != 0ull) {
+                int ring_id = gp_table_create_ring_by_id(ctx, target_uid, ru);
+                if (ring_id == -2) {
+                    printf("gp_table_deserialize: ERROR - could not resolve rope id=%llu for ring creation\n", (unsigned long long)target_uid);
+                    return 3; // hard-fail: unresolved rope id for ring
+                }
+                if (ring_id >= 0) {
+                    gp_table_register_ring_edge(ctx, ring_id, mg->id);
+                    printf("gp_table_deserialize: recreated ring id=%d u=%.3f for mg=%p id=%llu\n", ring_id, ru, (void*)mg, (unsigned long long)mg->id);
+                }
+            }
+        }
+        mg->overlay_key_a = d.oka;
+        mg->overlay_key_b = d.okb;
+        // If a canvas is present, prefer attaching the canvas root RopeSim
+        // so meta-group membership is registered against the shared root sim
+        // instead of creating a local simulator. Do not synthesize a local
+        // sim here; defer to the canvas to create one if needed.
+        if (cvs && !ctx->rope_sim) {
+            void* root_sim_void = gp_canvas_get_rope_sim(cvs);
+            if (root_sim_void) {
+                RopeSim* rootsim = reinterpret_cast<RopeSim*>(root_sim_void);
+                gp_table_attach_rope_sim(ctx, rootsim, 0);
+                printf("gp_table_deserialize: attached canvas root RopeSim %p to table %p\n", (void*)rootsim, (void*)ctx);
+            } else {
+                printf("gp_table_deserialize: canvas has no root RopeSim available; deferring sim attachment for table %p\n", (void*)ctx);
+            }
+        }
+
+        // add vertices (resolve via canvas mapping by persistent rope UID)
+        printf("gp_table_deserialize: mg id=%llu sim_idx=%d overlay_oka=%llu okb=%llu lasso_flags=%u widget=%u spring_min_rest=%.2f spring_reduce_rate=%.2f spring_mode=%u verts=%zu\n",
+               (unsigned long long)mg->id, d.sim_idx, (unsigned long long)d.oka, (unsigned long long)d.okb,
+               d.lc.flags, static_cast<unsigned int>(d.lc.widget_type), d.lc.spring_min_rest, d.lc.spring_reduce_rate, static_cast<unsigned int>(d.lc.spring_mode), d.verts.size());
+
+        for (auto &vp : d.verts) {
+            uint64_t want_uid = vp.first;
+            if (want_uid == 0ull) {
+                printf("gp_table_deserialize: warning, vertex has zero rope_uid, skipping\n");
+                continue;
+            }
+            if (cvs) {
+                int resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, want_uid);
+                if (resolved < 0) {
+                    // fallback: try table-local mapping
+                    for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
+                        if (ctx->rope_ids[ri] == want_uid) { resolved = static_cast<int>(ri); break; }
+                    }
+                }
+                printf("gp_table_deserialize: mapping rope_id=%llu -> resolved_idx=%d vert=%d\n", (unsigned long long)want_uid, resolved, vp.second);
+                int ok = gp_canvas_table_meta_add_vertex_by_id(cvs, ctx, reinterpret_cast<void*>(mg), want_uid, vp.second);
+                if (!ok) {
+                    printf("gp_table_deserialize: ERROR - canvas failed to add meta vertex for rope_id=%llu\n", (unsigned long long)want_uid);
+                    return 4; // hard-fail: could not add meta vertex by id
+                }
+            } else {
+                // fallback: try table-local mapping (deprecated)
+                int mapped_idx = -1;
+                for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
+                    if (ctx->rope_ids[ri] == want_uid) { mapped_idx = static_cast<int>(ri); break; }
+                }
+                if (mapped_idx < 0) {
+                    printf("gp_table_deserialize: ERROR - could not find rope id=%llu for meta-group vertex\n", (unsigned long long)want_uid);
+                    return 5; // hard-fail: could not resolve vertex rope UID
+                }
+                gp_table_meta_add_vertex(ctx, mg, mapped_idx, vp.second);
+                printf("gp_table_deserialize: added vertex (fallback) mapped_idx=%d vert=%d\n", mapped_idx, vp.second);
+            }
+            // If we registered an overlay earlier, attach the ropes referenced
+            // by this meta-group deterministically to that canonical overlay.
+            if ((mg->overlay_key_a != 0ull || mg->overlay_key_b != 0ull) && cvs) {
+                std::unordered_set<uint64_t> seen_rope_ids;
+                for (const auto &vp : d.verts) {
+                    uint64_t ru = vp.first;
+                    if (ru == 0ull) continue;
+                    if (seen_rope_ids.find(ru) != seen_rope_ids.end()) continue;
+                    seen_rope_ids.insert(ru);
+                    int resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, ru);
+                    if (resolved < 0) {
+                        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
+                            if (ctx->rope_ids[ri] == ru) { resolved = static_cast<int>(ri); break; }
+                        }
+                    }
+                    if (resolved >= 0) {
+                        gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, resolved);
+                    }
+                }
+                gp_canvas_set_overlay_meta(cvs, mg->overlay_key_a, mg->overlay_key_b, ctx, reinterpret_cast<void*>(mg));
+            }
+        }
+        // If the serialized blob indicated a sim meta-group existed previously
+        // (d.sim_idx >= 0) then enable edge-springs on the reconstituted
+        // meta-group now that vertices have been registered into the current
+        // RopeSim. This re-enables the short T-off / spring binding behavior
+        // that was active when the snapshot was taken.
+        if (d.sim_idx >= 0) {
+            // prefer saved spring params from the serialized LassoConfig; fall
+            // back to conservative defaults if they are zero/unset.
+            float use_min_rest = (d.lc.spring_min_rest > 0.0f) ? d.lc.spring_min_rest : 2.0f;
+            float use_reduce_rate = (d.lc.spring_reduce_rate > 0.0f) ? d.lc.spring_reduce_rate : 50.0f;
+            gp_table_meta_set_edge_spring_params(ctx, mg, use_min_rest, use_reduce_rate, static_cast<int32_t>(d.lc.spring_mode));
+            gp_table_meta_enable_edge_springs(ctx, mg, use_min_rest, use_reduce_rate);
+        }
+        // log sim installation if present
+        {
+            RopeSim* sim = ctx->rope_sim;
+            if (sim && mg->sim_group_idx >= 0) {
+                printf("gp_table_deserialize: installed mg=%p id=%llu sim=%p sim_group_idx=%d vertices=%zu\n",
+                       (void*)mg, (unsigned long long)mg->id, (void*)sim, mg->sim_group_idx, mg->vertices.size());
+                fflush(stdout);
+            }
+        }
+        // set lasso config via API
+        gp_table_meta_set_lasso_config(ctx, mg, &d.lc);
+        // set anchor if present (resolved earlier)
+        if (mg->anchor_rope >= 0) {
+            gp_table_meta_set_anchor(ctx, mg, mg->anchor_rope, mg->anchor_vert);
+        }
+        // set channel/group
+        gp_table_meta_set_channel_group(ctx, mg, d.channel_group);
+        // Dump meta-group state after vertices and attachments for diagnostics
+        gp_table_debug_dump_meta_group(ctx, mg, "deserialize_post_add");
+        
+    }
+
+    // If this table blob contained module UUID or frame-port UUIDs, attempt
+    // to register them with the canvas so bindings can be reconstructed
+    // deterministically. Find the canvas module index for this table.
+    if (ctx->module_uuid != 0ull && cvs) {
+        // register module UUID with canvas using table pointer (canvas will
+        // map table->module_idx internally)
+        gp_canvas_register_table_module_uuid(cvs, ctx, ctx->module_uuid);
+        // register frame-port UUIDs
+        for (const auto &fpe : ctx->frame_port_uuids) {
+            gp_canvas_register_table_frame_port_uuid(cvs, ctx, fpe.row, fpe.idx, fpe.uuid);
+        }
+    }
     return 1;
 }
 
@@ -5797,6 +6832,18 @@ int32_t gp_table_get_row(const GP_TableContext* ctx, int32_t idx, GP_TableRow* o
     if (idx < 0 || idx >= static_cast<int32_t>(ctx->rows.size())) return 0;
     *out_row = ctx->rows[static_cast<size_t>(idx)];
     return 1;
+}
+
+extern "C" int gp_table_get_rope_id_count(GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    return static_cast<int>(ctx->rope_ids.size());
+}
+
+extern "C" int gp_table_get_rope_ids(GP_TableContext* ctx, uint64_t* out_ids, int cap) {
+    if (!ctx || !out_ids || cap <= 0) return 0;
+    int n = std::min(cap, static_cast<int>(ctx->rope_ids.size()));
+    for (int i = 0; i < n; ++i) out_ids[i] = ctx->rope_ids[static_cast<size_t>(i)];
+    return n;
 }
 
 int32_t gp_table_set_led_selected(GP_TableContext* ctx, int32_t row_idx, int32_t col_idx, int32_t led_index, int32_t selected) {
@@ -6354,7 +7401,7 @@ int32_t gp_table_render_rgba_with_state(
                         int max_ropes = 16;
                         int max_segs = std::max(4, ctx->st.cable_segments);
                         ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
-                        ctx->rope_sim_idx.clear();
+                        ctx->rope_id_to_sim_idx.clear();
                     }
                     float plug_z = -ctx->st.cable_plug_depth;
                     // create a single persistent prospective rope if not present
@@ -6372,7 +7419,7 @@ int32_t gp_table_render_rgba_with_state(
                     float d2 = ddx*ddx + ddy*ddy;
                     if (d2 <= ctx->prospective_slack * ctx->prospective_slack) ctx->prospective_targets.clear();
                     // if no permanent edges will step the sim later, step now so prospective rope animates
-                    if (ctx->edges.empty()) {
+                    if (ctx->edges.empty() && table_should_step_sim(ctx)) {
                         // freer whipping (lower damping) but stronger constraint solve so it settles quickly
                         float gravity = 800.0f;
                         int constraint_iters = 8;
@@ -6441,12 +7488,10 @@ int32_t gp_table_render_rgba_with_state(
             int max_ropes = std::max<int>(1024, static_cast<int>(ctx->edges.size()) + 16);
             int max_segs = std::max(4, ctx->st.cable_segments);
             ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
-            ctx->rope_sim_idx.clear();
+            ctx->rope_id_to_sim_idx.clear();
         }
 
-        // ensure rope_sim_idx matches edge count
-        while (ctx->rope_sim_idx.size() < ctx->edges.size()) ctx->rope_sim_idx.push_back(-1);
-
+        // ensure uid->sim mapping is present for any existing mapped ropes
         // update endpoints in sim (and create ropes if missing)
         for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
             const auto &e = ctx->edges[ei];
@@ -6466,13 +7511,26 @@ int32_t gp_table_render_rgba_with_state(
             edge_glow_a[ei] = glow_a;
             edge_glow_b[ei] = glow_b;
 
-            int rope_idx = ctx->rope_sim_idx[ei];
+            // resolve sim index using persistent id mapping
+            uint64_t uid = (ei < ctx->rope_ids.size()) ? ctx->rope_ids[ei] : 0ull;
+            int rope_idx = -1;
+            if (uid != 0ull) {
+                auto it = ctx->rope_id_to_sim_idx.find(uid);
+                if (it != ctx->rope_id_to_sim_idx.end()) rope_idx = it->second;
+            }
             if (rope_idx < 0) {
                 int segs = std::max(4, ctx->st.cable_segments);
                 float slack = 0.0f;
                 float plug_z = -ctx->st.cable_plug_depth;
                 int new_idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
-                ctx->rope_sim_idx[ei] = new_idx;
+                if (uid == 0ull) {
+                        // assign persistent id for this rope if not already present
+                        uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+                        if (ei < ctx->rope_ids.size()) ctx->rope_ids[ei] = uid;
+                        else ctx->rope_ids.push_back(uid);
+                    }
+                ctx->rope_id_to_sim_idx[uid] = new_idx;
+                rope_idx = new_idx;
             } else {
                 float plug_z = -ctx->st.cable_plug_depth;
                 rope_sim_move_endpoints3(ctx->rope_sim, rope_idx, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z);
@@ -6485,12 +7543,15 @@ int32_t gp_table_render_rgba_with_state(
         // to make the short rope participate in ring physics.
 
         // Step the simulator for this frame: allow more whip (lower damping) but more constraint iterations to settle
-        float gravity = 800.0f;
-        int constraint_iters = 8;
-        float damping = 0.86f;
-        // fall back to a reasonable fixed step if frame dt isn't available in this scope
+        // default sim step (used by FIFO timing even when sim disabled)
         float sim_dt = 1.0f / 60.0f;
-        rope_sim_step(ctx->rope_sim, sim_dt, gravity, constraint_iters, damping);
+        if (table_should_step_sim(ctx)) {
+            float gravity = 800.0f;
+            int constraint_iters = 8;
+            float damping = 0.86f;
+            // use sim_dt (could be overridden in future if frame dt available)
+            rope_sim_step(ctx->rope_sim, sim_dt, gravity, constraint_iters, damping);
+        }
 
         // Now render ropes from simulator vertices
         for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
@@ -6536,7 +7597,7 @@ int32_t gp_table_render_rgba_with_state(
                 fifo_tint = std::clamp(theta / kPi, 0.0f, 1.0f) * ctx->st.cable_fifo_friction_tint;
                 fifo_write_phase = fifo.write_phase();
                 fifo_read_phase = fifo.read_phase();
-                uint64_t edge_id = (ei < ctx->edge_uids.size()) ? ctx->edge_uids[ei] : 0ull;
+                uint64_t edge_id = (ei < ctx->edge_ids.size()) ? ctx->edge_ids[ei] : 0ull;
                 fifo_has_state = fifo.fill_state(edge_id, fifo_fill, fifo_head_phase, fifo_tail_phase);
                 float fifo_fill_glow = fifo_has_state ? std::clamp(fifo_fill * ev, 0.0f, 1.0f) : 0.0f;
                 fifo_core_intensity = std::max({fifo_fill_glow, fifo_write_glow_eff, fifo_read_glow_eff});
@@ -6558,7 +7619,13 @@ int32_t gp_table_render_rgba_with_state(
                 }
             }
             bool reverse_phases = info_b.is_output && !info_a.is_output;
-            int rope_idx = ctx->rope_sim_idx[ei];
+            // resolve sim index from persistent rope id mapping
+            uint64_t rope_id = (ei < ctx->rope_ids.size()) ? ctx->rope_ids[ei] : 0ull;
+            int rope_idx = -1;
+            if (rope_id != 0ull) {
+                auto it = ctx->rope_id_to_sim_idx.find(rope_id);
+                if (it != ctx->rope_id_to_sim_idx.end()) rope_idx = it->second;
+            }
             if (rope_idx < 0) continue;
             int vc = rope_sim_get_vertex_count(ctx->rope_sim, rope_idx);
             if (getenv("NODUS_DEBUG_EDGE") != nullptr) {

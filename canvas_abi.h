@@ -17,6 +17,12 @@ extern "C" {
 
 typedef struct GP_CanvasContext GP_CanvasContext;
 typedef struct GP_TableContext GP_TableContext; // forward from table_abi
+typedef struct GP_TableHitBox GP_TableHitBox; // forward
+
+// Pointer-mode event payload published into root table FIFOs for bound
+// canvas actions. Consumers should cast pointer to this layout and free
+// contents when handled.
+typedef struct EventPayload { void* pending; int src_module; int frame_idx; } EventPayload;
 
 // Module background rasterizer hook.
 typedef void(*GP_CanvasModuleBgFn)(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
@@ -107,6 +113,20 @@ int gp_canvas_free_pending_action(GP_CanvasContext* ctx, void* pending_ptr);
 // table action). Returns 1 on success.
 int gp_canvas_invoke_pending_action(GP_CanvasContext* ctx, void* pending_ptr);
 
+// Note: the queued pending-action pop API was removed. Canvas bindings now
+// publish pointer-mode EventPayloads into root table FIFOs using
+// `gp_edge_publish_ptr`; the manager consumes them via normal FIFO APIs.
+
+// Action subscriber callback. Return 1 if the subscriber handled the action
+// (suppressing default canvas dispatch), 0 to allow further processing.
+typedef int(*GP_CanvasActionSubscriberFn)(void* user, GP_CanvasContext* ctx, int32_t action_id, const GP_TableHitBox* hit);
+
+// Subscribe/unsubscribe to canvas actions. `action_id` is the numeric
+// action identifier (e.g., GP_TABLE_ACTION_* or application-defined ids).
+// Returns 1 on success, 0 on failure.
+int gp_canvas_subscribe_action(GP_CanvasContext* ctx, int32_t action_id, GP_CanvasActionSubscriberFn cb, void* user);
+int gp_canvas_unsubscribe_action(GP_CanvasContext* ctx, int32_t action_id, GP_CanvasActionSubscriberFn cb, void* user);
+
 // Return pointer to singleton canvas (may be null)
 GP_CanvasContext* gp_canvas_get_singleton();
 
@@ -149,11 +169,26 @@ void* gp_canvas_get_rope_sim(GP_CanvasContext* ctx);
 // canvas/edge APIs. Keys follow internal sentinel encoding and are valid for
 // the lifetime of the canvas. Returns 1 on success.
 int gp_canvas_create_overlay_with_leds(GP_CanvasContext* ctx, float x1, float y1, float x2, float y2, unsigned long long* out_key_a, unsigned long long* out_key_b);
+int gp_canvas_set_overlay_meta(GP_CanvasContext* ctx, unsigned long long key_a, unsigned long long key_b, GP_TableContext* table, void* meta_mg);
+// Register an overlay using persisted overlay keys during table deserialization.
+// Creates the overlay entry only if the keys are not already known. Returns 1 on success.
+// Register an overlay using persisted overlay keys during table deserialization.
+// `port_uuid_a` and `port_uuid_b` are optional persisted per-port UUIDs; pass 0 to let canvas
+// assign deterministic UUIDs. Creates the overlay entry only if the keys are not already known.
+// Returns 1 on success.
+int gp_canvas_register_table_overlay(GP_CanvasContext* ctx, unsigned long long key_a, unsigned long long key_b, uint64_t port_uuid_a, uint64_t port_uuid_b);
+
+// Retrieve the persisted/runtime port UUIDs for an overlay identified by keys.
+// Returns 1 and fills out_port_a/out_port_b on success, 0 on failure.
+int gp_canvas_get_overlay_port_uuids(GP_CanvasContext* ctx, unsigned long long key_a, unsigned long long key_b, uint64_t* out_port_a, uint64_t* out_port_b);
 
 // Attach an existing rope index to an overlay by supplying the two overlay
 // keys and the rope index. This creates a canvas edge record that links the
 // rope to the overlay so rendering and interaction bind to the rope.
 int gp_canvas_attach_rope_to_overlay(GP_CanvasContext* ctx, unsigned long long key_a, unsigned long long key_b, int rope_idx);
+// Variant that attaches an overlay's rope to a specified module/contact indices
+// instead of the canvas root module. Returns edge index on success or -1.
+int gp_canvas_attach_rope_to_overlay_with_module(GP_CanvasContext* ctx, unsigned long long key_a, unsigned long long key_b, int rope_idx, int module_idx, int a_contact_idx, int b_contact_idx);
 // Resolve an overlay key into canvas pixel coordinates. Returns 1 on success.
 int gp_canvas_resolve_overlay_key(GP_CanvasContext* ctx, unsigned long long key, int* out_x, int* out_y);
 // Resolve a canonical root key (packed as (module<<32)|(col<<16)|led) to
@@ -173,6 +208,43 @@ int gp_canvas_detach_table(GP_CanvasContext* ctx, int module_idx);
 // Attach a pointer to a module-frame LED cell (send row if is_send!=0, receive row otherwise).
 int gp_canvas_set_module_frame_ptr(GP_CanvasContext* ctx, int module_idx, int is_send, int led_idx, void* ptr);
 
+// Module and module-port UUID management
+// Generate a new stable module UUID (monotonic 64-bit id).
+uint64_t gp_canvas_generate_module_uuid(GP_CanvasContext* ctx);
+// Central ID generator (pluggable): returns a non-zero stable id.
+uint64_t gp_canvas_generate_id(GP_CanvasContext* ctx, uint64_t hint);
+// Set/get a module's stable UUID. Returns 1 on success for setter.
+int gp_canvas_set_module_uuid(GP_CanvasContext* ctx, int module_idx, uint64_t module_uuid);
+uint64_t gp_canvas_get_module_uuid(GP_CanvasContext* ctx, int module_idx);
+// Set/get a module frame port's stable UUID. `is_send` selects send(1)/receive(0),
+// `col` selects left(0)/right(1) column pair, `led_idx` selects the LED index.
+int gp_canvas_set_module_frame_port_uuid(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx, uint64_t port_uuid);
+uint64_t gp_canvas_get_module_frame_port_uuid(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx);
+
+// Register module UUID and frame-port UUIDs using a table pointer. These
+// convenience APIs let table deserialization register persistent UUIDs
+// without needing the module index. The canvas will map the table to its
+// module_idx internally. Returns 1 on success, 0 on failure.
+int gp_canvas_register_table_module_uuid(GP_CanvasContext* ctx, GP_TableContext* table, uint64_t module_uuid);
+int gp_canvas_register_table_frame_port_uuid(GP_CanvasContext* ctx, GP_TableContext* table, int row, int col_idx, uint64_t port_uuid);
+
+// Create a retained pending-action object from a numeric action id. Returned
+// pointer has ownership transferred to caller and may be bound into a
+// module frame with `gp_canvas_bind_action_ptr_to_module_port` or freed via
+// `gp_canvas_free_pending_action`.
+void* gp_canvas_create_action_from_enum(GP_CanvasContext* ctx, int32_t action_id);
+
+// Bind a previously-created pending-action pointer into a specific module
+// frame port. `is_send` selects send(1)/receive(0); `col` selects the
+// left(0)/right(1) pair within the frame; `led_idx` is 0..kModuleExtraLedCount-1.
+// The function will set the internal frame ptr and update the module's
+// attached table LED glow so the port appears illuminated. Returns 1 on
+// success.
+int gp_canvas_bind_action_ptr_to_module_port(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx, void* pending_ptr);
+
+// Convenience: create-and-bind in one call from an action enum id.
+int gp_canvas_bind_action_enum_to_module_port(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx, int32_t action_id);
+
 // Per-module background rasterizer hook. Returns 1 on success.
 int gp_canvas_set_module_bg_callback(GP_CanvasContext* ctx, int module_idx, GP_CanvasModuleBgFn cb, void* user);
 int gp_canvas_clear_module_bg_callback(GP_CanvasContext* ctx, int module_idx);
@@ -186,6 +258,11 @@ int gp_canvas_set_module_raytrace_tuning(GP_CanvasContext* ctx, int module_idx, 
 // Set per-module table alpha (0..1). When raytrace mode is active, alpha is
 // clamped to `raytrace_alpha`.
 int gp_canvas_set_module_table_alpha(GP_CanvasContext* ctx, int module_idx, float alpha, float raytrace_alpha);
+
+// Standard mouse event action ids usable by bindings/subscribers.
+#define CANVAS_ACT_MOUSE_DOWN (3001)
+#define CANVAS_ACT_MOUSE_UP (3002)
+#define CANVAS_ACT_MOUSE_MOVE (3003)
 
 // Register a host window pointer with the canvas so the canvas can retain
 // references to windows it will handle (opaque pointer). Returns 1 on success.
@@ -204,6 +281,27 @@ int gp_canvas_set_module_io_types(GP_CanvasContext* ctx, int module_idx, const i
 // Return the backing graph node id for a module, or -1 if none.
 int gp_canvas_get_module_node_id(GP_CanvasContext* ctx, int module_idx);
 
+// Clear and remove all overlays and meta-groups. This will unbind overlays
+// from any tables and destroy table-side meta-groups (and their rings).
+// Returns 1 on success.
+int gp_canvas_clear_meta_and_overlays(GP_CanvasContext* ctx);
+// Register per-table rope UIDs with the canvas so the canvas can map
+// persistent rope UIDs to runtime rope indices for deterministic restore.
+int gp_canvas_register_table_rope_ids_from_array(GP_CanvasContext* ctx, GP_TableContext* table, const uint64_t* ids, int count);
+// Add a meta-group vertex by persistent rope id. Returns 1 on success, 0 on failure.
+int gp_canvas_table_meta_add_vertex_by_id(GP_CanvasContext* ctx, GP_TableContext* table, void* meta_mg, uint64_t rope_id, int vertex_idx);
+// Resolve a persisted rope id to the runtime rope index for a given table.
+// Returns >=0 rope index on success, -1 if not found.
+int gp_canvas_resolve_rope_id_to_index(GP_CanvasContext* ctx, GP_TableContext* table, uint64_t rope_id);
+// Find a persistent rope id for a runtime rope index on a table.
+// Lookup order: local table -> container/root -> breadth-first across modules.
+uint64_t gp_canvas_find_persistent_rope_id(GP_CanvasContext* ctx, GP_TableContext* table, int sim_idx);
+// Generate a new stable port UUID for the canvas (monotonic 64-bit id).
+uint64_t gp_canvas_generate_port_uuid(GP_CanvasContext* ctx);
+// Query canvas for edges that belong entirely to `table` (both endpoints' modules map to the same table).
+// If `out_edges` or `out_rope_ids` are NULL, the function returns the required count without writing.
+// Returns the number of entries written (or required).
+int gp_canvas_get_table_local_edges_and_rope_ids(GP_CanvasContext* ctx, GP_TableContext* table, GP_CanvasEdgeDesc* out_edges, uint64_t* out_rope_ids, int max_entries);
 // Persist/restore canvas state to a simple text file. Returns 1 on success.
 int gp_canvas_save_to_file(GP_CanvasContext* ctx, const char* path);
 int gp_canvas_load_from_file(GP_CanvasContext* ctx, const char* path);

@@ -11,14 +11,8 @@
 #include <cmath>
 #include <limits>
 
-// Payload wrapper for pointer-mode FIFO events. Carries the original
-// pending-action pointer and origin module/frame index so consumers can
-// clear the module-frame slot after handling the event.
-struct EventPayload {
-    void* pending;
-    int src_module;
-    int frame_idx; // 0..kModuleExtraLedCount-1
-};
+// EventPayload is declared in canvas_abi.h and used for pointer-mode FIFO
+// events published by the canvas.
 
 extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
 extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
@@ -310,6 +304,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
     // module vector indices as canonical ids.
     int N = static_cast<int>(req.modules.size());
     std::vector<std::vector<int>> succ(N);
+    // Note: GUI-originated events for bound ports are published into root
+    // table FIFOs (pointer-mode). They are consumed during the normal per-row
+    // FIFO consumption below; the legacy canvas pop-queue path was removed.
     for (const auto& e : req.edges) {
         if (e.a_module >= 0 && e.a_module < N && e.b_module >= 0 && e.b_module < N) {
             succ[e.a_module].push_back(e.b_module);
@@ -494,7 +491,34 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
     for (int mod_idx : order) {
         if (mod_idx < 0 || mod_idx >= (int)req.modules.size()) continue;
         const auto& mod = req.modules[static_cast<size_t>(mod_idx)];
+        // Skip modules that have no table or are marked to skip entirely by canvas UI
         if (!mod.table) continue;
+        if (mod.module_skip != 0) continue;
+        // Handle per-module execution cadence (exec_skip_count): manager maintains a persistent
+        // counter per module and only executes the module once every (exec_skip_count+1) frames.
+        if (mod.module_idx >= 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (static_cast<size_t>(mod.module_idx) >= module_ledger_.size()) {
+                module_ledger_.resize(static_cast<size_t>(mod.module_idx) + 1);
+            }
+        }
+        uint64_t exec_skip = 0;
+        if (mod.exec_skip_count > 0) exec_skip = static_cast<uint64_t>(mod.exec_skip_count);
+        if (exec_skip > 0) {
+            // check ledger counter and possibly skip this module execution this tick
+            bool should_execute = false;
+            if (mod.module_idx >= 0) {
+                std::lock_guard<std::mutex> lk(mu_);
+                auto &ledger = module_ledger_[static_cast<size_t>(mod.module_idx)];
+                // increment counter and test
+                ledger.exec_tick_counter = ledger.exec_tick_counter + 1;
+                should_execute = ((ledger.exec_tick_counter % (exec_skip + 1ull)) == 0ull);
+            } else {
+                // module has no ledger index; fall back to executing every frame
+                should_execute = true;
+            }
+            if (!should_execute) continue;
+        }
         std::vector<ModuleIORow> io_rows;
         {
             if (const auto* rows = canvas_get_module_io_rows(mod_idx)) {
@@ -657,7 +681,58 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         float my = 0.0f;
                         float down = 0.0f;
                         float up = 0.0f;
-                        if (load_input_state()) {
+                        // Prefer FIFO-backed events published into root table FIFOs
+                        // for module-frame bindings. If none available, fall back
+                        // to the GUI-captured input_state as a last resort.
+                        bool handled_fifo = false;
+                        GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
+                        if (fifo_table) {
+                            const int frame_base = kModuleFrameContactBase;
+                            const int frame_end = frame_base + kModuleExtraLedCount * kModuleExtraLedRows;
+                            for (int contact_idx = frame_base; contact_idx < frame_end; ++contact_idx) {
+                                int edge_idx = -1;
+                                for (const auto& e : req.edges) {
+                                    if (e.b_module == mod_idx && e.b_contact_idx == contact_idx) {
+                                        edge_idx = e.edge_idx;
+                                        break;
+                                    }
+                                }
+                                if (edge_idx < 0) continue;
+                                uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
+                                if (reader_key == 0) reader_key = 0x8000000000000000ull;
+                                int32_t unread = 0;
+                                gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
+                                gp_table_edge_unread(fifo_table, edge_idx, reader_key, &unread);
+                                if (unread <= 0) continue;
+                                void* maybe_p = nullptr;
+                                if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && maybe_p) {
+                                    // Pointer-mode EventPayload expected
+                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                    if (ep) {
+                                        void* pa_void = ep->pending;
+                                        struct LocalPendingAction { int32_t action_id; GP_TableHitBox hit; };
+                                        auto *pa = reinterpret_cast<LocalPendingAction*>(pa_void);
+                                        if (pa) {
+                                            if (pa->action_id == CANVAS_ACT_MOUSE_DOWN) down = 1.0f;
+                                            else if (pa->action_id == CANVAS_ACT_MOUSE_UP) up = 1.0f;
+                                            mx = static_cast<float>(pa->hit.x0);
+                                            my = static_cast<float>(pa->hit.y0);
+                                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                                            if (canvas_single) {
+                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                                gp_canvas_free_pending_action(canvas_single, pa_void);
+                                            }
+                                        }
+                                        delete ep;
+                                    }
+                                    handled_fifo = true;
+                                    input_state_used = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!handled_fifo && load_input_state()) {
                             mx = input_state.mouse_x;
                             my = input_state.mouse_y;
                             down = input_state.mouse_down ? 1.0f : 0.0f;

@@ -48,12 +48,17 @@ int rope_sim_meta_group_add(RopeSim* s, int group_idx, int rope_idx, int vertex_
 // If the (after_rope_idx, after_vertex_idx) pair is not found, the new
 // member is appended. Returns 1 on success.
 int rope_sim_meta_group_insert(RopeSim* s, int group_idx, int after_rope_idx, int after_vertex_idx, int rope_idx, int vertex_idx);
+// Check whether a meta-group already contains the given (rope_idx,vertex_idx) member.
+int rope_sim_meta_group_has_member(RopeSim* s, int group_idx, int rope_idx, int vertex_idx);
 int rope_sim_meta_group_set_pressure(RopeSim* s, int group_idx, float pressure);
 // Edge-spring support for meta-groups: create springs connecting consecutive
 // meta-group members. Springs have a rest length that can be reduced over
 // time until a minimum. Returns 1 on success.
 int rope_sim_meta_group_enable_edge_springs(RopeSim* s, int group_idx, float min_rest, float reduce_rate);
 int rope_sim_meta_group_disable_edge_springs(RopeSim* s, int group_idx);
+// Mark a dangling/widget rope index on the meta-group so edge creation
+// can give it special rest-length and stiffness behavior.
+int rope_sim_meta_group_set_dangling_rope(RopeSim* s, int group_idx, int rope_idx);
 // Set ring creation mode for a meta-group (0=ribbon,1=closed,2=dense)
 int rope_sim_meta_group_set_mode(RopeSim* s, int group_idx, int mode);
 // Query meta-group mode (0/1/2). Returns 1 on success.

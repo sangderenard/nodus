@@ -230,6 +230,10 @@ struct MetaGroup {
     std::vector<std::pair<int,int>> edges;
     // per-edge rest lengths (same order as `edges`)
     std::vector<float> edge_rest;
+    // per-edge stiffness multiplier (1.0 = default/full correction)
+    std::vector<float> edge_strength;
+    // optional rope index for a dangling/widget rope attached to this meta-group
+    int dangling_rope = -1;
     // per-member parametric position along rope (0..1). Mirrors `members`.
     std::vector<float> member_u;
 };
@@ -264,7 +268,8 @@ int rope_sim_create_meta_group(RopeSim* s, float pressure) {
     mg->pressure = pressure;
     int idx = static_cast<int>(si->meta_groups.size());
     si->meta_groups.push_back(std::move(mg));
-    printf("[rope_sim] create_meta_group %d pressure=%f\n", idx, pressure);
+    // debug: create_meta_group logging removed to reduce output
+    // printf("[rope_sim] create_meta_group %d pressure=%f\n", idx, pressure);
     return idx;
 }
 
@@ -279,6 +284,7 @@ int rope_sim_destroy_meta_group(RopeSim* s, int group_idx) {
 int rope_sim_meta_group_add(RopeSim* s, int group_idx, int rope_idx, int vertex_idx) {
     if (!s) return 0;
     RopeSim_internal* si = to_internal(s);
+    printf("rope_sim_meta_group_add: sim=%p group=%d rope=%d vert=%d ropes=%zu mg_count=%zu\n", (void*)s, group_idx, rope_idx, vertex_idx, si->ropes.size(), si->meta_groups.size());
     if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
     MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
     if (!mg) return 0;
@@ -293,12 +299,26 @@ int rope_sim_meta_group_add(RopeSim* s, int group_idx, int rope_idx, int vertex_
         }
     }
     mg->member_u.push_back(u);
+    printf("  -> added member u=%.6f (computed from verts=%d)\n", u, (rope_idx >= 0 && rope_idx < static_cast<int>(si->ropes.size())) ? si->ropes[static_cast<size_t>(rope_idx)]->segments + 1 : 0);
     return 1;
+}
+
+int rope_sim_meta_group_has_member(RopeSim* s, int group_idx, int rope_idx, int vertex_idx) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    for (size_t i = 0; i < mg->members.size(); ++i) {
+        if (mg->members[i].first == rope_idx && mg->members[i].second == vertex_idx) return 1;
+    }
+    return 0;
 }
 
 int rope_sim_meta_group_insert(RopeSim* s, int group_idx, int after_rope_idx, int after_vertex_idx, int rope_idx, int vertex_idx) {
     if (!s) return 0;
     RopeSim_internal* si = to_internal(s);
+    printf("rope_sim_meta_group_insert: sim=%p group=%d after=(%d,%d) insert=(%d,%d) ropes=%zu mg_count=%zu\n", (void*)s, group_idx, after_rope_idx, after_vertex_idx, rope_idx, vertex_idx, si->ropes.size(), si->meta_groups.size());
     if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
     MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
     if (!mg) return 0;
@@ -321,6 +341,7 @@ int rope_sim_meta_group_insert(RopeSim* s, int group_idx, int after_rope_idx, in
         }
     }
     mg->member_u.insert(mg->member_u.begin() + static_cast<ptrdiff_t>(pos), u);
+    printf("  -> inserted member at pos=%zu u=%.6f (computed from verts=%d)\n", pos, u, (rope_idx >= 0 && rope_idx < static_cast<int>(si->ropes.size())) ? si->ropes[static_cast<size_t>(rope_idx)]->segments + 1 : 0);
     return 1;
 }
 
@@ -341,7 +362,8 @@ int rope_sim_meta_group_set_mode(RopeSim* s, int group_idx, int mode) {
     MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
     if (!mg) return 0;
     mg->mode = mode;
-    printf("[rope_sim] meta_group_set_mode: sim=%p group_idx=%d mode=%d\n", (void*)s, group_idx, mode);
+    // debug: meta_group_set_mode logging removed
+    // printf("[rope_sim] meta_group_set_mode: sim=%p group_idx=%d mode=%d\n", (void*)s, group_idx, mode);
     return 1;
 }
 
@@ -394,7 +416,8 @@ int rope_sim_create_ring(RopeSim* s, int rope_idx, float u) {
     ring->prev_x = ring->x; ring->prev_y = ring->y; ring->prev_z = ring->z;
     int id = static_cast<int>(si->rings.size());
     si->rings.push_back(std::move(ring));
-    printf("[rope_sim] create_ring id=%d rope=%d u=%f\n", id, rope_idx, u);
+    // debug: create_ring logging removed
+    // printf("[rope_sim] create_ring id=%d rope=%d u=%f\n", id, rope_idx, u);
     return id;
 }
 
@@ -473,6 +496,7 @@ int rope_sim_meta_group_enable_edge_springs(RopeSim* s, int group_idx, float min
     mg->min_rest = min_rest;
     mg->reduce_rate = reduce_rate;
     mg->edge_rest.clear();
+    mg->edge_strength.clear();
     // print created springs for debug
     for (const auto &e : mg->edges) {
         int ia = e.first;
@@ -513,8 +537,20 @@ int rope_sim_meta_group_enable_edge_springs(RopeSim* s, int group_idx, float min
         }
         float dx = bx - ax; float dy = by - ay; float dz = bz - az;
         float d = std::sqrt(dx*dx + dy*dy + dz*dz);
-        printf("[rope_sim] created spring: %d.%d -> %d.%d rest=%f\n", a.first, a.second, b.first, b.second, d);
-        mg->edge_rest.push_back(std::max(d, mg->min_rest));
+        // debug: created spring logging removed
+        // printf("[rope_sim] created spring: %d.%d -> %d.%d rest=%f\n", a.first, a.second, b.first, b.second, d);
+        float init_rest = std::max(d, mg->min_rest);
+        float strength = 1.2f; // default: somewhat stiff
+        // If this edge touches the dangling/widget rope, give it a longer
+        // initial rest and higher stiffness so widget pulls feel stronger.
+        if (mg->dangling_rope >= 0) {
+            if (a.first == mg->dangling_rope || b.first == mg->dangling_rope) {
+                init_rest = std::max(init_rest * 1.5f, mg->min_rest);
+                strength = 1.6f;
+            }
+        }
+        mg->edge_rest.push_back(init_rest);
+        mg->edge_strength.push_back(strength);
     }
     return 1;
 }
@@ -528,6 +564,7 @@ int rope_sim_meta_group_disable_edge_springs(RopeSim* s, int group_idx) {
     mg->edges_enabled = false;
     mg->edges.clear();
     mg->edge_rest.clear();
+    mg->edge_strength.clear();
     return 1;
 }
 
@@ -556,6 +593,35 @@ int rope_sim_meta_group_get_member_world_pos(RopeSim* s, int group_idx, int memb
     out_xyz[0] = r->pos_x[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_x[static_cast<size_t>(i1)] * local_t;
     out_xyz[1] = r->pos_y[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_y[static_cast<size_t>(i1)] * local_t;
     out_xyz[2] = r->pos_z[static_cast<size_t>(i0)] * (1.0f - local_t) + r->pos_z[static_cast<size_t>(i1)] * local_t;
+    return 1;
+}
+
+int rope_sim_meta_group_set_dangling_rope(RopeSim* s, int group_idx, int rope_idx) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    if (group_idx < 0 || group_idx >= static_cast<int>(si->meta_groups.size())) return 0;
+    MetaGroup* mg = si->meta_groups[static_cast<size_t>(group_idx)].get();
+    if (!mg) return 0;
+    mg->dangling_rope = rope_idx;
+    // make the dangling rope slightly elastic so it can deform naturally
+    if (rope_idx >= 0 && rope_idx < static_cast<int>(si->ropes.size())) {
+        Rope* r = si->ropes[static_cast<size_t>(rope_idx)].get();
+        if (r) {
+            // ensure slight slack and recompute rest_len
+            float new_slack = std::max(r->slack, 0.08f);
+            if (new_slack > r->slack) {
+                r->slack = new_slack;
+                // recompute rest_len from endpoints
+                float dx = r->bx - r->ax;
+                float dy = r->by - r->ay;
+                float dz = r->bz - r->az;
+                float total = std::sqrt(dx*dx + dy*dy + dz*dz);
+                int segs = std::max(1, r->segments);
+                float seglen = total / float(segs);
+                r->rest_len = seglen * (1.0f + r->slack);
+            }
+        }
+    }
     return 1;
 }
 
@@ -695,7 +761,9 @@ static void apply_meta_group_edges(RopeSim_internal* si, float dt) {
             float d = std::sqrt(dx*dx + dy*dy + dz*dz);
             if (d <= 1e-6f) continue;
             float rest = (ei < mg->edge_rest.size()) ? mg->edge_rest[ei] : d;
-            float diff = (d - rest) / d;
+            float strength = 1.0f;
+            if (ei < mg->edge_strength.size()) strength = mg->edge_strength[ei];
+            float diff = (d - rest) / d * strength;
             // full correction vector from A->B
             float cx = dx * diff; float cy = dy * diff; float cz = dz * diff;
 
@@ -731,7 +799,8 @@ static void apply_meta_group_edges(RopeSim_internal* si, float dt) {
                 if (static_cast<size_t>(ib) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fub);
                 float oldu = mg->member_u[static_cast<size_t>(ib)];
                 mg->member_u[static_cast<size_t>(ib)] = proj_u;
-                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ib, oldu, proj_u);
+                // debug: meta_group member u logging removed
+                // printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ib, oldu, proj_u);
             } else if (b_fixed && !a_fixed) {
                 // move A only: remove tangential component along A's tangent
                 float px, py, pz; project_perp(cx, cy, cz, tax, tay, taz, px, py, pz);
@@ -749,7 +818,8 @@ static void apply_meta_group_edges(RopeSim_internal* si, float dt) {
                 if (static_cast<size_t>(ia) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fua);
                 float oldu_a = mg->member_u[static_cast<size_t>(ia)];
                 mg->member_u[static_cast<size_t>(ia)] = proj_u_a;
-                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ia, oldu_a, proj_u_a);
+                // debug: meta_group member u logging removed
+                // printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ia, oldu_a, proj_u_a);
             } else {
                 // move both: split correction and convert tangential parts into u deltas
                 float half_cx = 0.5f * cx; float half_cy = 0.5f * cy; float half_cz = 0.5f * cz;
@@ -783,7 +853,8 @@ static void apply_meta_group_edges(RopeSim_internal* si, float dt) {
                 if (static_cast<size_t>(ia) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fua);
                 float oldu_a = mg->member_u[static_cast<size_t>(ia)];
                 mg->member_u[static_cast<size_t>(ia)] = proj_u_a;
-                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ia, oldu_a, proj_u_a);
+                // debug: meta_group member u logging removed
+                // printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ia, oldu_a, proj_u_a);
                 // tangential conversion to delta-u for B
                 float dot_b = -half_cx * tbx_ + -half_cy * tby + -half_cz * tbz;
                 float seg_len_b = std::sqrt(
@@ -800,7 +871,8 @@ static void apply_meta_group_edges(RopeSim_internal* si, float dt) {
                 if (static_cast<size_t>(ib) >= mg->member_u.size()) mg->member_u.resize(mg->members.size(), fub);
                 float oldu_b = mg->member_u[static_cast<size_t>(ib)];
                 mg->member_u[static_cast<size_t>(ib)] = proj_u_b;
-                printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ib, oldu_b, proj_u_b);
+                // debug: meta_group member u logging removed
+                // printf("[rope_sim] meta_group %zu member %d set u: %f -> %f\n", gi, ib, oldu_b, proj_u_b);
             }
         }
     }
@@ -959,8 +1031,9 @@ int rope_sim_step(RopeSim* s, float dt, float gravity, int constraint_iters, flo
          rg->u = new_u;
 
          // debug log: show ring parameter changes so we can see `u` moving
-         printf("[rope_sim] ring %d rope=%d old_u=%f proj_u=%f new_u=%f seg=%d best_t=%f\n",
-             (int)ri, rope_idx, old_u_val, proj_u, new_u, best_seg, best_t);
+         // debug: ring parameter logging removed
+         // printf("[rope_sim] ring %d rope=%d old_u=%f proj_u=%f new_u=%f seg=%d best_t=%f\n",
+         //     (int)ri, rope_idx, old_u_val, proj_u, new_u, best_seg, best_t);
 
         // recompute world pos from rope at updated u
         float fidx = rg->u * static_cast<float>(verts - 1);

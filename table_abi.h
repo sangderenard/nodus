@@ -280,6 +280,9 @@ GP_MetaGroup* gp_table_get_meta_group(GP_TableContext* ctx, int32_t idx);
 int32_t gp_table_meta_get_vertex(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t idx, int32_t* out_rope_idx, int32_t* out_vertex_idx);
 int32_t gp_table_meta_get_vertex_count(GP_TableContext* ctx, GP_MetaGroup* mg);
 int32_t gp_table_meta_get_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, LassoConfig* out_cfg);
+
+// Debug helper: print a meta-group's vertices and lasso config with a tag
+int32_t gp_table_debug_dump_meta_group(GP_TableContext* ctx, GP_MetaGroup* mg, const char* tag);
 int32_t gp_table_meta_get_subgroup_flags(GP_TableContext* ctx, GP_MetaGroup* mg, uint32_t* out_flags);
 // If the meta-group has a dangling widget rope, return its rope index and vertex index.
 int32_t gp_table_meta_get_dangling_rope_info(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_rope_idx, int32_t* out_vertex_idx);
@@ -302,6 +305,10 @@ int32_t gp_table_rope_insert_vertex(GP_TableContext* ctx, int32_t rope_idx, int3
 // Create/destroy a sliding ring attached to a rope. `u` is parametric 0..1
 // along the rope. Returns ring id >=0 on success or -1 on failure.
 int32_t gp_table_create_ring(GP_TableContext* ctx, int32_t rope_idx, float u);
+// Create a ring by persisted rope UID. Resolves the UID to a runtime rope index
+// using the canvas mapping and table-local fallback, then calls
+// `gp_table_create_ring`. Returns ring id >=0 on success or -1 on failure.
+int32_t gp_table_create_ring_by_id(GP_TableContext* ctx, uint64_t rope_id, float u);
 int32_t gp_table_destroy_ring(GP_TableContext* ctx, int32_t ring_id);
 // Move a ring towards `target_u` at `speed` (parametric units per second).
 int32_t gp_table_set_ring_target(GP_TableContext* ctx, int32_t ring_id, float target_u, float speed);
@@ -347,6 +354,15 @@ int32_t gp_table_get_scroll_fraction_xy(GP_TableContext* ctx, float* out_frac_x,
 // Get row count and fetch a copy of a row by original index.
 int32_t gp_table_get_row_count(const GP_TableContext* ctx);
 int32_t gp_table_get_row(const GP_TableContext* ctx, int32_t idx, GP_TableRow* out_row);
+// Accessors for persistent rope UIDs (safe C API so other modules may
+// register per-table UIDs with the canvas without exposing internal types).
+int gp_table_get_rope_id_count(GP_TableContext* ctx);
+int gp_table_get_rope_ids(GP_TableContext* ctx, uint64_t* out_ids, int cap);
+// Resolve a persisted rope id to the attached RopeSim index for this table.
+// Returns -1 if not present.
+int gp_table_resolve_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t id);
+// Set the table's persistent rope id vector from an array. Returns 1 on success.
+int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint64_t* ids, int count);
 
 // Per-LED selection API: set/get selection state for a specific LED (row/col/index).
 // Selected LEDs are rendered with a selection ring; selection is independent of
@@ -398,6 +414,25 @@ typedef struct GP_TableEdgeBatchMetadata {
 
 int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpec* spec);
 int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpec* out_spec);
+
+// Enable or disable simulator stepping for this table. When disabled the
+// table's `RopeSim` will not be advanced by table-side ticks. Defaults to enabled (1).
+int32_t gp_table_set_sim_enabled(GP_TableContext* ctx, int32_t enabled);
+int32_t gp_table_get_sim_enabled(GP_TableContext* ctx, int32_t* out_enabled);
+// Per-table frame-skip percent for rope sim (0..100). When >0 the table's
+// rope sim will only be stepped on a subset of frames to reduce CPU load.
+// Global rope-sim frame-skip percent (0..100). Applied across all table
+// and canvas rope simulators; advance tick once per canvas frame via
+// `gp_table_advance_global_sim_tick()` to produce deterministic stepping.
+// Global rope-sim frame-skip count (0..). When set to N, each rope sim will
+// be stepped once every (N+1) frames. 0 = step every frame.
+int32_t gp_table_set_global_sim_frame_skip_count(int32_t count);
+int32_t gp_table_get_global_sim_frame_skip_count(int32_t* out_count);
+// Advance the global sim frame tick (called once per canvas frame).
+void gp_table_advance_global_sim_tick();
+// Query whether the table's rope sim should step this frame (honors per-table
+// `sim_enabled` and the global sim frame-skip count). Returns 1 if should step, 0 otherwise.
+int32_t gp_table_should_step_sim(GP_TableContext* ctx);
 int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
 // Subscribe with explicit start policy. If `start_at_head` is non-zero, the subscriber
 // begins at the current write head (new samples only). If zero, it begins at the
@@ -435,6 +470,9 @@ int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx,
 int32_t gp_table_edge_set_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t flags);
 // Query the RopeSim index associated with an edge, or -1 if none.
 int32_t gp_table_get_edge_rope_index(const GP_TableContext* ctx, int32_t edge_idx, int32_t* out_rope_idx);
+// Resolve a persistent rope id to the attached RopeSim index for this table.
+// Returns -1 if not present.
+int gp_table_resolve_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t id);
 int32_t gp_table_edge_get_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t* out_flags);
 int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx);
 int32_t gp_table_edge_index_for_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b, int32_t* out_edge_idx);
@@ -524,6 +562,12 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
 // desired afterward.
 int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t in_len);
 
+// Module/port UUID helpers embedded into serialized blobs
+// Set a module UUID onto a table context so it will be included in serialization.
+int32_t gp_table_set_module_uuid(GP_TableContext* ctx, uint64_t module_uuid);
+// Set a module frame port UUID (row,row_idx) so it will be included in serialization.
+int32_t gp_table_set_frame_port_uuid(GP_TableContext* ctx, int row, int idx, uint64_t port_uuid);
+
 // Editable flag: tables may be marked editable to expose them to an editor.
 // Default is editable (1). Callers can toggle editability at will.
 int32_t gp_table_set_editable(GP_TableContext* ctx, int32_t editable);
@@ -564,11 +608,39 @@ int32_t gp_table_meta_get_anchor(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t
 // resets to defaults. Returns 1 on success.
 int32_t gp_table_meta_set_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, const LassoConfig* cfg);
 int32_t gp_table_meta_get_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, LassoConfig* out_cfg);
+
+// Store edge-spring parameters for a meta-group so they survive save/load.
+int32_t gp_table_meta_set_edge_spring_params(GP_TableContext* ctx, GP_MetaGroup* mg, float min_rest, float reduce_rate, int32_t mode);
 // Create a dangling widget attached to a meta-group. The widget is created
 // in the attached RopeSim (if any) and follows the first vertex in the
 // meta-group. Returns 1 on success.
 int32_t gp_table_meta_create_widget(GP_TableContext* ctx, GP_MetaGroup* mg);
 int32_t gp_table_meta_destroy_widget(GP_TableContext* ctx, GP_MetaGroup* mg);
+// Associate canvas overlay keys with a meta-group so they will be serialized.
+int32_t gp_table_meta_set_overlay_keys(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long key_a, unsigned long long key_b);
+int32_t gp_table_meta_get_overlay_keys(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long* out_key_a, unsigned long long* out_key_b);
+// Set/get the integer "channel group" for a meta-group. Returns 1 on success.
+int32_t gp_table_meta_set_channel_group(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t channel_group);
+int32_t gp_table_meta_get_channel_group(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t* out_channel_group);
+// Additional accessors for canvas-level serialization
+int32_t gp_table_meta_get_confinement(const GP_TableContext* ctx, GP_MetaGroup* mg, float* out_conf);
+int32_t gp_table_meta_set_confinement(GP_TableContext* ctx, GP_MetaGroup* mg, float conf);
+int32_t gp_table_meta_get_id(const GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long* out_id);
+int32_t gp_table_meta_set_id(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned long long id);
+int32_t gp_table_meta_get_dangling_hang_len(const GP_TableContext* ctx, GP_MetaGroup* mg, float* out_len);
+int32_t gp_table_meta_set_dangling_hang_len(GP_TableContext* ctx, GP_MetaGroup* mg, float len);
+// Lasso fields (flags + widget type) accessor helpers (avoid exposing full struct in headers)
+int32_t gp_table_meta_get_lasso_fields(const GP_TableContext* ctx, GP_MetaGroup* mg, unsigned int* out_flags, int32_t* out_widget_type);
+int32_t gp_table_meta_set_lasso_fields(GP_TableContext* ctx, GP_MetaGroup* mg, unsigned int flags, int32_t widget_type);
+// Ring mode setter (getter already exists)
+int32_t gp_table_meta_set_ring_mode(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t mode);
+// Snapshot the FIFO metadata for a meta-group into a float array.
+// Returns the number of floats written (or 0 on error). The buffer should be
+// large enough to hold: id, vertex_count, channel_group, stride, slots,
+// top_k, write_seq, writer_low, last_write_seq, last_read_seq,
+// write_friction, read_friction, last_write_region, last_read_region,
+// write_phase, read_phase, friction_regions, configured(0/1), shape_len, shape[...]
+int32_t gp_table_meta_get_fifo_snapshot(GP_TableContext* ctx, GP_MetaGroup* mg, float* out_buf, int32_t out_len);
 // Enable/disable edge-springs for a meta-group. Springs connect consecutive
 // vertices in the group's member list and will reduce their rest length
 // over time until `min_rest` at the given `reduce_rate` (units per second).
