@@ -450,6 +450,12 @@ int rope_sim_get_ring_rope_index(RopeSim* s, int ring_id, int* out_rope_idx) {
     return 1;
 }
 
+int rope_sim_get_ring_count(RopeSim* s) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    return static_cast<int>(si->rings.size());
+}
+
 int rope_sim_set_ring_target(RopeSim* s, int ring_id, float target_u, float speed) {
     if (!s) return 0;
     RopeSim_internal* si = to_internal(s);
