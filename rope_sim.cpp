@@ -450,6 +450,12 @@ int rope_sim_get_ring_rope_index(RopeSim* s, int ring_id, int* out_rope_idx) {
     return 1;
 }
 
+int rope_sim_get_ring_count(RopeSim* s) {
+    if (!s) return 0;
+    RopeSim_internal* si = to_internal(s);
+    return static_cast<int>(si->rings.size());
+}
+
 int rope_sim_set_ring_target(RopeSim* s, int ring_id, float target_u, float speed) {
     if (!s) return 0;
     RopeSim_internal* si = to_internal(s);
@@ -711,6 +717,16 @@ int rope_sim_serialized_size(RopeSim* s) {
         need += edge_count * 4; // edge_rest
         need += edge_count * 4; // edge_strength
     }
+    int32_t ring_count = static_cast<int32_t>(si->rings.size());
+    need += 4; // ring_count
+    for (int32_t ri = 0; ri < ring_count; ++ri) {
+        RopeSim_internal::Ring* ring = si->rings[static_cast<size_t>(ri)].get();
+        need += 4; // present flag
+        if (!ring) continue;
+        need += 4; // rope_idx
+        need += 4; // u
+        need += 6 * 4; // x/y/z + prev_x/prev_y/prev_z
+    }
     return need;
 }
 
@@ -723,7 +739,7 @@ int rope_sim_serialize(RopeSim* s, char* out_buf, int out_len) {
     char* p = out_buf;
     char* end = out_buf + out_len;
     const char magic[8] = {'R','P','S','I','M','0','0','1'};
-    const int32_t version = 1;
+    const int32_t version = 2;
     if (!rope_sim_write_bytes(p, end, magic, sizeof(magic))) return 0;
     if (!rope_sim_write_bytes(p, end, &version, sizeof(version))) return 0;
     int32_t max_ropes = s->max_ropes;
@@ -793,6 +809,18 @@ int rope_sim_serialize(RopeSim* s, char* out_buf, int out_len) {
             if (!rope_sim_write_bytes(p, end, &strength, sizeof(strength))) return 0;
         }
     }
+    int32_t ring_count = static_cast<int32_t>(si->rings.size());
+    if (!rope_sim_write_bytes(p, end, &ring_count, sizeof(ring_count))) return 0;
+    for (int32_t ri = 0; ri < ring_count; ++ri) {
+        RopeSim_internal::Ring* ring = si->rings[static_cast<size_t>(ri)].get();
+        int32_t present = ring ? 1 : 0;
+        if (!rope_sim_write_bytes(p, end, &present, sizeof(present))) return 0;
+        if (!ring) continue;
+        if (!rope_sim_write_bytes(p, end, &ring->rope_idx, sizeof(ring->rope_idx))) return 0;
+        if (!rope_sim_write_bytes(p, end, &ring->u, sizeof(ring->u))) return 0;
+        float rpos[6] = {ring->x, ring->y, ring->z, ring->prev_x, ring->prev_y, ring->prev_z};
+        if (!rope_sim_write_bytes(p, end, rpos, sizeof(rpos))) return 0;
+    }
     return need;
 }
 
@@ -805,7 +833,7 @@ RopeSim* rope_sim_deserialize(const char* in_buf, int in_len) {
     if (!rope_sim_read_bytes(p, end, magic, sizeof(magic))) return nullptr;
     if (memcmp(magic, "RPSIM001", 8) != 0) return nullptr;
     if (!rope_sim_read_bytes(p, end, &version, sizeof(version))) return nullptr;
-    if (version != 1) return nullptr;
+    if (version != 1 && version != 2) return nullptr;
     int32_t max_ropes = 0;
     int32_t max_segments = 0;
     int32_t rope_count = 0;
@@ -920,6 +948,36 @@ RopeSim* rope_sim_deserialize(const char* in_buf, int in_len) {
             mg->edge_strength[static_cast<size_t>(ei)] = strength;
         }
         si->meta_groups.push_back(std::move(mg));
+    }
+    if (version >= 2) {
+        int32_t ring_count = 0;
+        if (!rope_sim_read_bytes(p, end, &ring_count, sizeof(ring_count))) { rope_sim_destroy(sim); return nullptr; }
+        if (ring_count < 0) { rope_sim_destroy(sim); return nullptr; }
+        si->rings.clear();
+        si->rings.reserve(static_cast<size_t>(ring_count));
+        for (int32_t ri = 0; ri < ring_count; ++ri) {
+            int32_t present = 0;
+            if (!rope_sim_read_bytes(p, end, &present, sizeof(present))) { rope_sim_destroy(sim); return nullptr; }
+            if (!present) {
+                si->rings.push_back(nullptr);
+                continue;
+            }
+            auto ring = std::make_unique<RopeSim_internal::Ring>();
+            if (!rope_sim_read_bytes(p, end, &ring->rope_idx, sizeof(ring->rope_idx))) { rope_sim_destroy(sim); return nullptr; }
+            if (!rope_sim_read_bytes(p, end, &ring->u, sizeof(ring->u))) { rope_sim_destroy(sim); return nullptr; }
+            float rpos[6] = {};
+            if (!rope_sim_read_bytes(p, end, rpos, sizeof(rpos))) { rope_sim_destroy(sim); return nullptr; }
+            ring->x = rpos[0]; ring->y = rpos[1]; ring->z = rpos[2];
+            ring->prev_x = rpos[3]; ring->prev_y = rpos[4]; ring->prev_z = rpos[5];
+            if (ring->rope_idx < 0 || ring->rope_idx >= static_cast<int32_t>(si->ropes.size())) {
+                ring->rope_idx = -1;
+            }
+            if (ring->u < 0.0f) ring->u = 0.0f;
+            if (ring->u > 1.0f) ring->u = 1.0f;
+            si->rings.push_back(std::move(ring));
+        }
+    } else {
+        si->rings.clear();
     }
     return sim;
 }

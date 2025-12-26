@@ -2439,7 +2439,9 @@ static int32_t gp_table_meta_add_vertex_with_id(GP_TableContext* ctx, GP_MetaGro
             if (sg >= 0) mg->sim_group_idx = sg;
         }
         if (mg->sim_group_idx >= 0) {
-            rope_sim_meta_group_add(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
+            if (!rope_sim_meta_group_has_member(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx))) {
+                rope_sim_meta_group_add(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
+            }
             // update pressure in sim if different
             rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
         }
@@ -3246,6 +3248,11 @@ extern "C" int32_t gp_table_meta_get_overlay_keys(GP_TableContext* ctx, GP_MetaG
 // its own simulator later on demand. Returns 1 on success.
 int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t take_ownership) {
     if (!ctx) return 0;
+    // If the table already owns a restored simulator, keep it instead of
+    // overwriting with a shared/root simulator attachment.
+    if (ctx->rope_sim && ctx->rope_sim_owned && sim && !take_ownership) {
+        return 1;
+    }
     // If we currently own a sim, destroy it first
     if (ctx->rope_sim && ctx->rope_sim_owned) {
         rope_sim_destroy(ctx->rope_sim);
@@ -6578,11 +6585,28 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     ctx->rows = std::move(rows);
     // clear existing edges via API to keep rope_sim indices consistent
     gp_table_clear_edges(ctx);
-    for (auto &e : edges) gp_table_add_edge(ctx, e.first, e.second);
+    auto add_edge_without_rope = [&](uint64_t a, uint64_t b) {
+        ctx->edges.emplace_back(a, b);
+        uint64_t uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+        ctx->edge_ids.push_back(uid);
+        ctx->relax_value.push_back(0.0f);
+        ctx->relax_vel.push_back(0.0f);
+        ctx->prospective_initialized = false;
+        ensure_edge_fifos(ctx);
+        sync_edge_tensor_for_idx(ctx, ctx->edges.size() - 1);
+    };
+    bool suppress_edge_rope_creation = (restored_sim != nullptr) || !rope_ids_temp.empty();
+    for (auto &e : edges) {
+        if (suppress_edge_rope_creation) add_edge_without_rope(e.first, e.second);
+        else gp_table_add_edge(ctx, e.first, e.second);
+    }
     // if serialized per-rope uids were present, adopt them so runtime rope
     // indices map to the saved stable ids (this preserves stable mapping
     // for meta-group vertices which reference ropes by uid).
     if (!rope_ids_temp.empty()) {
+        if (rope_ids_temp.size() < ctx->edges.size()) {
+            rope_ids_temp.resize(ctx->edges.size(), 0ull);
+        }
         ctx->rope_ids = rope_ids_temp;
         // rebuild rope_id_to_sim_idx so canvas lookups resolve to the current
         // rope indices (edge order) using the persisted ids.
@@ -6603,6 +6627,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     }
     ctx->selected_leds = std::move(selset);
     recompute_geom(ctx);
+    const bool restored_sim_attached = (restored_sim != nullptr);
     if (restored_sim) {
         if (ctx->rope_sim && ctx->rope_sim_owned) {
             rope_sim_destroy(ctx->rope_sim);
@@ -6663,12 +6688,10 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
                (void*)ctx, (void*)mg, static_cast<unsigned long long>(d.id), static_cast<unsigned long long>(d.oka), static_cast<unsigned long long>(d.okb), d.verts.size(), d.sim_idx);
         // restore simple fields
         mg->confinement = d.confinement;
-        // Do NOT blindly restore the serialized sim_group_idx value: rope-sim
-        // meta-group indices are not stable across process runs or when the
-        // RopeSim instance is (re)attached. Leave sim_group_idx unset so
-        // that `gp_table_meta_add_vertex` will create a fresh sim meta-group
-        // in the current simulator and register members deterministically.
-        mg->sim_group_idx = -1;
+        // If we restored a RopeSim blob, preserve its meta-group index so we
+        // can reuse the saved meta-group state without duplicating members.
+        // Otherwise, leave sim_group_idx unset so we create a fresh sim group.
+        mg->sim_group_idx = restored_sim_attached ? d.sim_idx : -1;
         mg->id = d.id;
         mg->lasso_config = d.lc;
         // resolve persisted anchor UID to runtime rope index (if present)
@@ -6702,23 +6725,50 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
             mg->overlay_key_a = d.oka;
             mg->overlay_key_b = d.okb;
         }
-        // If a ring parameter was serialized, prefer to defer ring creation
-        // to MetaCloud re-application when available. For now, recreate ring
-        // here the old way to preserve prior behavior.
+        // If a ring parameter was serialized, prefer to reuse an existing
+        // ring from the restored RopeSim blob. Fall back to recreating a ring
+        // only when we cannot find a matching ring to bind.
         if (d.ring_mode != 0) {
             float ru = d.ring_u;
             uint64_t target_uid = 0ull;
             if (d.anchor_uid != 0ull) target_uid = d.anchor_uid;
             else if (!d.verts.empty()) target_uid = d.verts[0].first;
             if (target_uid != 0ull) {
-                int ring_id = gp_table_create_ring_by_id(ctx, target_uid, ru);
-                if (ring_id == -2) {
-                    printf("gp_table_deserialize: ERROR - could not resolve rope id=%llu for ring creation\n", (unsigned long long)target_uid);
-                    return 3; // hard-fail: unresolved rope id for ring
+                int ring_id = -1;
+                RopeSim* sim = ctx->rope_sim;
+                if (sim && rope_sim_get_ring_count(sim) > 0) {
+                    int resolved = -1;
+                    if (cvs) resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, target_uid);
+                    if (resolved < 0) resolved = gp_table_resolve_rope_id_to_sim_index(ctx, target_uid);
+                    if (resolved >= 0) {
+                        int ring_count = rope_sim_get_ring_count(sim);
+                        float best_dist = std::numeric_limits<float>::infinity();
+                        for (int ri = 0; ri < ring_count; ++ri) {
+                            int rope_idx = -1;
+                            float ring_u = 0.0f;
+                            if (!rope_sim_get_ring_rope_index(sim, ri, &rope_idx)) continue;
+                            if (rope_idx != resolved) continue;
+                            if (!rope_sim_get_ring_u(sim, ri, &ring_u)) continue;
+                            float dist = std::fabs(ring_u - ru);
+                            if (dist < best_dist) {
+                                best_dist = dist;
+                                ring_id = ri;
+                            }
+                        }
+                    }
+                }
+                if (ring_id < 0) {
+                    ring_id = gp_table_create_ring_by_id(ctx, target_uid, ru);
+                    if (ring_id == -2) {
+                        printf("gp_table_deserialize: ERROR - could not resolve rope id=%llu for ring creation\n", (unsigned long long)target_uid);
+                        return 3; // hard-fail: unresolved rope id for ring
+                    }
+                    if (ring_id >= 0) {
+                        printf("gp_table_deserialize: recreated ring id=%d u=%.3f for mg=%p id=%llu\n", ring_id, ru, (void*)mg, (unsigned long long)mg->id);
+                    }
                 }
                 if (ring_id >= 0) {
                     gp_table_register_ring_edge(ctx, ring_id, mg->id);
-                    printf("gp_table_deserialize: recreated ring id=%d u=%.3f for mg=%p id=%llu\n", ring_id, ru, (void*)mg, (unsigned long long)mg->id);
                 }
             }
         }
@@ -6766,24 +6816,32 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
             }
             gp_table_meta_add_vertex_with_id(ctx, mg, want_uid, resolved, vp.second);
         }
-        // If we registered an overlay earlier, attach the ropes referenced
-        // by this meta-group deterministically to that canonical overlay.
+        // If we registered an overlay earlier, attach a single rope (prefer
+        // the dangling widget rope) to that canonical overlay.
         if ((mg->overlay_key_a != 0ull || mg->overlay_key_b != 0ull) && cvs) {
-            std::unordered_set<uint64_t> seen_rope_ids;
-            for (const auto &vp : d.verts) {
-                uint64_t ru = vp.first;
-                if (ru == 0ull) continue;
-                if (seen_rope_ids.find(ru) != seen_rope_ids.end()) continue;
-                seen_rope_ids.insert(ru);
-                int resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, ru);
-                if (resolved < 0) {
+            int overlay_rope_idx = -1;
+            if (d.dang_rope >= 0) {
+                overlay_rope_idx = d.dang_rope;
+            } else if (d.anchor_uid != 0ull) {
+                overlay_rope_idx = gp_canvas_resolve_rope_id_to_index(cvs, ctx, d.anchor_uid);
+                if (overlay_rope_idx < 0) {
                     for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
-                        if (ctx->rope_ids[ri] == ru) { resolved = static_cast<int>(ri); break; }
+                        if (ctx->rope_ids[ri] == d.anchor_uid) { overlay_rope_idx = static_cast<int>(ri); break; }
                     }
                 }
-                if (resolved >= 0) {
-                    gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, resolved);
+            } else if (!d.verts.empty()) {
+                uint64_t ru = d.verts[0].first;
+                if (ru != 0ull) {
+                    overlay_rope_idx = gp_canvas_resolve_rope_id_to_index(cvs, ctx, ru);
+                    if (overlay_rope_idx < 0) {
+                        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
+                            if (ctx->rope_ids[ri] == ru) { overlay_rope_idx = static_cast<int>(ri); break; }
+                        }
+                    }
                 }
+            }
+            if (overlay_rope_idx >= 0) {
+                gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, overlay_rope_idx);
             }
             gp_canvas_set_overlay_meta(cvs, mg->overlay_key_a, mg->overlay_key_b, ctx, reinterpret_cast<void*>(mg));
         }
@@ -6792,7 +6850,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         // meta-group now that vertices have been registered into the current
         // RopeSim. This re-enables the short T-off / spring binding behavior
         // that was active when the snapshot was taken.
-        if (d.sim_idx >= 0) {
+        if (d.sim_idx >= 0 && !restored_sim_attached) {
             // prefer saved spring params from the serialized LassoConfig; fall
             // back to conservative defaults if they are zero/unset.
             float use_min_rest = (d.lc.spring_min_rest > 0.0f) ? d.lc.spring_min_rest : 2.0f;

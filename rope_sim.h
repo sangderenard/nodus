@@ -81,6 +81,8 @@ int rope_sim_set_ring_target(RopeSim* s, int ring_id, float target_u, float spee
 int rope_sim_get_ring_u(RopeSim* s, int ring_id, float* out_u);
 // Query which rope a ring is attached to. Returns 1 on success and sets out_rope_idx, 0 on failure.
 int rope_sim_get_ring_rope_index(RopeSim* s, int ring_id, int* out_rope_idx);
+// Query number of rings currently in the sim.
+int rope_sim_get_ring_count(RopeSim* s);
 
 // Dangling widget API: create a small widget attached to a rope vertex that
 // follows the vertex position each simulation step. `widget_type` is one of
