@@ -2170,6 +2170,14 @@ struct GP_TableContext {
     // to map serialized vertices to runtime rope indices deterministically.
     std::vector<uint64_t> rope_ids;
     uint64_t next_rope_id = 1;
+    // Deferred meta-group vertices awaiting rope-id resolution after sim attach.
+    struct PendingMetaVertex {
+        GP_MetaGroup* mg = nullptr;
+        uint64_t rope_id = 0ull;
+        int vertex_idx = -1;
+    };
+    std::vector<PendingMetaVertex> pending_meta_vertices;
+    std::mutex pending_meta_mu;
     // flag set during gp_table_deserialize to indicate we're restoring
     int restoring = 0;
     // Optional module UUID embedded into serialized blobs (0 == unset)
@@ -2290,8 +2298,14 @@ int32_t gp_table_should_step_sim(GP_TableContext* ctx) {
 // Internal representation of a meta-group. Exposed to C callers as an
 // opaque `GP_MetaGroup*` pointer (allocated here and stored in the
 // table's `meta_groups` vector to keep lifetime management consistent).
+struct GP_MetaVertex {
+    uint64_t rope_id = 0ull;
+    int rope_idx = -1;
+    int vertex_idx = -1;
+};
+
 struct GP_MetaGroup {
-    std::vector<std::pair<int,int>> vertices; // (rope_idx, vertex_idx)
+    std::vector<GP_MetaVertex> vertices; // rope identity + runtime index
     float confinement = 1.0f; // tightness/pressure
     int sim_group_idx = -1; // index into RopeSim meta_groups if registered
     uint64_t id = 0; // debug id
@@ -2353,19 +2367,112 @@ extern "C" int32_t gp_table_debug_dump_meta_group(GP_TableContext* ctx, GP_MetaG
     int vcount = static_cast<int>(mg->vertices.size());
     printf("  vertices.count=%d\n", vcount);
     for (int vi = 0; vi < vcount; ++vi) {
-        int r = mg->vertices[static_cast<size_t>(vi)].first;
-        int v = mg->vertices[static_cast<size_t>(vi)].second;
-        uint64_t ru = 0ull;
-        if (r >= 0) {
-            // rope indices are transient sim indices; find the persistent UID that maps to this sim index
-            for (const auto &kv : ctx->rope_id_to_sim_idx) {
-                if (kv.second == r) { ru = kv.first; break; }
-            }
-        }
-        printf("    [%d] rope_idx=%d vert_idx=%d rope_id=%llu\n", vi, r, v, (unsigned long long)ru);
+        const auto &mv = mg->vertices[static_cast<size_t>(vi)];
+        printf("    [%d] rope_idx=%d vert_idx=%d rope_id=%llu\n",
+               vi, mv.rope_idx, mv.vertex_idx, (unsigned long long)mv.rope_id);
     }
     fflush(stdout);
     return 1;
+}
+
+static uint64_t gp_table_lookup_rope_id_for_index(GP_TableContext* ctx, int rope_idx) {
+    if (!ctx || rope_idx < 0) return 0ull;
+    if (static_cast<size_t>(rope_idx) < ctx->rope_ids.size()) {
+        uint64_t rid = ctx->rope_ids[static_cast<size_t>(rope_idx)];
+        if (rid != 0ull) return rid;
+    }
+    for (const auto &kv : ctx->rope_id_to_sim_idx) {
+        if (kv.second == rope_idx) return kv.first;
+    }
+    return 0ull;
+}
+
+static uint64_t gp_table_ensure_rope_id_for_index(GP_TableContext* ctx, int rope_idx) {
+    if (!ctx || rope_idx < 0) return 0ull;
+    uint64_t rid = gp_table_lookup_rope_id_for_index(ctx, rope_idx);
+    if (rid != 0ull) return rid;
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    rid = gp_canvas_generate_id(cvs, 0ull);
+    if (rid != 0ull && rope_idx >= 0 && ctx) {
+        ctx->rope_id_to_sim_idx[rid] = rope_idx;
+    }
+    return rid;
+}
+
+static bool gp_table_meta_vertex_exists(const GP_MetaGroup* mg, uint64_t rope_id, int rope_idx, int vertex_idx) {
+    if (!mg) return false;
+    for (const auto &mv : mg->vertices) {
+        if (rope_id != 0ull) {
+            if (mv.rope_id == rope_id && mv.vertex_idx == vertex_idx) return true;
+        } else if (rope_idx >= 0) {
+            if (mv.rope_idx == rope_idx && mv.vertex_idx == vertex_idx) return true;
+        }
+    }
+    return false;
+}
+
+static int32_t gp_table_meta_add_vertex_with_id(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t rope_id, int32_t rope_idx, int32_t vertex_idx) {
+    if (!ctx || !mg) return 0;
+    if (gp_table_meta_vertex_exists(mg, rope_id, rope_idx, vertex_idx)) return 1;
+    if (rope_id != 0ull && rope_idx >= 0) {
+        ctx->rope_id_to_sim_idx[rope_id] = rope_idx;
+        if (static_cast<size_t>(rope_idx) >= ctx->rope_ids.size()) {
+            ctx->rope_ids.resize(static_cast<size_t>(rope_idx) + 1, 0ull);
+        }
+        if (ctx->rope_ids[static_cast<size_t>(rope_idx)] == 0ull) {
+            ctx->rope_ids[static_cast<size_t>(rope_idx)] = rope_id;
+        }
+    }
+    GP_MetaVertex mv{};
+    mv.rope_id = rope_id;
+    mv.rope_idx = static_cast<int>(rope_idx);
+    mv.vertex_idx = static_cast<int>(vertex_idx);
+    mg->vertices.push_back(mv);
+    RopeSim* sim = ctx->rope_sim;
+    printf("gp_table_meta_add_vertex: mg=%p add (rope=%d,vert=%d) sim=%p sim_group_idx=%d\n", (void*)mg, rope_idx, vertex_idx, (void*)sim, mg->sim_group_idx);
+    // If the table owns or is attached to a RopeSim, ensure a sim-level
+    // meta group exists and register the vertex there so confinement
+    // forces are applied during simulation.
+    if (sim && rope_idx >= 0) {
+        if (mg->sim_group_idx < 0) {
+            int sg = rope_sim_create_meta_group(sim, mg->confinement);
+            if (sg >= 0) mg->sim_group_idx = sg;
+        }
+        if (mg->sim_group_idx >= 0) {
+            rope_sim_meta_group_add(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
+            // update pressure in sim if different
+            rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
+        }
+    }
+    return 1;
+}
+
+static void gp_table_queue_pending_meta_vertex(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t rope_id, int vertex_idx) {
+    if (!ctx || !mg || rope_id == 0ull) return;
+    std::lock_guard<std::mutex> lk(ctx->pending_meta_mu);
+    ctx->pending_meta_vertices.push_back({mg, rope_id, vertex_idx});
+}
+
+static void gp_table_apply_pending_meta_vertices(GP_TableContext* ctx) {
+    if (!ctx || !ctx->rope_sim) return;
+    std::vector<GP_TableContext::PendingMetaVertex> pending;
+    {
+        std::lock_guard<std::mutex> lk(ctx->pending_meta_mu);
+        if (ctx->pending_meta_vertices.empty()) return;
+        pending.swap(ctx->pending_meta_vertices);
+    }
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    for (const auto &entry : pending) {
+        if (!entry.mg || entry.rope_id == 0ull) continue;
+        int resolved = -1;
+        if (cvs) resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, entry.rope_id);
+        if (resolved < 0) resolved = gp_table_resolve_rope_id_to_sim_index(ctx, entry.rope_id);
+        if (resolved < 0) {
+            gp_table_queue_pending_meta_vertex(ctx, entry.mg, entry.rope_id, entry.vertex_idx);
+            continue;
+        }
+        gp_table_meta_add_vertex_with_id(ctx, entry.mg, entry.rope_id, resolved, entry.vertex_idx);
+    }
 }
 
 // Removed: gp_table_sim_toggle_meta_group_mode_for_rope
@@ -2463,7 +2570,7 @@ extern "C" int32_t gp_table_meta_enable_edge_springs(GP_TableContext* ctx, GP_Me
     float shorten_delay = 0.5f; // seconds before shortening begins
     std::unordered_set<int> handled;
     for (const auto &p : mg->vertices) {
-        int r = p.first;
+        int r = p.rope_idx;
         if (handled.find(r) != handled.end()) continue;
         handled.insert(r);
         rope_sim_modify_rest_length(sim, r, extend_amount);
@@ -2718,24 +2825,8 @@ extern "C" int32_t gp_table_get_ring_u(GP_TableContext* ctx, int32_t ring_id, fl
 
 extern "C" int32_t gp_table_meta_add_vertex(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx) {
     if (!ctx || !mg) return 0;
-    mg->vertices.emplace_back(static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
-    RopeSim* sim = ctx->rope_sim;
-    printf("gp_table_meta_add_vertex: mg=%p add (rope=%d,vert=%d) sim=%p sim_group_idx=%d\n", (void*)mg, rope_idx, vertex_idx, (void*)sim, mg->sim_group_idx);
-    // If the table owns or is attached to a RopeSim, ensure a sim-level
-    // meta group exists and register the vertex there so confinement
-    // forces are applied during simulation.
-    if (sim) {
-        if (mg->sim_group_idx < 0) {
-            int sg = rope_sim_create_meta_group(sim, mg->confinement);
-            if (sg >= 0) mg->sim_group_idx = sg;
-        }
-        if (mg->sim_group_idx >= 0) {
-            rope_sim_meta_group_add(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
-            // update pressure in sim if different
-            rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
-        }
-    }
-    return 1;
+    uint64_t rope_id = gp_table_ensure_rope_id_for_index(ctx, rope_idx);
+    return gp_table_meta_add_vertex_with_id(ctx, mg, rope_id, rope_idx, vertex_idx);
 }
 
 extern "C" int32_t gp_table_meta_set_anchor(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx) {
@@ -2771,9 +2862,9 @@ extern "C" GP_MetaGroup* gp_table_get_meta_group(GP_TableContext* ctx, int32_t i
 extern "C" int32_t gp_table_meta_get_vertex(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t idx, int32_t* out_rope_idx, int32_t* out_vertex_idx) {
     if (!ctx || !mg) return 0;
     if (idx < 0 || static_cast<size_t>(idx) >= mg->vertices.size()) return 0;
-    auto &p = mg->vertices[static_cast<size_t>(idx)];
-    if (out_rope_idx) *out_rope_idx = p.first;
-    if (out_vertex_idx) *out_vertex_idx = p.second;
+    auto &mv = mg->vertices[static_cast<size_t>(idx)];
+    if (out_rope_idx) *out_rope_idx = mv.rope_idx;
+    if (out_vertex_idx) *out_vertex_idx = mv.vertex_idx;
     return 1;
 }
 
@@ -2934,8 +3025,8 @@ extern "C" int32_t gp_table_meta_create_widget(GP_TableContext* ctx, GP_MetaGrou
     // Prefer creating a short hanging rope anchored to the meta-group, then
     // attach the widget to the rope's lower vertex so it can hang freely.
     // prefer explicit anchor if set on the meta-group
-    int anchor_rope = mg->anchor_rope >= 0 ? mg->anchor_rope : mg->vertices[0].first;
-    int anchor_vert = mg->anchor_vert >= 0 ? mg->anchor_vert : mg->vertices[0].second;
+    int anchor_rope = mg->anchor_rope >= 0 ? mg->anchor_rope : mg->vertices[0].rope_idx;
+    int anchor_vert = mg->anchor_vert >= 0 ? mg->anchor_vert : mg->vertices[0].vertex_idx;
     // Query 3D vertex positions for anchor
     int vc = rope_sim_get_vertex_count(sim, anchor_rope);
     if (vc <= 0) return 0;
@@ -3242,6 +3333,7 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
     if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
         gp_canvas_mark_rope_map_dirty(cvs);
     }
+    gp_table_apply_pending_meta_vertices(ctx);
     return 1;
 }
 
@@ -6074,7 +6166,7 @@ int32_t gp_table_get_editable(GP_TableContext* ctx, int32_t* out_editable) {
 // version 1: GP_TableStyle, cols, rows, edges, selected keys
 // version 2: same as v1, then int32 meta_group_count, followed by per-meta-group blob
 // version 4: adds RopeSim blob (int32 size + bytes) before meta-groups
-// Per-meta-group blob: int32 vertex_count, (int32 rope_idx,int32 vert_idx)*N, float confinement, int32 sim_group_idx,
+// Per-meta-group blob: int32 vertex_count, (uint64 rope_uid,int32 vert_idx)*N, float confinement, int32 sim_group_idx,
 // uint64 id, LassoConfig (8 bytes), uint64 anchor_rope_uid, int32 anchor_vert, uint32 subgroup_flags, int32 channel_group,
 // int32 dangling_widget_rope, int32 dangling_widget_rope_vid, float dangling_hang_len, int32 ring_mode,
 // uint64 overlay_key_a, uint64 overlay_key_b
@@ -6107,6 +6199,7 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
     int32_t col_count = static_cast<int32_t>(ctx->cols.size());
     int32_t row_count = static_cast<int32_t>(ctx->rows.size());
     int32_t edge_count = static_cast<int32_t>(ctx->edges.size());
+    int32_t rope_id_count = static_cast<int32_t>(ctx->rope_ids.size());
     int32_t sel_count = static_cast<int32_t>(ctx->selected_leds.size());
     int32_t rope_blob_len = 0;
     if (ctx->rope_sim) {
@@ -6125,9 +6218,9 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
     need += row_count * static_cast<int32_t>(sizeof(GP_TableRow));
     need += 4; // edge_count
     need += edge_count * static_cast<int32_t>(sizeof(uint64_t) * 2);
-    // per-rope persistent uids (one per edge/rope created)
+    // per-rope persistent uids (one per rope created)
     need += 4; // rope_uid_count
-    need += edge_count * static_cast<int32_t>(sizeof(uint64_t));
+    need += rope_id_count * static_cast<int32_t>(sizeof(uint64_t));
     need += 4; // sel_count
     need += sel_count * static_cast<int32_t>(sizeof(uint64_t));
     // module uuid + frame-port entries (version 3)
@@ -6217,7 +6310,6 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
         memcpy(p, &b, sizeof(uint64_t)); p += sizeof(uint64_t);
     }
     // write per-rope ids (one per edge/rope)
-    int32_t rope_id_count = static_cast<int32_t>(ctx->rope_ids.size());
     memcpy(p, &rope_id_count, 4); p += 4;
     for (int i = 0; i < rope_id_count; ++i) {
         uint64_t ru = ctx->rope_ids[static_cast<size_t>(i)];
@@ -6268,10 +6360,9 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
         int32_t vcount = static_cast<int32_t>(mg ? mg->vertices.size() : 0);
         memcpy(p, &vcount, 4); p += 4;
         for (int vi = 0; vi < vcount; ++vi) {
-            int32_t rope_idx = mg->vertices[static_cast<size_t>(vi)].first;
-            int32_t vert_idx = mg->vertices[static_cast<size_t>(vi)].second;
-            uint64_t rope_id = 0ull;
-            if (rope_idx >= 0 && static_cast<size_t>(rope_idx) < ctx->rope_ids.size()) rope_id = ctx->rope_ids[static_cast<size_t>(rope_idx)];
+            const auto &mv = mg->vertices[static_cast<size_t>(vi)];
+            uint64_t rope_id = mv.rope_id;
+            int32_t vert_idx = mv.vertex_idx;
             memcpy(p, &rope_id, 8); p += 8;
             memcpy(p, &vert_idx, 4); p += 4;
         }
@@ -6659,54 +6750,42 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
                 printf("gp_table_deserialize: warning, vertex has zero rope_uid, skipping\n");
                 continue;
             }
-            if (cvs) {
-                int resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, want_uid);
+            if (!ctx->rope_sim) {
+                printf("gp_table_deserialize: deferring meta vertex rope_id=%llu (no RopeSim attached yet)\n", (unsigned long long)want_uid);
+                gp_table_queue_pending_meta_vertex(ctx, mg, want_uid, vp.second);
+                continue;
+            }
+            int resolved = -1;
+            if (cvs) resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, want_uid);
+            if (resolved < 0) resolved = gp_table_resolve_rope_id_to_sim_index(ctx, want_uid);
+            printf("gp_table_deserialize: mapping rope_id=%llu -> resolved_idx=%d vert=%d\n", (unsigned long long)want_uid, resolved, vp.second);
+            if (resolved < 0) {
+                printf("gp_table_deserialize: deferring unresolved rope id=%llu for meta-group vertex\n", (unsigned long long)want_uid);
+                gp_table_queue_pending_meta_vertex(ctx, mg, want_uid, vp.second);
+                continue;
+            }
+            gp_table_meta_add_vertex_with_id(ctx, mg, want_uid, resolved, vp.second);
+        }
+        // If we registered an overlay earlier, attach the ropes referenced
+        // by this meta-group deterministically to that canonical overlay.
+        if ((mg->overlay_key_a != 0ull || mg->overlay_key_b != 0ull) && cvs) {
+            std::unordered_set<uint64_t> seen_rope_ids;
+            for (const auto &vp : d.verts) {
+                uint64_t ru = vp.first;
+                if (ru == 0ull) continue;
+                if (seen_rope_ids.find(ru) != seen_rope_ids.end()) continue;
+                seen_rope_ids.insert(ru);
+                int resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, ru);
                 if (resolved < 0) {
-                    // fallback: try table-local mapping
                     for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
-                        if (ctx->rope_ids[ri] == want_uid) { resolved = static_cast<int>(ri); break; }
+                        if (ctx->rope_ids[ri] == ru) { resolved = static_cast<int>(ri); break; }
                     }
                 }
-                printf("gp_table_deserialize: mapping rope_id=%llu -> resolved_idx=%d vert=%d\n", (unsigned long long)want_uid, resolved, vp.second);
-                int ok = gp_canvas_table_meta_add_vertex_by_id(cvs, ctx, reinterpret_cast<void*>(mg), want_uid, vp.second);
-                if (!ok) {
-                    printf("gp_table_deserialize: ERROR - canvas failed to add meta vertex for rope_id=%llu\n", (unsigned long long)want_uid);
-                    return 4; // hard-fail: could not add meta vertex by id
+                if (resolved >= 0) {
+                    gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, resolved);
                 }
-            } else {
-                // fallback: try table-local mapping (deprecated)
-                int mapped_idx = -1;
-                for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
-                    if (ctx->rope_ids[ri] == want_uid) { mapped_idx = static_cast<int>(ri); break; }
-                }
-                if (mapped_idx < 0) {
-                    printf("gp_table_deserialize: ERROR - could not find rope id=%llu for meta-group vertex\n", (unsigned long long)want_uid);
-                    return 5; // hard-fail: could not resolve vertex rope UID
-                }
-                gp_table_meta_add_vertex(ctx, mg, mapped_idx, vp.second);
-                printf("gp_table_deserialize: added vertex (fallback) mapped_idx=%d vert=%d\n", mapped_idx, vp.second);
             }
-            // If we registered an overlay earlier, attach the ropes referenced
-            // by this meta-group deterministically to that canonical overlay.
-            if ((mg->overlay_key_a != 0ull || mg->overlay_key_b != 0ull) && cvs) {
-                std::unordered_set<uint64_t> seen_rope_ids;
-                for (const auto &vp : d.verts) {
-                    uint64_t ru = vp.first;
-                    if (ru == 0ull) continue;
-                    if (seen_rope_ids.find(ru) != seen_rope_ids.end()) continue;
-                    seen_rope_ids.insert(ru);
-                    int resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, ru);
-                    if (resolved < 0) {
-                        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) {
-                            if (ctx->rope_ids[ri] == ru) { resolved = static_cast<int>(ri); break; }
-                        }
-                    }
-                    if (resolved >= 0) {
-                        gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, resolved);
-                    }
-                }
-                gp_canvas_set_overlay_meta(cvs, mg->overlay_key_a, mg->overlay_key_b, ctx, reinterpret_cast<void*>(mg));
-            }
+            gp_canvas_set_overlay_meta(cvs, mg->overlay_key_a, mg->overlay_key_b, ctx, reinterpret_cast<void*>(mg));
         }
         // If the serialized blob indicated a sim meta-group existed previously
         // (d.sim_idx >= 0) then enable edge-springs on the reconstituted
@@ -6742,6 +6821,8 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         gp_table_debug_dump_meta_group(ctx, mg, "deserialize_post_add");
         
     }
+
+    gp_table_apply_pending_meta_vertices(ctx);
 
     // If this table blob contained module UUID or frame-port UUIDs, attempt
     // to register them with the canvas so bindings can be reconstructed
