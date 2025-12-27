@@ -6819,8 +6819,10 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
                 continue;
             }
             // If we restored a RopeSim blob, preserve its meta-group membership
-            // (including saved member_u) rather than re-adding members.
-            const bool update_sim = !restored_sim_attached;
+            // (including saved member_u) rather than re-adding members. If the
+            // saved meta-group had no sim index, allow creation so lasso
+            // attachments remain functional.
+            const bool update_sim = !restored_sim_attached || d.sim_idx < 0;
             gp_table_meta_add_vertex_with_id_internal(ctx, mg, want_uid, resolved, vp.second, update_sim);
         }
         // If we registered an overlay earlier, attach a single rope (prefer
