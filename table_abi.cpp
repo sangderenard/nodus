@@ -2411,7 +2411,7 @@ static bool gp_table_meta_vertex_exists(const GP_MetaGroup* mg, uint64_t rope_id
     return false;
 }
 
-static int32_t gp_table_meta_add_vertex_with_id(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t rope_id, int32_t rope_idx, int32_t vertex_idx) {
+static int32_t gp_table_meta_add_vertex_with_id_internal(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t rope_id, int32_t rope_idx, int32_t vertex_idx, bool update_sim) {
     if (!ctx || !mg) return 0;
     if (gp_table_meta_vertex_exists(mg, rope_id, rope_idx, vertex_idx)) return 1;
     if (rope_id != 0ull && rope_idx >= 0) {
@@ -2433,7 +2433,7 @@ static int32_t gp_table_meta_add_vertex_with_id(GP_TableContext* ctx, GP_MetaGro
     // If the table owns or is attached to a RopeSim, ensure a sim-level
     // meta group exists and register the vertex there so confinement
     // forces are applied during simulation.
-    if (sim && rope_idx >= 0) {
+    if (update_sim && sim && rope_idx >= 0) {
         if (mg->sim_group_idx < 0) {
             int sg = rope_sim_create_meta_group(sim, mg->confinement);
             if (sg >= 0) mg->sim_group_idx = sg;
@@ -2447,6 +2447,10 @@ static int32_t gp_table_meta_add_vertex_with_id(GP_TableContext* ctx, GP_MetaGro
         }
     }
     return 1;
+}
+
+static int32_t gp_table_meta_add_vertex_with_id(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t rope_id, int32_t rope_idx, int32_t vertex_idx) {
+    return gp_table_meta_add_vertex_with_id_internal(ctx, mg, rope_id, rope_idx, vertex_idx, true);
 }
 
 static void gp_table_queue_pending_meta_vertex(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t rope_id, int vertex_idx) {
@@ -6814,7 +6818,10 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
                 gp_table_queue_pending_meta_vertex(ctx, mg, want_uid, vp.second);
                 continue;
             }
-            gp_table_meta_add_vertex_with_id(ctx, mg, want_uid, resolved, vp.second);
+            // If we restored a RopeSim blob, preserve its meta-group membership
+            // (including saved member_u) rather than re-adding members.
+            const bool update_sim = !restored_sim_attached;
+            gp_table_meta_add_vertex_with_id_internal(ctx, mg, want_uid, resolved, vp.second, update_sim);
         }
         // If we registered an overlay earlier, attach a single rope (prefer
         // the dangling widget rope) to that canonical overlay.
