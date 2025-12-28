@@ -677,14 +677,14 @@ int32_t gp_table_render_rgba_with_state(
                     int ipy = static_cast<int>(std::lround(py));
                     if (!ctx->rope_sim) {
                         int max_ropes = 16;
-                        int max_segs = std::max(4, ctx->st.cable_segments);
+                        int max_segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->st.cable_segments);
                         ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
                         ctx->rope_id_to_sim_idx.clear();
                     }
                     float plug_z = -ctx->st.cable_plug_depth;
                     // create a single persistent prospective rope if not present
                     if (ctx->prospective_rope_idx < 0) {
-                        int segs = std::max(4, ctx->st.cable_segments);
+                        int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->st.cable_segments);
                         float slack = ctx->prospective_rope_length > 0.0f ? ctx->prospective_rope_length : 0.0f;
                         ctx->prospective_rope_idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(sx), static_cast<float>(sy), plug_z, static_cast<float>(ipx), static_cast<float>(ipy), plug_z, segs, slack);
                     } else {
@@ -699,10 +699,14 @@ int32_t gp_table_render_rgba_with_state(
                     // if no permanent edges will step the sim later, step now so prospective rope animates
                     if (ctx->edges.empty() && table_should_step_sim(ctx)) {
                         // freer whipping (lower damping) but stronger constraint solve so it settles quickly
-                        float gravity = 800.0f;
+                        uint32_t dbg = ctx->debug_flags;
+                        bool disable_sim = (dbg & GP_CANVAS_DEBUG_NO_SPRINGS) != 0u || (dbg & GP_CANVAS_DEBUG_RING_STATIC) != 0u;
+                        float gravity = (dbg & GP_CANVAS_DEBUG_NO_GRAVITY) ? 0.0f : 800.0f;
                         int constraint_iters = 8;
                         float damping = 0.86f;
-                        rope_sim_step(ctx->rope_sim, static_cast<float>(dt_frame), gravity, constraint_iters, damping);
+                        if (!disable_sim) {
+                            rope_sim_step(ctx->rope_sim, static_cast<float>(dt_frame), gravity, constraint_iters, damping);
+                        }
                     }
                     // draw prospective rope from sim vertices
                     if (ctx->prospective_rope_idx >= 0) {
@@ -764,7 +768,7 @@ int32_t gp_table_render_rgba_with_state(
         // ensure rope simulator exists
         if (!ctx->rope_sim) {
             int max_ropes = std::max<int>(1024, static_cast<int>(ctx->edges.size()) + 16);
-            int max_segs = std::max(4, ctx->st.cable_segments);
+            int max_segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->st.cable_segments);
             ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
             ctx->rope_id_to_sim_idx.clear();
         }
@@ -797,7 +801,7 @@ int32_t gp_table_render_rgba_with_state(
                 if (it != ctx->rope_id_to_sim_idx.end()) rope_idx = it->second;
             }
             if (rope_idx < 0) {
-                int segs = std::max(4, ctx->st.cable_segments);
+                int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->st.cable_segments);
                 float slack = 0.0f;
                 float plug_z = -ctx->st.cable_plug_depth;
                 int new_idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
@@ -824,11 +828,15 @@ int32_t gp_table_render_rgba_with_state(
         // default sim step (used by FIFO timing even when sim disabled)
         float sim_dt = 1.0f / 60.0f;
         if (table_should_step_sim(ctx)) {
-            float gravity = 800.0f;
+            uint32_t dbg = ctx->debug_flags;
+            bool disable_sim = (dbg & GP_CANVAS_DEBUG_NO_SPRINGS) != 0u || (dbg & GP_CANVAS_DEBUG_RING_STATIC) != 0u;
+            float gravity = (dbg & GP_CANVAS_DEBUG_NO_GRAVITY) ? 0.0f : 800.0f;
             int constraint_iters = 8;
             float damping = 0.86f;
             // use sim_dt (could be overridden in future if frame dt available)
-            rope_sim_step(ctx->rope_sim, sim_dt, gravity, constraint_iters, damping);
+            if (!disable_sim) {
+                rope_sim_step(ctx->rope_sim, sim_dt, gravity, constraint_iters, damping);
+            }
         }
 
         // Now render ropes from simulator vertices

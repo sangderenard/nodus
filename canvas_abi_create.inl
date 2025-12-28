@@ -148,6 +148,12 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         if (view_x >= bx && view_x < bx + bw) {
             if (canvas_dispatch_root_action(c, CANVAS_ACT_SIM_SEGS_INC)) return 1;
         }
+        // rope sim menu
+        int menu_w = std::max(bw, 36);
+        int menu_x = bx + bw + spacing;
+        if (view_x >= menu_x && view_x < menu_x + menu_w) {
+            if (canvas_dispatch_root_action(c, CANVAS_ACT_ROPE_MENU_TOGGLE)) return 1;
+        }
         // slack -
         int bx2 = c->width - 8 - bw*2 - spacing;
         if (view_x >= bx2 && view_x < bx2 + bw) {
@@ -157,6 +163,36 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         bx2 += bw + spacing;
         if (view_x >= bx2 && view_x < bx2 + bw) {
             if (canvas_dispatch_root_action(c, CANVAS_ACT_SIM_SLACK_INC)) return 1;
+        }
+    }
+    // rope sim menu (floating)
+    if (c->rope_menu_open) {
+        RopeMenuLayout layout = compute_rope_menu_layout(c);
+        if (view_x >= layout.x && view_x < layout.x + layout.w && view_y >= layout.y && view_y < layout.y + layout.h) {
+            int rel_y = view_y - layout.item_start_y;
+            if (rel_y >= 0) {
+                int row = rel_y / layout.row_h;
+                if (row == 0) {
+                    if (canvas_dispatch_root_action(c, CANVAS_ACT_ROPE_MODE_SIMPLE)) return 1;
+                } else if (row == 1) {
+                    if (canvas_dispatch_root_action(c, CANVAS_ACT_ROPE_MODE_FULL)) return 1;
+                } else if (row == 2 || row == 3) {
+                    RopeMenuCounterLayout counter = compute_rope_menu_counter_layout(layout, row);
+                    if (view_x >= counter.bx_minus && view_x < counter.bx_minus + counter.nbw &&
+                        view_y >= counter.by && view_y < counter.by + counter.h) {
+                        int action_id = (row == 2) ? CANVAS_ACT_SIM_SEGS_DEC : CANVAS_ACT_SIM_SLACK_DEC;
+                        if (canvas_dispatch_root_action(c, action_id)) return 1;
+                    }
+                    if (view_x >= counter.bx_plus && view_x < counter.bx_plus + counter.nbw &&
+                        view_y >= counter.by && view_y < counter.by + counter.h) {
+                        int action_id = (row == 2) ? CANVAS_ACT_SIM_SEGS_INC : CANVAS_ACT_SIM_SLACK_INC;
+                        if (canvas_dispatch_root_action(c, action_id)) return 1;
+                    }
+                }
+            }
+            return 1;
+        } else {
+            c->rope_menu_open = false;
         }
     }
     // check control bar button regions first — buttons are canvas-local coords (shifted down by rope_bar_h)
@@ -385,6 +421,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         }
         c->tool_menu_open = false;
         c->selected_tool_table = 0;
+        c->rope_menu_open = false;
     }
     if (c->plugin_menu_open) {
         PluginMenuLayout layout = compute_plugin_menu_layout(c, c->plugin_menu_module_idx, static_cast<int>(c->plugin_tool_ids.size()));
@@ -665,6 +702,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                                 c->tool_menu_open = false;
                                 c->selected_tool_table = 0;
                             }
+                            c->rope_menu_open = false;
                             return 1;
                         }
                         // Per-module pause/play and sim-toggle buttons (drawn in top UI)

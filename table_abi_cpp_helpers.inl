@@ -324,3 +324,16 @@ extern "C" void table_draw_rope_curve_blend(uint8_t* img, int w, int h, int pitc
 extern "C" void table_draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, const float* hues, int hue_count, int samples_per_segment, float hue_intensity) {
     draw_rope_curve_blend_colored(img, w, h, pitch, verts, count, jacket_px, jacket_border, hues, hue_count, samples_per_segment, hue_intensity);
 }
+
+extern "C" void table_draw_rope_polyline(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int radius, uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca) {
+    if (!img || !verts || count < 2) return;
+    Color col{cr, cg, cb, ca};
+    int use_radius = std::max(1, radius);
+    for (int i = 0; i + 1 < count; ++i) {
+        float x1 = verts[i * 2 + 0];
+        float y1 = verts[i * 2 + 1];
+        float x2 = verts[(i + 1) * 2 + 0];
+        float y2 = verts[(i + 1) * 2 + 1];
+        draw_segment_blend(img, w, h, pitch, x1, y1, x2, y2, use_radius, col);
+    }
+}

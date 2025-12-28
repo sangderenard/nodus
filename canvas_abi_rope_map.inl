@@ -1,3 +1,22 @@
+// Forward declare meta-group type so helpers can accept pointers without needing the full definition here.
+struct GP_MetaGroup;
+// Local copy of LassoConfig layout (header only forward-declares it).
+typedef struct LassoConfig {
+    uint32_t flags;
+    uint8_t widget_type;
+    uint8_t reserved[3];
+    float spring_min_rest;
+    float spring_reduce_rate;
+    uint8_t spring_mode;
+    uint8_t spring_reserved[3];
+} LassoConfig;
+
+// Forward declarations for helpers defined later.
+static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx);
+static RopeSim* canvas_root_sim(GP_CanvasContextImpl* ctx);
+static RopeSim* canvas_require_root_sim(GP_CanvasContextImpl* ctx);
+static uint64_t canvas_root_key_for_contact(int module_idx, int contact_idx);
+
 extern "C" int gp_canvas_register_table_rope_ids_from_array(GP_CanvasContext* ctx, GP_TableContext* table, const uint64_t* ids, int count) {
     if (!ctx || !ids || count <= 0) return 0;
     GP_CanvasContextImpl* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
@@ -257,6 +276,49 @@ extern "C" uint64_t gp_canvas_generate_module_uuid(GP_CanvasContext* ctx) {
     if (!ctx) return 0ull;
     GP_CanvasContextImpl* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
     return gp_canvas_generate_id(ctx, 0ull);
+}
+
+// Rope metadata exposure: rope-owned dense network and membership info.
+static RopeSim* canvas_table_sim(GP_CanvasContextImpl* c, GP_TableContext* t) {
+    if (!t && c) t = c->container_table;
+    return t ? gp_table_get_rope_sim(t) : nullptr;
+}
+
+extern "C" int gp_canvas_get_rope_meta_owner(GP_CanvasContext* ctx_, GP_TableContext* table, int rope_idx) {
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    RopeSim* sim = canvas_table_sim(c, table);
+    if (!sim) return -1;
+    int owner = -1;
+    if (rope_sim_get_rope_meta_owner(sim, rope_idx, &owner)) return owner;
+    return -1;
+}
+
+extern "C" int gp_canvas_get_rope_rings(GP_CanvasContext* ctx_, GP_TableContext* table, int rope_idx, int* out_ids, int max_count) {
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    RopeSim* sim = canvas_table_sim(c, table);
+    if (!sim) return 0;
+    return rope_sim_get_rope_rings(sim, rope_idx, out_ids, max_count);
+}
+
+extern "C" int gp_canvas_get_rope_meta_groups(GP_CanvasContext* ctx_, GP_TableContext* table, int rope_idx, int* out_groups, int max_count) {
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    RopeSim* sim = canvas_table_sim(c, table);
+    if (!sim) return 0;
+    return rope_sim_get_rope_meta_groups(sim, rope_idx, out_groups, max_count);
+}
+
+extern "C" int gp_canvas_is_meta_rope(GP_CanvasContext* ctx_, GP_TableContext* table, int rope_idx) {
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    RopeSim* sim = canvas_table_sim(c, table);
+    if (!sim) return 0;
+    return rope_sim_is_meta_rope(sim, rope_idx);
+}
+
+extern "C" int gp_canvas_get_meta_vertices(GP_CanvasContext* ctx_, GP_TableContext* table, int rope_idx, int* out_vertices, int max_count) {
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    RopeSim* sim = canvas_table_sim(c, table);
+    if (!sim) return 0;
+    return rope_sim_get_meta_vertices(sim, rope_idx, out_vertices, max_count);
 }
 
 extern "C" int gp_canvas_set_module_uuid(GP_CanvasContext* ctx, int module_idx, uint64_t module_uuid) {
@@ -643,6 +705,7 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->lasso_id_map.clear();
     ctx->next_overlay_id = 1;
     ctx->tool_menu_open = false;
+    ctx->rope_menu_open = false;
     int max_window_node = 0;
     for (const auto &entry : ctx->window_node_ids) {
         max_window_node = std::max(max_window_node, entry.second);
@@ -832,7 +895,36 @@ static void canvas_record_key_input(GP_CanvasContextImpl* ctx, int key, int acti
 // forward declarations for helpers used by interactive and deserialization paths
 static int canvas_create_overlay_and_attach(GP_CanvasContextImpl* c, GP_TableContext* t, float ox1, float oy1, float ox2, float oy2, unsigned long long* out_key_a, unsigned long long* out_key_b);
 static void canvas_create_and_register_ring(GP_CanvasContextImpl* c, GP_TableContext* tbl, GP_MetaGroup* mg, int first_rope_for_ring_local, int first_vid_for_ring_local, float saved_u_override);
-static void canvas_finalize_lasso_meta_group(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int first_rope_for_ring_local, int first_vid_for_ring_local, float saved_u_override);
+static bool canvas_spawn_lasso_anchor_module(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int anchor_rope_idx, uint64_t anchor_rope_uid);
+static void canvas_finalize_lasso_meta_group(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int first_rope_for_ring_local, int first_vid_for_ring_local, float saved_u_override, int lasso_rope_idx, float spawn_x, float spawn_y);
+static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx);
+static int canvas_spawn_meta_rope_module(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int lasso_rope_idx, float cx, float cy);
+static int canvas_create_lasso_meta_rope(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, float cx, float cy);
+
+// Sync a root-table rope's endpoints to explicit world coordinates. This ensures
+// the canonical RopeSim used for lasso/meta operations matches the on-screen
+// cable geometry.
+static void canvas_sync_root_rope_endpoints(GP_CanvasContextImpl* ctx, const GP_CanvasEdgeDesc& desc, float ax, float ay, float bx, float by) {
+    if (!ctx) return;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    RopeSim* sim = canvas_root_sim(ctx);
+    if (!root || !sim) return;
+    gp_table_apply_pending_ops(root);
+    uint64_t ka = canvas_root_key_for_contact(desc.a_module, desc.a_contact_idx);
+    uint64_t kb = canvas_root_key_for_contact(desc.b_module, desc.b_contact_idx);
+    int edge_idx = -1;
+    if (!gp_table_edge_index_for_pair(root, ka, kb, &edge_idx)) return;
+    int id_count = gp_table_get_rope_id_count(root);
+    if (edge_idx < 0 || edge_idx >= id_count) return;
+    std::vector<uint64_t> ids(static_cast<size_t>(id_count));
+    int got = gp_table_get_rope_ids(root, ids.data(), id_count);
+    if (got <= edge_idx) return;
+    uint64_t rid = ids[static_cast<size_t>(edge_idx)];
+    int rsi = gp_table_resolve_rope_id_to_sim_index(root, rid);
+    if (rsi < 0) return;
+    float plug_z = -10.0f;
+    rope_sim_move_endpoints3(sim, rsi, ax, ay, plug_z, bx, by, plug_z);
+}
 
 static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, bool down, bool up) {
     if (!ctx) return;
@@ -878,45 +970,9 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                 float pts[2] = { fx, fy };
                 ctx->lasso_cb(ctx->lasso_cb_user, 1, pts, 1);
             }
-            // Create a prospective rope in the table's sim so the UI shows
-            // a temporary rope while the user is drawing. Use table-local
-            // coords so projection/rendering aligns.
-            GP_TableContext* tbl_start = ctx->container_table;
-            if (!tbl_start && ctx->root_module_idx >= 0 && ctx->root_module_idx < static_cast<int>(ctx->module_tables.size())) {
-                tbl_start = ctx->module_tables[ctx->root_module_idx];
-            }
-            if (tbl_start) {
-                RopeSim* sim = gp_table_get_rope_sim(tbl_start);
-                if (!sim) {
-                    RopeSim* rootsim = canvas_root_sim(ctx);
-                    if (!rootsim) rootsim = canvas_require_root_sim(ctx);
-                    if (rootsim) { gp_table_attach_rope_sim(tbl_start, rootsim, 0); sim = gp_table_get_rope_sim(tbl_start); }
-                }
-                if (sim) {
-                    // compute table-local offset for host module if present
-                    float table_off_x = 0.0f, table_off_y = 0.0f;
-                    int host_mod = -1;
-                    for (int mi = 0; mi < static_cast<int>(ctx->module_tables.size()); ++mi) {
-                        if (ctx->module_tables[mi] == tbl_start) { host_mod = mi; break; }
-                    }
-                    if (host_mod >= 0) {
-                        const auto &m = ctx->modules[host_mod];
-                        int top_h = std::min(m.h, kModuleTopUiHeight);
-                        table_off_x = static_cast<float>(m.x);
-                        table_off_y = static_cast<float>(m.y + top_h);
-                    }
-                    float sx_local = fx - table_off_x;
-                    float sy_local = fy - table_off_y;
-                    float plug_z = -10.0f;
-                    int segs = 2;
-                    int rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, sx_local, sy_local, plug_z, segs, 0.0f);
-                    if (rope_idx >= 0) {
-                        ctx->prospective_rope_idx = rope_idx;
-                        gp_table_set_prospective_rope_index(tbl_start, rope_idx);
-                        /* prospective rope creation log removed */
-                    }
-                }
-            }
+            // Defer module spawn until mouse-up so it only appears after intersections.
+            ctx->lasso_module_idx = -1;
+            ctx->lasso_rope_idx = -1;
         } else if (up) {
             // finalize lasso: if we have any points, process intersections
             if (!ctx->lasso_points.empty()) {
@@ -935,6 +991,7 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                 GP_TableContext* tbl = ctx->container_table;
                 int first_rope_for_ring = -1;
                 int first_vid_for_ring = -1;
+                float first_u_for_ring = -1.0f;
                 if (!tbl && ctx->root_module_idx >= 0 && ctx->root_module_idx < static_cast<int>(ctx->module_tables.size())) {
                     tbl = ctx->module_tables[ctx->root_module_idx];
                 }
@@ -977,70 +1034,93 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                             }
                         }
                         if (sim) {
+                            GP_TableGeom g{};
+                            gp_table_get_geom(tbl, &g);
+                            // offsets computed below; log geom only
+                            printf("lasso: table geom w=%d h=%d\n", g.width_px, g.height_px);
                             // Build table-local lasso points. If this table is hosted
                             // inside a module, convert world coords -> table-local so
                             // intersections use the same space as projected verts.
                             float table_off_x = 0.0f;
                             float table_off_y = 0.0f;
                             int host_mod = -1;
-                            for (int mi = 0; mi < static_cast<int>(ctx->module_tables.size()); ++mi) {
-                                if (ctx->module_tables[mi] == tbl) { host_mod = mi; break; }
+                            bool is_container = (tbl == ctx->container_table);
+                            if (!is_container) {
+                                for (int mi = 0; mi < static_cast<int>(ctx->module_tables.size()); ++mi) {
+                                    if (ctx->module_tables[mi] == tbl) { host_mod = mi; break; }
+                                }
+                                if (host_mod >= 0) {
+                                    const auto& m = ctx->modules[host_mod];
+                                    int top_h = std::min(m.h, kModuleTopUiHeight);
+                                    table_off_x = static_cast<float>(m.x);
+                                    table_off_y = static_cast<float>(m.y + top_h);
+                                }
                             }
-                            if (host_mod >= 0) {
-                                const auto& m = ctx->modules[host_mod];
-                                int top_h = std::min(m.h, kModuleTopUiHeight);
-                                table_off_x = static_cast<float>(m.x);
-                                table_off_y = static_cast<float>(m.y + top_h);
-                            }
+                            printf("lasso: table_off=(%.2f,%.2f) host_mod=%d\n", table_off_x, table_off_y, host_mod);
 
                             std::vector<std::pair<float,float>> lasso_local;
                             lasso_local.reserve(ctx->lasso_points.size());
                             for (const auto &p : ctx->lasso_points) {
                                 lasso_local.emplace_back(p.first - table_off_x, p.second - table_off_y);
                             }
+                            // Log lasso segments for diagnostics
+                            printf("lasso: lasso_local pts=%zu\n", lasso_local.size());
+                            for (size_t li = 0; li + 1 < lasso_local.size(); ++li) {
+                                printf("  lasso seg[%zu]=(%.2f,%.2f)->(%.2f,%.2f)\n",
+                                    li, lasso_local[li].first, lasso_local[li].second,
+                                    lasso_local[li+1].first, lasso_local[li+1].second);
+                            }
 
-                            // Collect rope indices to test — id-first.
-                            // Only consider rope indices that have a canonical persistent id
-                            // (local table -> container/root -> BFS) so we never test
-                            // attached-only ropes without canonical ids.
+                            // Collect rope indices to test.
                             std::unordered_set<int> rope_set;
-                            int32_t edge_count = gp_table_get_edge_count(tbl);
-                            for (int32_t ei = 0; ei < edge_count; ++ei) {
-                                int32_t rope_idx = -1;
-                                if (!gp_table_get_edge_rope_index(tbl, ei, &rope_idx)) continue;
-                                if (rope_idx < 0) continue;
-                                uint64_t pid = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, rope_idx);
-                                if (pid != 0ull) rope_set.insert(rope_idx);
-                            }
-
-                            // Also include ropes referenced in the canvas registry that share
-                            // the same RopeSim as the current table (allows top-level ropes
-                            // hosted on root/container tables to be discovered).
-                            for (const auto &kv : ctx->rope_id_map) {
-                                GP_TableContext* rt = kv.second.table;
-                                if (!rt) continue;
-                                RopeSim* rt_sim = gp_table_get_rope_sim(rt);
-                                if (!rt_sim || rt_sim != sim) continue;
-                                int rsi = gp_table_resolve_rope_id_to_sim_index(rt, kv.second.rope_id);
-                                if (rsi >= 0) rope_set.insert(rsi);
-                            }
-
-                            // Prefer any explicit per-table rope id list for this table
-                            // (adds indices which have non-zero per-table ids).
-                            int local_cnt = gp_table_get_rope_id_count(tbl);
-                            if (local_cnt > 0) {
-                                std::vector<uint64_t> tmp(static_cast<size_t>(local_cnt));
-                                int got = gp_table_get_rope_ids(tbl, tmp.data(), local_cnt);
-                                if (got > 0) {
-                                    for (int ri = 0; ri < got; ++ri) {
-                                        if (tmp[static_cast<size_t>(ri)] != 0ull) rope_set.insert(ri);
+                            if (is_container) {
+                                RopeSim* rootsim = canvas_root_sim(ctx);
+                                if (rootsim) {
+                                    for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+                                        int rsi = ctx->edges[ei].rope_idx;
+                                        if (rsi < 0) continue;
+                                        int vc = rope_sim_get_vertex_count(rootsim, rsi);
+                                        if (vc <= 1) continue;
+                                        rope_set.insert(rsi);
+                                        uint64_t rid = ctx->edges[ei].rope_uid;
+                                        if (rid == 0ull) rid = gp_canvas_generate_id(reinterpret_cast<GP_CanvasContext*>(ctx), 0ull);
+                                        if (rid != 0ull) {
+                                            gp_table_bind_rope_id_to_sim_index(tbl, rid, rsi);
+                                            ctx->rope_id_map[rid] = RopeIdEntry{tbl, rid};
+                                            ctx->edges[ei].rope_uid = rid;
+                                        }
                                     }
                                 }
-                            }
+                            } else {
+                                int32_t edge_count = gp_table_get_edge_count(tbl);
+                                for (int32_t ei = 0; ei < edge_count; ++ei) {
+                                    int32_t rope_idx = -1;
+                                    if (!gp_table_get_edge_rope_index(tbl, ei, &rope_idx)) continue;
+                                    if (rope_idx < 0) continue;
+                                    uint64_t pid = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, rope_idx);
+                                    if (pid != 0ull) rope_set.insert(rope_idx);
+                                }
 
-                            // Scan the attached RopeSim for active ropes and keep only those
-                            // that resolve to canonical ids via the standard lookup.
-                            {
+                                for (const auto &kv : ctx->rope_id_map) {
+                                    GP_TableContext* rt = kv.second.table;
+                                    if (!rt) continue;
+                                    RopeSim* rt_sim = gp_table_get_rope_sim(rt);
+                                    if (!rt_sim || rt_sim != sim) continue;
+                                    int rsi = gp_table_resolve_rope_id_to_sim_index(rt, kv.second.rope_id);
+                                    if (rsi >= 0) rope_set.insert(rsi);
+                                }
+
+                                int local_cnt = gp_table_get_rope_id_count(tbl);
+                                if (local_cnt > 0) {
+                                    std::vector<uint64_t> tmp(static_cast<size_t>(local_cnt));
+                                    int got = gp_table_get_rope_ids(tbl, tmp.data(), local_cnt);
+                                    if (got > 0) {
+                                        for (int ri = 0; ri < got; ++ri) {
+                                            if (tmp[static_cast<size_t>(ri)] != 0ull) rope_set.insert(ri);
+                                        }
+                                    }
+                                }
+
                                 const int kScanMax = 128;
                                 for (int ri = 0; ri < kScanMax; ++ri) {
                                     int vc = rope_sim_get_vertex_count(sim, ri);
@@ -1053,36 +1133,76 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                             printf("lasso: finalize points=%zu rope_set=%zu tbl=%p sim=%p\n",
                                 ctx->lasso_points.size(), rope_set.size(), (void*)tbl, (void*)sim);
 
-                            int first_rope_for_ring = -1;
-                            int first_vid_for_ring = -1;
+                            // track first intersected rope for anchor ring
+                            std::set<int> hit_ropes;
                             for (int rope_idx : rope_set) {
+                                if (hit_ropes.find(rope_idx) != hit_ropes.end()) continue;
                                 int vc = rope_sim_get_vertex_count(sim, rope_idx);
                                 if (vc <= 1) continue;
                                 std::vector<float> proj_xy(static_cast<size_t>(vc * 2));
                                 int got = gp_table_get_projected_rope_vertices(tbl, rope_idx, proj_xy.data(), static_cast<int>(proj_xy.size()));
                                 if (got != vc) continue;
-                                // for each straight physics segment, test against lasso segments
+                                bool rope_hit = false;
+                                float min_dist = 1e9f;
+                                // Also log raw sim vertices for comparison
+                                std::vector<float> verts3(static_cast<size_t>(vc * 3));
+                                rope_sim_get_vertices3(sim, rope_idx, verts3.data(), static_cast<int>(verts3.size()));
+                                printf("lasso: testing rope=%d vc=%d raw_xyz:", rope_idx, vc);
+                                for (int vi = 0; vi < vc; ++vi) {
+                                    printf(" (%.2f,%.2f,%.2f)", verts3[3*vi+0], verts3[3*vi+1], verts3[3*vi+2]);
+                                }
+                                printf("\n");
+                                // Build segment list (projected).
+                                struct Seg { float x0,y0,x1,y1; };
+                                std::vector<Seg> segs;
                                 for (int ri = 0; ri < vc - 1; ++ri) {
                                     float rx0 = proj_xy[2*ri+0]; float ry0 = proj_xy[2*ri+1];
                                     float rx1 = proj_xy[2*(ri+1)+0]; float ry1 = proj_xy[2*(ri+1)+1];
+                                    segs.push_back({rx0, ry0, rx1, ry1});
+                                }
+                                // Also print projected verts for diagnostic purposes
+                                printf("lasso: projected rope=%d vc=%d segs=%zu\n", rope_idx, vc, segs.size());
+                                printf("lasso: proj_xy:");
+                                for (int vi = 0; vi < vc; ++vi) {
+                                    printf(" (%.2f,%.2f)", proj_xy[2*vi+0], proj_xy[2*vi+1]);
+                                }
+                                printf("\n");
+                                // If the rope appears to be a closed loop (last->first non-negligible), include wrap-around segment
+                                if (vc > 1) {
+                                    float lx0 = proj_xy[0]; float ly0 = proj_xy[1];
+                                    float lx1 = proj_xy[2*(vc-1)+0]; float ly1 = proj_xy[2*(vc-1)+1];
+                                    float dx = lx0 - lx1; float dy = ly0 - ly1;
+                                    if ((dx*dx + dy*dy) > 1e-6f) {
+                                        // include last->first as an additional segment for diagnostics
+                                        segs.push_back({lx1, ly1, lx0, ly0});
+                                    }
+                                }
+                                for (size_t si = 0; si < segs.size() && !rope_hit; ++si) {
+                                    auto s = segs[si];
+                                    printf("  rope seg[%zu]=(%.2f,%.2f)->(%.2f,%.2f)\n", si, s.x0, s.y0, s.x1, s.y1);
                                     for (size_t li = 0; li + 1 < lasso_local.size(); ++li) {
                                         float lx0 = lasso_local[li].first; float ly0 = lasso_local[li].second;
                                         float lx1 = lasso_local[li+1].first; float ly1 = lasso_local[li+1].second;
                                         float ix=0, iy=0;
-                                        if (seg_intersect(rx0,ry0,rx1,ry1,lx0,ly0,lx1,ly1,&ix,&iy)) {
-                                                float d0 = (ix-rx0)*(ix-rx0)+(iy-ry0)*(iy-ry0);
-                                                float d1 = (ix-rx1)*(ix-rx1)+(iy-ry1)*(iy-ry1);
+                                        if (seg_intersect(s.x0,s.y0,s.x1,s.y1,lx0,ly0,lx1,ly1,&ix,&iy)) {
+                                                rope_hit = true;
+                                                float d0 = (ix-s.x0)*(ix-s.x0)+(iy-s.y0)*(iy-s.y0);
+                                                float d1 = (ix-s.x1)*(ix-s.x1)+(iy-s.y1)*(iy-s.y1);
                                                 // compute fractional parameter along projected segment
-                                                float sx = rx1 - rx0; float sy = ry1 - ry0;
+                                                float sx = s.x1 - s.x0; float sy = s.y1 - s.y0;
                                                 float denom = sx*sx + sy*sy;
                                                 float t = 0.0f;
-                                                if (denom > 1e-8f) t = ((ix - rx0) * sx + (iy - ry0) * sy) / denom;
+                                                if (denom > 1e-8f) t = ((ix - s.x0) * sx + (iy - s.y0) * sy) / denom;
                                                 if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
-                                                int new_vid = gp_table_rope_insert_vertex(tbl, static_cast<int32_t>(rope_idx), ri, t);
+                                                float u_param = 0.0f;
+                                                if (vc > 1) {
+                                                    u_param = (static_cast<float>(si) + t) / static_cast<float>(vc - 1);
+                                                }
+                                                int new_vid = gp_table_rope_insert_vertex(tbl, static_cast<int32_t>(rope_idx), static_cast<int>(si), t);
                                                 // make meta-group lazily when first vertex is about to be added
                                                 if (!mg) mg = gp_table_meta_create(tbl);
                                                 if (new_vid < 0) {
-                                                    int pick = (d0 <= d1) ? ri : (ri+1);
+                                                    int pick = (d0 <= d1) ? static_cast<int>(si) : static_cast<int>(si+1);
                                                     // Use canonical canvas lookup for persistent id (local -> up -> BFS)
                                                     uint64_t persistent_id = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, rope_idx);
                                                     if (persistent_id == 0ull) {
@@ -1092,7 +1212,12 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                                                     }
                                                     gp_table_meta_add_vertex(tbl, mg, static_cast<int32_t>(rope_idx), static_cast<int32_t>(pick));
                                                     printf("lasso: added existing vertex rope=%d vid=%d pid=%llu to mg=%p at ix=%.2f,iy=%.2f (tbl_mod=%d)\n", rope_idx, pick, (unsigned long long)persistent_id, (void*)mg, ix, iy, host_mod);
-                                                    if (first_rope_for_ring < 0) { first_rope_for_ring = rope_idx; first_vid_for_ring = pick; }
+                                                    gp_table_meta_set_vertex_u(tbl, mg, rope_idx, pick, u_param);
+                                                    int sim_idx = -1;
+                                                    if (gp_table_meta_get_sim_group_index(tbl, mg, &sim_idx) && sim_idx >= 0) {
+                                                        rope_sim_meta_group_set_member_u(sim, sim_idx, rope_idx, pick, u_param);
+                                                    }
+                                                    if (first_rope_for_ring < 0) { first_rope_for_ring = rope_idx; first_vid_for_ring = pick; first_u_for_ring = u_param; }
                                                 } else {
                                                     // Use canonical canvas lookup for persistent id (local -> up -> BFS)
                                                     uint64_t persistent_id = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, rope_idx);
@@ -1103,11 +1228,31 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                                                     }
                                                     gp_table_meta_add_vertex(tbl, mg, static_cast<int32_t>(rope_idx), static_cast<int32_t>(new_vid));
                                                     printf("lasso: inserted vertex rope=%d vid=%d pid=%llu to mg=%p at t=%.3f ix=%.2f,iy=%.2f (tbl_mod=%d)\n", rope_idx, new_vid, (unsigned long long)persistent_id, (void*)mg, t, ix, iy, host_mod);
-                                                    if (first_rope_for_ring < 0) { first_rope_for_ring = rope_idx; first_vid_for_ring = new_vid; }
+                                                    gp_table_meta_set_vertex_u(tbl, mg, rope_idx, new_vid, u_param);
+                                                    int sim_idx = -1;
+                                                    if (gp_table_meta_get_sim_group_index(tbl, mg, &sim_idx) && sim_idx >= 0) {
+                                                        rope_sim_meta_group_set_member_u(sim, sim_idx, rope_idx, new_vid, u_param);
+                                                    }
+                                                    if (first_rope_for_ring < 0) { first_rope_for_ring = rope_idx; first_vid_for_ring = new_vid; first_u_for_ring = u_param; }
                                                 }
+                                            rope_hit = true;
+                                            hit_ropes.insert(rope_idx);
                                             break;
                                         }
+                                        // track nearest approach for diagnostics
+                                        float vx = lx1 - lx0; float vy = ly1 - ly0;
+                                        float wx = s.x0 - lx0; float wy = s.y0 - ly0;
+                                        float seg_len = vx*vx + vy*vy;
+                                        float tproj = (seg_len > 1e-6f) ? (wx*vx + wy*vy) / seg_len : 0.0f;
+                                        tproj = std::clamp(tproj, 0.0f, 1.0f);
+                                        float px = lx0 + tproj * vx;
+                                        float py = ly0 + tproj * vy;
+                                        float dd = (s.x0 - px)*(s.x0 - px) + (s.y0 - py)*(s.y0 - py);
+                                        if (dd < min_dist) min_dist = dd;
                                     }
+                                }
+                                if (!rope_hit) {
+                                    printf("lasso: no intersection for rope=%d (vc=%d) against %zu lasso segments (min_dist=%.2f)\n", rope_idx, vc, lasso_local.size() > 0 ? lasso_local.size() - 1 : 0, std::sqrt(min_dist));
                                 }
                             }
                         }
@@ -1130,7 +1275,6 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                                     }
                                 }
                                 // Recompute vcount directly from internal storage as a cross-check
-                                int direct_vcount = 0;
                                 if (tbl) {
                                     // find mg in ctx meta_groups and inspect directly
                                     bool found = false;
@@ -1158,28 +1302,17 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                                     // get created with a visible widget.
                                     int default_widget_type = 1; // non-zero default
                                     gp_table_meta_set_lasso_fields(tbl, mg, ctx->selected_tool_subgroup_flags, default_widget_type);
-                                    // Create a dangling widget attached to the meta-group (conceptual object).
-                                    // Do this before enabling edge-springs so the T-off center is
-                                    // a genuine member when the sim builds edge-springs.
-                                    if (gp_table_meta_create_widget(tbl, mg)) {
-                                        printf("lasso: created dangling widget for mg=%p\n", (void*)mg);
-                                    }
-                                    // Enable edge-springs connecting the found vertices so
-                                    // the set compresses over time. Use conservative
-                                    // defaults: minimum rest length and a linear reduction
-                                    // rate (units per second).
-                                    float min_rest = 2.0f;
-                                    float reduce_rate = 50.0f;
-                                    if (gp_table_meta_enable_edge_springs(tbl, mg, min_rest, reduce_rate)) {
-                                        printf("lasso: enabled edge-springs for mg=%p min_rest=%.2f rate=%.2f\n", (void*)mg, min_rest, reduce_rate);
-                                    }
                                     // Create a ring at the first added rope/vertex so the renderer will show a small sampled ring.
                                     // Prefer registering the ring on the root table when both tables share the same RopeSim
                                     int first_rope_for_ring_local = first_rope_for_ring;
                                     int first_vid_for_ring_local = first_vid_for_ring;
-                                    if (first_rope_for_ring_local >= 0 && first_vid_for_ring_local >= 0) {
-                                        canvas_finalize_lasso_meta_group(ctx, tbl, mg, first_rope_for_ring_local, first_vid_for_ring_local, 0.0f);
-                                    }
+                                    printf("lasso: before finalize mg=%p vcount=%d first_rope=%d first_vid=%d\n",
+                                        (void*)mg, gp_table_meta_get_vertex_count(tbl, mg), first_rope_for_ring_local, first_vid_for_ring_local);
+                                    canvas_finalize_lasso_meta_group(ctx, tbl, mg, first_rope_for_ring_local, first_vid_for_ring_local, first_u_for_ring, ctx->lasso_rope_idx, fx, fy);
+                                    printf("lasso: finalized mg=%p on tbl=%p vcount=%d mg_total=%d\n",
+                                        (void*)mg, (void*)tbl,
+                                        gp_table_meta_get_vertex_count(tbl, mg),
+                                        gp_table_get_meta_group_count(tbl));
                                 }
                                 // dispatch lasso-end event with collected points
                                 if (ctx->lasso_cb && !ctx->lasso_points.empty()) {
@@ -1188,6 +1321,8 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                                     for (int i = 0; i < n; ++i) { pts[2*i+0] = ctx->lasso_points[static_cast<size_t>(i)].first; pts[2*i+1] = ctx->lasso_points[static_cast<size_t>(i)].second; }
                                     ctx->lasso_cb(ctx->lasso_cb_user, 3, pts.data(), n);
                                 }
+                    } else {
+                        printf("lasso: finalize aborted with mg=null (no intersections)\n");
                     }
                 }
             }
@@ -1196,7 +1331,7 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
             if (!tbl_clear && ctx->root_module_idx >= 0 && ctx->root_module_idx < static_cast<int>(ctx->module_tables.size())) {
                 tbl_clear = ctx->module_tables[ctx->root_module_idx];
             }
-            if (tbl_clear && ctx->prospective_rope_idx >= 0) {
+            if (tbl_clear && ctx->prospective_rope_idx >= 0 && ctx->prospective_rope_idx != ctx->lasso_rope_idx) {
                 gp_table_set_prospective_rope_index(tbl_clear, -1);
                 /* cleared prospective rope log removed */
                 ctx->prospective_rope_idx = -1;
@@ -1213,8 +1348,8 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
                     ctx->lasso_points.emplace_back(fx, fy);
                     /* lasso sample log removed */
                     if (ctx->lasso_cb) { float pts[2] = { fx, fy }; ctx->lasso_cb(ctx->lasso_cb_user, 2, pts, 1); }
-                    // update prospective rope endpoints if present
-                    if (ctx->prospective_rope_idx >= 0) {
+                    // update prospective rope endpoints if present and not the meta rope
+                    if (ctx->prospective_rope_idx >= 0 && ctx->prospective_rope_idx != ctx->lasso_rope_idx) {
                         GP_TableContext* tbl_upd = ctx->container_table;
                         if (!tbl_upd && ctx->root_module_idx >= 0 && ctx->root_module_idx < static_cast<int>(ctx->module_tables.size())) {
                             tbl_upd = ctx->module_tables[ctx->root_module_idx];
@@ -1265,15 +1400,86 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
     }
 }
 
-// Finalize a meta-group after vertices have been added: set anchor, create
-// dangling widget, enable edge-springs, and create/register a ring using the
-// same logic as the interactive lasso. This does NOT dispatch lasso callbacks.
-static void canvas_finalize_lasso_meta_group(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int first_rope_for_ring_local, int first_vid_for_ring_local, float saved_u_override) {
+// Finalize a meta-group after vertices have been added: set anchor, enforce
+// dense ring topology, enable edge-springs, and create/register rings. This
+static int canvas_find_module_loopback_edge(const GP_CanvasContextImpl* ctx, int module_idx) {
+    if (!ctx || module_idx < 0) return -1;
+    for (int ei = static_cast<int>(ctx->edges.size()) - 1; ei >= 0; --ei) {
+        const auto &e = ctx->edges[static_cast<size_t>(ei)].desc;
+        if (e.a_module == module_idx && e.b_module == module_idx && e.a_contact_idx == 1 && e.b_contact_idx == 0) return ei;
+    }
+    return -1;
+}
+
+static int canvas_create_lasso_rope_for_module(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, int module_idx) {
+    if (!ctx || !tbl || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return -1;
+    GP_TableContext* root = canvas_ensure_root_table(ctx);
+    if (!root) return -1;
+    RopeSim* sim = gp_table_get_rope_sim(root);
+    if (!sim) sim = canvas_require_root_sim(ctx);
+    if (sim && gp_table_get_rope_sim(tbl) != sim) {
+        gp_table_attach_rope_sim(tbl, sim, 0);
+    }
+    if (!sim) return -1;
+    gp_table_apply_pending_ops(root);
+    uint64_t ka = (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) |
+                  (static_cast<uint64_t>(1u) << 16);
+    uint64_t kb = (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) |
+                  (static_cast<uint64_t>(0u) << 16);
+    int edge_idx = -1;
+    if (!gp_table_edge_index_for_pair(root, ka, kb, &edge_idx)) {
+        if (!gp_table_edge_index_for_pair(root, kb, ka, &edge_idx)) {
+            printf("canvas_create_lasso_rope_for_module: no loopback edge for module=%d\n", module_idx);
+            return -1;
+        }
+    }
+    int rope_idx = -1;
+    if (!gp_table_get_edge_rope_index(root, edge_idx, &rope_idx) || rope_idx < 0) {
+        printf("canvas_create_lasso_rope_for_module: missing rope for edge_idx=%d module=%d\n", edge_idx, module_idx);
+        return -1;
+    }
+    uint64_t rid = 0ull;
+    int id_count = gp_table_get_rope_id_count(root);
+    if (edge_idx >= 0 && edge_idx < id_count) {
+        std::vector<uint64_t> ids(static_cast<size_t>(id_count));
+        int got = gp_table_get_rope_ids(root, ids.data(), id_count);
+        if (edge_idx < got) rid = ids[static_cast<size_t>(edge_idx)];
+    }
+    if (rid == 0ull) {
+        rid = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, rope_idx);
+    }
+    if (rid != 0ull) {
+        gp_table_bind_rope_id_to_sim_index(tbl, rid, rope_idx);
+        ctx->rope_id_map[rid] = RopeIdEntry{tbl, rid};
+    }
+    ctx->lasso_rope_idx = rope_idx;
+    ctx->prospective_rope_idx = rope_idx;
+    int eidx = canvas_find_module_loopback_edge(ctx, module_idx);
+    if (eidx >= 0 && eidx < static_cast<int>(ctx->edges.size())) {
+        ctx->edges[static_cast<size_t>(eidx)].rope_idx = rope_idx;
+        if (rid != 0ull) ctx->edges[static_cast<size_t>(eidx)].rope_uid = rid;
+        // Align the root rope geometry with the new module's port positions.
+        const auto &m = ctx->modules[static_cast<size_t>(module_idx)];
+        float margin_y = 12.0f;
+        float span = std::max(1.0f, float(m.h) - 2.0f * margin_y);
+        float in_y = float(m.y) + margin_y + 0.5f * span;
+        float out_y = in_y;
+        float in_x = float(m.x) + 10.0f;
+        float out_x = float(m.x + m.w) - 10.0f;
+        float plug_z = -10.0f;
+        // Use a hard set here so the rope spawns at rest (no endpoint velocity).
+        rope_sim_set_endpoints3(sim, rope_idx, in_x, in_y, plug_z, out_x, out_y, plug_z);
+    }
+    return rope_idx;
+}
+
+// does NOT dispatch lasso callbacks.
+static void canvas_finalize_lasso_meta_group(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int first_rope_for_ring_local, int first_vid_for_ring_local, float saved_u_override, int lasso_rope_idx, float spawn_x, float spawn_y) {
     if (!ctx || !tbl || !mg) return;
     int mg_vcount = gp_table_meta_get_vertex_count(tbl, mg);
     int sim_idx = -999; gp_table_meta_get_sim_group_index(tbl, mg, &sim_idx);
     unsigned long long mgid = 0ull; gp_table_meta_get_id(tbl, mg, &mgid);
-    printf("canvas_finalize_lasso_meta_group: mg=%p id=%llu vcount=%d sim_group_idx=%d tbl=%p\n", (void*)mg, (unsigned long long)mgid, mg_vcount, sim_idx, (void*)tbl);
+    printf("canvas_finalize_lasso_meta_group: mg=%p id=%llu vcount=%d sim_group_idx=%d tbl=%p first_rope=%d first_vid=%d\n", (void*)mg, (unsigned long long)mgid, mg_vcount, sim_idx, (void*)tbl, first_rope_for_ring_local, first_vid_for_ring_local);
     if (sim_idx >= 0 && mgid != 0ull) {
         ctx->lasso_id_map[mgid] = sim_idx;
         printf("canvas_finalize_lasso_meta_group: registered lasso_id=%llu -> sim_idx=%d\n", (unsigned long long)mgid, sim_idx);
@@ -1298,22 +1504,190 @@ static void canvas_finalize_lasso_meta_group(GP_CanvasContextImpl* ctx, GP_Table
     if (first_rope_for_ring_local >= 0 && first_vid_for_ring_local >= 0) {
         gp_table_meta_set_anchor(tbl, mg, first_rope_for_ring_local, first_vid_for_ring_local);
     }
-    // Create dangling widget attached to the meta-group
-    if (gp_table_meta_create_widget(tbl, mg)) {
-        printf("canvas_finalize_lasso_meta_group: created dangling widget for mg=%p\n", (void*)mg);
+    printf("canvas_finalize_lasso_meta_group: before anchor rope count=%d mg_count_on_tbl=%d\n",
+           gp_table_get_edge_count(tbl),
+           gp_table_get_meta_group_count(tbl));
+    RopeSim* sim = gp_table_get_rope_sim(tbl);
+    if (!sim || sim_idx < 0) {
+        printf("canvas_finalize_lasso_meta_group: missing sim (sim=%p sim_idx=%d)\n",
+               (void*)sim, sim_idx);
+        return;
     }
-    // Enable edge-springs
-    float min_rest = 2.0f;
-    float reduce_rate = 50.0f;
-    // store spring params on the meta-group so they persist through save/load
+    // Spawn the module at mouse-up before proceeding with meta construction.
+    if (ctx->lasso_module_idx < 0) {
+        float cx_spawn = spawn_x + kModuleDefaultWidth * 0.5f;
+        float cy_spawn = spawn_y + kModuleDefaultHeight * 0.5f;
+        int mod = canvas_spawn_meta_rope_module(ctx, tbl, mg, -1, cx_spawn, cy_spawn);
+        ctx->lasso_module_idx = mod;
+    }
+    if (ctx->lasso_module_idx < 0) {
+        printf("canvas_finalize_lasso_meta_group: failed to spawn module; aborting\n");
+        return;
+    }
+    if (ctx->lasso_rope_idx < 0) {
+        canvas_create_lasso_rope_for_module(ctx, tbl, ctx->lasso_module_idx);
+    }
+    if (ctx->lasso_rope_idx < 0) {
+        printf("canvas_finalize_lasso_meta_group: failed to create lasso rope; aborting\n");
+        return;
+    }
+    lasso_rope_idx = ctx->lasso_rope_idx;
+    float table_off_x = 0.0f, table_off_y = 0.0f;
+    if (tbl != ctx->container_table) {
+        int host_mod = -1;
+        for (int mi = 0; mi < static_cast<int>(ctx->module_tables.size()); ++mi) {
+            if (ctx->module_tables[mi] == tbl) { host_mod = mi; break; }
+        }
+        if (host_mod >= 0) {
+            const auto &m = ctx->modules[host_mod];
+            int top_h = std::min(m.h, kModuleTopUiHeight);
+            table_off_x = static_cast<float>(m.x);
+            table_off_y = static_cast<float>(m.y + top_h);
+        }
+    }
+    // Compute centroid from non-lasso members for star center placement.
+    float cx = 0.0f, cy = 0.0f;
+    int samples = 0;
+    for (int vi = 0; vi < mg_vcount; ++vi) {
+        int r = -1, v = -1;
+        if (!gp_table_meta_get_vertex(tbl, mg, vi, &r, &v)) continue;
+        if (r == lasso_rope_idx) continue;
+        float pos[3] = {0.0f, 0.0f, 0.0f};
+        if (rope_sim_meta_group_get_member_world_pos(sim, sim_idx, vi, pos)) {
+            // Member positions are table-local; convert to canvas coords for the meta rope.
+            cx += pos[0] + table_off_x;
+            cy += pos[1] + table_off_y;
+            ++samples;
+        }
+    }
+    if (samples > 0) {
+        cx /= static_cast<float>(samples);
+        cy /= static_cast<float>(samples);
+    } else {
+        // fallback to lasso rope midpoint
+        int vc = rope_sim_get_vertex_count(sim, lasso_rope_idx);
+        if (vc > 1) {
+            std::vector<float> verts3(static_cast<size_t>(vc * 3));
+            rope_sim_get_vertices3(sim, lasso_rope_idx, verts3.data(), static_cast<int>(verts3.size()));
+            int mid = vc / 2;
+            cx = verts3[static_cast<size_t>(mid) * 3 + 0];
+            cy = verts3[static_cast<size_t>(mid) * 3 + 1];
+        }
+    }
+    // Force dense ring topology for lasso-generated groups.
+    gp_table_meta_set_ring_mode(tbl, mg, 2);
+    rope_sim_meta_group_set_mode(sim, sim_idx, 2);
+    rope_sim_set_rope_meta_owner(sim, lasso_rope_idx, sim_idx);
+    // Keep the lasso rope geometry minimal; insert a dedicated centroid vertex
+    // and pick a separate stem vertex closest to u=0.5.
+    int vc = rope_sim_get_vertex_count(sim, lasso_rope_idx);
+    if (vc < 2) {
+        rope_sim_insert_vertex(sim, lasso_rope_idx, 0, 0.5f);
+        vc = rope_sim_get_vertex_count(sim, lasso_rope_idx);
+    }
+    int segs = std::max(1, vc - 1);
+    int mid_seg = std::clamp(segs / 2, 0, segs - 1);
+    int centroid_idx = rope_sim_insert_vertex(sim, lasso_rope_idx, mid_seg, 0.5f);
+    vc = rope_sim_get_vertex_count(sim, lasso_rope_idx);
+    if (centroid_idx < 0) centroid_idx = std::clamp(mid_seg, 0, std::max(0, vc - 1));
+    int stem_idx = -1;
+    float best_du = 1e9f;
+    for (int vi = 0; vi < vc; ++vi) {
+        if (vi == centroid_idx) continue;
+        float u = (vc > 1) ? (static_cast<float>(vi) / static_cast<float>(vc - 1)) : 0.5f;
+        float du = std::fabs(u - 0.5f);
+        if (du < best_du) { best_du = du; stem_idx = vi; }
+    }
+    if (stem_idx < 0) stem_idx = std::clamp(centroid_idx, 0, std::max(0, vc - 1));
+    rope_sim_set_vertex_position(sim, lasso_rope_idx, centroid_idx, cx, cy, -10.0f);
+    bool has_centroid = false;
+    bool has_stem = false;
+    for (int vi = 0; vi < mg_vcount; ++vi) {
+        int r = -1, v = -1;
+        if (!gp_table_meta_get_vertex(tbl, mg, vi, &r, &v)) continue;
+        if (r != lasso_rope_idx) continue;
+        if (v == centroid_idx) has_centroid = true;
+        if (v == stem_idx) has_stem = true;
+    }
+    if (!has_centroid) {
+        gp_table_meta_add_vertex(tbl, mg, lasso_rope_idx, centroid_idx);
+        float cu = (vc > 1) ? (static_cast<float>(centroid_idx) / static_cast<float>(vc - 1)) : 0.5f;
+        gp_table_meta_set_vertex_u(tbl, mg, lasso_rope_idx, centroid_idx, cu);
+        mg_vcount = gp_table_meta_get_vertex_count(tbl, mg);
+    }
+    if (!has_stem) {
+        gp_table_meta_add_vertex(tbl, mg, lasso_rope_idx, stem_idx);
+        gp_table_meta_set_vertex_u(tbl, mg, lasso_rope_idx, stem_idx, 0.5f);
+        mg_vcount = gp_table_meta_get_vertex_count(tbl, mg);
+    }
+    int stem_member_idx = -1;
+    for (int vi = 0; vi < mg_vcount; ++vi) {
+        int r = -1, v = -1;
+        if (!gp_table_meta_get_vertex(tbl, mg, vi, &r, &v)) continue;
+        if (r == lasso_rope_idx && v == stem_idx) { stem_member_idx = vi; break; }
+    }
+    rope_sim_meta_group_set_star_center(sim, sim_idx, lasso_rope_idx, centroid_idx);
+    // Mark lasso rope as meta rope and store all its vertices.
+    int vc_all = rope_sim_get_vertex_count(sim, lasso_rope_idx);
+    std::vector<int> meta_vertices;
+    meta_vertices.reserve(static_cast<size_t>(vc_all));
+    for (int vi = 0; vi < vc_all; ++vi) meta_vertices.push_back(vi);
+    rope_sim_mark_meta_rope(sim, lasso_rope_idx, meta_vertices.data(), static_cast<int>(meta_vertices.size()));
+    // Ensure the meta rope has a persistent id bound to this table for endpoint registration.
+    uint64_t rid = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, lasso_rope_idx);
+    if (rid == 0ull) {
+        rid = gp_canvas_generate_id(reinterpret_cast<GP_CanvasContext*>(ctx), 0ull);
+        gp_table_bind_rope_id_to_sim_index(tbl, rid, lasso_rope_idx);
+        ctx->rope_id_map[rid] = RopeIdEntry{tbl, rid};
+    }
+    // Enable edge-springs (use lasso-config values if present)
+    LassoConfig lc{};
+    gp_table_meta_get_lasso_config(tbl, mg, &lc);
+    float min_rest = (lc.spring_min_rest > 0.0f) ? lc.spring_min_rest : 8.0f;
+    float reduce_rate = (lc.spring_reduce_rate > 0.0f) ? lc.spring_reduce_rate : 20.0f;
     gp_table_meta_set_edge_spring_params(tbl, mg, min_rest, reduce_rate, 0);
     if (gp_table_meta_enable_edge_springs(tbl, mg, min_rest, reduce_rate)) {
         printf("canvas_finalize_lasso_meta_group: enabled edge-springs for mg=%p min_rest=%.2f rate=%.2f\n", (void*)mg, min_rest, reduce_rate);
     }
-    // Create/register ring if we have a rope+vertex
-    if (first_rope_for_ring_local >= 0 && first_vid_for_ring_local >= 0) {
-        canvas_create_and_register_ring(ctx, tbl, mg, first_rope_for_ring_local, first_vid_for_ring_local, saved_u_override);
+    // Create rings for all non-lasso members, plus the stem ring at u=0.5.
+    if (mgid != 0ull) {
+        uint32_t mg_flags = 0u;
+        gp_table_meta_get_subgroup_flags(tbl, mg, &mg_flags);
+        std::set<std::pair<int,int>> seen;
+        for (int vi = 0; vi < mg_vcount; ++vi) {
+            int r = -1, v = -1;
+            if (!gp_table_meta_get_vertex(tbl, mg, vi, &r, &v)) continue;
+            if (r == lasso_rope_idx) continue;
+            auto key = std::make_pair(r, v);
+            if (seen.insert(key).second) {
+                int vcount = rope_sim_get_vertex_count(sim, r);
+                float u = -1.0f;
+                gp_table_meta_get_vertex_u(tbl, mg, vi, &u);
+                if (!(u >= 0.0f && u <= 1.0f)) {
+                    u = (vcount > 1) ? (static_cast<float>(v) / static_cast<float>(vcount - 1)) : 0.5f;
+                }
+                int ring_id = gp_table_create_ring(tbl, r, u);
+                if (ring_id >= 0) {
+                    rope_sim_bind_ring_to_member(sim, ring_id, sim_idx, vi);
+                    int ring_entry = gp_table_register_ring_edge(tbl, ring_id, mgid);
+                    if (ring_entry >= 0 && mg_flags != 0u) gp_table_ring_set_subgroup_flags(tbl, ring_entry, mg_flags);
+                }
+            }
+        }
+        int stem_ring = gp_table_create_ring(tbl, lasso_rope_idx, 0.5f);
+        if (stem_ring >= 0) {
+            if (stem_member_idx >= 0) {
+                rope_sim_bind_ring_to_member(sim, stem_ring, sim_idx, stem_member_idx);
+            }
+            int ring_entry = gp_table_register_ring_edge(tbl, stem_ring, mgid);
+            if (ring_entry >= 0 && mg_flags != 0u) gp_table_ring_set_subgroup_flags(tbl, ring_entry, mg_flags);
+        }
     }
+    printf("canvas_finalize_lasso_meta_group: complete mg=%p now vcount=%d sim_idx=%d table_mg_count=%d\n",
+           (void*)mg,
+           gp_table_meta_get_vertex_count(tbl, mg),
+           sim_idx,
+           gp_table_get_meta_group_count(tbl));
 }
 
 // Helper: create an overlay at given canvas coords, ensure the table has a
@@ -1346,7 +1720,7 @@ static int canvas_create_overlay_and_attach(GP_CanvasContextImpl* c, GP_TableCon
         float fx_local = ox2 - table_off_x;
         float fy_local = oy2 - table_off_y;
         float plug_z = -10.0f;
-        int segs = 2;
+        int segs = (c->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : 2;
         rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
     }
     unsigned long long ka = 0ull, kb = 0ull;
@@ -1356,6 +1730,99 @@ static int canvas_create_overlay_and_attach(GP_CanvasContextImpl* c, GP_TableCon
         if (rope_idx >= 0) gp_canvas_attach_rope_to_overlay(reinterpret_cast<GP_CanvasContext*>(c), ka, kb, rope_idx);
     }
     return rope_idx;
+}
+
+// Create a normal module and a lasso/meta rope bound to its first in/out ports.
+static int canvas_create_lasso_meta_rope(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, float cx, float cy) {
+    if (!ctx || !tbl) return -1;
+    RopeSim* sim = gp_table_get_rope_sim(tbl);
+    if (!sim) {
+        RopeSim* rootsim = canvas_root_sim(ctx);
+        if (!rootsim) rootsim = canvas_require_root_sim(ctx);
+        if (rootsim) gp_table_attach_rope_sim(tbl, rootsim, 0);
+        sim = gp_table_get_rope_sim(tbl);
+    }
+    if (!sim) return -1;
+    int mod = canvas_spawn_meta_rope_module(ctx, tbl, nullptr, -1, cx, cy);
+    if (mod < 0) return -1;
+    ctx->lasso_module_idx = mod;
+    // Compute approximate port positions on the module.
+    const auto &m = ctx->modules[static_cast<size_t>(mod)];
+    float margin_y = 12.0f;
+    float span = std::max(1.0f, float(m.h) - 2.0f * margin_y);
+    float step = span;
+    float in_y = float(m.y) + margin_y + 0.5f * step;
+    float out_y = in_y;
+    float in_x = float(m.x) + 10.0f;
+    float out_x = float(m.x + m.w) - 10.0f;
+    float plug_z = -10.0f;
+    int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : 2;
+    int rope_idx = rope_sim_add_rope3(sim, in_x, in_y, plug_z, out_x, out_y, plug_z, segs, 0.0f);
+    if (rope_idx < 0) return -1;
+    ctx->lasso_rope_idx = rope_idx;
+    ctx->prospective_rope_idx = rope_idx;
+    // Bind rope to the module edge (output->input).
+    if (!ctx->edges.empty()) {
+        int eidx = static_cast<int>(ctx->edges.size() - 1);
+        if (eidx >= 0 && eidx < static_cast<int>(ctx->edges.size())) {
+            uint64_t rid = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, rope_idx);
+            if (rid == 0ull) {
+                rid = gp_canvas_generate_id(reinterpret_cast<GP_CanvasContext*>(ctx), 0ull);
+                gp_table_bind_rope_id_to_sim_index(tbl, rid, rope_idx);
+                ctx->rope_id_map[rid] = RopeIdEntry{tbl, rid};
+            }
+            ctx->edges[static_cast<size_t>(eidx)].rope_idx = rope_idx;
+            ctx->edges[static_cast<size_t>(eidx)].rope_uid = rid;
+        }
+    }
+    return rope_idx;
+}
+
+// Spawn a normal module and bind the lasso/meta rope to its first in/out ports.
+static int canvas_spawn_meta_rope_module(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int lasso_rope_idx, float cx, float cy) {
+    if (!ctx || !tbl) return -1;
+    GP_CanvasModuleDesc md{};
+    md.w = kModuleDefaultWidth; md.h = kModuleDefaultHeight;
+    md.x = static_cast<int>(std::round(cx - md.w * 0.5f));
+    md.y = static_cast<int>(std::round(cy - md.h * 0.5f));
+    std::memset(md.label, 0, sizeof(md.label));
+    std::memcpy(md.label, LABEL_MODULE_TABLE, std::min<size_t>(std::strlen(LABEL_MODULE_TABLE), sizeof(md.label) - 1));
+    int mod = gp_canvas_add_module(reinterpret_cast<GP_CanvasContext*>(ctx), &md);
+    if (mod < 0) return -1;
+    gp_canvas_create_table(reinterpret_cast<GP_CanvasContext*>(ctx), mod);
+    if (mod < static_cast<int>(ctx->module_io_in_count.size())) ctx->module_io_in_count[mod] = 1;
+    if (mod < static_cast<int>(ctx->module_io_out_count.size())) ctx->module_io_out_count[mod] = 1;
+    // Force IO layout so ports exist immediately.
+    int prev_focus = ctx->focused_module;
+    ctx->focused_module = mod;
+    sync_module_table_io_layout(ctx, mod);
+    ctx->focused_module = prev_focus;
+
+    // Create edge between output->input and bind lasso rope to it.
+    GP_CanvasEdgeDesc ed{};
+    ed.a_module = mod; ed.a_contact_idx = 1; // output
+    ed.b_module = mod; ed.b_contact_idx = 0; // input
+    int eidx = gp_canvas_add_edge(reinterpret_cast<GP_CanvasContext*>(ctx), &ed);
+    if (eidx >= 0 && eidx < static_cast<int>(ctx->edges.size())) {
+        uint64_t rid = 0ull;
+        if (lasso_rope_idx >= 0) {
+            rid = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, lasso_rope_idx);
+        }
+        if (lasso_rope_idx >= 0) {
+            if (rid == 0ull) {
+                rid = gp_canvas_generate_id(reinterpret_cast<GP_CanvasContext*>(ctx), 0ull);
+                gp_table_bind_rope_id_to_sim_index(tbl, rid, lasso_rope_idx);
+                ctx->rope_id_map[rid] = RopeIdEntry{tbl, rid};
+            }
+            ctx->edges[static_cast<size_t>(eidx)].rope_idx = lasso_rope_idx;
+            ctx->edges[static_cast<size_t>(eidx)].rope_uid = rid;
+        }
+        uint32_t sflags = 0;
+        if (mg && gp_table_meta_get_subgroup_flags(tbl, mg, &sflags)) {
+            ctx->edges[static_cast<size_t>(eidx)].subgroup_flags = sflags;
+        }
+    }
+    return mod;
 }
 
 // Helper: from first rope+vertex metadata, create a ring using the same
@@ -1388,10 +1855,152 @@ static void canvas_create_and_register_ring(GP_CanvasContextImpl* c, GP_TableCon
         if (ring_id >= 0) {
             unsigned long long mgid = 0ull;
             if (!gp_table_meta_get_id(reg_tbl, mg, &mgid)) mgid = 0ull;
-            gp_table_register_ring_edge(reg_tbl, ring_id, mgid);
+            int ring_entry = gp_table_register_ring_edge(reg_tbl, ring_id, mgid);
+            uint32_t flags = 0u;
+            gp_table_meta_get_subgroup_flags(reg_tbl, mg, &flags);
+            if (ring_entry >= 0 && flags != 0u) gp_table_ring_set_subgroup_flags(reg_tbl, ring_entry, flags);
             printf("canvas_create_and_register_ring: created ring id=%d on rope=%d u=%.3f registered mgid=%llu\n", ring_id, first_rope_for_ring_local, u, (unsigned long long)mgid);
         }
     }
+}
+
+// Create a minimal anchor module at the centroid of the meta-group members,
+// add a single input/output rope between its first contacts, and join that
+// rope into the provided meta-group with a ring for visibility.
+static bool canvas_spawn_lasso_anchor_module(GP_CanvasContextImpl* ctx, GP_TableContext* tbl, GP_MetaGroup* mg, int anchor_rope_idx, uint64_t anchor_rope_uid) {
+    if (!ctx || !tbl || !mg) return false;
+    RopeSim* sim = gp_table_get_rope_sim(tbl);
+    if (!sim) {
+        RopeSim* rootsim = canvas_root_sim(ctx);
+        if (!rootsim) rootsim = canvas_require_root_sim(ctx);
+        if (rootsim) {
+            gp_table_attach_rope_sim(tbl, rootsim, 0);
+            sim = gp_table_get_rope_sim(tbl);
+        }
+    }
+    int sim_idx = -1;
+    gp_table_meta_get_sim_group_index(tbl, mg, &sim_idx);
+    if (!sim || sim_idx < 0) {
+        printf("lasso_anchor: no sim or sim_idx for mg=%p tbl=%p sim=%p sim_idx=%d\n", (void*)mg, (void*)tbl, (void*)sim, sim_idx);
+        return false;
+    }
+    int member_count = gp_table_meta_get_vertex_count(tbl, mg);
+    if (member_count <= 0) {
+        printf("lasso_anchor: mg=%p has no members; skipping anchor\n", (void*)mg);
+        return false;
+    }
+
+    float table_off_x = 0.0f, table_off_y = 0.0f;
+    if (tbl != ctx->container_table) {
+        int host_mod = -1;
+        for (int mi = 0; mi < static_cast<int>(ctx->module_tables.size()); ++mi) {
+            if (ctx->module_tables[mi] == tbl) { host_mod = mi; break; }
+        }
+        if (host_mod >= 0) {
+            const auto &m = ctx->modules[host_mod];
+            int top_h = std::min(m.h, kModuleTopUiHeight);
+            table_off_x = static_cast<float>(m.x);
+            table_off_y = static_cast<float>(m.y + top_h);
+        }
+    }
+
+    float cx = 0.0f, cy = 0.0f;
+    int samples = 0;
+    for (int i = 0; i < member_count; ++i) {
+        float pos[3] = {0.0f, 0.0f, 0.0f};
+        if (rope_sim_meta_group_get_member_world_pos(sim, sim_idx, i, pos)) {
+            // Member positions are table-local; convert to canvas coords.
+            cx += pos[0] + table_off_x;
+            cy += pos[1] + table_off_y;
+            ++samples;
+        } else {
+            printf("lasso_anchor: failed to sample member %d\n", i);
+        }
+    }
+    if (samples <= 0) {
+        printf("lasso_anchor: could not sample member positions for mg=%p\n", (void*)mg);
+        return false;
+    }
+    cx /= static_cast<float>(samples);
+    cy /= static_cast<float>(samples);
+
+    // Convert centroid to table-local coords (if table is hosted in a module)
+    float lx = cx - table_off_x;
+    float ly = cy - table_off_y;
+    float plug_z = -10.0f;
+    int rope_idx = anchor_rope_idx;
+    if (rope_idx < 0) {
+        printf("lasso_anchor: no anchor rope provided; skipping module spawn\n");
+        return false;
+    }
+    uint64_t anchor_rid = anchor_rope_uid;
+    if (anchor_rid == 0ull) {
+        anchor_rid = gp_canvas_find_persistent_rope_id(reinterpret_cast<GP_CanvasContext*>(ctx), tbl, rope_idx);
+        if (anchor_rid == 0ull) anchor_rid = gp_canvas_generate_id(reinterpret_cast<GP_CanvasContext*>(ctx), 0ull);
+    }
+    gp_table_bind_rope_id_to_sim_index(tbl, anchor_rid, rope_idx);
+    ctx->rope_id_map[anchor_rid] = RopeIdEntry{tbl, anchor_rid};
+
+    // Use the existing rope as anchor: add its midpoint as meta vertex/anchor.
+    int vc = rope_sim_get_vertex_count(sim, rope_idx);
+    int anchor_vid = (vc > 1) ? std::max(0, std::min(vc - 1, vc / 2)) : 0;
+    gp_table_meta_add_vertex(tbl, mg, rope_idx, anchor_vid);
+    gp_table_meta_set_anchor(tbl, mg, rope_idx, anchor_vid);
+
+    // Spawn a small canvas module at the centroid with one input and one output,
+    // and attach the anchor rope to its first edge for data endpoints.
+    GP_CanvasModuleDesc md{};
+    md.w = kModuleDefaultWidth; md.h = kModuleDefaultHeight;
+    md.x = static_cast<int>(std::round(cx - md.w * 0.5f));
+    md.y = static_cast<int>(std::round(cy - md.h * 0.5f));
+    std::memset(md.label, 0, sizeof(md.label));
+    std::memcpy(md.label, LABEL_MODULE_TABLE, std::min<size_t>(std::strlen(LABEL_MODULE_TABLE), sizeof(md.label) - 1));
+    int anchor_mod = gp_canvas_add_module(reinterpret_cast<GP_CanvasContext*>(ctx), &md);
+    if (anchor_mod >= 0) {
+        gp_canvas_create_table(reinterpret_cast<GP_CanvasContext*>(ctx), anchor_mod);
+    }
+    if (anchor_mod >= 0 && anchor_mod < static_cast<int>(ctx->module_io_in_count.size())) {
+        ctx->module_io_in_count[anchor_mod] = 1;
+    }
+    if (anchor_mod >= 0 && anchor_mod < static_cast<int>(ctx->module_io_out_count.size())) {
+        ctx->module_io_out_count[anchor_mod] = 1;
+    }
+    if (anchor_mod >= 0) {
+        // Force-build IO layout so hitboxes exist even if this module isn't focused.
+        int prev_focus = ctx->focused_module;
+        ctx->focused_module = anchor_mod;
+        sync_module_table_io_layout(ctx, anchor_mod);
+        ctx->focused_module = prev_focus;
+        GP_TableContext* mt = (anchor_mod < static_cast<int>(ctx->module_tables.size())) ? ctx->module_tables[anchor_mod] : nullptr;
+        if (mt && gp_table_get_rope_sim(mt) != sim) gp_table_attach_rope_sim(mt, sim, 0);
+        if (mt) {
+            gp_table_bind_rope_id_to_sim_index(mt, anchor_rid, rope_idx);
+            ctx->rope_id_map[anchor_rid] = RopeIdEntry{mt, anchor_rid};
+        }
+        GP_CanvasEdgeDesc ed{};
+        ed.a_module = anchor_mod; ed.a_contact_idx = 1; // output
+        ed.b_module = anchor_mod; ed.b_contact_idx = 0; // input
+        int eidx = gp_canvas_add_edge(reinterpret_cast<GP_CanvasContext*>(ctx), &ed);
+        if (eidx >= 0 && eidx < static_cast<int>(ctx->edges.size())) {
+            ctx->edges[static_cast<size_t>(eidx)].rope_idx = rope_idx;
+            ctx->edges[static_cast<size_t>(eidx)].rope_uid = anchor_rid;
+            uint32_t sflags = 0;
+            if (gp_table_meta_get_subgroup_flags(tbl, mg, &sflags)) {
+                ctx->edges[static_cast<size_t>(eidx)].subgroup_flags = sflags;
+            }
+        }
+        // Snap the anchor rope endpoints roughly to the first input/output contact centers.
+        const auto &m = ctx->modules[static_cast<size_t>(anchor_mod)];
+        float margin_y = 12.0f;
+        float span = std::max(1.0f, float(m.h) - 2.0f * margin_y);
+        float step = span; // only one contact each side
+        float in_y = float(m.y) + margin_y + 0.5f * step;
+        float out_y = in_y;
+        float in_x = float(m.x) + 10.0f;
+        float out_x = float(m.x + m.w) - 10.0f;
+        rope_sim_set_endpoints3(sim, rope_idx, in_x, in_y, plug_z, out_x, out_y, plug_z);
+    }
+    return true;
 }
 static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
     if (hb.row_idx >= 0) return hb.row_idx;
@@ -2054,6 +2663,9 @@ enum CanvasActionId {
     CANVAS_ACT_MENU_TOOL_CLONE = 2109,
     CANVAS_ACT_MENU_TOOL_RECT = 2110,
     CANVAS_ACT_MENU_TOOL_NUMBER = 2111,
+    CANVAS_ACT_ROPE_MENU_TOGGLE = 2112,
+    CANVAS_ACT_ROPE_MODE_SIMPLE = 2113,
+    CANVAS_ACT_ROPE_MODE_FULL = 2114,
 };
 
 struct InputRayLight {
@@ -2434,6 +3046,28 @@ struct PluginMenuLayout {
     int item_count = 0;
 };
 
+struct RopeMenuLayout {
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+    int header_h = 0;
+    int row_h = 0;
+    int item_start_y = 0;
+};
+
+struct RopeMenuCounterLayout {
+    int bx_minus = 0;
+    int bx_num = 0;
+    int bx_plus = 0;
+    int by = 0;
+    int nbw = 0;
+    int num_w = 0;
+    int h = 0;
+    int label_x = 0;
+    int label_w = 0;
+};
+
 static ToolMenuLayout compute_tool_menu_layout(const GP_CanvasContextImpl* ctx) {
     ToolMenuLayout layout{};
     if (!ctx) return layout;
@@ -2470,6 +3104,54 @@ static ToolMenuLayout compute_tool_menu_layout(const GP_CanvasContextImpl* ctx) 
     layout.table_control_y = table_start_y + header_h;
     layout.table_control_h = row_h;
     return layout;
+}
+
+static RopeMenuLayout compute_rope_menu_layout(const GP_CanvasContextImpl* ctx) {
+    RopeMenuLayout layout{};
+    if (!ctx) return layout;
+    const int padding = 8;
+    const int margin = 12;
+    const int header_h = 18;
+    const int row_h = 22;
+    const int row_count = 4;
+    const int w = 220;
+    int h = padding * 2 + header_h + row_h * row_count;
+    int bw = std::max(8, ctx->rope_bar_h - 8);
+    int spacing = 8;
+    int menu_btn_x = 8 + (bw + spacing) * 2;
+    int x = std::clamp(menu_btn_x, margin, std::max(margin, ctx->width - w - margin));
+    int y = ctx->rope_bar_h + ctx->control_bar_h + margin;
+    layout.x = x;
+    layout.y = y;
+    layout.w = w;
+    layout.h = h;
+    layout.header_h = header_h;
+    layout.row_h = row_h;
+    layout.item_start_y = y + padding + header_h;
+    return layout;
+}
+
+static RopeMenuCounterLayout compute_rope_menu_counter_layout(const RopeMenuLayout& layout, int row_idx) {
+    RopeMenuCounterLayout out{};
+    const int padding = 8;
+    const int gap = 8;
+    const int label_w = 64;
+    int control_x = layout.x + padding;
+    int control_w = layout.w - padding * 2;
+    int control_h = std::max(18, layout.row_h - 2);
+    int nbw = control_h;
+    int num_w = std::max(32, control_w - label_w - nbw * 2 - gap * 2);
+    int bx_minus = control_x + label_w;
+    out.bx_minus = bx_minus;
+    out.bx_num = bx_minus + nbw + gap;
+    out.bx_plus = out.bx_num + num_w + gap;
+    out.by = layout.item_start_y + row_idx * layout.row_h + 1;
+    out.nbw = nbw;
+    out.num_w = num_w;
+    out.h = control_h;
+    out.label_x = control_x;
+    out.label_w = label_w;
+    return out;
 }
 
 static PluginMenuLayout compute_plugin_menu_layout(const GP_CanvasContextImpl* ctx, int module_idx, int item_count) {
@@ -2603,6 +3285,137 @@ static ToolMenuCounterLayout compute_tool_menu_counter_layout(const ToolMenuLayo
     return out;
 }
 
+struct CanvasTableSnapshot {
+    GP_TableContext* table = nullptr;
+    std::vector<char> data;
+};
+
+static bool canvas_strip_table_rope_blob(const std::vector<char>& in_buf, std::vector<char>& out_buf) {
+    if (in_buf.size() < 8 + 4 + 4 + sizeof(GP_TableStyle)) return false;
+    const char* base = in_buf.data();
+    const char* p = base;
+    const char* end = base + in_buf.size();
+    p += 8; // magic
+    if (p + 4 > end) return false; // version
+    p += 4;
+    if (p + 4 > end) return false;
+    int32_t atlas_count = 0;
+    std::memcpy(&atlas_count, p, 4); p += 4;
+    if (atlas_count < 0) return false;
+    if (p + static_cast<size_t>(atlas_count) * 8 > end) return false;
+    p += static_cast<size_t>(atlas_count) * 8;
+    if (p + sizeof(GP_TableStyle) > end) return false;
+    p += sizeof(GP_TableStyle);
+    if (p + 4 > end) return false;
+    int32_t col_count = 0;
+    std::memcpy(&col_count, p, 4); p += 4;
+    if (col_count < 0 || col_count > 8) return false;
+    if (p + static_cast<size_t>(col_count) * sizeof(GP_TableColumn) > end) return false;
+    p += static_cast<size_t>(col_count) * sizeof(GP_TableColumn);
+    if (p + 4 > end) return false;
+    int32_t row_count = 0;
+    std::memcpy(&row_count, p, 4); p += 4;
+    if (row_count < 0) return false;
+    if (p + static_cast<size_t>(row_count) * sizeof(GP_TableRow) > end) return false;
+    p += static_cast<size_t>(row_count) * sizeof(GP_TableRow);
+    if (p + 4 > end) return false;
+    int32_t edge_count = 0;
+    std::memcpy(&edge_count, p, 4); p += 4;
+    if (edge_count < 0) return false;
+    if (p + static_cast<size_t>(edge_count) * sizeof(uint64_t) * 2 > end) return false;
+    p += static_cast<size_t>(edge_count) * sizeof(uint64_t) * 2;
+    if (p + 4 > end) return false;
+    int32_t rope_id_count = 0;
+    std::memcpy(&rope_id_count, p, 4); p += 4;
+    if (rope_id_count < 0) return false;
+    if (p + static_cast<size_t>(rope_id_count) * sizeof(uint64_t) > end) return false;
+    p += static_cast<size_t>(rope_id_count) * sizeof(uint64_t);
+    if (p + 4 > end) return false;
+    int32_t sel_count = 0;
+    std::memcpy(&sel_count, p, 4); p += 4;
+    if (sel_count < 0) return false;
+    if (p + static_cast<size_t>(sel_count) * sizeof(uint64_t) > end) return false;
+    p += static_cast<size_t>(sel_count) * sizeof(uint64_t);
+    if (p + 8 > end) return false;
+    p += 8; // module uuid
+    if (p + 4 > end) return false;
+    int32_t fpcount = 0;
+    std::memcpy(&fpcount, p, 4); p += 4;
+    if (fpcount < 0) return false;
+    if (p + static_cast<size_t>(fpcount) * (4 + 4 + 8) > end) return false;
+    p += static_cast<size_t>(fpcount) * (4 + 4 + 8);
+
+    const char* len_ptr = p;
+    if (p + 4 > end) return false;
+    int32_t rope_blob_len = 0;
+    std::memcpy(&rope_blob_len, p, 4);
+    if (rope_blob_len < 0) return false;
+    const char* blob_start = p + 4;
+    const char* blob_end = blob_start + rope_blob_len;
+    if (blob_end > end) return false;
+    if (rope_blob_len == 0) {
+        out_buf = in_buf;
+        return true;
+    }
+    out_buf.resize(in_buf.size() - static_cast<size_t>(rope_blob_len));
+    size_t prefix_len = static_cast<size_t>(len_ptr - base);
+    std::memcpy(out_buf.data(), in_buf.data(), prefix_len);
+    int32_t zero = 0;
+    std::memcpy(out_buf.data() + prefix_len, &zero, 4);
+    size_t suffix_len = static_cast<size_t>(end - blob_end);
+    std::memcpy(out_buf.data() + prefix_len + 4, blob_end, suffix_len);
+    return true;
+}
+
+static void canvas_reinstantiate_all_ropes(GP_CanvasContextImpl* ctx) {
+    if (!ctx) return;
+    std::vector<CanvasTableSnapshot> snapshots;
+    std::unordered_set<GP_TableContext*> seen;
+    auto capture = [&](GP_TableContext* t) {
+        if (!t || seen.find(t) != seen.end()) return;
+        int need = gp_table_serialize(t, nullptr, 0);
+        if (need <= 0) return;
+        std::vector<char> raw(static_cast<size_t>(need));
+        int wrote = gp_table_serialize(t, raw.data(), need);
+        if (wrote != need) return;
+        CanvasTableSnapshot snap{};
+        snap.table = t;
+        if (!canvas_strip_table_rope_blob(raw, snap.data)) {
+            snap.data = std::move(raw);
+        }
+        snapshots.push_back(std::move(snap));
+        seen.insert(t);
+    };
+    capture(ctx->container_table);
+    for (GP_TableContext* t : ctx->module_tables) capture(t);
+    if (snapshots.empty()) return;
+
+    for (GP_TableContext* t : seen) {
+        gp_table_attach_rope_sim(t, nullptr, 0);
+    }
+    ctx->rope_id_map.clear();
+    ctx->prospective_rope_idx = -1;
+    ctx->lasso_rope_idx = -1;
+
+    int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->sim_segs);
+    for (auto &snap : snapshots) {
+        if (!snap.table || snap.data.empty()) continue;
+        gp_table_deserialize(snap.table, snap.data.data(), static_cast<int32_t>(snap.data.size()));
+        gp_table_set_debug_flags(snap.table, ctx->debug_flags);
+        gp_table_set_cable_segments(snap.table, segs);
+    }
+
+    RopeSim* sim = rope_sim_create(1024, segs);
+    GP_TableContext* root = ctx->container_table;
+    if (root) gp_table_attach_rope_sim(root, sim, 1);
+    for (GP_TableContext* t : ctx->module_tables) {
+        if (t && t != root) gp_table_attach_rope_sim(t, sim, 0);
+    }
+    if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+        gp_canvas_mark_rope_map_dirty(cvs);
+    }
+}
+
 static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SIM_SEGS_DEC, CANVAS_ACT_SIM_SEGS_DEC },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_SIM_SEGS_INC, CANVAS_ACT_SIM_SEGS_INC },
@@ -2668,6 +3481,9 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_CLONE, CANVAS_ACT_MENU_TOOL_CLONE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_RECT, CANVAS_ACT_MENU_TOOL_RECT },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_NUMBER, CANVAS_ACT_MENU_TOOL_NUMBER },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_ROPE_MENU_TOGGLE, CANVAS_ACT_ROPE_MENU_TOGGLE },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_ROPE_MODE_SIMPLE, CANVAS_ACT_ROPE_MODE_SIMPLE },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_ROPE_MODE_FULL, CANVAS_ACT_ROPE_MODE_FULL },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_ARG, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_LED_TABLE, GP_TABLE_ACTION_ANY, CANVAS_ACT_MODULE_LED },
@@ -2856,10 +3672,12 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
             case CANVAS_ACT_SIM_SEGS_DEC:
                 c->sim_segs = std::max(2, c->sim_segs - 1);
                 printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs);
+                canvas_reinstantiate_all_ropes(c);
                 break;
             case CANVAS_ACT_SIM_SEGS_INC:
                 c->sim_segs = std::min(64, c->sim_segs + 1);
                 printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs);
+                canvas_reinstantiate_all_ropes(c);
                 break;
             case CANVAS_ACT_SIM_SLACK_DEC:
                 c->sim_slack = std::max(0.0f, c->sim_slack - 0.1f);
@@ -2869,6 +3687,27 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 c->sim_slack = std::min(8.0f, c->sim_slack + 0.1f);
                 printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack);
                 break;
+            case CANVAS_ACT_ROPE_MENU_TOGGLE:
+                c->rope_menu_open = !c->rope_menu_open;
+                if (c->rope_menu_open) {
+                    c->tool_menu_open = false;
+                    c->plugin_menu_open = false;
+                    c->plugin_menu_module_idx = -1;
+                }
+                printf("gp_canvas_on_click: rope_menu_open -> %d\n", c->rope_menu_open ? 1 : 0);
+                break;
+            case CANVAS_ACT_ROPE_MODE_SIMPLE: {
+                gp_canvas_set_debug_flags(reinterpret_cast<GP_CanvasContext*>(c), GP_CANVAS_DEBUG_NORENDER_MODE);
+                canvas_reinstantiate_all_ropes(c);
+                printf("gp_canvas_on_click: rope_mode -> simple\n");
+                break;
+            }
+            case CANVAS_ACT_ROPE_MODE_FULL: {
+                gp_canvas_set_debug_flags(reinterpret_cast<GP_CanvasContext*>(c), 0u);
+                canvas_reinstantiate_all_ropes(c);
+                printf("gp_canvas_on_click: rope_mode -> full\n");
+                break;
+            }
             case CANVAS_ACT_SAVE:
                 if (!c->autosave_path.empty()) {
                     gp_canvas_save_to_file(reinterpret_cast<GP_CanvasContext*>(c), c->autosave_path.c_str());
@@ -2905,6 +3744,10 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 // Lasso button: toggle lasso_mode and ensure other edge tools are deselected
                 c->selected_tool_edge = -1;
                 c->lasso_mode = !c->lasso_mode;
+                if (c->lasso_mode) {
+                    c->lasso_module_idx = -1;
+                    c->lasso_rope_idx = -1;
+                }
                 printf("gp_canvas_on_click: lasso_mode toggled -> %d\n", c->lasso_mode);
                 break;
             }
@@ -2936,6 +3779,7 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 }
                 c->plugin_menu_open = false;
                 c->plugin_menu_module_idx = -1;
+                c->rope_menu_open = false;
                 printf("gp_canvas_on_click: table tool %d toggled -> selected_tool_table=%d\n", tool, c->selected_tool_table);
                 break;
             }
@@ -3255,12 +4099,18 @@ static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx) {
         ctx->container_table = gp_table_create(nullptr);
         ctx->container_table_owned = 1;
         ctx->root_actions_installed = 0;
+        gp_table_set_debug_flags(ctx->container_table, ctx->debug_flags);
+        {
+            int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->sim_segs);
+            gp_table_set_cable_segments(ctx->container_table, segs);
+        }
     }
     canvas_install_root_actions(ctx, ctx->container_table);
     // Ensure a root RopeSim exists immediately so edges created later
     // on the root/container table get real rope indices and persistent uids.
     if (ctx->container_table && !gp_table_get_rope_sim(ctx->container_table)) {
-        RopeSim* sim = rope_sim_create(1024, 64);
+        int max_segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->sim_segs);
+        RopeSim* sim = rope_sim_create(1024, max_segs);
         gp_table_attach_rope_sim(ctx->container_table, sim, 1);
         // Attach any existing module tables to the new root sim so their
         // edges also get real ropes/uids rather than deferring until later.
@@ -3313,7 +4163,8 @@ static RopeSim* canvas_require_root_sim(GP_CanvasContextImpl* ctx) {
     if (!root) return nullptr;
     RopeSim* sim = gp_table_get_rope_sim(root);
     if (!sim) {
-        sim = rope_sim_create(1024, 64);
+        int max_segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->sim_segs);
+        sim = rope_sim_create(1024, max_segs);
         gp_table_attach_rope_sim(root, sim, 1);
     }
     return sim;
@@ -3972,6 +4823,7 @@ static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKin
     sync_module_table_io_layout(ctx, focused);
     update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
     ctx->tool_menu_open = false;
+    ctx->rope_menu_open = false;
     ctx->selected_tool_table = 0;
     // If the mouse tool was enabled for this module, programmatically bind
     // a small set of receive ports so the module's frame LEDs reflect that
@@ -4144,7 +4996,8 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
         if (sim) {
             int ax0 = ax, ay0 = ay;
             int bx = ax, by = ay;
-            int segs = ctx->sim_segs; float slack = ctx->sim_slack;
+            int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : ctx->sim_segs;
+            float slack = ctx->sim_slack;
             ctx->prospective_rope_idx = rope_sim_add_rope(sim, static_cast<float>(ax0), static_cast<float>(ay0), static_cast<float>(bx), static_cast<float>(by), segs, slack);
             printf("gp_canvas_on_click: created prospective rope %d for table LED %d/%d\n", ctx->prospective_rope_idx, module_idx, contact_idx);
         }
@@ -4152,36 +5005,46 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
     }
     bool sel_producer = (ctx->selected.left == 1);
     // allow connecting producer -> consumer only
-    if (sel_producer && !is_producer) {
-        GP_CanvasEdgeDesc e; e.a_module = ctx->selected.module; e.a_contact_idx = ctx->selected.contact_idx; e.b_module = module_idx; e.b_contact_idx = contact_idx;
-        printf("gp_canvas_on_click: adding edge sel %d.%d->%d.%d prospective_rope=%d\n",
-            ctx->selected.module, ctx->selected.contact_idx, module_idx, contact_idx, ctx->prospective_rope_idx);
-        int ei = gp_canvas_add_edge_with_type(reinterpret_cast<GP_CanvasContext*>(ctx), &e, /*type_id=*/0);
-        printf("gp_canvas_on_click: gp_canvas_add_edge returned %d\n", ei);
-        if (ei >= 0 && ctx->prospective_rope_idx >= 0) {
-            ctx->edges[ei].rope_idx = ctx->prospective_rope_idx;
-            printf("gp_canvas_on_click: attached rope %d to edge %d\n", ctx->prospective_rope_idx, ei);
-            ctx->prospective_rope_idx = -1;
-        } else {
-            printf("gp_canvas_on_click: no rope attached (prospective=%d)\n", ctx->prospective_rope_idx);
-        }
-        ctx->selected.module = -1; ctx->selected.contact_idx = -1; ctx->selected.left = -1; ctx->selected.anchor_x = -1; ctx->selected.anchor_y = -1;
-        return 1;
-    } else if (!sel_producer && is_producer) {
-        GP_CanvasEdgeDesc e; e.a_module = module_idx; e.a_contact_idx = contact_idx; e.b_module = ctx->selected.module; e.b_contact_idx = ctx->selected.contact_idx;
-        printf("gp_canvas_on_click: adding edge sel %d.%d->%d.%d prospective_rope=%d\n",
-            module_idx, contact_idx, ctx->selected.module, ctx->selected.contact_idx, ctx->prospective_rope_idx);
-        int ei = gp_canvas_add_edge_with_type(reinterpret_cast<GP_CanvasContext*>(ctx), &e, /*type_id=*/0);
-        printf("gp_canvas_on_click: gp_canvas_add_edge returned %d\n", ei);
-        if (ei >= 0 && ctx->prospective_rope_idx >= 0) {
-            ctx->edges[ei].rope_idx = ctx->prospective_rope_idx;
-            printf("gp_canvas_on_click: attached rope %d to edge %d\n", ctx->prospective_rope_idx, ei);
-            ctx->prospective_rope_idx = -1;
-        } else {
-            printf("gp_canvas_on_click: no rope attached (prospective=%d)\n", ctx->prospective_rope_idx);
-        }
-        ctx->selected.module = -1; ctx->selected.contact_idx = -1; ctx->selected.left = -1; ctx->selected.anchor_x = -1; ctx->selected.anchor_y = -1;
-        return 1;
+        if (sel_producer && !is_producer) {
+            GP_CanvasEdgeDesc e; e.a_module = ctx->selected.module; e.a_contact_idx = ctx->selected.contact_idx; e.b_module = module_idx; e.b_contact_idx = contact_idx;
+            printf("gp_canvas_on_click: adding edge sel %d.%d->%d.%d prospective_rope=%d\n",
+                ctx->selected.module, ctx->selected.contact_idx, module_idx, contact_idx, ctx->prospective_rope_idx);
+            int ei = gp_canvas_add_edge_with_type(reinterpret_cast<GP_CanvasContext*>(ctx), &e, /*type_id=*/0);
+            printf("gp_canvas_on_click: gp_canvas_add_edge returned %d\n", ei);
+            if (ei >= 0 && ctx->prospective_rope_idx >= 0) {
+                ctx->edges[ei].rope_idx = ctx->prospective_rope_idx;
+                printf("gp_canvas_on_click: attached rope %d to edge %d\n", ctx->prospective_rope_idx, ei);
+                ctx->prospective_rope_idx = -1;
+            }
+            if (ei >= 0) {
+                canvas_sync_root_rope_endpoints(ctx, e,
+                    static_cast<float>(ctx->selected.anchor_x), static_cast<float>(ctx->selected.anchor_y),
+                    static_cast<float>(ax), static_cast<float>(ay));
+            } else {
+                printf("gp_canvas_on_click: no rope attached (prospective=%d)\n", ctx->prospective_rope_idx);
+            }
+            ctx->selected.module = -1; ctx->selected.contact_idx = -1; ctx->selected.left = -1; ctx->selected.anchor_x = -1; ctx->selected.anchor_y = -1;
+            return 1;
+        } else if (!sel_producer && is_producer) {
+            GP_CanvasEdgeDesc e; e.a_module = module_idx; e.a_contact_idx = contact_idx; e.b_module = ctx->selected.module; e.b_contact_idx = ctx->selected.contact_idx;
+            printf("gp_canvas_on_click: adding edge sel %d.%d->%d.%d prospective_rope=%d\n",
+                module_idx, contact_idx, ctx->selected.module, ctx->selected.contact_idx, ctx->prospective_rope_idx);
+            int ei = gp_canvas_add_edge_with_type(reinterpret_cast<GP_CanvasContext*>(ctx), &e, /*type_id=*/0);
+            printf("gp_canvas_on_click: gp_canvas_add_edge returned %d\n", ei);
+            if (ei >= 0 && ctx->prospective_rope_idx >= 0) {
+                ctx->edges[ei].rope_idx = ctx->prospective_rope_idx;
+                printf("gp_canvas_on_click: attached rope %d to edge %d\n", ctx->prospective_rope_idx, ei);
+                ctx->prospective_rope_idx = -1;
+            }
+            if (ei >= 0) {
+                canvas_sync_root_rope_endpoints(ctx, e,
+                    static_cast<float>(ax), static_cast<float>(ay),
+                    static_cast<float>(ctx->selected.anchor_x), static_cast<float>(ctx->selected.anchor_y));
+            } else {
+                printf("gp_canvas_on_click: no rope attached (prospective=%d)\n", ctx->prospective_rope_idx);
+            }
+            ctx->selected.module = -1; ctx->selected.contact_idx = -1; ctx->selected.left = -1; ctx->selected.anchor_x = -1; ctx->selected.anchor_y = -1;
+            return 1;
     }
     // same direction: switch selection to this
     ctx->selected.module = module_idx; ctx->selected.contact_idx = contact_idx; ctx->selected.left = is_producer ? 1 : 0; ctx->selected.anchor_x = ax; ctx->selected.anchor_y = ay;

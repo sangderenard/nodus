@@ -726,7 +726,7 @@ GP_TableContext* gp_table_create(const GP_TableStyle* style) {
     recompute_geom(ctx.get());
     // create rope simulator with reasonable capacities (owned by default)
     int max_ropes = 1024;
-    int max_segs = std::max(4, ctx->st.cable_segments);
+    int max_segs = std::max(2, ctx->st.cable_segments);
     ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
     ctx->rope_sim_owned = 1;
     ctx->rope_id_to_sim_idx.clear();

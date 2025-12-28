@@ -7,6 +7,11 @@ extern "C" int gp_canvas_create_table(GP_CanvasContext* ctx_, int module_idx) {
     if (!t) return 0;
     c->module_tables[module_idx] = t;
     c->module_table_owned[module_idx] = 1;
+    gp_table_set_debug_flags(t, c->debug_flags);
+    {
+        int segs = (c->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, c->sim_segs);
+        gp_table_set_cable_segments(t, segs);
+    }
     // Tweak the table style for canvas-owned tables so row height is
     // compact and rows aren't vertically stretched to fill module height.
     // This helps keep LED hitboxes aligned with visual rows when modules
@@ -186,8 +191,11 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
         gp_table_advance_global_sim_tick();
         // Only step the root rope sim if the table-level sim is enabled and
         // the global sim-skip cadence allows stepping this frame.
-        if (root_tbl && gp_table_should_step_sim(root_tbl)) {
-            rope_sim_step(sim, dt, c->sim_maxforce, c->sim_iters, c->sim_damping);
+        uint32_t dbg = c->debug_flags;
+        bool disable_sim = (dbg & GP_CANVAS_DEBUG_NO_SPRINGS) != 0u || (dbg & GP_CANVAS_DEBUG_RING_STATIC) != 0u;
+        float gravity = (dbg & GP_CANVAS_DEBUG_NO_GRAVITY) ? 0.0f : c->sim_maxforce;
+        if (!disable_sim && root_tbl && gp_table_should_step_sim(root_tbl)) {
+            rope_sim_step(sim, dt, gravity, c->sim_iters, c->sim_damping);
         }
     }
     // decay chat highlight TTLs and clear chat bg callback when expired

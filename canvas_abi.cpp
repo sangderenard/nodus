@@ -18,6 +18,7 @@
 #include <string>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <cmath>
 #include <algorithm>
 #include <limits>

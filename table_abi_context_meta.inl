@@ -91,6 +91,7 @@ struct GP_TableContext {
     // Whether table-side simulator stepping is enabled (1) or disabled (0).
     // KPN or other managers can toggle this to pause heavy sim work per table.
     int32_t sim_enabled = 1;
+    uint32_t debug_flags = 0u; // debug render/sim overrides propagated from canvas
     // (No per-table frame-skip; global frame-skip handled by table_abi global state)
     // Optional click-action dispatch
     std::vector<GP_TableAction> actions;
@@ -170,6 +171,28 @@ int32_t gp_table_should_step_sim(GP_TableContext* ctx) {
     return table_should_step_sim(ctx) ? 1 : 0;
 }
 
+extern "C" int32_t gp_table_set_debug_flags(GP_TableContext* ctx, uint32_t flags) {
+    if (!ctx) return 0;
+    ctx->debug_flags = flags;
+    return 1;
+}
+
+extern "C" int32_t gp_table_get_debug_flags(const GP_TableContext* ctx, uint32_t* out_flags) {
+    if (!ctx || !out_flags) return 0;
+    *out_flags = ctx->debug_flags;
+    return 1;
+}
+
+extern "C" int32_t gp_table_set_cable_segments(GP_TableContext* ctx, int32_t segments) {
+    if (!ctx) return 0;
+    int segs = std::clamp(segments, 1, 64);
+    ctx->st.cable_segments = segs;
+    if (ctx->st.cable_fifo_friction_regions <= 0) {
+        ctx->st.cable_fifo_friction_regions = std::max(1, segs);
+    }
+    return 1;
+}
+
 // Internal representation of a meta-group. Exposed to C callers as an
 // opaque `GP_MetaGroup*` pointer (allocated here and stored in the
 // table's `meta_groups` vector to keep lifetime management consistent).
@@ -177,6 +200,7 @@ struct GP_MetaVertex {
     uint64_t rope_id = 0ull;
     int rope_idx = -1;
     int vertex_idx = -1;
+    float u = -1.0f;
 };
 
 struct GP_MetaGroup {
@@ -243,8 +267,8 @@ extern "C" int32_t gp_table_debug_dump_meta_group(GP_TableContext* ctx, GP_MetaG
     printf("  vertices.count=%d\n", vcount);
     for (int vi = 0; vi < vcount; ++vi) {
         const auto &mv = mg->vertices[static_cast<size_t>(vi)];
-        printf("    [%d] rope_idx=%d vert_idx=%d rope_id=%llu\n",
-               vi, mv.rope_idx, mv.vertex_idx, (unsigned long long)mv.rope_id);
+    printf("    [%d] rope_idx=%d vert_idx=%d rope_id=%llu u=%.6f\n",
+               vi, mv.rope_idx, mv.vertex_idx, (unsigned long long)mv.rope_id, mv.u);
     }
     fflush(stdout);
     return 1;
@@ -302,6 +326,7 @@ static int32_t gp_table_meta_add_vertex_with_id_internal(GP_TableContext* ctx, G
     mv.rope_id = rope_id;
     mv.rope_idx = static_cast<int>(rope_idx);
     mv.vertex_idx = static_cast<int>(vertex_idx);
+    mv.u = -1.0f;
     mg->vertices.push_back(mv);
     RopeSim* sim = ctx->rope_sim;
     printf("gp_table_meta_add_vertex: mg=%p add (rope=%d,vert=%d) sim=%p sim_group_idx=%d\n", (void*)mg, rope_idx, vertex_idx, (void*)sim, mg->sim_group_idx);
@@ -316,6 +341,14 @@ static int32_t gp_table_meta_add_vertex_with_id_internal(GP_TableContext* ctx, G
         if (mg->sim_group_idx >= 0) {
             if (!rope_sim_meta_group_has_member(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx))) {
                 rope_sim_meta_group_add(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx));
+            }
+            int vc = rope_sim_get_vertex_count(sim, static_cast<int>(rope_idx));
+            if (vc > 1) {
+                float u = static_cast<float>(vertex_idx) / static_cast<float>(vc - 1);
+                if (u < 0.0f) u = 0.0f;
+                if (u > 1.0f) u = 1.0f;
+                mg->vertices.back().u = u;
+                rope_sim_meta_group_set_member_u(sim, mg->sim_group_idx, static_cast<int>(rope_idx), static_cast<int>(vertex_idx), u);
             }
             // update pressure in sim if different
             rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
@@ -441,26 +474,32 @@ extern "C" int32_t gp_table_meta_enable_edge_springs(GP_TableContext* ctx, GP_Me
     if (!ctx || !mg) return 0;
     RopeSim* sim = ctx->rope_sim;
     if (!sim || mg->sim_group_idx < 0) return 0;
+    // respect the meta-group's requested topology before wiring springs
+    rope_sim_meta_group_set_mode(sim, mg->sim_group_idx, mg->ring_mode);
     int res = rope_sim_meta_group_enable_edge_springs(sim, mg->sim_group_idx, min_rest, reduce_rate);
     if (!res) return 0;
-    // Additionally, schedule per-rope rest-length adjustments so ropes are
-    // briefly let out and then gradually shortened to simulate trimming/tensioning.
-    float extend_amount = 5.0f; // increase rest length immediately
-    float shorten_factor = 0.6f; // target = current * factor
-    float shorten_rate = 1.0f; // units per second
-    float shorten_delay = 0.5f; // seconds before shortening begins
-    std::unordered_set<int> handled;
-    for (const auto &p : mg->vertices) {
-        int r = p.rope_idx;
-        if (handled.find(r) != handled.end()) continue;
-        handled.insert(r);
-        rope_sim_modify_rest_length(sim, r, extend_amount);
-        float cur = 0.0f;
-        if (rope_sim_get_rope_rest_length(sim, r, &cur)) {
-            float target = std::max(0.0001f, cur * shorten_factor);
-            rope_sim_set_rope_rest_target(sim, r, target, shorten_rate, shorten_delay);
-            printf("gp_table_meta_enable_edge_springs: rope %d rest increased by %.2f then scheduled target %.2f (delay=%.2f rate=%.2f)\n", r, extend_amount, target, shorten_delay, shorten_rate);
+    // For lasso-style dense networks, leave rope rest lengths alone; the
+    // meta-group springs handle contraction without collapsing the ropes.
+    if (mg->ring_mode != 2) {
+        float extend_amount = 5.0f; // increase rest length immediately
+        float shorten_factor = 0.6f; // target = current * factor
+        float shorten_rate = 1.0f; // units per second
+        float shorten_delay = 0.5f; // seconds before shortening begins
+        std::unordered_set<int> handled;
+        for (const auto &p : mg->vertices) {
+            int r = p.rope_idx;
+            if (handled.find(r) != handled.end()) continue;
+            handled.insert(r);
+            rope_sim_modify_rest_length(sim, r, extend_amount);
+            float cur = 0.0f;
+            if (rope_sim_get_rope_rest_length(sim, r, &cur)) {
+                float target = std::max(0.0001f, cur * shorten_factor);
+                rope_sim_set_rope_rest_target(sim, r, target, shorten_rate, shorten_delay);
+                printf("gp_table_meta_enable_edge_springs: rope %d rest increased by %.2f then scheduled target %.2f (delay=%.2f rate=%.2f)\n", r, extend_amount, target, shorten_delay, shorten_rate);
+            }
         }
+    } else if (std::getenv("NODUS_DEBUG_META")) {
+        printf("gp_table_meta_enable_edge_springs: ring_mode=2 skipping rope rest-length adjustment\n");
     }
     return 1;
 }
@@ -534,131 +573,8 @@ extern "C" int32_t gp_table_create_ring(GP_TableContext* ctx, int32_t rope_idx, 
     if (!ctx) return -1;
     RopeSim* sim = ctx->rope_sim;
     if (!sim) return -1;
-    // Create a ring at parameter u (no insertion into the main rope). Then
-    // create a short T-off rope centered at the ring's world position and
-    // attach a heavy widget to its center. The T-off center is joined into
-    // the meta-group next to the existing anchor vertex so forces transmit.
-    int vc = rope_sim_get_vertex_count(sim, static_cast<int>(rope_idx));
-    if (vc <= 1) {
-        return rope_sim_create_ring(sim, static_cast<int>(rope_idx), u);
-    }
-    // sample world position along rope at param u
-    std::vector<float> verts3(static_cast<size_t>(vc) * 3);
-    int got = rope_sim_get_vertices3(sim, static_cast<int>(rope_idx), verts3.data(), static_cast<int>(verts3.size()));
-    if (got <= 1) return rope_sim_create_ring(sim, static_cast<int>(rope_idx), u);
-    float fidx = u * static_cast<float>(vc - 1);
-    int i0 = static_cast<int>(std::floor(fidx));
-    if (i0 < 0) i0 = 0; if (i0 >= vc-1) i0 = vc-2;
-    int i1 = i0 + 1;
-    float local_t = fidx - static_cast<float>(i0);
-    float ax = verts3[3*i0+0]; float ay = verts3[3*i0+1]; float az = verts3[3*i0+2];
-    float bx = verts3[3*i1+0]; float by = verts3[3*i1+1]; float bz = verts3[3*i1+2];
-    float px = ax + (bx - ax) * local_t;
-    float py = ay + (by - ay) * local_t;
-    float pz = az + (bz - az) * local_t;
-    // create ring at u
-    int ring_id = rope_sim_create_ring(sim, static_cast<int>(rope_idx), u);
-
-    // Build T-off: compute perpendicular to tangent (using local segment)
-    float tx = bx - ax; float ty = by - ay; float tz = bz - az;
-    float tlen = std::sqrt(tx*tx + ty*ty + tz*tz);
-    float pxp = 0.0f, pyp = 1.0f; // default perp
-    if (tlen > 1e-6f) {
-        tx /= tlen; ty /= tlen; tz /= tlen;
-        // 2D perp in XY plane
-        pxp = -ty; pyp = tx;
-    }
-    float half = 12.0f; // half-length of T-off
-    float e1x = px + pxp * half;
-    float e1y = py + pyp * half;
-    float e1z = pz;
-    float e2x = px - pxp * half;
-    float e2y = py - pyp * half;
-    float e2z = pz;
-    int to_segs = 2;
-    int to_rope = rope_sim_add_rope3(sim, e1x, e1y, e1z, e2x, e2y, e2z, to_segs, 0.0f);
-    if (to_rope < 0) return ring_id;
-
-    // Create a custom canvas overlay rectangle for the short T-off endpoints
-    // and register two overlay LED keys. Also attach the created rope to the
-    // overlay so canvas-level rendering and interaction can bind to it.
-    GP_CanvasContext* cvs = gp_canvas_get_singleton();
-    unsigned long long t_off_overlay_a = 0ull, t_off_overlay_b = 0ull;
-    if (cvs) {
-        // If the meta-group already has persisted overlay keys, prefer them
-        // and attach the created T-off rope to the canonical overlay instead
-        // of creating a new overlay instance. This avoids duplicate overlays
-        // when restoring from persisted keys.
-        // Note: we'll attach per-meta-group below when iterating meta-groups.
-    }
-
-    // For every meta-group anchored to this rope, insert the T-off center vertex
-    // into the group's ordering adjacent to the anchor so the T-off is joined
-    // to the existing ring bindings (transmits forces). Attach a heavy widget
-    // to the T-off center (vertex index 1) and increase its mass.
-    for (size_t mgi = 0; mgi < ctx->meta_groups.size(); ++mgi) {
-        auto &mgptr = ctx->meta_groups[mgi];
-        if (!mgptr) continue;
-        GP_MetaGroup* mg = mgptr.get();
-        if (!mg) continue;
-        if (mg->anchor_rope != rope_idx) continue;
-        if (mg->sim_group_idx < 0) {
-            int sg = rope_sim_create_meta_group(sim, mg->confinement);
-            if (sg >= 0) mg->sim_group_idx = sg;
-        }
-            if (mg->sim_group_idx >= 0) {
-            // add T-off center to the table-level meta-group record so it's a
-            // genuine member visible to APIs and rendering
-            gp_table_meta_add_vertex(ctx, mg, static_cast<int32_t>(to_rope), 1);
-            // insert T-off center (vertex 1) after the anchor vertex in sim ordering
-            rope_sim_meta_group_insert(sim, mg->sim_group_idx, mg->anchor_rope, mg->anchor_vert, to_rope, 1);
-            // if there is a dangling widget rope, insert it after the T-off so it's connected
-            if (mg->dangling_widget_rope >= 0) {
-                rope_sim_meta_group_insert(sim, mg->sim_group_idx, to_rope, 1, mg->dangling_widget_rope, 0);
-            }
-            rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
-            // create heavy widget on center of T-off
-            int wid = rope_sim_create_dangling_widget(sim, to_rope, 1, static_cast<unsigned int>(mg->lasso_config.widget_type));
-            if (wid >= 0) {
-                rope_sim_set_widget_mass(sim, wid, 50.0f);
-            }
-            // record dangling widget/rope on meta-group so rendering and
-            // queries will reference the real hanging rope and widget.
-            if (wid >= 0) {
-                mg->dangling_widget_id = wid;
-                mg->dangling_widget_rope = to_rope;
-                mg->dangling_widget_rope_vid = 1;
-                mg->dangling_hang_len = half;
-                // inform RopeSim about the dangling/widget rope so it can
-                // give special rest-length and stiffness behavior on edges.
-                rope_sim_meta_group_set_dangling_rope(sim, mg->sim_group_idx, to_rope);
-            }
-            // If the meta-group already had persisted overlay keys, attach
-            // the created T-off rope to that canonical overlay. Otherwise,
-            // create a new overlay for the T-off endpoints as before.
-            if (cvs) {
-                if (mg->overlay_key_a != 0ull || mg->overlay_key_b != 0ull) {
-                    // ensure canonical overlay exists and attach rope
-                    gp_canvas_register_table_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, 0ull, 0ull);
-                    gp_canvas_attach_rope_to_overlay(cvs, mg->overlay_key_a, mg->overlay_key_b, to_rope);
-                    gp_canvas_set_overlay_meta(cvs, mg->overlay_key_a, mg->overlay_key_b, ctx, reinterpret_cast<void*>(mg));
-                } else {
-                    unsigned long long key_a = 0ull, key_b = 0ull;
-                    if (gp_canvas_create_overlay_with_leds(cvs, e1x, e1y, e2x, e2y, &key_a, &key_b)) {
-                        int edge_idx = gp_canvas_attach_rope_to_overlay(cvs, key_a, key_b, to_rope);
-                        printf("gp_table: attached rope %d to overlay keys (%llu,%llu) edge_idx=%d\n", to_rope, (unsigned long long)key_a, (unsigned long long)key_b, edge_idx);
-                        t_off_overlay_a = key_a;
-                        t_off_overlay_b = key_b;
-                        mg->overlay_key_a = t_off_overlay_a;
-                        mg->overlay_key_b = t_off_overlay_b;
-                        gp_canvas_set_overlay_meta(cvs, t_off_overlay_a, t_off_overlay_b, ctx, reinterpret_cast<void*>(mg));
-                    }
-                }
-            }
-        }
-    }
-
-    return ring_id;
+    // Create a lightweight ring at parameter u; no overlays or dangling widgets.
+    return rope_sim_create_ring(sim, static_cast<int>(rope_idx), u);
 }
 
 // Create ring by persisted rope id. Resolve id to runtime rope index using
@@ -747,6 +663,30 @@ extern "C" int32_t gp_table_meta_get_vertex(const GP_TableContext* ctx, GP_MetaG
     if (out_rope_idx) *out_rope_idx = mv.rope_idx;
     if (out_vertex_idx) *out_vertex_idx = mv.vertex_idx;
     return 1;
+}
+
+extern "C" int32_t gp_table_meta_get_vertex_u(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t idx, float* out_u) {
+    if (!ctx || !mg || !out_u) return 0;
+    if (idx < 0 || static_cast<size_t>(idx) >= mg->vertices.size()) return 0;
+    *out_u = mg->vertices[static_cast<size_t>(idx)].u;
+    return 1;
+}
+
+extern "C" int32_t gp_table_meta_set_vertex_u(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx, float u) {
+    if (!ctx || !mg) return 0;
+    if (u < 0.0f) u = 0.0f;
+    if (u > 1.0f) u = 1.0f;
+    for (auto &mv : mg->vertices) {
+        if (mv.rope_idx == rope_idx && mv.vertex_idx == vertex_idx) {
+            mv.u = u;
+            RopeSim* sim = ctx->rope_sim;
+            if (sim && mg->sim_group_idx >= 0) {
+                rope_sim_meta_group_set_member_u(sim, mg->sim_group_idx, rope_idx, vertex_idx, u);
+            }
+            return 1;
+        }
+    }
+    return 0;
 }
 
 extern "C" int32_t gp_table_get_widget_position(GP_TableContext* ctx, int32_t widget_id, float* out_xyz) {
@@ -893,204 +833,15 @@ int32_t gp_table_meta_get_sim_group_index(GP_TableContext* ctx, GP_MetaGroup* mg
 
 extern "C" int32_t gp_table_meta_create_widget(GP_TableContext* ctx, GP_MetaGroup* mg) {
     if (!ctx || !mg) return 0;
-    // Quick runtime toggle to disable creating the hanging widget/rope for testing.
-    const char* disable_env = std::getenv("NODUS_DISABLE_WIDGET_HANG");
-    if (disable_env && disable_env[0] != '\0') {
-        printf("gp_table_meta_create_widget: disabled via NODUS_DISABLE_WIDGET_HANG\n");
-        return 0;
-    }
-    if (mg->dangling_widget_id >= 0) return 1; // already created
-    if (mg->vertices.empty()) return 0;
-    RopeSim* sim = ctx->rope_sim;
-    if (!sim) return 0;
-    // Prefer creating a short hanging rope anchored to the meta-group, then
-    // attach the widget to the rope's lower vertex so it can hang freely.
-    // prefer explicit anchor if set on the meta-group
-    int anchor_rope = mg->anchor_rope >= 0 ? mg->anchor_rope : mg->vertices[0].rope_idx;
-    int anchor_vert = mg->anchor_vert >= 0 ? mg->anchor_vert : mg->vertices[0].vertex_idx;
-    // Query 3D vertex positions for anchor
-    int vc = rope_sim_get_vertex_count(sim, anchor_rope);
-    if (vc <= 0) return 0;
-    std::vector<float> verts3(static_cast<size_t>(vc) * 3);
-    int got = rope_sim_get_vertices3(sim, anchor_rope, verts3.data(), static_cast<int>(verts3.size()));
-    if (got <= anchor_vert) {
-        // fallback: attach widget directly to the existing vertex
-        int wid = rope_sim_create_dangling_widget(sim, anchor_rope, anchor_vert, static_cast<unsigned int>(mg->lasso_config.widget_type));
-        if (wid < 0) return 0;
-        mg->dangling_widget_id = wid;
-        return 1;
-    }
-    float ax = verts3[anchor_vert * 3 + 0];
-    float ay = verts3[anchor_vert * 3 + 1];
-    float az = verts3[anchor_vert * 3 + 2];
-    // Create a short T-off rope anchored near the anchor vertex so the
-    // hanging endpoints are genuine rope vertices (this lets rings/connectors
-    // slide and bind to the rope correctly). We create a small horizontal
-    // T-off centered at the anchor, create an overlay with two LED keys at
-    // the endpoints, attach the rope to that overlay, and create a heavy
-    // dangling widget attached to the center vertex (vid=1).
-    float hang_len = 48.0f;
-    // choose neighbor to compute tangent
-    int neighbor = (anchor_vert + 1 < got) ? (anchor_vert + 1) : (anchor_vert - 1);
-    if (neighbor < 0) neighbor = anchor_vert;
-    float bx = verts3[neighbor * 3 + 0];
-    float by = verts3[neighbor * 3 + 1];
-    float bz = verts3[neighbor * 3 + 2];
-    float tx = bx - ax; float ty = by - ay; float tz = bz - az;
-    float tlen = std::sqrt(tx*tx + ty*ty + tz*tz);
-    if (tlen > 1e-6f) { tx /= tlen; ty /= tlen; tz /= tlen; }
-    float pxp = -ty; float pyp = tx; // 2D perp
-    float half = hang_len * 0.5f;
-    float e1x = ax + pxp * half;
-    float e1y = ay + pyp * half;
-    float e1z = az;
-    float e2x = ax - pxp * half;
-    float e2y = ay - pyp * half;
-    float e2z = az;
-    int to_segs = 2;
-    int to_rope = rope_sim_add_rope3(sim, e1x, e1y, e1z, e2x, e2y, e2z, to_segs, 0.0f);
-    if (to_rope < 0) {
-        // fallback: create widget attached to anchor vertex
-        int wid_fb = rope_sim_create_dangling_widget(sim, anchor_rope, anchor_vert, static_cast<unsigned int>(mg->lasso_config.widget_type));
-        if (wid_fb < 0) return 0;
-        mg->dangling_widget_id = wid_fb;
-        mg->dangling_widget_rope = anchor_rope;
-        mg->dangling_widget_rope_vid = anchor_vert;
-        mg->dangling_hang_len = hang_len;
-        return 1;
-    }
-
-    // create overlay for the T-off endpoints and attach the rope to the overlay
-    GP_CanvasContext* cvs = gp_canvas_get_singleton();
-    if (cvs) {
-        unsigned long long key_a = 0ull, key_b = 0ull;
-        if (gp_canvas_create_overlay_with_leds(cvs, e1x, e1y, e2x, e2y, &key_a, &key_b)) {
-            gp_canvas_attach_rope_to_overlay(cvs, key_a, key_b, to_rope);
-            // ensure this initial overlay is also bound to the meta-group
-            gp_canvas_set_overlay_meta(cvs, key_a, key_b, ctx, mg);
-            mg->overlay_key_a = key_a;
-            mg->overlay_key_b = key_b;
-        }
-    }
-
-    // ensure meta-group sim registration
-    if (mg->sim_group_idx < 0) {
-        int sg = rope_sim_create_meta_group(sim, mg->confinement);
-        if (sg >= 0) mg->sim_group_idx = sg;
-    }
+    // Strip down: no dangling widget or overlays. Clear prior hooks and signal success.
+    mg->dangling_widget_id = -1;
+    mg->dangling_widget_rope = -1;
+    mg->dangling_widget_rope_vid = -1;
+    mg->dangling_hang_len = 0.0f;
+    mg->overlay_key_a = 0ull;
+    mg->overlay_key_b = 0ull;
     try { mg->fifo.configure_default(); } catch(...) {}
     mg->subgroup_flags = mg->lasso_config.flags;
-
-    if (mg->sim_group_idx >= 0) {
-        // add the T-off center (vid=1) into the meta-group so forces transmit
-        gp_table_meta_add_vertex(ctx, mg, static_cast<int32_t>(to_rope), 1);
-        rope_sim_meta_group_insert(sim, mg->sim_group_idx, mg->anchor_rope, mg->anchor_vert, to_rope, 1);
-        if (mg->dangling_widget_rope >= 0) {
-            rope_sim_meta_group_insert(sim, mg->sim_group_idx, to_rope, 1, mg->dangling_widget_rope, 0);
-        }
-        rope_sim_meta_group_set_pressure(sim, mg->sim_group_idx, mg->confinement);
-    }
-
-    // create heavy widget attached to T-off center
-    int wid = rope_sim_create_dangling_widget(sim, to_rope, 1, static_cast<unsigned int>(mg->lasso_config.widget_type));
-    if (wid >= 0) rope_sim_set_widget_mass(sim, wid, 8.0f);
-    if (wid < 0) {
-        // fallback to attach to anchor
-        int fallback_wid = rope_sim_create_dangling_widget(sim, anchor_rope, anchor_vert, static_cast<unsigned int>(mg->lasso_config.widget_type));
-        if (fallback_wid < 0) return 0;
-        mg->dangling_widget_id = fallback_wid;
-        mg->dangling_widget_rope = anchor_rope;
-        mg->dangling_widget_rope_vid = anchor_vert;
-        mg->dangling_hang_len = hang_len;
-        return 1;
-    }
-
-    mg->dangling_widget_id = wid;
-    mg->dangling_widget_rope = to_rope;
-    mg->dangling_widget_rope_vid = 1;
-    mg->dangling_hang_len = hang_len;
-    // Create three small overlays (minus/number/plus) centered on the widget
-    // so control regions are allocated at creation time and attached to the
-    // widget rope. These overlays provide clickable regions the canvas will
-    // route through the existing overlay click handling logic.
-    try {
-        GP_CanvasContext* cvs = gp_canvas_get_singleton();
-        if (cvs) {
-            float wpos[3] = {0.0f,0.0f,0.0f};
-            // Try to obtain the widget world position; if unavailable (sim
-            // provides stubs), fall back to the T-off center computed earlier.
-            if (!gp_table_get_widget_position(ctx, mg->dangling_widget_id, wpos)) {
-                wpos[0] = (e1x + e2x) * 0.5f;
-                wpos[1] = (e1y + e2y) * 0.5f;
-                wpos[2] = 0.0f;
-            }
-            float ox = wpos[0]; float oy = wpos[1];
-            unsigned long long ka=0ull,kb=0ull;
-            if (gp_canvas_create_overlay_with_leds(cvs, ox - 18.0f, oy - 10.0f, ox + 18.0f, oy + 10.0f, &ka, &kb)) {
-                gp_canvas_attach_rope_to_overlay(cvs, ka, kb, mg->dangling_widget_rope);
-                printf("gp_table_meta_create_widget: created center overlays for mg=%p wid=%d rope=%d ox=%.1f oy=%.1f ka=%llu kb=%llu\n",
-                    (void*)mg, mg->dangling_widget_id, mg->dangling_widget_rope, ox, oy, ka, kb);
-                {
-                    int oxa=0, oya=0, oxb=0, oyb=0;
-                    if (gp_canvas_resolve_overlay_key(cvs, ka, &oxa, &oya)) {
-                        printf("  resolved ka -> %d,%d\n", oxa, oya);
-                    }
-                    if (gp_canvas_resolve_overlay_key(cvs, kb, &oxb, &oyb)) {
-                        printf("  resolved kb -> %d,%d\n", oxb, oyb);
-                    }
-                }
-            } else {
-                printf("gp_table_meta_create_widget: failed to create center overlay for mg=%p wid=%d ox=%.1f oy=%.1f\n",
-                    (void*)mg, mg->dangling_widget_id, ox, oy);
-            }
-                // populate overlay meta binding so the canvas can dispatch clicks
-                if (ka || kb) {
-                    gp_canvas_set_overlay_meta(cvs, ka, kb, ctx, mg);
-                    mg->overlay_key_a = ka;
-                    mg->overlay_key_b = kb;
-                }
-            unsigned long long la=0ull,lb=0ull;
-            if (gp_canvas_create_overlay_with_leds(cvs, ox - 52.0f, oy - 10.0f, ox - 22.0f, oy + 10.0f, &la, &lb)) {
-                gp_canvas_attach_rope_to_overlay(cvs, la, lb, mg->dangling_widget_rope);
-                printf("gp_table_meta_create_widget: created left overlay for mg=%p wid=%d rope=%d la=%llu lb=%llu\n",
-                    (void*)mg, mg->dangling_widget_id, mg->dangling_widget_rope, la, lb);
-                {
-                    int lxa=0, lya=0, lxb=0, lyb=0;
-                    if (gp_canvas_resolve_overlay_key(cvs, la, &lxa, &lya)) printf("  resolved la -> %d,%d\n", lxa, lya);
-                    if (gp_canvas_resolve_overlay_key(cvs, lb, &lxb, &lyb)) printf("  resolved lb -> %d,%d\n", lxb, lyb);
-                }
-            } else {
-                printf("gp_table_meta_create_widget: failed to create left overlay for mg=%p wid=%d\n", (void*)mg, mg->dangling_widget_id);
-            }
-                if (la || lb) {
-                    gp_canvas_set_overlay_meta(cvs, la, lb, ctx, mg);
-                    if (mg->overlay_key_a == 0ull && mg->overlay_key_b == 0ull) {
-                        mg->overlay_key_a = la;
-                        mg->overlay_key_b = lb;
-                    }
-                }
-            unsigned long long ra=0ull,rb=0ull;
-            if (gp_canvas_create_overlay_with_leds(cvs, ox + 22.0f, oy - 10.0f, ox + 52.0f, oy + 10.0f, &ra, &rb)) {
-                gp_canvas_attach_rope_to_overlay(cvs, ra, rb, mg->dangling_widget_rope);
-                printf("gp_table_meta_create_widget: created right overlay for mg=%p wid=%d rope=%d ra=%llu rb=%llu\n",
-                    (void*)mg, mg->dangling_widget_id, mg->dangling_widget_rope, ra, rb);
-                {
-                    int rxa=0, rya=0, rxb=0, ryb=0;
-                    if (gp_canvas_resolve_overlay_key(cvs, ra, &rxa, &rya)) printf("  resolved ra -> %d,%d\n", rxa, rya);
-                    if (gp_canvas_resolve_overlay_key(cvs, rb, &rxb, &ryb)) printf("  resolved rb -> %d,%d\n", rxb, ryb);
-                }
-            } else {
-                printf("gp_table_meta_create_widget: failed to create right overlay for mg=%p wid=%d\n", (void*)mg, mg->dangling_widget_id);
-            }
-                if (ra || rb) {
-                    gp_canvas_set_overlay_meta(cvs, ra, rb, ctx, mg);
-                    if (mg->overlay_key_a == 0ull && mg->overlay_key_b == 0ull) {
-                        mg->overlay_key_a = ra;
-                        mg->overlay_key_b = rb;
-                    }
-                }
-        }
-    } catch(...) {}
     return 1;
 }
 
@@ -1194,7 +945,27 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
             int ax = 0, ay = 0, bx = 0, by = 0;
             compute_center_local(a, ax, ay);
             compute_center_local(b, bx, by);
-            int segs = std::max(4, ctx->st.cable_segments);
+            if (ax == bx && ay == by) {
+                // Guard against degenerate endpoints: derive a simple offset from contact ids.
+                auto decode = [](uint64_t key, int &row, int &col, int &led) {
+                    row = static_cast<int>(static_cast<uint32_t>(key >> 32));
+                    col = static_cast<int>((static_cast<uint32_t>(key >> 16)) & 0xFFFFu);
+                    led = static_cast<int>(static_cast<uint32_t>(key & 0xFFFFu));
+                };
+                int ra = 0, ca = 0, la = 0;
+                int rb = 0, cb = 0, lb = 0;
+                decode(a, ra, ca, la);
+                decode(b, rb, cb, lb);
+                int row_h = ctx->st.row_h > 0 ? ctx->st.row_h : 22;
+                int dx = (cb - ca) * 16 + (lb - la) * 8;
+                int dy = (rb - ra) * std::max(10, row_h / 2);
+                if (dx == 0 && dy == 0) dx = 24; // last resort nudge
+                bx += dx;
+                by += dy;
+                printf("gp_table_attach_rope_sim: adjusted degenerate endpoints a_row=%d b_row=%d dx=%d dy=%d -> (%d,%d)->(%d,%d)\n",
+                    ra, rb, dx, dy, ax, ay, bx, by);
+            }
+            int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->st.cable_segments);
             float slack = 0.0f;
             float plug_z = -ctx->st.cable_plug_depth;
             int idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);

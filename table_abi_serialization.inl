@@ -292,7 +292,40 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     // Canvas singleton (may be null). Declare early so deserialization can
     // register persisted rope/module UUIDs with the canvas if available.
     GP_CanvasContext* cvs = gp_canvas_get_singleton();
-    if (version < 2 || version > 4) return 0;
+    const uint32_t expected_version = 4u;
+    if (version != expected_version) {
+        // No backward-compatibility: if save version mismatches current
+        // format, abandon any attempt to negotiate and wipe the context.
+        printf("gp_table_deserialize: version mismatch (have=%u want=%u) - wiping ctx=%p\n", (unsigned)version, (unsigned)expected_version, (void*)ctx);
+        if (ctx) {
+            // Clear visible data and reset state to a clean default.
+            ctx->rows.clear();
+            ctx->cols.clear();
+            ctx->selected_leds.clear();
+            ctx->led_glow_strength.clear();
+            ctx->led_flow_glow_strength.clear();
+            ctx->frame_port_uuids.clear();
+            ctx->module_uuid = 0ull;
+            ctx->meta_groups.clear();
+            ctx->pending_meta_vertices.clear();
+            ctx->pending_ops.clear();
+            ctx->actions.clear();
+            ctx->stage_ports.clear();
+            ctx->key_type_hint.clear();
+            ctx->key_is_input.clear();
+            ctx->key_is_output.clear();
+            ctx->rings.clear();
+            ctx->ring_subscriber_slots.clear();
+            ctx->ring_subscriber_slots.shrink_to_fit();
+            // Clear edges and associated rope state (this will destroy owned RopeSim)
+            gp_table_clear_edges(ctx);
+            // Reset style to defaults and recompute geometry
+            ctx->style_raw = GP_TableStyle();
+            ctx->st = load_style(&ctx->style_raw);
+            recompute_geom(ctx);
+        }
+        return 1; // indicate success (wiped/ignored)
+    }
     // read style
     GP_TableStyle style{};
     memcpy(&style, p, sizeof(GP_TableStyle)); p += sizeof(GP_TableStyle);

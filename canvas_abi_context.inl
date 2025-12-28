@@ -117,6 +117,9 @@ struct GP_CanvasContextImpl {
     DragState drag;
     // provisional rope index while user is selecting a contact and moving the mouse
     int prospective_rope_idx = -1;
+    // lasso meta rope/module created for the current lasso action
+    int lasso_rope_idx = -1;
+    int lasso_module_idx = -1;
     // rope simulation tuning parameters and UI bar height
     int rope_bar_h = 28; // extra bar above control bar
     int sim_segs = 8;
@@ -128,6 +131,7 @@ struct GP_CanvasContextImpl {
     // The count is the number of frames to skip between steps (step every count+1 frames).
     int sim_frame_skip_count = 0;
     int sim_root_paused = 0; // toolbar-level pause for the root/global rope sim
+    uint32_t debug_flags = GP_CANVAS_DEBUG_NORENDER_MODE; // debug render/sim overrides (see GP_CanvasDebugFlags)
     // tool selection state: separate groups (exclusive within group)
     // canvas tool group: 0 = select, 1 = new table, 2 = edge mode, 3 = new stage
     int selected_tool_canvas = 0;
@@ -176,6 +180,7 @@ struct GP_CanvasContextImpl {
     };
     std::vector<ToolbarLedBox> toolbar_leds;
     bool tool_menu_open = false;
+    bool rope_menu_open = false;
     // Custom canvas overlays keyed by small integer id. Overlays are
     // lightweight rectangle-only panes carrying two LED positions used for
     // anchoring ropes and interactions. Keys returned to callers encode the

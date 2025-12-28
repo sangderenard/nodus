@@ -856,7 +856,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                             float fx_local = ox2 - table_off_x;
                             float fy_local = oy2 - table_off_y;
                             float plug_z = -10.0f;
-                            int segs = 2;
+                            int segs = (c->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : 2;
                             if (allow_overlay_rope) {
                                 rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
                             }
@@ -944,7 +944,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                             float fx_local = ox2 - table_off_x;
                             float fy_local = oy2 - table_off_y;
                             float plug_z = -10.0f;
-                            int segs = 2;
+                            int segs = (c->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : 2;
                             if (allow_overlay_rope) {
                                 rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
                             }
@@ -1160,7 +1160,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                     float fx_local = pov->x2 - table_off_x;
                     float fy_local = pov->y2 - table_off_y;
                     float plug_z = -10.0f;
-                    int segs = 2;
+                    int segs = (c->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : 2;
                     int rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
                     if (rope_idx >= 0) {
                         gp_canvas_attach_rope_to_overlay(reinterpret_cast<GP_CanvasContext*>(c), pov->key_a, pov->key_b, rope_idx);
@@ -1220,7 +1220,18 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             continue;
         }
 
-        canvas_finalize_lasso_meta_group(c, t, mg, first_rope, first_vid, saved_u);
+        float spawn_x = 0.0f;
+        float spawn_y = 0.0f;
+        if (sim && first_rope >= 0 && first_vid >= 0) {
+            int vc = rope_sim_get_vertex_count(sim, first_rope);
+            if (vc > 0 && first_vid < vc) {
+                std::vector<float> verts3(static_cast<size_t>(vc * 3));
+                rope_sim_get_vertices3(sim, first_rope, verts3.data(), static_cast<int>(verts3.size()));
+                spawn_x = verts3[static_cast<size_t>(first_vid) * 3 + 0];
+                spawn_y = verts3[static_cast<size_t>(first_vid) * 3 + 1];
+            }
+        }
+        canvas_finalize_lasso_meta_group(c, t, mg, first_rope, first_vid, saved_u, first_rope, spawn_x, spawn_y);
         // Ensure RopeSim meta-group contains all table-side vertices. Some
         // vertices may have been added before a RopeSim was attached; replay
         // any missing members into the sim meta-group now that a root sim
@@ -1489,6 +1500,24 @@ extern "C" int gp_canvas_set_subgroup_toolbar_rgba_at(GP_CanvasContext* ctx_, in
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     const Color col = rgba_from_floats(rgba);
     c->subgroup_target_rgba[static_cast<size_t>(idx)].store(pack_rgba(col), std::memory_order_release);
+    return 1;
+}
+
+extern "C" int gp_canvas_set_debug_flags(GP_CanvasContext* ctx_, uint32_t flags) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->debug_flags = flags;
+    if (c->container_table) gp_table_set_debug_flags(c->container_table, flags);
+    for (GP_TableContext* t : c->module_tables) {
+        if (t) gp_table_set_debug_flags(t, flags);
+    }
+    return 1;
+}
+
+extern "C" int gp_canvas_get_debug_flags(GP_CanvasContext* ctx_, uint32_t* out_flags) {
+    if (!ctx_ || !out_flags) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    *out_flags = c->debug_flags;
     return 1;
 }
 

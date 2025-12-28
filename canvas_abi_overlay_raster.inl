@@ -163,7 +163,7 @@ extern "C" int gp_canvas_create_overlay_with_leds(GP_CanvasContext* ctx_, float 
                                 float fx_local = pov->x2 - table_off_x;
                                 float fy_local = pov->y2 - table_off_y;
                                 float plug_z = -10.0f;
-                                int segs = 2;
+                                int segs = (c->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : 2;
                                 int rope_idx = rope_sim_add_rope3(sim, sx_local, sy_local, plug_z, fx_local, fy_local, plug_z, segs, 0.0f);
                                 if (rope_idx >= 0) {
                                     // attach root/canonical edge and map overlay keys
@@ -203,7 +203,19 @@ extern "C" int gp_canvas_create_overlay_with_leds(GP_CanvasContext* ctx_, float 
                             }
                         }
                         if (first_rope >= 0 && first_vid >= 0) {
-                            canvas_finalize_lasso_meta_group(c, t, mg, first_rope, first_vid, ms.ring_u);
+                            RopeSim* sim = gp_table_get_rope_sim(t);
+                            float spawn_x = 0.0f;
+                            float spawn_y = 0.0f;
+                            if (sim) {
+                                int vc = rope_sim_get_vertex_count(sim, first_rope);
+                                if (vc > 0 && first_vid < vc) {
+                                    std::vector<float> verts3(static_cast<size_t>(vc * 3));
+                                    rope_sim_get_vertices3(sim, first_rope, verts3.data(), static_cast<int>(verts3.size()));
+                                    spawn_x = verts3[static_cast<size_t>(first_vid) * 3 + 0];
+                                    spawn_y = verts3[static_cast<size_t>(first_vid) * 3 + 1];
+                                }
+                            }
+                            canvas_finalize_lasso_meta_group(c, t, mg, first_rope, first_vid, ms.ring_u, first_rope, spawn_x, spawn_y);
                         } else {
                             // couldn't find a rope/vertex to finalize ring registration
                             printf("pending_meta_snapshot: cannot finalize ring for mg=%p ring_mode=%d first_rope=%d first_vid=%d overlay_a=%llu overlay_b=%llu mgid=%llu\n",
@@ -684,6 +696,11 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
 
     update_canvas_scroll_state(ctx, /*pull_from_container=*/true);
     canvas_update_subgroup_palette(ctx);
+    const uint32_t debug_flags = ctx->debug_flags;
+    const bool simple_render = (debug_flags & GP_CANVAS_DEBUG_SIMPLE_RENDER) != 0u;
+    const bool no_lighting = (debug_flags & GP_CANVAS_DEBUG_NO_LIGHTING) != 0u;
+    const int simple_line_radius = 2;
+    const int simple_dot_radius = std::max(3, simple_line_radius + 2);
 
     // clear
     memset(out_rgba, 0, static_cast<size_t>(w) * h * 4);
@@ -695,9 +712,15 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         // draw simple controls: segs +/- at left, slack +/- at right, and display values
         int bw = std::max(4, rb - 8);
         int spacing = 8;
-        int bx = 8; int byy = 4;
-        memset_rect(out_rgba, w, h, pitch, bx, byy, bw, rb - 8, Color{60,60,72,255}); bx += bw + spacing;
-        memset_rect(out_rgba, w, h, pitch, bx, byy, bw, rb - 8, Color{60,60,72,255});
+        int byy = 4;
+        int seg_minus_x = 8;
+        int seg_plus_x = seg_minus_x + bw + spacing;
+        int menu_w = std::max(bw, 36);
+        int menu_x = seg_plus_x + bw + spacing;
+        memset_rect(out_rgba, w, h, pitch, seg_minus_x, byy, bw, rb - 8, Color{60,60,72,255});
+        memset_rect(out_rgba, w, h, pitch, seg_plus_x, byy, bw, rb - 8, Color{60,60,72,255});
+        Color menu_fill = ctx->rope_menu_open ? Color{70,70,84,255} : Color{60,60,72,255};
+        memset_rect(out_rgba, w, h, pitch, menu_x, byy, menu_w, rb - 8, menu_fill);
         // slack buttons on right
         int bx2 = w - 8 - bw*2 - spacing; memset_rect(out_rgba, w, h, pitch, bx2, byy, bw, rb - 8, Color{60,60,72,255}); bx2 += bw + spacing; memset_rect(out_rgba, w, h, pitch, bx2, byy, bw, rb - 8, Color{60,60,72,255});
         // value text (render_text_to_rgba is available)
@@ -737,6 +760,30 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 auto tb = render_text_to_rgba(lbls[i], 0.9f, {230,230,230,255});
                 if (!tb.pixels.empty()) {
                     int tx = bx_i + (bw - tb.width) / 2;
+                    int ty = byy + (rb - 8 - tb.height) / 2;
+                    for (int yy = 0; yy < tb.height; ++yy) {
+                        int dst_y = ty + yy;
+                        if (dst_y < 0 || dst_y >= h) continue;
+                        for (int xx = 0; xx < tb.width; ++xx) {
+                            int dst_x = tx + xx;
+                            if (dst_x < 0 || dst_x >= w) continue;
+                            uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                            const unsigned char* src = &tb.pixels[(yy * tb.width + xx) * 4];
+                            float sa = src[3] / 255.0f;
+                            if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                            else if (sa > 0.001f) {
+                                for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                                dst[3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+            // rope sim menu button label
+            {
+                auto tb = render_text_to_rgba(LABEL_ROPE_MENU_BUTTON, 0.85f, {230,230,230,255});
+                if (!tb.pixels.empty()) {
+                    int tx = menu_x + (menu_w - tb.width) / 2;
                     int ty = byy + (rb - 8 - tb.height) / 2;
                     for (int yy = 0; yy < tb.height; ++yy) {
                         int dst_y = ty + yy;
@@ -1714,6 +1761,16 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     std::vector<ContactLight> edge_light_b(ctx->edges.size());
     const float rope_decay = 0.35f;
     const float rope_end_gain = std::exp(-rope_decay);
+    auto resolve_edge_light_for_rope = [&](int rope_idx, ContactLight* out_a, ContactLight* out_b) -> bool {
+        if (rope_idx < 0) return false;
+        for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+            if (ctx->edges[ei].rope_idx != rope_idx) continue;
+            if (out_a) *out_a = edge_light_a[ei];
+            if (out_b) *out_b = edge_light_b[ei];
+            return true;
+        }
+        return false;
+    };
     auto is_input_contact = [&](int module_idx, int contact_idx) -> bool {
         if (module_idx >= 0 && module_idx < static_cast<int>(module_frame_roles.size())) {
             const auto &roles = module_frame_roles[module_idx];
@@ -1809,7 +1866,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
         int ridx = ctx->edges[ei].rope_idx;
         if (ridx < 0) {
-            int segs = ctx->sim_segs;
+            int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : ctx->sim_segs;
             float slack = ctx->sim_slack;
             int newr = sim ? rope_sim_add_rope(sim, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), segs, slack) : -1;
             ctx->edges[ei].rope_idx = newr;
@@ -1822,7 +1879,12 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     if (sim) {
         GP_TableContext* root_tbl = canvas_ensure_root_table(ctx);
         if (root_tbl && gp_table_should_step_sim(root_tbl)) {
-            rope_sim_step(sim, 1.0f/60.0f, ctx->sim_maxforce, ctx->sim_iters, ctx->sim_damping);
+            uint32_t dbg = ctx->debug_flags;
+            bool disable_sim = (dbg & GP_CANVAS_DEBUG_NO_SPRINGS) != 0u || (dbg & GP_CANVAS_DEBUG_RING_STATIC) != 0u;
+            float gravity = (dbg & GP_CANVAS_DEBUG_NO_GRAVITY) ? 0.0f : ctx->sim_maxforce;
+            if (!disable_sim) {
+                rope_sim_step(sim, 1.0f/60.0f, gravity, ctx->sim_iters, ctx->sim_damping);
+            }
         }
     }
 
@@ -2422,6 +2484,19 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
     }
 
+    auto draw_polyline = [&](const float* verts, int count, Color col) {
+        if (!verts || count < 2) return;
+        table_draw_rope_polyline(out_rgba, w, h, pitch, verts, count, simple_line_radius, col.r, col.g, col.b, col.a);
+    };
+    auto draw_vertices = [&](const float* verts, int count, Color col) {
+        if (!verts || count <= 0) return;
+        for (int vi = 0; vi < count; ++vi) {
+            int cx = static_cast<int>(std::lround(verts[vi * 2 + 0]));
+            int cy = static_cast<int>(std::lround(verts[vi * 2 + 1]));
+            draw_blob_blend(out_rgba, w, h, pitch, cx, cy, simple_dot_radius, col);
+        }
+    };
+
     // Prefer manager-supplied immutable network snapshot for rendering the connection graph.
     // The snapshot contains only endpoint keys and edges (no UI data). Map endpoint keys
     // to module centers for visual placement (canvas module positions are UI-owned).
@@ -2429,7 +2504,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     std::shared_ptr<ThreadManager::NetworkSnapshot> snap;
     ThreadManager* tm = ThreadManager::global();
     if (tm && root_table) snap = tm->get_table_snapshot(root_table);
-    if (snap && !snap->edges.empty()) {
+    if (snap && !snap->edges.empty() && !simple_render) {
         // Draw simple straight lines between module centers derived from endpoint keys.
         for (size_t ei = 0; ei < snap->edges.size(); ++ei) {
             const auto &se = snap->edges[ei];
@@ -2480,15 +2555,23 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             int jacket_px = ctx->jacket_px;
             int jacket_border = ctx->jacket_border;
             uint32_t subgroup_flags = ctx->edges[ei].subgroup_flags;
-            if (subgroup_flags != 0u) {
-                float hue = subgroup_flags_to_hue(ctx, subgroup_flags);
-                float hue_vals[1] = { hue };
-                table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, 3, 0.65f);
+            Color rope_col = (subgroup_flags != 0u) ? subgroup_flags_to_color(ctx, subgroup_flags, 220) : Color{200,200,200,220};
+            if (simple_render) {
+                draw_polyline(verts_view.data(), got, rope_col);
+                draw_vertices(verts_view.data(), got, rope_col);
             } else {
-                table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, 3);
+                if (subgroup_flags != 0u) {
+                    float hue = subgroup_flags_to_hue(ctx, subgroup_flags);
+                    float hue_vals[1] = { hue };
+                    table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, 3, 0.65f);
+                } else {
+                    table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, 3);
+                }
+                if (!no_lighting) {
+                    int glow_r = std::max(2, jacket_px * 2);
+                    draw_rope_light_falloff(out_rgba, w, h, pitch, verts_view.data(), got, edge_light_a[ei], edge_light_b[ei], rope_decay, glow_r);
+                }
             }
-            int glow_r = std::max(2, jacket_px * 2);
-            draw_rope_light_falloff(out_rgba, w, h, pitch, verts_view.data(), got, edge_light_a[ei], edge_light_b[ei], rope_decay, glow_r);
         }
     }
 
@@ -2508,13 +2591,19 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 int jacket_px = ctx->jacket_px;
                 int jacket_border = ctx->jacket_border;
                 int samples_per_segment = 3;
-                if (ctx->selected_tool_subgroup_flags != 0u) {
-                    uint32_t flags = ctx->selected_tool_subgroup_flags;
-                    float hue = subgroup_flags_to_hue(ctx, flags);
-                    float hue_vals[1] = { hue };
-                    table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, samples_per_segment, 0.55f);
+                uint32_t flags = ctx->selected_tool_subgroup_flags;
+                Color rope_col = (flags != 0u) ? subgroup_flags_to_color(ctx, flags, 220) : Color{200,200,200,220};
+                if (simple_render) {
+                    draw_polyline(verts_view.data(), got, rope_col);
+                    draw_vertices(verts_view.data(), got, rope_col);
                 } else {
-                    table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, samples_per_segment);
+                    if (flags != 0u) {
+                        float hue = subgroup_flags_to_hue(ctx, flags);
+                        float hue_vals[1] = { hue };
+                        table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hue_vals, 1, samples_per_segment, 0.55f);
+                    } else {
+                        table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, 200, 200, 200, 180, samples_per_segment);
+                    }
                 }
             }
         }
@@ -2528,8 +2617,28 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         if (ctx->container_table) draw_tables.push_back(ctx->container_table);
         for (GP_TableContext* mt : ctx->module_tables) if (mt) draw_tables.push_back(mt);
 
+        std::unordered_map<unsigned long long, int> ring_mode_by_key;
+        for (GP_TableContext* rt : draw_tables) {
+            if (!rt) continue;
+            int mg_count = gp_table_get_meta_group_count(rt);
+            for (int mgi = 0; mgi < mg_count; ++mgi) {
+                GP_MetaGroup* mg = gp_table_get_meta_group(rt, mgi);
+                if (!mg) continue;
+                unsigned long long mgid = 0ull;
+                gp_table_meta_get_id(rt, mg, &mgid);
+                if (mgid == 0ull) continue;
+                int mode = 0;
+                gp_table_meta_get_ring_mode(rt, mg, &mode);
+                ring_mode_by_key[mgid] = mode;
+            }
+        }
+
+        struct RingGroupData {
+            std::vector<std::pair<float,float>> pts;
+            int rope_idx = -1;
+        };
         // collect per-key ring world positions (canvas coords)
-        std::unordered_map<unsigned long long, std::vector<std::pair<float,float>>> ring_groups;
+        std::unordered_map<unsigned long long, RingGroupData> ring_groups;
 
         for (GP_TableContext* rt : draw_tables) {
             if (!rt) continue;
@@ -2560,7 +2669,16 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 // transform to canvas coords and collect
                 float cx = wx - static_cast<float>(ctx->offset_x);
                 float cy = wy - static_cast<float>(ctx->offset_y);
-                ring_groups[ring_key].emplace_back(cx, cy);
+                auto &group = ring_groups[ring_key];
+                if (group.rope_idx < 0) group.rope_idx = parent_ridx;
+                group.pts.emplace_back(cx, cy);
+                if (simple_render) {
+                    uint32_t flags = 0;
+                    gp_table_ring_get_subgroup_flags(rt, rei, &flags);
+                    Color ring_col = (flags != 0u) ? subgroup_flags_to_color(ctx, flags, 230) : Color{220,160,80,230};
+                    draw_blob_blend(out_rgba, w, h, pitch, static_cast<int>(std::lround(cx)), static_cast<int>(std::lround(cy)), simple_dot_radius, ring_col);
+                    continue;
+                }
 
                 // draw a short sampled segment centered at u (as before)
                 int center_idx = static_cast<int>(idxf + 0.5f);
@@ -2587,12 +2705,25 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 } else {
                     table_draw_rope_curve_blend(out_rgba, w, h, pitch, verts_view.data(), use_count, jacket_px, jacket_border, 220, 160, 80, 220, samples_per_segment);
                 }
+                if (!no_lighting) {
+                    ContactLight la{}, lb{};
+                    if (resolve_edge_light_for_rope(parent_ridx, &la, &lb)) {
+                        int glow_r = std::max(2, jacket_px * 2);
+                        draw_rope_light_falloff(out_rgba, w, h, pitch, verts_view.data(), use_count, la, lb, rope_decay, glow_r);
+                    }
+                }
             }
         }
 
         // Now draw connecting splines for each group of rings sharing the same key
         for (auto &kv : ring_groups) {
-            auto &pts = kv.second;
+            if (simple_render) continue;
+            auto it_mode = ring_mode_by_key.find(kv.first);
+            if (it_mode != ring_mode_by_key.end() && it_mode->second == 2) {
+                continue;
+            }
+            auto &group = kv.second;
+            auto &pts = group.pts;
             if (pts.size() < 2) continue;
             // build simple polyline in collected order
             std::vector<float> poly(static_cast<size_t>(pts.size() * 2));
@@ -2601,6 +2732,13 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             int jacket_border = ctx->jacket_border;
             // neutral colored connecting rope
             table_draw_rope_curve_blend(out_rgba, w, h, pitch, poly.data(), static_cast<int>(pts.size()), jacket_px, jacket_border, 180, 140, 100, 220, 3);
+            if (!no_lighting) {
+                ContactLight la{}, lb{};
+                if (resolve_edge_light_for_rope(group.rope_idx, &la, &lb)) {
+                    int glow_r = std::max(2, jacket_px * 2);
+                    draw_rope_light_falloff(out_rgba, w, h, pitch, poly.data(), static_cast<int>(pts.size()), la, lb, rope_decay, glow_r);
+                }
+            }
         }
     }
 
@@ -2656,15 +2794,118 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 if (!got_all) continue;
                 int jacket_px = ctx->jacket_px;
                 int jacket_border = ctx->jacket_border;
+                int ring_mode = 0;
+                gp_table_meta_get_ring_mode(rt, mg, &ring_mode);
+                int light_rope_idx = -1;
+                int light_vert_idx = -1;
+                gp_table_meta_get_anchor(rt, mg, &light_rope_idx, &light_vert_idx);
+                if (light_rope_idx < 0) {
+                    gp_table_meta_get_vertex(rt, mg, 0, &light_rope_idx, &light_vert_idx);
+                }
                 // draw meta-group connector spline using subgroup color when present
                 uint32_t mg_flags = 0u;
                 gp_table_meta_get_subgroup_flags(rt, mg, &mg_flags);
+                if (ring_mode == 2) {
+                    RopeSim* tsim = gp_table_get_rope_sim(rt);
+                    int center_rope = -1;
+                    float cx = 0.0f;
+                    float cy = 0.0f;
+                    int center_members = 0;
+                    for (int vi = 0; vi < vcount; ++vi) {
+                        int r = -1, v = -1;
+                        if (!gp_table_meta_get_vertex(rt, mg, vi, &r, &v)) continue;
+                        if (tsim && rope_sim_is_meta_rope(tsim, r)) {
+                            center_rope = r;
+                            continue;
+                        }
+                        float wx = poly[vi * 2 + 0] + static_cast<float>(ctx->offset_x);
+                        float wy = poly[vi * 2 + 1] + static_cast<float>(ctx->offset_y);
+                        cx += wx;
+                        cy += wy;
+                        ++center_members;
+                    }
+                    if (center_members > 0) {
+                        cx /= static_cast<float>(center_members);
+                        cy /= static_cast<float>(center_members);
+                    }
+                    int stem_idx = -1;
+                    float stem_dist = 1e9f;
+                    if (center_rope >= 0) {
+                        int stem_vc = rope_sim_get_vertex_count(tsim, center_rope);
+                        for (int vi = 0; vi < vcount; ++vi) {
+                            int r = -1, v = -1;
+                            if (!gp_table_meta_get_vertex(rt, mg, vi, &r, &v)) continue;
+                            if (r != center_rope) continue;
+                            float u = (stem_vc > 1) ? (static_cast<float>(v) / static_cast<float>(stem_vc - 1)) : 0.5f;
+                            float du = std::fabs(u - 0.5f);
+                            if (du < stem_dist) { stem_dist = du; stem_idx = vi; }
+                        }
+                    }
+                    auto draw_star_edge = [&](float x0, float y0, float x1, float y1) {
+                        float seg[4] = { x0 - ctx->offset_x, y0 - ctx->offset_y, x1 - ctx->offset_x, y1 - ctx->offset_y };
+                        Color edge_col = (mg_flags != 0u) ? subgroup_flags_to_color(ctx, mg_flags, 220) : Color{160,200,210,220};
+                        if (simple_render) {
+                            draw_polyline(seg, 2, edge_col);
+                            draw_vertices(seg, 2, edge_col);
+                        } else {
+                            if (mg_flags != 0u) {
+                                float hue = subgroup_flags_to_hue(ctx, mg_flags);
+                                float hue_vals[1] = { hue };
+                                table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, seg, 2, jacket_px, jacket_border, hue_vals, 1, 3, 0.55f);
+                            } else {
+                                table_draw_rope_curve_blend(out_rgba, w, h, pitch, seg, 2, jacket_px, jacket_border, 160, 200, 210, 200, 3);
+                            }
+                            if (!no_lighting) {
+                                ContactLight la{}, lb{};
+                                if (resolve_edge_light_for_rope(center_rope, &la, &lb)) {
+                                    int glow_r = std::max(2, jacket_px * 2);
+                                    draw_rope_light_falloff(out_rgba, w, h, pitch, seg, 2, la, lb, rope_decay, glow_r);
+                                }
+                            }
+                        }
+                    };
+                    if (center_members > 0) {
+                        for (int vi = 0; vi < vcount; ++vi) {
+                            int r = -1, v = -1;
+                            if (!gp_table_meta_get_vertex(rt, mg, vi, &r, &v)) continue;
+                            if (r == center_rope) continue;
+                            float wx = poly[vi * 2 + 0] + static_cast<float>(ctx->offset_x);
+                            float wy = poly[vi * 2 + 1] + static_cast<float>(ctx->offset_y);
+                            draw_star_edge(cx, cy, wx, wy);
+                        }
+                        if (stem_idx >= 0) {
+                            float sx = poly[stem_idx * 2 + 0] + static_cast<float>(ctx->offset_x);
+                            float sy = poly[stem_idx * 2 + 1] + static_cast<float>(ctx->offset_y);
+                            draw_star_edge(cx, cy, sx, sy);
+                        }
+                    }
+                    continue;
+                }
                 if (mg_flags != 0u) {
-                    float hue = subgroup_flags_to_hue(ctx, mg_flags);
-                    float hue_vals[1] = { hue };
-                    table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, poly.data(), vcount, jacket_px, jacket_border, hue_vals, 1, 3, 0.6f);
+                    if (simple_render) {
+                        Color edge_col = subgroup_flags_to_color(ctx, mg_flags, 220);
+                        draw_polyline(poly.data(), vcount, edge_col);
+                        draw_vertices(poly.data(), vcount, edge_col);
+                    } else {
+                        float hue = subgroup_flags_to_hue(ctx, mg_flags);
+                        float hue_vals[1] = { hue };
+                        table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, poly.data(), vcount, jacket_px, jacket_border, hue_vals, 1, 3, 0.6f);
+                    }
                 } else {
-                    table_draw_rope_curve_blend(out_rgba, w, h, pitch, poly.data(), vcount, jacket_px, jacket_border, 160, 200, 210, 200, 3);
+                    if (simple_render) {
+                        Color edge_col{160,200,210,220};
+                        draw_polyline(poly.data(), vcount, edge_col);
+                        draw_vertices(poly.data(), vcount, edge_col);
+                    } else {
+                        table_draw_rope_curve_blend(out_rgba, w, h, pitch, poly.data(), vcount, jacket_px, jacket_border, 160, 200, 210, 200, 3);
+                    }
+                }
+                if (!simple_render && !no_lighting) {
+                    ContactLight la{}, lb{};
+                    if (resolve_edge_light_for_rope(light_rope_idx, &la, &lb)) {
+                        int glow_r = std::max(2, jacket_px * 2);
+                        draw_rope_light_falloff(out_rgba, w, h, pitch, poly.data(), vcount, la, lb, rope_decay, glow_r);
+                    }
                 }
 
                 // Debug overlay: draw a small blob at each stored vertex and always log mapping
@@ -2830,12 +3071,25 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                         int jacket_border_w = ctx->jacket_border;
                         uint32_t mf = 0u;
                         gp_table_meta_get_subgroup_flags(rt, mg, &mf);
-                        if (mf != 0u) {
-                            float hue = subgroup_flags_to_hue(ctx, mf);
-                            float hue_vals[1] = { hue };
-                            table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, wseg.data(), wgot, jacket_px_w, jacket_border_w, hue_vals, 1, 3, 0.6f);
+                        Color rope_col = (mf != 0u) ? subgroup_flags_to_color(ctx, mf, 220) : Color{160,200,210,220};
+                        if (simple_render) {
+                            draw_polyline(wseg.data(), wgot, rope_col);
+                            draw_vertices(wseg.data(), wgot, rope_col);
                         } else {
-                            table_draw_rope_curve_blend(out_rgba, w, h, pitch, wseg.data(), wgot, jacket_px_w, jacket_border_w, 160, 200, 210, 200, 3);
+                            if (mf != 0u) {
+                                float hue = subgroup_flags_to_hue(ctx, mf);
+                                float hue_vals[1] = { hue };
+                                table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, wseg.data(), wgot, jacket_px_w, jacket_border_w, hue_vals, 1, 3, 0.6f);
+                            } else {
+                                table_draw_rope_curve_blend(out_rgba, w, h, pitch, wseg.data(), wgot, jacket_px_w, jacket_border_w, 160, 200, 210, 200, 3);
+                            }
+                            if (!no_lighting) {
+                                ContactLight la{}, lb{};
+                                if (resolve_edge_light_for_rope(wrope, &la, &lb)) {
+                                    int glow_r = std::max(2, jacket_px_w * 2);
+                                    draw_rope_light_falloff(out_rgba, w, h, pitch, wseg.data(), wgot, la, lb, rope_decay, glow_r);
+                                }
+                            }
                         }
                     }
                 }
@@ -2868,22 +3122,35 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                                     // prefer meta-group's own subgroup flags (set via lasso config)
                                     uint32_t mf = 0u;
                                     gp_table_meta_get_subgroup_flags(rt, mg, &mf);
-                                    if (mf != 0u) {
-                                        float hue = subgroup_flags_to_hue(ctx, mf);
-                                        float hue_vals[1] = { hue };
-                                        table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, seg.data(), use_count, jacket_px, jacket_border, hue_vals, 1, 3, 0.45f);
+                                    Color rope_col = (mf != 0u) ? subgroup_flags_to_color(ctx, mf, 200) : Color{200,160,160,200};
+                                    if (simple_render) {
+                                        draw_polyline(seg.data(), use_count, rope_col);
+                                        draw_vertices(seg.data(), use_count, rope_col);
                                     } else {
-                                        int mapped_edge = -1;
-                                        for (size_t eii = 0; eii < ctx->edges.size(); ++eii) {
-                                            if (ctx->edges[eii].rope_idx == rope_idx) { mapped_edge = static_cast<int>(eii); break; }
-                                        }
-                                        if (mapped_edge >= 0 && mapped_edge < static_cast<int>(ctx->edges.size()) && ctx->edges[mapped_edge].subgroup_flags != 0u) {
-                                            float hue = subgroup_flags_to_hue(ctx, ctx->edges[mapped_edge].subgroup_flags);
+                                        if (mf != 0u) {
+                                            float hue = subgroup_flags_to_hue(ctx, mf);
                                             float hue_vals[1] = { hue };
                                             table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, seg.data(), use_count, jacket_px, jacket_border, hue_vals, 1, 3, 0.45f);
                                         } else {
-                                            // subtle neutral tint so widget rope doesn't fully overlay the real rope
-                                            table_draw_rope_curve_blend(out_rgba, w, h, pitch, seg.data(), use_count, jacket_px, jacket_border, 200, 160, 160, 120, 2);
+                                            int mapped_edge = -1;
+                                            for (size_t eii = 0; eii < ctx->edges.size(); ++eii) {
+                                                if (ctx->edges[eii].rope_idx == rope_idx) { mapped_edge = static_cast<int>(eii); break; }
+                                            }
+                                            if (mapped_edge >= 0 && mapped_edge < static_cast<int>(ctx->edges.size()) && ctx->edges[mapped_edge].subgroup_flags != 0u) {
+                                                float hue = subgroup_flags_to_hue(ctx, ctx->edges[mapped_edge].subgroup_flags);
+                                                float hue_vals[1] = { hue };
+                                                table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, seg.data(), use_count, jacket_px, jacket_border, hue_vals, 1, 3, 0.45f);
+                                            } else {
+                                                // subtle neutral tint so widget rope doesn't fully overlay the real rope
+                                                table_draw_rope_curve_blend(out_rgba, w, h, pitch, seg.data(), use_count, jacket_px, jacket_border, 200, 160, 160, 120, 2);
+                                            }
+                                        }
+                                        if (!no_lighting) {
+                                            ContactLight la{}, lb{};
+                                            if (resolve_edge_light_for_rope(rope_idx, &la, &lb)) {
+                                                int glow_r = std::max(2, jacket_px * 2);
+                                                draw_rope_light_falloff(out_rgba, w, h, pitch, seg.data(), use_count, la, lb, rope_decay, glow_r);
+                                            }
                                         }
                                     }
                                 }
@@ -2891,6 +3158,67 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if (ctx->rope_menu_open) {
+        RopeMenuLayout layout = compute_rope_menu_layout(ctx);
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y, layout.w, layout.h, Color{32,32,40,230});
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y, layout.w, 1, Color{90,90,110,255});
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y + layout.h - 1, layout.w, 1, Color{10,10,14,255});
+        auto blit_text = [&](const char* text, int tx, int ty, float scale, Color col) {
+            if (!text || text[0] == '\0') return;
+            auto bm = render_text_to_rgba(text, scale, {col.r, col.g, col.b, col.a});
+            if (bm.pixels.empty()) return;
+            for (int yy = 0; yy < bm.height; ++yy) {
+                int dst_y = ty + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < bm.width; ++xx) {
+                    int dst_x = tx + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        };
+        int title_x = layout.x + 8;
+        int title_y = layout.y + 6;
+        blit_text(LABEL_ROPE_MENU_TITLE, title_x, title_y, 0.95f, Color{220,220,230,255});
+        bool simple_mode = (ctx->debug_flags & GP_CANVAS_DEBUG_NORENDER_MODE) == GP_CANVAS_DEBUG_NORENDER_MODE;
+        for (int row = 0; row < 4; ++row) {
+            int y0 = layout.item_start_y + row * layout.row_h;
+            Color row_col{32,32,40,230};
+            if ((row == 0 && simple_mode) || (row == 1 && !simple_mode)) {
+                row_col = Color{46,46,58,255};
+            }
+            memset_rect(out_rgba, w, h, pitch, layout.x + 1, y0, layout.w - 2, layout.row_h, row_col);
+            if (row == 0) {
+                blit_text(LABEL_ROPE_MODE_SIMPLE, layout.x + 12, y0 + 3, 0.9f, Color{240,240,240,255});
+            } else if (row == 1) {
+                blit_text(LABEL_ROPE_MODE_FULL, layout.x + 12, y0 + 3, 0.9f, Color{240,240,240,255});
+            } else {
+                RopeMenuCounterLayout counter = compute_rope_menu_counter_layout(layout, row);
+                const char* lbl = (row == 2) ? "Segments" : "Slack";
+                blit_text(lbl, counter.label_x, y0 + 3, 0.85f, Color{200,200,210,255});
+                memset_rect(out_rgba, w, h, pitch, counter.bx_minus, counter.by, counter.nbw, counter.h, Color{60,60,70,255});
+                memset_rect(out_rgba, w, h, pitch, counter.bx_num, counter.by, counter.num_w, counter.h, Color{36,36,46,255});
+                memset_rect(out_rgba, w, h, pitch, counter.bx_plus, counter.by, counter.nbw, counter.h, Color{60,60,70,255});
+                blit_text("-", counter.bx_minus + (counter.nbw / 2) - 4, counter.by + 1, 0.9f, Color{220,220,220,255});
+                blit_text("+", counter.bx_plus + (counter.nbw / 2) - 4, counter.by + 1, 0.9f, Color{220,220,220,255});
+                char buf[32];
+                if (row == 2) {
+                    std::snprintf(buf, sizeof(buf), "%d", ctx->sim_segs);
+                } else {
+                    std::snprintf(buf, sizeof(buf), "%.2f", ctx->sim_slack);
+                }
+                blit_text(buf, counter.bx_num + 6, counter.by + 2, 0.85f, Color{230,230,235,255});
             }
         }
     }

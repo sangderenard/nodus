@@ -61,7 +61,27 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
         };
         compute_center_local(a, ax, ay);
         compute_center_local(b, bx, by);
-        int segs = std::max(4, ctx->st.cable_segments);
+        if (ax == bx && ay == by) {
+            // Guard against degenerate endpoints: derive a simple offset from contact ids.
+            auto decode = [](uint64_t key, int &row, int &col, int &led) {
+                row = static_cast<int>(static_cast<uint32_t>(key >> 32));
+                col = static_cast<int>((static_cast<uint32_t>(key >> 16)) & 0xFFFFu);
+                led = static_cast<int>(static_cast<uint32_t>(key & 0xFFFFu));
+            };
+            int ra = 0, ca = 0, la = 0;
+            int rb = 0, cb = 0, lb = 0;
+            decode(a, ra, ca, la);
+            decode(b, rb, cb, lb);
+            int row_h = ctx->st.row_h > 0 ? ctx->st.row_h : 22;
+            int dx = (cb - ca) * 16 + (lb - la) * 8;
+            int dy = (rb - ra) * std::max(10, row_h / 2);
+            if (dx == 0 && dy == 0) dx = 24; // last resort nudge
+            bx += dx;
+            by += dy;
+            printf("gp_table_add_edge: adjusted degenerate endpoints a_row=%d b_row=%d dx=%d dy=%d -> (%d,%d)->(%d,%d)\n",
+                ra, rb, dx, dy, ax, ay, bx, by);
+        }
+        int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->st.cable_segments);
         float slack = 0.0f;
         float plug_z = -ctx->st.cable_plug_depth;
         int idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
@@ -114,7 +134,7 @@ int32_t gp_table_clear_edges(GP_TableContext* ctx) {
     if (ctx->rope_sim && ctx->rope_sim_owned) {
         rope_sim_destroy(ctx->rope_sim);
         int max_ropes = 1024;
-        int max_segs = std::max(4, ctx->st.cable_segments);
+        int max_segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : std::max(2, ctx->st.cable_segments);
         ctx->rope_sim = rope_sim_create(max_ropes, max_segs);
     } else {
         // if rope_sim is external or null, leave it alone; indices already cleared
@@ -810,6 +830,24 @@ extern "C" int gp_table_resolve_rope_id_to_sim_index(GP_TableContext* ctx, uint6
     if (it == ctx->rope_id_to_sim_idx.end()) return -1;
     return it->second;
 }
+
+// Bind a persistent rope id to a specific RopeSim index. Useful when a caller
+// creates a rope externally and wants the table to resolve it later.
+extern "C" int gp_table_bind_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t id, int32_t rope_idx) {
+    if (!ctx || id == 0ull || rope_idx < 0) return 0;
+    ctx->rope_id_to_sim_idx[id] = rope_idx;
+    if (static_cast<size_t>(rope_idx) >= ctx->rope_ids.size()) {
+        ctx->rope_ids.resize(static_cast<size_t>(rope_idx) + 1, 0ull);
+    }
+    if (ctx->rope_ids[static_cast<size_t>(rope_idx)] == 0ull) {
+        ctx->rope_ids[static_cast<size_t>(rope_idx)] = id;
+    }
+    if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+        gp_canvas_mark_rope_map_dirty(cvs);
+    }
+    return 1;
+}
+
     // Allow external code (canvas) to set the table's persistent rope id list
     // prior to serialization so exported blobs include canonical ids.
 extern "C" int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint64_t* ids, int count) {

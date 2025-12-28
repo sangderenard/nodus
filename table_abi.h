@@ -278,6 +278,8 @@ int32_t gp_table_get_projected_rope_vertices(GP_TableContext* ctx, int32_t rope_
 int32_t gp_table_get_meta_group_count(const GP_TableContext* ctx);
 GP_MetaGroup* gp_table_get_meta_group(GP_TableContext* ctx, int32_t idx);
 int32_t gp_table_meta_get_vertex(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t idx, int32_t* out_rope_idx, int32_t* out_vertex_idx);
+int32_t gp_table_meta_get_vertex_u(const GP_TableContext* ctx, GP_MetaGroup* mg, int32_t idx, float* out_u);
+int32_t gp_table_meta_set_vertex_u(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t rope_idx, int32_t vertex_idx, float u);
 int32_t gp_table_meta_get_vertex_count(GP_TableContext* ctx, GP_MetaGroup* mg);
 int32_t gp_table_meta_get_lasso_config(GP_TableContext* ctx, GP_MetaGroup* mg, LassoConfig* out_cfg);
 
@@ -433,6 +435,11 @@ void gp_table_advance_global_sim_tick();
 // Query whether the table's rope sim should step this frame (honors per-table
 // `sim_enabled` and the global sim frame-skip count). Returns 1 if should step, 0 otherwise.
 int32_t gp_table_should_step_sim(GP_TableContext* ctx);
+// Debug flags propagated from canvas (0 = default behavior).
+int32_t gp_table_set_debug_flags(GP_TableContext* ctx, uint32_t flags);
+int32_t gp_table_get_debug_flags(const GP_TableContext* ctx, uint32_t* out_flags);
+// Override cable segment count used for rope simulation and rendering.
+int32_t gp_table_set_cable_segments(GP_TableContext* ctx, int32_t segments);
 int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
 // Subscribe with explicit start policy. If `start_at_head` is non-zero, the subscriber
 // begins at the current write head (new samples only). If zero, it begins at the
@@ -473,6 +480,8 @@ int32_t gp_table_get_edge_rope_index(const GP_TableContext* ctx, int32_t edge_id
 // Resolve a persistent rope id to the attached RopeSim index for this table.
 // Returns -1 if not present.
 int gp_table_resolve_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t id);
+// Bind an existing rope id to a specific RopeSim index.
+int32_t gp_table_bind_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t id, int32_t rope_idx);
 int32_t gp_table_edge_get_subgroup_flags(GP_TableContext* ctx, int32_t edge_idx, uint32_t* out_flags);
 int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led_key, int32_t* out_edge_idx);
 int32_t gp_table_edge_index_for_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b, int32_t* out_edge_idx);
