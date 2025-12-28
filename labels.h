@@ -68,6 +68,10 @@
 #define LABEL_ROPE_SLACK_INC "Slack +"
 #define LABEL_ROPE_SEGS_PREFIX "segs:"
 #define LABEL_ROPE_SLACK_PREFIX " slack:"
+#define LABEL_ROPE_MENU_BUTTON "SIM"
+#define LABEL_ROPE_MENU_TITLE "Rope Sim"
+#define LABEL_ROPE_MODE_SIMPLE "No Sim / No Frills"
+#define LABEL_ROPE_MODE_FULL "Full Sim"
 
 // IO row labels
 #define LABEL_IO_INPUT "INPUT"

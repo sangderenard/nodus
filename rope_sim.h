@@ -29,6 +29,8 @@ int rope_sim_step(RopeSim* s, float dt, float gravity, int constraint_iters, flo
 int rope_sim_get_vertex_count(RopeSim* s, int rope_idx);
 int rope_sim_get_vertices(RopeSim* s, int rope_idx, float* out_xy, int max_count);
 int rope_sim_get_vertices3(RopeSim* s, int rope_idx, float* out_xyz, int max_count);
+// Set a specific vertex position (and its previous position) on a rope.
+int rope_sim_set_vertex_position(RopeSim* s, int rope_idx, int vertex_idx, float x, float y, float z);
 // Insert a vertex into a rope at segment seg_index (between seg_index and seg_index+1)
 // at param t in [0,1]. Returns the new vertex index or -1 on error.
 int rope_sim_insert_vertex(RopeSim* s, int rope_idx, int seg_index, float t);
@@ -56,6 +58,9 @@ int rope_sim_meta_group_set_pressure(RopeSim* s, int group_idx, float pressure);
 // time until a minimum. Returns 1 on success.
 int rope_sim_meta_group_enable_edge_springs(RopeSim* s, int group_idx, float min_rest, float reduce_rate);
 int rope_sim_meta_group_disable_edge_springs(RopeSim* s, int group_idx);
+// For dense mode, set a star center member by rope/vertex pair.
+int rope_sim_meta_group_set_star_center(RopeSim* s, int group_idx, int rope_idx, int vertex_idx);
+int rope_sim_meta_group_set_member_u(RopeSim* s, int group_idx, int rope_idx, int vertex_idx, float u);
 // Mark a dangling/widget rope index on the meta-group so edge creation
 // can give it special rest-length and stiffness behavior.
 int rope_sim_meta_group_set_dangling_rope(RopeSim* s, int group_idx, int rope_idx);
@@ -83,6 +88,23 @@ int rope_sim_get_ring_u(RopeSim* s, int ring_id, float* out_u);
 int rope_sim_get_ring_rope_index(RopeSim* s, int ring_id, int* out_rope_idx);
 // Query number of rings currently in the sim.
 int rope_sim_get_ring_count(RopeSim* s);
+// Bind a ring to a meta-group member so its `u` is driven by the same constraints.
+int rope_sim_bind_ring_to_member(RopeSim* s, int ring_id, int group_idx, int member_idx);
+
+// Mark a rope as owning a meta-group's ring/spring network; query ownership.
+int rope_sim_set_rope_meta_owner(RopeSim* s, int rope_idx, int group_idx);
+int rope_sim_get_rope_meta_owner(RopeSim* s, int rope_idx, int* out_group_idx);
+// Query ring ids bound to a rope. If out_ids is null, returns count only.
+int rope_sim_get_rope_rings(RopeSim* s, int rope_idx, int* out_ids, int max_count);
+// Query meta-groups a rope participates in (membership list). If out_groups
+// is null, returns count only.
+int rope_sim_get_rope_meta_groups(RopeSim* s, int rope_idx, int* out_groups, int max_count);
+// Mark a rope as a meta-rope and store lasso vertex indices that define its dense connection.
+int rope_sim_mark_meta_rope(RopeSim* s, int rope_idx, const int* vertex_indices, int count);
+// Query whether a rope is marked as meta-rope; returns 1/0.
+int rope_sim_is_meta_rope(RopeSim* s, int rope_idx);
+// Query stored meta vertices; if out_vertices is null, returns count only.
+int rope_sim_get_meta_vertices(RopeSim* s, int rope_idx, int* out_vertices, int max_count);
 
 // Dangling widget API: create a small widget attached to a rope vertex that
 // follows the vertex position each simulation step. `widget_type` is one of

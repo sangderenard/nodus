@@ -91,6 +91,25 @@ int gp_canvas_set_subgroup_toolbar_rgba(GP_CanvasContext* ctx, const float* rgba
 // Set a single subgroup toolbar RGBA color at index `idx` (rgba = 4 floats)
 int gp_canvas_set_subgroup_toolbar_rgba_at(GP_CanvasContext* ctx, int idx, const float* rgba);
 
+// Debug flags for simple render/sim control (all disabled by default).
+typedef enum GP_CanvasDebugFlags {
+    GP_CANVAS_DEBUG_SIMPLE_RENDER = 1u << 0,
+    GP_CANVAS_DEBUG_SEGMENTS_1 = 1u << 1,
+    GP_CANVAS_DEBUG_NO_LIGHTING = 1u << 2,
+    GP_CANVAS_DEBUG_NO_GRAVITY = 1u << 3,
+    GP_CANVAS_DEBUG_NO_SPRINGS = 1u << 4,
+    GP_CANVAS_DEBUG_RING_STATIC = 1u << 5,
+    GP_CANVAS_DEBUG_NORENDER_MODE = (GP_CANVAS_DEBUG_SIMPLE_RENDER |
+                                     GP_CANVAS_DEBUG_SEGMENTS_1 |
+                                     GP_CANVAS_DEBUG_NO_LIGHTING |
+                                     GP_CANVAS_DEBUG_NO_GRAVITY |
+                                     GP_CANVAS_DEBUG_NO_SPRINGS |
+                                     GP_CANVAS_DEBUG_RING_STATIC)
+} GP_CanvasDebugFlags;
+
+int gp_canvas_set_debug_flags(GP_CanvasContext* ctx, uint32_t flags);
+int gp_canvas_get_debug_flags(GP_CanvasContext* ctx, uint32_t* out_flags);
+
 // Click-listen mode: when enabled, root-table click actions will be captured
 // instead of acted upon. Use `gp_canvas_bind_pending_action_to_module` to
 // bind the retained action pointer into a module's frame receive slot.
@@ -227,6 +246,13 @@ uint64_t gp_canvas_get_module_frame_port_uuid(GP_CanvasContext* ctx, int module_
 // module_idx internally. Returns 1 on success, 0 on failure.
 int gp_canvas_register_table_module_uuid(GP_CanvasContext* ctx, GP_TableContext* table, uint64_t module_uuid);
 int gp_canvas_register_table_frame_port_uuid(GP_CanvasContext* ctx, GP_TableContext* table, int row, int col_idx, uint64_t port_uuid);
+
+// Rope metadata exposure: query rope ownership and participation for dense ring/spring networks.
+int gp_canvas_get_rope_meta_owner(GP_CanvasContext* ctx, GP_TableContext* table, int rope_idx);
+int gp_canvas_get_rope_rings(GP_CanvasContext* ctx, GP_TableContext* table, int rope_idx, int* out_ids, int max_count);
+int gp_canvas_get_rope_meta_groups(GP_CanvasContext* ctx, GP_TableContext* table, int rope_idx, int* out_groups, int max_count);
+int gp_canvas_is_meta_rope(GP_CanvasContext* ctx, GP_TableContext* table, int rope_idx);
+int gp_canvas_get_meta_vertices(GP_CanvasContext* ctx, GP_TableContext* table, int rope_idx, int* out_vertices, int max_count);
 
 // Create a retained pending-action object from a numeric action id. Returned
 // pointer has ownership transferred to caller and may be bound into a
