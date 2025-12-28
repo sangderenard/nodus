@@ -1,15 +1,19 @@
-// Generated from module module_0
+// Generated from module tool_3
 #include "tool_api.h"
 
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
 #include <string>
+#include <vector>
 
-class Tool_tool_module_0 : public ITool {
+// Tool stack (in order):
+//  - Multiply (attachments=1)
+
+class Tool_tool_3 : public ITool {
 public:
-    std::string id() const override { return "tool_module_0"; }
-    std::string name() const override { return "tool_module_0"; }
+    std::string id() const override { return "tool_3"; }
+    std::string name() const override { return "Multiply"; }
     ToolCaps caps() const override { return static_cast<ToolCaps>(0); }
 
     void initialize(const ToolInitContext& ctx) override {
@@ -21,7 +25,8 @@ public:
         }
     }
 
-    void shutdown() override {}
+    void shutdown() override {
+    }
 
     void tick(double /*dt*/, HostAPI& /*host*/) override {}
 
@@ -31,6 +36,12 @@ public:
         ToolStackFrame& stack = ctx.stack;
         const ToolInputState* input = ctx.input;
         (void)input;
+        // step 0: Multiply
+        {
+            float b = tool_stack_pop(stack);
+            float a = tool_stack_pop(stack);
+            tool_stack_push(stack, a * b);
+        }
     }
 
     int32_t port_count() const override {
@@ -43,24 +54,26 @@ public:
     }
 
 private:
-    static constexpr const ToolPortSpec* kPorts = nullptr;
-    static constexpr int kPortCount = 0;
+    static constexpr ToolPortSpec kPorts[] = {
+        {ToolPortKind::Argument, 2},
+        {ToolPortKind::Return, 1},
+    };
+    static constexpr int kPortCount = static_cast<int>(sizeof(kPorts) / sizeof(kPorts[0]));
 };
 
-#if defined(_WIN32)
-extern "C" __declspec(dllexport) ITool* create_tool() {
-#else
-extern "C" ITool* create_tool() {
-#endif
-    return new Tool_tool_module_0();
+extern "C" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() {
+    return new Tool_tool_3();
 }
-#if defined(_WIN32)
-extern "C" __declspec(dllexport) void destroy_tool(ITool* t) {
-#else
-extern "C" void destroy_tool(ITool* t) {
-#endif
+extern "C" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* t) {
     delete t;
 }
+
+extern "C" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME() {
+    return __FILE__;
+}
+
+extern "C" NODUS_PLUGIN_EXPORT int nodus_autobind_mouse_ports() { return 0; }
+extern "C" NODUS_PLUGIN_EXPORT int nodus_autobind_keyboard_ports() { return 0; }
 
 #if defined(_WIN32)
 extern "C" __declspec(dllexport) int plugin_init(HostAPI* host) {

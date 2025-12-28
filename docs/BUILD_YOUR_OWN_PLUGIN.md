@@ -5,6 +5,8 @@ This guide explains how to write a plugin tool for nodus by hand. It covers the 
 **Quick summary**
 - Implement `ITool` (see `tool_api.h`).
 - Export `create_tool()` and `destroy_tool()` (and optionally `plugin_init(HostAPI*)`/`plugin_shutdown()`).
+- Optionally export `plugin_source_path()` so the host can record which source file produced the plugin.
+- For composable sources (inline into generated tools), use the `NODUS_PLUGIN_*` macros so the host can rename your exports when inlined.
 - Declare ports via `port_count()` and `port_spec()` and use `execute_stack()` to consume/produce values.
 - Draw table rows by implementing `render_table(TableRenderArgs&)` and calling `gp_table_raster_rgba()`.
 - Reserve/advertise module frame ports using `gp_canvas_generate_port_uuid()` and `gp_canvas_set_module_frame_port_uuid()` where appropriate.
@@ -75,15 +77,29 @@ private:
 #if defined(_WIN32)
 extern "C" __declspec(dllexport) ITool* create_tool() { return new MyTool(); }
 extern "C" __declspec(dllexport) void destroy_tool(ITool* t) { delete t; }
+extern "C" __declspec(dllexport) const char* plugin_source_path() { return __FILE__; }
 extern "C" __declspec(dllexport) int plugin_init(HostAPI* host) { (void)host; return 1; }
 extern "C" __declspec(dllexport) void plugin_shutdown() { }
 #else
 extern "C" ITool* create_tool() { return new MyTool(); }
 extern "C" void destroy_tool(ITool* t) { delete t; }
+extern "C" const char* plugin_source_path() { return __FILE__; }
 int plugin_init(HostAPI* host) { (void)host; return 1; }
 void plugin_shutdown() { }
 #endif
 ```
+
+## Composable plugin sources (inlined into generated tools)
+
+If you want your plugin source to be inlined into a generated tool (so a tool stack can be compiled into a single binary), use the export macros defined in `tool_api.h`:
+
+```cpp
+extern "C" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new MyTool(); }
+extern "C" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* t) { delete t; }
+extern "C" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME() { return __FILE__; }
+```
+
+The actualizer defines `NODUS_PLUGIN_COMPOSITE` and rewires these names to unique symbols when inlining your source, so there are no collisions.
 
 ## Lifecycle notes
 - `create_tool()` is called by the host (see `PluginLoader::load_module`). The host will instantiate a temporary tool to discover `id()/name()/caps()` and later register a factory that calls your `create_tool()`.

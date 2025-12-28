@@ -16,13 +16,17 @@ public:
         std::string id;
         std::string name;
         ToolCaps caps = ToolCaps::None;
+        std::string source_path;
         Factory factory;
+        int auto_mouse_ports = 0;
+        int auto_keyboard_ports = 0;
     };
 
     bool register_tool(Entry entry);
     const Entry* find(const std::string& id) const;
     std::unique_ptr<ITool, std::function<void(ITool*)>> create(const std::string& id) const;
     std::vector<Entry> entries() const;
+    bool set_source_path(const std::string& id, const std::string& path);
 
     bool unregister_tool(const std::string& id);
 

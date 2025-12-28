@@ -150,6 +150,11 @@ extern "C" int gp_canvas_invoke_pending_action(GP_CanvasContext* ctx_, void* pen
 // Deliver a synthesized event to all ports bound to `action_id`.
 static void canvas_dispatch_event_to_bound_ports(GP_CanvasContextImpl* c, int32_t action_id, int x, int y, bool down, bool up) {
     if (!c) return;
+    auto is_valid_pending_ptr = [](void* p) -> bool {
+        uintptr_t v = reinterpret_cast<uintptr_t>(p);
+        if (v == 0 || v == static_cast<uintptr_t>(~0ULL)) return false;
+        return (v & (alignof(void*) - 1)) == 0;
+    };
     std::vector<GP_CanvasContextImpl::ActionBinding> copy;
     {
         std::lock_guard<std::mutex> lk(c->action_subscribers_mu);
@@ -159,7 +164,12 @@ static void canvas_dispatch_event_to_bound_ports(GP_CanvasContextImpl* c, int32_
     }
     GP_TableContext* root = canvas_ensure_root_table(c);
     for (const auto &b : copy) {
-        if (!b.pending_ptr) continue;
+        if (!b.pending_ptr || !is_valid_pending_ptr(b.pending_ptr)) continue;
+        if (b.module_idx < 0 || b.module_idx >= static_cast<int>(c->module_frame_links.size())) continue;
+        if (b.led_idx < 0 || b.led_idx >= kModuleExtraLedCount) continue;
+        if (b.row < 0 || b.row >= kModuleExtraLedRows) continue;
+        void* live_ptr = c->module_frame_links[static_cast<size_t>(b.module_idx)].ptrs[static_cast<size_t>(b.row)][static_cast<size_t>(b.led_idx)];
+        if (live_ptr != b.pending_ptr) continue; // stale binding; skip
         auto *orig = reinterpret_cast<GP_CanvasContextImpl::PendingAction*>(b.pending_ptr);
         if (!orig) continue;
         auto *copy_pa = new GP_CanvasContextImpl::PendingAction();

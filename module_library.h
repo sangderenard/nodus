@@ -26,6 +26,8 @@ struct GP_ModuleLibraryModule {
     bool convert_to_tool = false;
     std::string tool_id;
     uint32_t tool_caps = 0;
+    int input_count = -1;
+    int output_count = -1;
     std::vector<GP_ModuleToolInstance> tool_instances;
 };
 

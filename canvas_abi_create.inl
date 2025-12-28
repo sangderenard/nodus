@@ -438,6 +438,27 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         c->plugin_menu_open = false;
         c->plugin_menu_module_idx = -1;
     }
+    if (c->module_menu_open) {
+        ModuleMenuLayout layout = compute_module_menu_layout(c, c->module_menu_module_idx, static_cast<int>(c->module_library_ids.size()));
+        if (view_x >= layout.x && view_x < layout.x + layout.w && view_y >= layout.y && view_y < layout.y + layout.h) {
+            int idx = (view_y - layout.item_start_y) / std::max(1, layout.row_h);
+            if (!c->module_library_ids.empty() && idx >= 0 && idx < static_cast<int>(c->module_library_ids.size())) {
+                const size_t lib_idx = static_cast<size_t>(idx);
+                const std::string manifest = (lib_idx < c->module_library_manifests.size())
+                    ? c->module_library_manifests[lib_idx]
+                    : std::string();
+                const std::string serialized = (lib_idx < c->module_library_serialized.size())
+                    ? c->module_library_serialized[lib_idx]
+                    : std::string();
+                canvas_apply_module_library_entry(c, c->module_menu_module_idx, manifest, serialized);
+            }
+            c->module_menu_open = false;
+            c->module_menu_module_idx = -1;
+            return 1;
+        }
+        c->module_menu_open = false;
+        c->module_menu_module_idx = -1;
+    }
     for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
         const auto &m = c->modules[mi];
         ModuleLayout layout = module_layout_for(c, mi, m);
@@ -658,9 +679,11 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     int gap = 6;
                     int right_x = sx + m.w - kModuleTopPadding;
                     int menu_w = std::max(30, control_h);
+                    int lib_w = menu_w;
                     int pause_w = std::max(42, control_h * 2);
                     int menu_x = right_x - menu_w;
-                    int pause_x = menu_x - gap - pause_w;
+                    int lib_x = menu_x - gap - lib_w;
+                    int pause_x = lib_x - gap - pause_w;
                     int module_btn_count = 5;
                     int module_btn_w = nbw;
                     int module_gap = 6;
@@ -693,6 +716,20 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         if (world_x >= bx && world_x < bx + module_btn_w) {
                             if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_EXPORT)) return 1;
                         }
+                        if (world_x >= lib_x && world_x < lib_x + lib_w) {
+                            bool reopen = !(c->module_menu_open && c->module_menu_module_idx == mi);
+                            c->module_menu_open = reopen;
+                            c->module_menu_module_idx = reopen ? mi : -1;
+                            if (reopen) {
+                                canvas_refresh_module_library(c);
+                                c->tool_menu_open = false;
+                                c->selected_tool_table = 0;
+                            }
+                            c->plugin_menu_open = false;
+                            c->plugin_menu_module_idx = -1;
+                            c->rope_menu_open = false;
+                            return 1;
+                        }
                         if (world_x >= menu_x && world_x < menu_x + menu_w) {
                             bool reopen = !(c->plugin_menu_open && c->plugin_menu_module_idx == mi);
                             c->plugin_menu_open = reopen;
@@ -702,6 +739,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                                 c->tool_menu_open = false;
                                 c->selected_tool_table = 0;
                             }
+                            c->module_menu_open = false;
+                            c->module_menu_module_idx = -1;
                             c->rope_menu_open = false;
                             return 1;
                         }

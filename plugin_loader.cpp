@@ -1,6 +1,7 @@
 #include "plugin_loader.h"
 #include "tool_registry.h"
 #include "tool_api.h"
+#include "module_library.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -9,6 +10,7 @@
 
 #include <iostream>
 #include <sstream>
+#include <filesystem>
 
 struct LoadedModuleInfo {
 #ifdef _WIN32
@@ -25,6 +27,8 @@ struct LoadedModuleInfo {
     destroy_fn_t destroy_fn = nullptr;
     plugin_init_fn_t plugin_init = nullptr;
     plugin_shutdown_fn_t plugin_shutdown = nullptr;
+    int auto_mouse_ports = 0;
+    int auto_keyboard_ports = 0;
 };
 
 PluginLoader::PluginLoader() {}
@@ -60,6 +64,54 @@ static std::string make_version_tag() {
     return ss.str();
 }
 
+static std::string normalize_source_path(const std::string& path) {
+    if (path.empty()) return {};
+    namespace fs = std::filesystem;
+    try {
+        fs::path p(path);
+        if (!p.is_absolute()) {
+            return p.generic_string();
+        }
+        fs::path root = fs::absolute(fs::path(gp_module_library_default_root()));
+        fs::path abs_p = fs::absolute(p);
+        std::error_code ec;
+        fs::path rel = fs::relative(abs_p, root, ec);
+        if (!ec) {
+            std::string rel_str = rel.generic_string();
+            if (!rel_str.empty() && rel_str.rfind("..", 0) != 0) {
+                return rel_str;
+            }
+        }
+        return abs_p.generic_string();
+    } catch (...) {
+        return path;
+    }
+}
+
+static std::string find_plugin_source_path(const std::string& dll_path, HMODULE module) {
+    using source_path_fn_t = const char* (*)();
+    source_path_fn_t src_fn = (source_path_fn_t)GetProcAddress(module, "plugin_source_path");
+    if (src_fn) {
+        const char* p = src_fn();
+        if (p && p[0] != '\0') return normalize_source_path(p);
+    }
+    namespace fs = std::filesystem;
+    try {
+        fs::path dll = fs::path(dll_path);
+        fs::path stem = dll.stem();
+        fs::path same_dir = dll.parent_path() / (stem.string() + ".cpp");
+        if (fs::exists(same_dir)) {
+            return normalize_source_path(same_dir.generic_string());
+        }
+        fs::path lib_src = fs::path(gp_module_library_default_root()) / "source" / "tools" / (stem.string() + ".cpp");
+        if (fs::exists(lib_src)) {
+            return normalize_source_path(lib_src.generic_string());
+        }
+    } catch (...) {
+    }
+    return {};
+}
+
 std::string PluginLoader::load_module(const std::string& path, void* host) {
 #ifdef _WIN32
     HMODULE h = LoadLibraryA(path.c_str());
@@ -70,6 +122,7 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
 
     using create_fn_t = ITool* (*)();
     create_fn_t create_fn = (create_fn_t)GetProcAddress(h, "create_tool");
+    std::cerr << "DEBUG: plugin_loader: create_tool fn at " << reinterpret_cast<void*>(create_fn) << " for " << path << "\n";
     LoadedModuleInfo* info = new LoadedModuleInfo();
     info->handle = h;
     info->path = path;
@@ -85,24 +138,37 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
     info->plugin_init = (LoadedModuleInfo::plugin_init_fn_t)GetProcAddress(h, "plugin_init");
     info->plugin_shutdown = (LoadedModuleInfo::plugin_shutdown_fn_t)GetProcAddress(h, "plugin_shutdown");
 
-    // instantiate temporary tool to discover id/name/caps
+    // instantiate temporary tool to ensure create/destroy are viable
     ITool* tmp = create_fn();
-    if (!tmp) {
-        std::cerr << "create_tool returned null in " << path << "\n";
-        if (info->destroy_fn) info->destroy_fn(tmp);
-        FreeLibrary(h);
-        delete info;
-        return {};
+    std::cerr << "DEBUG: plugin_loader: create_tool returned " << tmp << " for " << path << "\n";
+    std::filesystem::path p(path);
+    std::string fallback_id = p.stem().string();
+    if (fallback_id.empty()) fallback_id = "tool";
+    std::string base_id = fallback_id;
+    std::string name = fallback_id;
+    ToolCaps caps = ToolCaps::None;
+    bool tmp_valid = (tmp != nullptr) && (reinterpret_cast<uintptr_t>(tmp) != static_cast<uintptr_t>(~0ull));
+    if (tmp_valid) {
+        try {
+            base_id = tmp->id();
+            name = tmp->name();
+            caps = tmp->caps();
+        } catch (...) {
+            tmp_valid = false;
+            base_id = fallback_id;
+            name = fallback_id;
+            caps = ToolCaps::None;
+        }
+    } else {
+        std::cerr << "create_tool returned invalid pointer in " << path << ", falling back to filename id\n";
     }
-
-    std::string base_id = tmp->id();
-    std::string name = tmp->name();
-    ToolCaps caps = tmp->caps();
 
     std::cerr << "DEBUG: plugin_loader: discovered base_id='" << base_id << "' name='" << name << "' caps=" << static_cast<int>(caps) << " from '" << path << "'\n";
 
-    // destroy temporary instance
-    if (info->destroy_fn) info->destroy_fn(tmp); else delete tmp;
+    // destroy temporary instance if it looked valid
+    if (tmp_valid) {
+        if (info->destroy_fn) info->destroy_fn(tmp); else delete tmp;
+    }
 
     // prepare factory that uses the DLL's create/destroy
     ToolRegistry::Entry entry;
@@ -116,6 +182,21 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
     entry.id = unique_id;
     entry.name = (name.empty() ? base_id : name) + std::string(" [v") + ver + "]";
     entry.caps = caps;
+    entry.source_path = find_plugin_source_path(path, h);
+    // Optional autobind exports
+#ifdef _WIN32
+    if (h) {
+        using autobind_fn = int (*)();
+        if (auto fn = reinterpret_cast<autobind_fn>(GetProcAddress(h, "nodus_autobind_mouse_ports"))) {
+            info->auto_mouse_ports = fn();
+        }
+        if (auto fn = reinterpret_cast<autobind_fn>(GetProcAddress(h, "nodus_autobind_keyboard_ports"))) {
+            info->auto_keyboard_ports = fn();
+        }
+    }
+#endif
+    entry.auto_mouse_ports = info->auto_mouse_ports;
+    entry.auto_keyboard_ports = info->auto_keyboard_ports;
     if (create_fn) {
         auto dfn = info->destroy_fn;
         if (dfn) {

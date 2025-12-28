@@ -3382,6 +3382,51 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
     }
 
+    if (ctx->module_menu_open) {
+        ModuleMenuLayout layout = compute_module_menu_layout(ctx, ctx->module_menu_module_idx, static_cast<int>(ctx->module_library_labels.size()));
+        if (layout.w <= 0 || layout.h <= 0) return 1;
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y, layout.w, layout.h, Color{30,36,32,235});
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y, layout.w, 1, Color{70,90,80,255});
+        memset_rect(out_rgba, w, h, pitch, layout.x, layout.y + layout.h - 1, layout.w, 1, Color{12,18,12,255});
+        auto blit_text = [&](const char* text, int tx, int ty, float scale, Color col) {
+            if (!text || text[0] == '\0') return;
+            auto bm = render_text_to_rgba(text, scale, {col.r, col.g, col.b, col.a});
+            if (bm.pixels.empty()) return;
+            for (int yy = 0; yy < bm.height; ++yy) {
+                int dst_y = ty + yy;
+                if (dst_y < 0 || dst_y >= h) continue;
+                for (int xx = 0; xx < bm.width; ++xx) {
+                    int dst_x = tx + xx;
+                    if (dst_x < 0 || dst_x >= w) continue;
+                    uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                    const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                    float sa = src[3] / 255.0f;
+                    if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                    else if (sa > 0.001f) {
+                        for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                        dst[3] = 255;
+                    }
+                }
+            }
+        };
+        int title_x = layout.x + 8;
+        int title_y = layout.y + 6;
+        blit_text(LABEL_MODULE_MENU_TITLE, title_x, title_y, 0.95f, Color{220,235,220,255});
+        int item_y = layout.item_start_y;
+        if (ctx->module_library_labels.empty()) {
+            int y0 = item_y;
+            memset_rect(out_rgba, w, h, pitch, layout.x + 4, y0, layout.w - 8, layout.row_h - 2, Color{34,42,36,235});
+            blit_text(LABEL_MODULE_MENU_EMPTY, layout.x + 12, y0 + 3, 0.9f, Color{170,190,175,255});
+        } else {
+            for (size_t i = 0; i < ctx->module_library_labels.size(); ++i) {
+                int y0 = item_y + static_cast<int>(i) * layout.row_h;
+                memset_rect(out_rgba, w, h, pitch, layout.x + 4, y0, layout.w - 8, layout.row_h - 2, Color{40,50,42,240});
+                const std::string &lbl = ctx->module_library_labels[static_cast<size_t>(i)];
+                blit_text(lbl.c_str(), layout.x + 12, y0 + 3, 0.9f, Color{235,245,235,255});
+            }
+        }
+    }
+
     if (ctx->plugin_menu_open) {
         PluginMenuLayout layout = compute_plugin_menu_layout(ctx, ctx->plugin_menu_module_idx, static_cast<int>(ctx->plugin_tool_ids.size()));
         if (layout.w <= 0 || layout.h <= 0) return 1;

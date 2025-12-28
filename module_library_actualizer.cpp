@@ -101,11 +101,24 @@ struct ToolPortPlan {
     int32_t args = 0;
     int32_t internal = 0;
     int32_t returns = 0;
+    int32_t produced_total = 0;
 };
 
 struct ToolStep {
     ModuleToolKind kind = ModuleToolKind::None;
     int attachment_count = 0;
+    std::string plugin_id;
+    int plugin_slot = -1;
+};
+
+struct PluginSourceInfo {
+    std::string id;
+    std::string include_path;
+};
+
+struct PluginSlotInfo {
+    std::string create_fn;
+    std::string destroy_fn;
 };
 
 ToolPortPlan build_port_plan(const std::vector<ModuleToolKind>& tools) {
@@ -127,7 +140,19 @@ ToolPortPlan build_port_plan(const std::vector<ModuleToolKind>& tools) {
     plan.args = args;
     plan.returns = stack;
     plan.internal = std::max(0, produced_total - plan.returns);
+    plan.produced_total = produced_total;
     return plan;
+}
+
+int compute_stack_after_tools(const std::vector<ModuleToolKind>& tools, int initial_stack) {
+    int stack = std::max(0, initial_stack);
+    for (ModuleToolKind tool : tools) {
+        ToolStackSpec spec = module_tool_stack_spec(tool);
+        int consumes = std::max(0, spec.consumes);
+        int produces = std::max(0, spec.produces);
+        stack = std::max(0, stack - consumes) + produces;
+    }
+    return stack;
 }
 
 void emit_stack_step(std::ostringstream& ss, ModuleToolKind kind, int attachment_count) {
@@ -267,6 +292,15 @@ void emit_stack_execution(std::ostringstream& ss, const std::vector<ToolStep>& s
     ss << "        (void)input;\n";
     for (size_t i = 0; i < steps.size(); ++i) {
         const auto& step = steps[i];
+        if (!step.plugin_id.empty()) {
+            ss << "        // step " << i << ": plugin " << step.plugin_id << "\n";
+            if (step.plugin_slot >= 0) {
+                ss << "        if (plugin_instances_[" << step.plugin_slot << "]) {\n";
+                ss << "            plugin_instances_[" << step.plugin_slot << "]->execute_stack(ctx);\n";
+                ss << "        }\n";
+            }
+            continue;
+        }
         ss << "        // step " << i << ": " << gp_module_tool_kind_name(step.kind) << "\n";
         emit_stack_step(ss, step.kind, step.attachment_count);
     }
@@ -277,23 +311,80 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
                                  const std::string& tool_id,
                                  const std::string& tool_name,
                                  const ToolPortPlan& plan,
-                                 const std::vector<ToolStep>& steps) {
+                                 const std::vector<ToolStep>& steps,
+                                 const std::vector<PluginSourceInfo>& plugin_sources,
+                                 const std::vector<PluginSlotInfo>& plugin_slots) {
     std::ostringstream ss;
     std::string class_name = "Tool_" + sanitize_identifier(tool_id);
     bool has_rect = false;
+    bool needs_mouse_bindings = false;
+    bool needs_keyboard_bindings = false;
+    int mouse_port_need = 0;
+    int keyboard_port_need = 0;
+    int plugin_slot_count = static_cast<int>(plugin_slots.size());
     for (const auto& step : steps) {
         if (step.kind == ModuleToolKind::RectRgba) {
             has_rect = true;
             break;
         }
     }
+    for (const auto& step : steps) {
+        if (!step.plugin_id.empty()) continue; // external plugin step: skip
+        if (step.kind == ModuleToolKind::MouseListener) {
+            needs_mouse_bindings = true;
+            mouse_port_need = std::max(mouse_port_need, 4); // x,y,down,up
+        } else if (step.kind == ModuleToolKind::KeyboardListener) {
+            needs_keyboard_bindings = true;
+            keyboard_port_need = std::max(keyboard_port_need, 1);
+        }
+    }
 
     ss << "// Generated from module " << module.id << "\n";
     ss << "#include \"tool_api.h\"\n\n";
+    if (needs_mouse_bindings || needs_keyboard_bindings) {
+        ss << "#include \"canvas_abi.h\"\n";
+        ss << "#include \"tool_events.h\"\n";
+    }
     ss << "#include <cstdint>\n";
     ss << "#include <cmath>\n";
     ss << "#include <algorithm>\n";
-    ss << "#include <string>\n\n";
+    ss << "#include <string>\n";
+    ss << "#include <vector>\n\n";
+    ss << "// Tool stack (in order):\n";
+    if (steps.empty()) {
+        ss << "//  (empty)\n";
+    } else {
+        for (const auto& step : steps) {
+            if (!step.plugin_id.empty()) {
+                ss << "//  - plugin " << step.plugin_id << " (attachments=" << step.attachment_count << ")\n";
+            } else {
+                ss << "//  - " << gp_module_tool_kind_name(step.kind) << " (attachments=" << step.attachment_count << ")\n";
+            }
+        }
+    }
+    ss << "\n";
+    if (!plugin_sources.empty()) {
+        for (const auto& entry : plugin_sources) {
+            std::string sym = sanitize_identifier(entry.id);
+            ss << "namespace nodus_plugin_" << sym << " {\n";
+            ss << "#define NODUS_PLUGIN_COMPOSITE 1\n";
+            ss << "#define NODUS_PLUGIN_FACTORY_NAME nodus_create_tool_" << sym << "\n";
+            ss << "#define NODUS_PLUGIN_DESTROY_NAME nodus_destroy_tool_" << sym << "\n";
+            ss << "#define NODUS_PLUGIN_SOURCE_NAME nodus_plugin_source_path_" << sym << "\n";
+            ss << "#define create_tool nodus_create_tool_" << sym << "\n";
+            ss << "#define destroy_tool nodus_destroy_tool_" << sym << "\n";
+            ss << "#define plugin_source_path nodus_plugin_source_path_" << sym << "\n";
+            ss << "#include \"" << entry.include_path << "\"\n";
+            ss << "#undef plugin_source_path\n";
+            ss << "#undef destroy_tool\n";
+            ss << "#undef create_tool\n";
+            ss << "#undef NODUS_PLUGIN_SOURCE_NAME\n";
+            ss << "#undef NODUS_PLUGIN_DESTROY_NAME\n";
+            ss << "#undef NODUS_PLUGIN_FACTORY_NAME\n";
+            ss << "#undef NODUS_PLUGIN_COMPOSITE\n";
+            ss << "} // namespace nodus_plugin_" << sym << "\n\n";
+        }
+    }
     if (has_rect) {
         ss << "static bool point_in_rounded_rect(float px, float py, float w, float h, float r) {\n";
         ss << "    if (r <= 0.0f) return (px >= 0.0f && py >= 0.0f && px <= w && py <= h);\n";
@@ -320,8 +411,32 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
     ss << "                deserialize(in);\n";
     ss << "            }\n";
     ss << "        }\n";
+    // Binding of module frame ports is deferred to the host when the tool is
+    // actually placed on a module. Do not autobind on load/registration.
+    if (plugin_slot_count > 0) {
+        ss << "        ToolInitContext sub = ctx;\n";
+        ss << "        sub.serialized_path = nullptr;\n";
+        ss << "        for (int i = 0; i < kPluginSlotCount; ++i) {\n";
+            ss << "            if (!plugin_instances_[i] && kPluginCreateFns[i]) {\n";
+            ss << "                plugin_instances_[i] = kPluginCreateFns[i]();\n";
+            ss << "                if (plugin_instances_[i]) {\n";
+                ss << "                    plugin_instances_[i]->initialize(sub);\n";
+            ss << "                }\n";
+            ss << "            }\n";
+        ss << "        }\n";
+    }
     ss << "    }\n\n";
-    ss << "    void shutdown() override {}\n\n";
+    ss << "    void shutdown() override {\n";
+    if (plugin_slot_count > 0) {
+        ss << "        for (int i = 0; i < kPluginSlotCount; ++i) {\n";
+        ss << "            if (plugin_instances_[i]) {\n";
+        ss << "                plugin_instances_[i]->shutdown();\n";
+        ss << "                if (kPluginDestroyFns[i]) kPluginDestroyFns[i](plugin_instances_[i]);\n";
+        ss << "                plugin_instances_[i] = nullptr;\n";
+        ss << "            }\n";
+        ss << "        }\n";
+    }
+    ss << "    }\n\n";
     ss << "    void tick(double /*dt*/, HostAPI& /*host*/) override {}\n\n";
     ss << "    void render(RenderContext& /*ctx*/) override {}\n\n";
 
@@ -360,25 +475,45 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
         ss << "    static constexpr int kPortCount = 0;\n";
     }
 
+    if (plugin_slot_count > 0) {
+        ss << "    using CreateFn = ITool* (*)();\n";
+        ss << "    using DestroyFn = void (*)(ITool*);\n";
+        ss << "    static constexpr int kPluginSlotCount = " << plugin_slot_count << ";\n";
+        ss << "    static const CreateFn kPluginCreateFns[kPluginSlotCount];\n";
+        ss << "    static const DestroyFn kPluginDestroyFns[kPluginSlotCount];\n";
+        ss << "    ITool* plugin_instances_[kPluginSlotCount] = {};\n";
+    }
+
     if (has_rect) {
         ss << "    uint64_t tool_cycle_ = 0;\n";
     }
     ss << "};\n\n";
-    ss << "#if defined(_WIN32)\n";
-    ss << "extern \"C\" __declspec(dllexport) ITool* create_tool() {\n";
-    ss << "#else\n";
-    ss << "extern \"C\" ITool* create_tool() {\n";
-    ss << "#endif\n";
+    if (plugin_slot_count > 0) {
+        ss << "const " << class_name << "::CreateFn " << class_name << "::kPluginCreateFns[kPluginSlotCount] = {\n";
+        for (size_t i = 0; i < plugin_slots.size(); ++i) {
+            ss << "    " << plugin_slots[i].create_fn << ",\n";
+        }
+        ss << "};\n";
+        ss << "const " << class_name << "::DestroyFn " << class_name << "::kPluginDestroyFns[kPluginSlotCount] = {\n";
+        for (size_t i = 0; i < plugin_slots.size(); ++i) {
+            ss << "    " << plugin_slots[i].destroy_fn << ",\n";
+        }
+        ss << "};\n\n";
+    }
+    ss << "extern \"C\" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() {\n";
     ss << "    return new " << class_name << "();\n";
     ss << "}\n";
 
-    ss << "#if defined(_WIN32)\n";
-    ss << "extern \"C\" __declspec(dllexport) void destroy_tool(ITool* t) {\n";
-    ss << "#else\n";
-    ss << "extern \"C\" void destroy_tool(ITool* t) {\n";
-    ss << "#endif\n";
+    ss << "extern \"C\" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* t) {\n";
     ss << "    delete t;\n";
     ss << "}\n\n";
+
+    ss << "extern \"C\" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME() {\n";
+    ss << "    return __FILE__;\n";
+    ss << "}\n\n";
+    // Optional autobind hints for host: how many mouse/keyboard ports to bind when placed on a module.
+    ss << "extern \"C\" NODUS_PLUGIN_EXPORT int nodus_autobind_mouse_ports() { return " << std::max(0, mouse_port_need) << "; }\n";
+    ss << "extern \"C\" NODUS_PLUGIN_EXPORT int nodus_autobind_keyboard_ports() { return " << std::max(0, keyboard_port_need) << "; }\n\n";
 
     // optional lifecycle hooks
     ss << "#if defined(_WIN32)\n";
@@ -407,7 +542,9 @@ std::string generate_builtin_tool_source(const GP_ModuleLibraryTool& tool) {
     GP_ModuleLibraryModule dummy{};
     dummy.id = tool.id;
     dummy.tool_caps = 0;
-    return generate_tool_source(dummy, tool.id, tool.name.empty() ? tool.id : tool.name, plan, steps);
+    std::vector<PluginSourceInfo> empty_sources;
+    std::vector<PluginSlotInfo> empty_slots;
+    return generate_tool_source(dummy, tool.id, tool.name.empty() ? tool.id : tool.name, plan, steps, empty_sources, empty_slots);
 }
 } // namespace
 
@@ -447,8 +584,13 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
 
     std::unordered_map<std::string, ModuleToolKind> tool_kind_by_id;
     tool_kind_by_id.reserve(library.tool_registry.size());
+    std::unordered_map<std::string, std::string> tool_source_by_id;
+    tool_source_by_id.reserve(library.tool_registry.size());
     for (const auto& tool : library.tool_registry) {
         tool_kind_by_id.emplace(tool.id, tool.kind);
+        if (!tool.source_path.empty()) {
+            tool_source_by_id.emplace(tool.id, tool.source_path);
+        }
     }
 
     for (const auto& module : library.modules) {
@@ -464,21 +606,85 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
                       });
             std::vector<ModuleToolKind> tool_stack;
             tool_stack.reserve(sorted_tools.size());
+            bool has_external_tools = false;
+            std::vector<std::string> external_ids;
+            std::vector<std::string> missing_source_ids;
+            std::unordered_map<std::string, PluginSourceInfo> plugin_source_map;
+            std::vector<PluginSourceInfo> plugin_sources;
             for (const auto& instance : sorted_tools) {
                 auto it = tool_kind_by_id.find(instance.tool_id);
-                tool_stack.push_back(it == tool_kind_by_id.end() ? ModuleToolKind::None : it->second);
+                ModuleToolKind kind = (it == tool_kind_by_id.end()) ? ModuleToolKind::None : it->second;
+                if (kind == ModuleToolKind::None) {
+                    if (!instance.tool_id.empty()) {
+                        has_external_tools = true;
+                        external_ids.push_back(instance.tool_id);
+                        auto src_it = tool_source_by_id.find(instance.tool_id);
+                        if (src_it != tool_source_by_id.end() && !src_it->second.empty()) {
+                            if (plugin_source_map.find(instance.tool_id) == plugin_source_map.end()) {
+                                std::filesystem::path src_path = std::filesystem::path(src_it->second);
+                                if (!src_path.is_absolute()) src_path = root / src_path;
+                                PluginSourceInfo info{};
+                                info.id = instance.tool_id;
+                                info.include_path = src_path.generic_string();
+                                plugin_source_map.emplace(info.id, info);
+                                plugin_sources.push_back(std::move(info));
+                            }
+                        } else {
+                            missing_source_ids.push_back(instance.tool_id);
+                        }
+                    }
+                }
+                tool_stack.push_back(kind);
+            }
+            if (has_external_tools) {
+                std::cerr << "module actualizer: module '" << module.id << "' uses external plugin tools:";
+                for (const auto& id : external_ids) std::cerr << " " << id;
+                std::cerr << "\n";
+            }
+            if (!missing_source_ids.empty()) {
+                std::cerr << "module actualizer: missing source for plugin tools:";
+                for (const auto& id : missing_source_ids) std::cerr << " " << id;
+                std::cerr << "\n";
             }
 
             ToolPortPlan plan = build_port_plan(tool_stack);
+            int initial_stack = plan.args;
+            if (module.input_count >= 0) {
+                initial_stack = module.input_count;
+                plan.args = module.input_count;
+            }
+            int final_stack = compute_stack_after_tools(tool_stack, initial_stack);
+            if (module.output_count >= 0) {
+                plan.returns = module.output_count;
+            } else {
+                plan.returns = final_stack;
+            }
+            plan.internal = std::max(0, final_stack - plan.returns);
             std::string tool_name = module.label.empty() ? tool_id : module.label;
             std::vector<ToolStep> steps;
             steps.reserve(sorted_tools.size());
+            std::vector<PluginSlotInfo> plugin_slots;
             for (const auto& instance : sorted_tools) {
                 auto it = tool_kind_by_id.find(instance.tool_id);
                 ModuleToolKind kind = it == tool_kind_by_id.end() ? ModuleToolKind::None : it->second;
-                steps.push_back(ToolStep{kind, instance.attachment_count});
+                ToolStep step{};
+                step.kind = kind;
+                step.attachment_count = instance.attachment_count;
+                if (kind == ModuleToolKind::None && !instance.tool_id.empty()) {
+                    step.plugin_id = instance.tool_id;
+                    auto src_it = tool_source_by_id.find(instance.tool_id);
+                    if (src_it != tool_source_by_id.end() && !src_it->second.empty()) {
+                        std::string sym = sanitize_identifier(instance.tool_id);
+                        step.plugin_slot = static_cast<int>(plugin_slots.size());
+                        PluginSlotInfo slot{};
+                        slot.create_fn = "nodus_plugin_" + sym + "::nodus_create_tool_" + sym;
+                        slot.destroy_fn = "nodus_plugin_" + sym + "::nodus_destroy_tool_" + sym;
+                        plugin_slots.push_back(std::move(slot));
+                    }
+                }
+                steps.push_back(std::move(step));
             }
-            std::string contents = generate_tool_source(module, tool_id, tool_name, plan, steps);
+            std::string contents = generate_tool_source(module, tool_id, tool_name, plan, steps, plugin_sources, plugin_slots);
             try {
                 // create a deterministic, versioned filename: <tool_id>_ver_<YYYYMMDD_HHMMSS>.cpp
                 auto now = std::chrono::system_clock::now();

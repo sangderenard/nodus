@@ -98,6 +98,28 @@ static bool point_in_rounded_rect(float px, float py, float w, float h, float r)
     return (dx * dx + dy * dy) <= (r * r);
 }
 
+// Helper: check whether an edge's tensor stride is large enough to safely carry a pointer value.
+static bool edge_stride_allows_pointer(GP_TableContext* table, int edge_idx) {
+    if (!table || edge_idx < 0) return false;
+    GP_TableEdgeTensorSpec spec{};
+    if (!gp_table_edge_get_tensor_spec(table, edge_idx, &spec)) return false;
+    uint64_t stride = 1;
+    for (int32_t di = 0; di < spec.dim_count; ++di) {
+        stride *= static_cast<uint64_t>(std::max(1, spec.dims[di]));
+    }
+    uint64_t bytes = stride * static_cast<uint64_t>(sizeof(float));
+    return bytes >= static_cast<uint64_t>(sizeof(void*));
+}
+
+static bool is_valid_event_payload_ptr(void* p) {
+    uintptr_t v = reinterpret_cast<uintptr_t>(p);
+    // Filter obvious invalids (null, all-ones) before dereferencing.
+    if (v == 0 || v == static_cast<uintptr_t>(~0ULL)) return false;
+    // Basic alignment check: payload contains pointers/ints so require pointer alignment.
+    if ((v & (alignof(void*) - 1)) != 0) return false;
+    return true;
+}
+
 } // namespace
 
 
@@ -382,7 +404,8 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             while (true) {
                                 // First check for pointer-mode events on stride-1 assembly pathway.
                                 void* maybe_p = nullptr;
-                                if (gp_table_edge_consume_ptr(req.root_table, edge_idx, reader_key, &maybe_p) && maybe_p) {
+                                if (edge_stride_allows_pointer(req.root_table, edge_idx) &&
+                                    gp_table_edge_consume_ptr(req.root_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p)) {
                                     // consumed a pointer EventPayload
                                     EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
                                     void* pa = ep->pending;
@@ -602,20 +625,21 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 tried_row = true;
                             }
                             if (tried_row && tbl_row.reserved0 > 0) {
-                                // Pointer mode: consume opaque EventPayload, clear origin frame ptrs,
-                                // invoke the pending action and free payload + action.
-                                void* maybe_p = nullptr;
-                                if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && maybe_p) {
-                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
-                                    void* pa = ep->pending;
-                                    GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-                                    if (canvas_single) {
-                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
-                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
-                                        gp_canvas_invoke_pending_action(canvas_single, pa);
-                                        gp_canvas_free_pending_action(canvas_single, pa);
+                                // Pointer mode: consume opaque EventPayload when the FIFO stride can safely hold a pointer.
+                                if (edge_stride_allows_pointer(fifo_table, edge_idx)) {
+                                    void* maybe_p = nullptr;
+                                    if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p)) {
+                                        EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                        void* pa = ep->pending;
+                                        GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                                        if (canvas_single) {
+                                            gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                            gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                            gp_canvas_invoke_pending_action(canvas_single, pa);
+                                            gp_canvas_free_pending_action(canvas_single, pa);
+                                        }
+                                        delete ep;
                                     }
-                                    delete ep;
                                 }
                             } else {
                                 float sample[1] = {0.0f};
@@ -704,31 +728,33 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
                                 gp_table_edge_unread(fifo_table, edge_idx, reader_key, &unread);
                                 if (unread <= 0) continue;
-                                void* maybe_p = nullptr;
-                                if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && maybe_p) {
-                                    // Pointer-mode EventPayload expected
-                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
-                                    if (ep) {
-                                        void* pa_void = ep->pending;
-                                        struct LocalPendingAction { int32_t action_id; GP_TableHitBox hit; };
-                                        auto *pa = reinterpret_cast<LocalPendingAction*>(pa_void);
-                                        if (pa) {
-                                            if (pa->action_id == CANVAS_ACT_MOUSE_DOWN) down = 1.0f;
-                                            else if (pa->action_id == CANVAS_ACT_MOUSE_UP) up = 1.0f;
-                                            mx = static_cast<float>(pa->hit.x0);
-                                            my = static_cast<float>(pa->hit.y0);
-                                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-                                            if (canvas_single) {
-                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
-                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
-                                                gp_canvas_free_pending_action(canvas_single, pa_void);
+                                if (edge_stride_allows_pointer(fifo_table, edge_idx)) {
+                                    void* maybe_p = nullptr;
+                                    if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p)) {
+                                        // Pointer-mode EventPayload expected
+                                        EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                        if (ep) {
+                                            void* pa_void = ep->pending;
+                                            struct LocalPendingAction { int32_t action_id; GP_TableHitBox hit; };
+                                            auto *pa = reinterpret_cast<LocalPendingAction*>(pa_void);
+                                            if (pa) {
+                                                if (pa->action_id == CANVAS_ACT_MOUSE_DOWN) down = 1.0f;
+                                                else if (pa->action_id == CANVAS_ACT_MOUSE_UP) up = 1.0f;
+                                                mx = static_cast<float>(pa->hit.x0);
+                                                my = static_cast<float>(pa->hit.y0);
+                                                GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                                                if (canvas_single) {
+                                                    gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                                    gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                                    gp_canvas_free_pending_action(canvas_single, pa_void);
+                                                }
                                             }
+                                            delete ep;
                                         }
-                                        delete ep;
+                                        handled_fifo = true;
+                                        input_state_used = true;
+                                        break;
                                     }
-                                    handled_fifo = true;
-                                    input_state_used = true;
-                                    break;
                                 }
                             }
                         }
@@ -864,7 +890,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
                             void* p = nullptr;
                             if (canvas_single) p = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, contact_idx);
-                                if (p) {
+                            if (p && edge_stride_allows_pointer(fifo_table, edge_idx) && is_valid_event_payload_ptr(p)) {
                                 int local = contact_idx - frame_base;
                                 int frame_idx = local % kModuleExtraLedCount;
                                 // Wrap into EventPayload so consumers can clear the frame slot after handling

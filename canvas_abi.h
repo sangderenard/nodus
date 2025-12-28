@@ -365,6 +365,13 @@ int gp_canvas_get_autosave(GP_CanvasContext* ctx, char* out_path, int out_len, d
 int gp_canvas_set_table_tool_number(GP_CanvasContext* ctx, int value);
 int gp_canvas_get_table_tool_number(GP_CanvasContext* ctx, int* out_value);
 
+// Auto-bind helpers for event-driven tools/plugins. They bind up to
+// `max_ports` receive-side frame ports that are currently unbound.
+// Returns how many ports were bound.
+int gp_canvas_autobind_actions(GP_CanvasContext* ctx, int module_idx, const int32_t* action_ids, int action_count, int max_ports);
+int gp_canvas_autobind_mouse_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
+int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
+
 // Thread manager / scheduler mode (0 = free-spinning, 1 = scheduled).
 // Current behavior: gp_canvas_step always waits for scheduled ticks to finish
 // before returning, so raster/input can remain single-threaded and safe.

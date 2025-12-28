@@ -1,5 +1,7 @@
 #include "plugin_manager.h"
 #include "plugin_loader.h"
+#include "tool_registry.h"
+#include "module_library.h"
 
 #include <string>
 #include <vector>
@@ -81,6 +83,28 @@ static std::string shared_library_extension() {
 #endif
 }
 
+static std::string normalize_source_path_for_registry(const std::string& path) {
+    if (path.empty()) return {};
+    namespace fs = std::filesystem;
+    try {
+        fs::path p(path);
+        if (!p.is_absolute()) return p.generic_string();
+        fs::path root = fs::absolute(fs::path(gp_module_library_default_root()));
+        fs::path abs_p = fs::absolute(p);
+        std::error_code ec;
+        fs::path rel = fs::relative(abs_p, root, ec);
+        if (!ec) {
+            std::string rel_str = rel.generic_string();
+            if (!rel_str.empty() && rel_str.rfind("..", 0) != 0) {
+                return rel_str;
+            }
+        }
+        return abs_p.generic_string();
+    } catch (...) {
+        return path;
+    }
+}
+
 int gp_plugin_build_and_load(const char* build_dir,
                              const char* target,
                              const char* built_relpath,
@@ -153,11 +177,25 @@ int gp_plugin_build_module_and_load(const char* module_src,
         cm << "cmake_minimum_required(VERSION 3.15)\n";
         cm << "project(" << module_name << " LANGUAGES CXX)\n";
         std::filesystem::path abs_src = std::filesystem::absolute(src);
-        cm << "add_library(" << module_name << " SHARED \"" << abs_src.generic_string() << "\")\n";
+        std::string abs_src_str = abs_src.generic_string();
+        cm << "add_library(" << module_name << " SHARED \"" << abs_src_str << "\")\n";
         if (repo_root && repo_root[0] != '\0') {
             std::filesystem::path rr(repo_root);
             std::filesystem::path abs_rr = std::filesystem::absolute(rr);
             cm << "target_include_directories(" << module_name << " PRIVATE \"" << abs_rr.generic_string() << "\")\n";
+            std::filesystem::path release_dir = abs_rr / "build" / "Release";
+            const std::vector<std::string> candidate_libs = {
+                (release_dir / "canvas_tables.lib").generic_string(),
+                (release_dir / "libcanvas_tables.a").generic_string(),
+                (release_dir / "canvas_tables.so").generic_string(),
+                (release_dir / "canvas_tables.dylib").generic_string()
+            };
+            for (const auto& lib_path : candidate_libs) {
+                if (std::filesystem::exists(lib_path)) {
+                    cm << "target_link_libraries(" << module_name << " PRIVATE \"" << lib_path << "\")\n";
+                    break;
+                }
+            }
         }
         cm << "set_target_properties(" << module_name << " PROPERTIES CXX_STANDARD 17)\n";
 
@@ -199,6 +237,7 @@ int gp_plugin_build_module_and_load(const char* module_src,
         std::string id = g_plugin_loader.load_module(destpath.string(), host);
         fs::remove_all(scratch);
         if (id.empty()) return 0;
+        (void)tool_registry_global().set_source_path(id, normalize_source_path_for_registry(abs_src_str));
         int copy_len = static_cast<int>(std::min<size_t>(id.size(), static_cast<size_t>(out_id_capacity - 1)));
         std::memcpy(out_id, id.c_str(), static_cast<size_t>(copy_len));
         out_id[copy_len] = '\0';

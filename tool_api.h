@@ -186,6 +186,26 @@ struct ITool {
     virtual bool deserialize(InputArchive& /*in*/) { return false; }
 };
 
+#if defined(_WIN32)
+#if defined(NODUS_PLUGIN_COMPOSITE)
+#define NODUS_PLUGIN_EXPORT
+#else
+#define NODUS_PLUGIN_EXPORT __declspec(dllexport)
+#endif
+#else
+#define NODUS_PLUGIN_EXPORT
+#endif
+
+#ifndef NODUS_PLUGIN_FACTORY_NAME
+#define NODUS_PLUGIN_FACTORY_NAME create_tool
+#endif
+#ifndef NODUS_PLUGIN_DESTROY_NAME
+#define NODUS_PLUGIN_DESTROY_NAME destroy_tool
+#endif
+#ifndef NODUS_PLUGIN_SOURCE_NAME
+#define NODUS_PLUGIN_SOURCE_NAME plugin_source_path
+#endif
+
 extern "C" {
     typedef ITool* (*CreateToolFn)();
 }

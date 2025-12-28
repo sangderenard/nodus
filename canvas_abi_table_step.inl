@@ -198,6 +198,49 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
             rope_sim_step(sim, dt, gravity, c->sim_iters, c->sim_damping);
         }
     }
+    // Process any pending module commits queued during input callbacks (e.g., mouse click)
+    if (!c->pending_module_commits.empty()) {
+        std::vector<int> commits;
+        commits.swap(c->pending_module_commits);
+        for (int mid : commits) {
+            if (mid < 0 || mid >= static_cast<int>(c->modules.size())) continue;
+            gp_canvas_export_module_to_root(ctx_, mid, nullptr);
+            (void)canvas_write_module_library_manifest(c, mid);
+            GP_ModuleLibrary lib{};
+            if (canvas_build_module_library_for_module(c, mid, true, &lib)) {
+                gp_module_library_actualize_sources(lib, lib.root_dir.c_str());
+            }
+            std::string module_id = gp_module_library_module_id(mid);
+            std::string dest = gp_module_library_default_root();
+            std::filesystem::path tools_dir = std::filesystem::path(dest) / "source" / "tools";
+            std::string prefix = ("tool_" + module_id) + std::string("_ver_");
+            std::filesystem::path chosen;
+            std::filesystem::file_time_type latest;
+            if (std::filesystem::exists(tools_dir)) {
+                for (auto &ent : std::filesystem::directory_iterator(tools_dir)) {
+                    if (!ent.is_regular_file()) continue;
+                    std::string name = ent.path().filename().string();
+                    if (name.rfind(prefix, 0) != 0) continue;
+                    auto ftime = std::filesystem::last_write_time(ent.path());
+                    if (chosen.empty() || ftime > latest) {
+                        latest = ftime;
+                        chosen = ent.path();
+                    }
+                }
+            }
+            std::string module_src;
+            if (!chosen.empty()) module_src = chosen.generic_string();
+            else module_src = std::filesystem::path(gp_module_library_module_source_path(std::string(), module_id)).generic_string();
+            char out_id[256];
+            int ok = gp_plugin_build_module_and_load(module_src.c_str(), ".", dest.c_str(), nullptr, out_id, static_cast<int>(sizeof(out_id)));
+            if (ok) {
+                printf("module commit: scratch-built+loaded id=%s (module=%s src=%s)\n", out_id, module_id.c_str(), module_src.c_str());
+                canvas_refresh_plugin_tools(c);
+            } else {
+                printf("module commit: build+load failed for module=%s\n", module_id.c_str());
+            }
+        }
+    }
     // decay chat highlight TTLs and clear chat bg callback when expired
     for (size_t mi = 0; mi < c->modules.size(); ++mi) {
         if (mi < c->module_chat_ttl.size() && c->module_chat_ttl[mi] > 0) {

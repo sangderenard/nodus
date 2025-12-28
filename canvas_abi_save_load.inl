@@ -1270,13 +1270,6 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     return 1;
 }
 
-static std::string canvas_module_label(const GP_CanvasModuleDesc& desc) {
-    std::string label(desc.label, desc.label + sizeof(desc.label));
-    size_t null_pos = label.find('\0');
-    if (null_pos != std::string::npos) label.resize(null_pos);
-    return label;
-}
-
 extern "C" int gp_canvas_export_module_library(GP_CanvasContext* ctx_, const char* path) {
     if (!ctx_ || !path) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
@@ -1285,6 +1278,28 @@ extern "C" int gp_canvas_export_module_library(GP_CanvasContext* ctx_, const cha
     library.root_dir = gp_module_library_default_root();
 
     std::map<int, GP_ModuleLibraryTool> tool_registry_by_kind;
+    std::map<std::string, GP_ModuleLibraryTool> plugin_registry_by_id;
+    auto normalize_source = [&](const std::string& source_path) -> std::string {
+        if (source_path.empty()) return {};
+        namespace fs = std::filesystem;
+        try {
+            fs::path src = fs::path(source_path);
+            if (!src.is_absolute()) return src.generic_string();
+            fs::path root = fs::absolute(fs::path(library.root_dir));
+            fs::path abs_src = fs::absolute(src);
+            std::error_code ec;
+            fs::path rel = fs::relative(abs_src, root, ec);
+            if (!ec) {
+                std::string rel_str = rel.generic_string();
+                if (!rel_str.empty() && rel_str.rfind("..", 0) != 0) {
+                    return rel_str;
+                }
+            }
+            return abs_src.generic_string();
+        } catch (...) {
+            return source_path;
+        }
+    };
 
     for (size_t i = 0; i < c->modules.size(); ++i) {
         const auto &mod = c->modules[i];
@@ -1295,35 +1310,65 @@ extern "C" int gp_canvas_export_module_library(GP_CanvasContext* ctx_, const cha
         // Use relative paths (no root) so actualizer will join with the chosen root
         module.serialized_path = gp_module_library_module_serialized_path(std::string(), module.id);
         module.source_path = gp_module_library_module_source_path(std::string(), module.id);
+        module.input_count = 0;
+        module.output_count = 0;
 
         if (i < c->module_io_rows.size()) {
             const auto &rows = c->module_io_rows[i];
             for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
                 const auto &row = rows[row_idx];
-                if (row.kind != ModuleRowKind::Tool) continue;
-                ModuleToolKind tool_kind = row.tool;
-                if (tool_kind == ModuleToolKind::None) continue;
-                auto tool_it = tool_registry_by_kind.find(static_cast<int>(tool_kind));
-                if (tool_it == tool_registry_by_kind.end()) {
-                    GP_ModuleLibraryTool tool{};
-                    tool.kind = tool_kind;
-                    tool.id = gp_module_library_tool_id(tool_kind);
-                    tool.name = gp_module_tool_kind_name(tool_kind);
-                    // Use relative tool source path
-                    tool.source_path = gp_module_library_tool_source_path(std::string(), tool.id);
-                    tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
+                if (row.kind == ModuleRowKind::Input) {
+                    module.input_count += std::clamp(row.attachment_count, 1, 32);
+                    continue;
                 }
-                GP_ModuleToolInstance instance{};
-                instance.row_idx = static_cast<int>(row_idx);
-                instance.attachment_count = row.attachment_count;
-                instance.tool_id = gp_module_library_tool_id(tool_kind);
-                module.tool_instances.push_back(std::move(instance));
+                if (row.kind == ModuleRowKind::Output) {
+                    module.output_count += std::clamp(row.attachment_count, 1, 32);
+                    continue;
+                }
+                if (row.kind != ModuleRowKind::Tool) continue;
+                if (row.tool_origin == ModuleToolOrigin::Builtin) {
+                    ModuleToolKind tool_kind = row.tool;
+                    if (tool_kind == ModuleToolKind::None) continue;
+                    auto tool_it = tool_registry_by_kind.find(static_cast<int>(tool_kind));
+                    if (tool_it == tool_registry_by_kind.end()) {
+                        GP_ModuleLibraryTool tool{};
+                        tool.kind = tool_kind;
+                        tool.id = gp_module_library_tool_id(tool_kind);
+                        tool.name = gp_module_tool_kind_name(tool_kind);
+                        // Use relative tool source path
+                        tool.source_path = gp_module_library_tool_source_path(std::string(), tool.id);
+                        tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
+                    }
+                    GP_ModuleToolInstance instance{};
+                    instance.row_idx = static_cast<int>(row_idx);
+                    instance.attachment_count = row.attachment_count;
+                    instance.tool_id = gp_module_library_tool_id(tool_kind);
+                    module.tool_instances.push_back(std::move(instance));
+                } else if (row.tool_origin == ModuleToolOrigin::Plugin && !row.plugin_id.empty()) {
+                    if (plugin_registry_by_id.find(row.plugin_id) == plugin_registry_by_id.end()) {
+                        GP_ModuleLibraryTool tool{};
+                        tool.kind = ModuleToolKind::None;
+                        tool.id = row.plugin_id;
+                        const auto *entry = tool_registry_global().find(row.plugin_id);
+                        tool.name = entry ? entry->name : row.plugin_id;
+                        if (entry) tool.source_path = normalize_source(entry->source_path);
+                        plugin_registry_by_id.emplace(tool.id, std::move(tool));
+                    }
+                    GP_ModuleToolInstance instance{};
+                    instance.row_idx = static_cast<int>(row_idx);
+                    instance.attachment_count = row.attachment_count;
+                    instance.tool_id = row.plugin_id;
+                    module.tool_instances.push_back(std::move(instance));
+                }
             }
         }
         library.modules.push_back(std::move(module));
     }
 
     for (auto &entry : tool_registry_by_kind) {
+        library.tool_registry.push_back(std::move(entry.second));
+    }
+    for (auto &entry : plugin_registry_by_id) {
         library.tool_registry.push_back(std::move(entry.second));
     }
 
@@ -1337,6 +1382,28 @@ extern "C" int gp_canvas_actualize_to_root(GP_CanvasContext* ctx_, const char* o
     GP_ModuleLibrary library{};
     library.root_dir = gp_module_library_default_root();
     std::map<int, GP_ModuleLibraryTool> tool_registry_by_kind;
+    std::map<std::string, GP_ModuleLibraryTool> plugin_registry_by_id;
+    auto normalize_source = [&](const std::string& source_path) -> std::string {
+        if (source_path.empty()) return {};
+        namespace fs = std::filesystem;
+        try {
+            fs::path src = fs::path(source_path);
+            if (!src.is_absolute()) return src.generic_string();
+            fs::path root = fs::absolute(fs::path(library.root_dir));
+            fs::path abs_src = fs::absolute(src);
+            std::error_code ec;
+            fs::path rel = fs::relative(abs_src, root, ec);
+            if (!ec) {
+                std::string rel_str = rel.generic_string();
+                if (!rel_str.empty() && rel_str.rfind("..", 0) != 0) {
+                    return rel_str;
+                }
+            }
+            return abs_src.generic_string();
+        } catch (...) {
+            return source_path;
+        }
+    };
 
     for (size_t i = 0; i < c->modules.size(); ++i) {
         const auto &mod = c->modules[i];
@@ -1347,35 +1414,65 @@ extern "C" int gp_canvas_actualize_to_root(GP_CanvasContext* ctx_, const char* o
         // Use relative paths (no root) so actualizer will join with the chosen root
         module.serialized_path = gp_module_library_module_serialized_path(std::string(), module.id);
         module.source_path = gp_module_library_module_source_path(std::string(), module.id);
+        module.input_count = 0;
+        module.output_count = 0;
 
         if (i < c->module_io_rows.size()) {
             const auto &rows = c->module_io_rows[i];
             for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
                 const auto &row = rows[row_idx];
-                if (row.kind != ModuleRowKind::Tool) continue;
-                ModuleToolKind tool_kind = row.tool;
-                if (tool_kind == ModuleToolKind::None) continue;
-                auto tool_it = tool_registry_by_kind.find(static_cast<int>(tool_kind));
-                if (tool_it == tool_registry_by_kind.end()) {
-                    GP_ModuleLibraryTool tool{};
-                    tool.kind = tool_kind;
-                    tool.id = gp_module_library_tool_id(tool_kind);
-                    tool.name = gp_module_tool_kind_name(tool_kind);
-                    // Use relative tool source path
-                    tool.source_path = gp_module_library_tool_source_path(std::string(), tool.id);
-                    tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
+                if (row.kind == ModuleRowKind::Input) {
+                    module.input_count += std::clamp(row.attachment_count, 1, 32);
+                    continue;
                 }
-                GP_ModuleToolInstance instance{};
-                instance.row_idx = static_cast<int>(row_idx);
-                instance.attachment_count = row.attachment_count;
-                instance.tool_id = gp_module_library_tool_id(tool_kind);
-                module.tool_instances.push_back(std::move(instance));
+                if (row.kind == ModuleRowKind::Output) {
+                    module.output_count += std::clamp(row.attachment_count, 1, 32);
+                    continue;
+                }
+                if (row.kind != ModuleRowKind::Tool) continue;
+                if (row.tool_origin == ModuleToolOrigin::Builtin) {
+                    ModuleToolKind tool_kind = row.tool;
+                    if (tool_kind == ModuleToolKind::None) continue;
+                    auto tool_it = tool_registry_by_kind.find(static_cast<int>(tool_kind));
+                    if (tool_it == tool_registry_by_kind.end()) {
+                        GP_ModuleLibraryTool tool{};
+                        tool.kind = tool_kind;
+                        tool.id = gp_module_library_tool_id(tool_kind);
+                        tool.name = gp_module_tool_kind_name(tool_kind);
+                        // Use relative tool source path
+                        tool.source_path = gp_module_library_tool_source_path(std::string(), tool.id);
+                        tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
+                    }
+                    GP_ModuleToolInstance instance{};
+                    instance.row_idx = static_cast<int>(row_idx);
+                    instance.attachment_count = row.attachment_count;
+                    instance.tool_id = gp_module_library_tool_id(tool_kind);
+                    module.tool_instances.push_back(std::move(instance));
+                } else if (row.tool_origin == ModuleToolOrigin::Plugin && !row.plugin_id.empty()) {
+                    if (plugin_registry_by_id.find(row.plugin_id) == plugin_registry_by_id.end()) {
+                        GP_ModuleLibraryTool tool{};
+                        tool.kind = ModuleToolKind::None;
+                        tool.id = row.plugin_id;
+                        const auto *entry = tool_registry_global().find(row.plugin_id);
+                        tool.name = entry ? entry->name : row.plugin_id;
+                        if (entry) tool.source_path = normalize_source(entry->source_path);
+                        plugin_registry_by_id.emplace(tool.id, std::move(tool));
+                    }
+                    GP_ModuleToolInstance instance{};
+                    instance.row_idx = static_cast<int>(row_idx);
+                    instance.attachment_count = row.attachment_count;
+                    instance.tool_id = row.plugin_id;
+                    module.tool_instances.push_back(std::move(instance));
+                }
             }
         }
         library.modules.push_back(std::move(module));
     }
 
     for (auto &entry : tool_registry_by_kind) {
+        library.tool_registry.push_back(std::move(entry.second));
+    }
+    for (auto &entry : plugin_registry_by_id) {
         library.tool_registry.push_back(std::move(entry.second));
     }
 

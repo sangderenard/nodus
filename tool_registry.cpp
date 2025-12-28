@@ -10,7 +10,9 @@ bool ToolRegistry::register_tool(Entry entry) {
     if (entry.id.empty() || !entry.factory) return false;
     bool inserted = entries_.emplace(entry.id, std::move(entry)).second;
     if (inserted) {
-        std::cerr << "DEBUG: ToolRegistry registered tool id='" << entries_.find(entry.id)->second.id << "'" << " name='" << entries_.find(entry.id)->second.name << "'\n";
+        const auto& e = entries_.find(entry.id)->second;
+        std::cerr << "DEBUG: ToolRegistry registered tool id='" << e.id << "'" << " name='" << e.name << "'"
+                  << " auto_mouse_ports=" << e.auto_mouse_ports << " auto_keyboard_ports=" << e.auto_keyboard_ports << "\n";
     } else {
         std::cerr << "DEBUG: ToolRegistry failed to register tool id='" << entry.id << "' (already exists?)\n";
     }
@@ -44,6 +46,13 @@ std::vector<ToolRegistry::Entry> ToolRegistry::entries() const {
         list.push_back(kv.second);
     }
     return list;
+}
+
+bool ToolRegistry::set_source_path(const std::string& id, const std::string& path) {
+    auto it = entries_.find(id);
+    if (it == entries_.end()) return false;
+    it->second.source_path = path;
+    return true;
 }
 
 ToolRegistrar::ToolRegistrar(const char* id, const char* name, ToolCaps caps, ToolRegistry::Factory factory) {

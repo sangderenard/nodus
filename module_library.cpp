@@ -77,7 +77,8 @@ int gp_module_library_write_to_file(const GP_ModuleLibrary& library, const char*
         ofs << "MODULE " << module.id << " " << module.module_idx << " "
             << std::quoted(module.label) << " " << std::quoted(module.serialized_path) << " "
             << std::quoted(module.source_path) << " " << module.convert_to_tool << " "
-            << std::quoted(module.tool_id) << " " << module.tool_caps << "\n";
+            << std::quoted(module.tool_id) << " " << module.tool_caps << " "
+            << module.input_count << " " << module.output_count << "\n";
         for (const auto& tool_instance : module.tool_instances) {
             ofs << "MODULETOOL " << module.id << " " << tool_instance.row_idx << " "
                 << tool_instance.tool_id << " " << tool_instance.attachment_count << "\n";
@@ -115,6 +116,12 @@ int gp_module_library_read_from_file(const char* path, GP_ModuleLibrary* out_lib
                 int convert_flag = 0;
                 ss >> convert_flag >> std::quoted(module.tool_id) >> module.tool_caps;
                 module.convert_to_tool = (convert_flag != 0);
+                int in_count = -1;
+                int out_count = -1;
+                if (ss >> in_count >> out_count) {
+                    module.input_count = in_count;
+                    module.output_count = out_count;
+                }
             }
             library.modules.push_back(std::move(module));
         } else if (tag == "MODULETOOL") {

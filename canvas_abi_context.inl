@@ -96,6 +96,8 @@ struct GP_CanvasContextImpl {
     std::vector<std::string> module_chat_text;
     std::vector<ChatCol> module_chat_color;
     std::vector<int> module_chat_ttl; // frames remaining to show chat highlight
+    // pending module commit/build requests to process outside of input callbacks
+    std::vector<int> pending_module_commits;
     // cable style/hues
     int jacket_px = 4;
     int jacket_border = 2;
@@ -240,6 +242,12 @@ struct GP_CanvasContextImpl {
     std::vector<ModuleToolKind> plugin_tool_kinds;
     std::vector<std::string> plugin_tool_ids;
     std::vector<std::string> plugin_tool_labels;
+    bool module_menu_open = false;
+    int module_menu_module_idx = -1;
+    std::vector<std::string> module_library_ids;
+    std::vector<std::string> module_library_labels;
+    std::vector<std::string> module_library_serialized;
+    std::vector<std::string> module_library_manifests;
     int io_attachment_count = 1;
     // number of send/receive row pairs to display (each pair == one grid-row)
     int module_frame_pair_count = 2;

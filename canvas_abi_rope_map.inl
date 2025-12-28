@@ -17,6 +17,111 @@ static RopeSim* canvas_root_sim(GP_CanvasContextImpl* ctx);
 static RopeSim* canvas_require_root_sim(GP_CanvasContextImpl* ctx);
 static uint64_t canvas_root_key_for_contact(int module_idx, int contact_idx);
 
+// Canvas action IDs moved up so autobind helpers can reference them immediately.
+enum CanvasActionId {
+    CANVAS_ACT_SIM_SEGS_DEC = 2000,
+    CANVAS_ACT_SIM_SEGS_INC = 2001,
+    CANVAS_ACT_SIM_SLACK_DEC = 2002,
+    CANVAS_ACT_SIM_SLACK_INC = 2003,
+    CANVAS_ACT_SAVE = 2004,
+    CANVAS_ACT_CLEAR = 2005,
+    CANVAS_ACT_TOOL_CANVAS_0 = 2010,
+    CANVAS_ACT_TOOL_CANVAS_1 = 2011,
+    CANVAS_ACT_TOOL_CANVAS_2 = 2012,
+    CANVAS_ACT_TOOL_CANVAS_3 = 2013,
+    CANVAS_ACT_TOOL_EDGE_0 = 2014,
+    CANVAS_ACT_TOOL_EDGE_1 = 2015,
+    CANVAS_ACT_TOOL_EDGE_2 = 2016,
+    CANVAS_ACT_TOOL_EDGE_3 = 2017,
+    CANVAS_ACT_TOOL_EDGE_4 = 2018, // Meta-Edge Lasso (toolbar edge-group button)
+    CANVAS_ACT_EDGE_ORDER_DEC = 2019,
+    CANVAS_ACT_EDGE_ORDER_INC = 2020,
+    CANVAS_ACT_EDGE_ORDER_TOOL = 2021,
+    CANVAS_ACT_TOOL_TABLE_0 = 2030,
+    CANVAS_ACT_TOOL_TABLE_1 = 2031,
+    CANVAS_ACT_TOOL_TABLE_2 = 2032,
+    CANVAS_ACT_IO_COUNT_DEC = 2040,
+    CANVAS_ACT_IO_COUNT_INC = 2041,
+    CANVAS_ACT_IO_CONSUMER_ADD = 2042,
+    CANVAS_ACT_IO_PRODUCER_ADD = 2043,
+    CANVAS_ACT_TABLE_TOOL_NUM_DEC = 2044,
+    CANVAS_ACT_TABLE_TOOL_NUM_INC = 2045,
+    CANVAS_ACT_META_CHAN_DEC = 2500,
+    CANVAS_ACT_META_CHAN_INC = 2501,
+    CANVAS_ACT_MODULE_LED = 2050,
+    CANVAS_ACT_FRAME_PAIRS_DEC = 2200,
+    CANVAS_ACT_FRAME_PAIRS_INC = 2201,
+    CANVAS_ACT_TOOL_KPN_0 = 2060,
+    CANVAS_ACT_TOOL_KPN_1 = 2061,
+    CANVAS_ACT_TOOL_KPN_2 = 2062,
+    CANVAS_ACT_THREAD_TOGGLE = 2070,
+    CANVAS_ACT_KPN_GLOBAL_TOGGLE = 2079,
+    CANVAS_ACT_THREAD_SIM_TOGGLE = 2078,
+    CANVAS_ACT_CANVAS_ROOT_SIM_TOGGLE = 2088,
+    CANVAS_ACT_THREAD_DELAY_DEC = 2071,
+    CANVAS_ACT_THREAD_DELAY_INC = 2072,
+    CANVAS_ACT_MODULE_CLONE = 2073,
+    CANVAS_ACT_MODULE_CLEAR = 2074,
+    CANVAS_ACT_MODULE_DESTROY = 2075,
+    CANVAS_ACT_MODULE_EXPORT = 2076,
+    CANVAS_ACT_MODULE_COMMIT = 2077,
+    CANVAS_ACT_TOOL_SUBGROUP_0 = 2080,
+    CANVAS_ACT_TOOL_SUBGROUP_1 = 2081,
+    CANVAS_ACT_TOOL_SUBGROUP_2 = 2082,
+    CANVAS_ACT_TOOL_SUBGROUP_3 = 2083,
+    CANVAS_ACT_TOOL_SUBGROUP_4 = 2084,
+    CANVAS_ACT_TOOL_SUBGROUP_5 = 2085,
+    CANVAS_ACT_TOOL_SUBGROUP_6 = 2086,
+    CANVAS_ACT_TOOL_SUBGROUP_7 = 2087,
+    CANVAS_ACT_SPAWN_ROOT = 2090, // explicit spawn-root toolbar button
+    CANVAS_ACT_MENU_TOOL_ADD = 2101,
+    CANVAS_ACT_MENU_TOOL_SUB = 2102,
+    CANVAS_ACT_MENU_TOOL_MUL = 2103,
+    CANVAS_ACT_MENU_TOOL_DIV = 2104,
+    CANVAS_ACT_MENU_TOOL_MOD = 2105,
+    CANVAS_ACT_MENU_TOOL_KEYBOARD = 2106,
+    CANVAS_ACT_MENU_TOOL_MOUSE = 2107,
+    CANVAS_ACT_MENU_TOOL_STACK = 2108,
+    CANVAS_ACT_MENU_TOOL_CLONE = 2109,
+    CANVAS_ACT_MENU_TOOL_RECT = 2110,
+    CANVAS_ACT_MENU_TOOL_NUMBER = 2111,
+    CANVAS_ACT_ROPE_MENU_TOGGLE = 2112,
+    CANVAS_ACT_ROPE_MODE_SIMPLE = 2113,
+    CANVAS_ACT_ROPE_MODE_FULL = 2114,
+};
+
+// Bind up to `max_ports` currently-empty receive frame ports on `module_idx`.
+static int canvas_autobind_action_ports(GP_CanvasContext* ctx_, int module_idx, int action_id, int max_ports) {
+    if (!ctx_ || module_idx < 0 || max_ports <= 0) return 0;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx >= static_cast<int>(c->module_frame_links.size())) return 0;
+    int bound = 0;
+    const int rows_to_try[2] = {2, 3};
+    for (int row_idx : rows_to_try) {
+        for (int li = 0; li < kModuleExtraLedCount && bound < max_ports; ++li) {
+            void* existing = c->module_frame_links[static_cast<size_t>(module_idx)].ptrs[static_cast<size_t>(row_idx)][static_cast<size_t>(li)];
+            if (existing) continue;
+            int col = (row_idx == 2) ? 0 : 1;
+            if (gp_canvas_bind_action_enum_to_module_port(ctx_, module_idx, /*is_send=*/0, col, li, action_id)) {
+                void* now_bound = c->module_frame_links[static_cast<size_t>(module_idx)].ptrs[static_cast<size_t>(row_idx)][static_cast<size_t>(li)];
+                if (now_bound) ++bound;
+            }
+        }
+        if (bound >= max_ports) break;
+    }
+    return bound;
+}
+
+extern "C" int gp_canvas_autobind_actions(GP_CanvasContext* ctx, int module_idx, const int32_t* action_ids, int action_count, int max_ports) {
+    if (!ctx || !action_ids || action_count <= 0) return 0;
+    int total_bound = 0;
+    for (int i = 0; i < action_count && total_bound < max_ports; ++i) {
+        int remaining = max_ports - total_bound;
+        total_bound += canvas_autobind_action_ports(ctx, module_idx, action_ids[i], remaining);
+    }
+    return total_bound;
+}
+
 extern "C" int gp_canvas_register_table_rope_ids_from_array(GP_CanvasContext* ctx, GP_TableContext* table, const uint64_t* ids, int count) {
     if (!ctx || !ids || count <= 0) return 0;
     GP_CanvasContextImpl* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
@@ -398,6 +503,14 @@ extern "C" int gp_canvas_register_table_frame_port_uuid(GP_CanvasContext* ctx, G
     return 0;
 }
 
+extern "C" int gp_canvas_autobind_mouse_ports(GP_CanvasContext* ctx, int module_idx, int max_ports) {
+    return canvas_autobind_action_ports(ctx, module_idx, CANVAS_ACT_MENU_TOOL_MOUSE, std::max(0, max_ports));
+}
+
+extern "C" int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int max_ports) {
+    return canvas_autobind_action_ports(ctx, module_idx, CANVAS_ACT_MENU_TOOL_KEYBOARD, std::max(0, max_ports));
+}
+
 static void canvas_update_subgroup_palette(GP_CanvasContextImpl* ctx) {
     if (!ctx) return;
     constexpr float kApproach = 0.18f;
@@ -600,7 +713,12 @@ static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, cons
         if (r.kind == ModuleRowKind::Tool && r.tool_origin == ModuleToolOrigin::Plugin && !r.plugin_id.empty()) {
             try {
                 auto inst = tool_registry_global().create(r.plugin_id);
-                if (inst) ctx->module_plugin_instances[module_idx][ri] = std::move(inst);
+                if (inst) {
+                    ToolInitContext tctx{};
+                    tctx.user = reinterpret_cast<void*>(static_cast<intptr_t>(module_idx));
+                    try { inst->initialize(tctx); } catch (...) {}
+                    ctx->module_plugin_instances[module_idx][ri] = std::move(inst);
+                }
             } catch (...) {}
         }
     }
@@ -706,6 +824,10 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->next_overlay_id = 1;
     ctx->tool_menu_open = false;
     ctx->rope_menu_open = false;
+    ctx->plugin_menu_open = false;
+    ctx->plugin_menu_module_idx = -1;
+    ctx->module_menu_open = false;
+    ctx->module_menu_module_idx = -1;
     int max_window_node = 0;
     for (const auto &entry : ctx->window_node_ids) {
         max_window_node = std::max(max_window_node, entry.second);
@@ -824,6 +946,28 @@ static void canvas_destroy_module(GP_CanvasContextImpl* ctx, int module_idx) {
             for (int li = 0; li < kModuleExtraLedCount; ++li) {
                 uint64_t pu = links.port_uuids[static_cast<size_t>(row)][static_cast<size_t>(li)];
                 if (pu != 0ull) ctx->module_port_uuid_map.erase(pu);
+            }
+        }
+    }
+    // Drop any action->port bindings that referenced this module so event dispatch
+    // can't hit stale PendingAction pointers after the module is destroyed or moved.
+    {
+        std::lock_guard<std::mutex> lk(ctx->action_subscribers_mu);
+        for (auto it = ctx->action_port_bindings.begin(); it != ctx->action_port_bindings.end(); ) {
+            auto &vec = it->second;
+            for (auto vit = vec.begin(); vit != vec.end(); ) {
+                if (vit->module_idx == module_idx) {
+                    vit = vec.erase(vit);
+                } else {
+                    // Fix up module indices greater than the removed one.
+                    if (vit->module_idx > module_idx) --vit->module_idx;
+                    ++vit;
+                }
+            }
+            if (vec.empty()) {
+                it = ctx->action_port_bindings.erase(it);
+            } else {
+                ++it;
             }
         }
     }
@@ -2247,9 +2391,11 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
 
     int right_x = sx + m.w - kModuleTopPadding;
     int menu_w = std::max(30, control_h);
+    int lib_w = menu_w;
     int pause_w = std::max(42, control_h * 2);
     int menu_x = right_x - menu_w;
-    int pause_x = menu_x - gap - pause_w;
+    int lib_x = menu_x - gap - lib_w;
+    int pause_x = lib_x - gap - pause_w;
     // Per-module play/pause: this button toggles the entire-module skip flag.
     bool module_paused = false;
     if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_skip.size())) module_paused = (ctx->module_skip[module_idx] != 0);
@@ -2268,6 +2414,7 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
     draw_button(sim_x, btn_y, sim_w, control_h, Color{46,46,56,255}, sim_label, 0.8f);
     // draw right play/pause half
     draw_button(play_x, btn_y, play_w, control_h, Color{44,52,60,255}, pause_label, 1.0f);
+    draw_button(lib_x, btn_y, lib_w, control_h, Color{46,54,52,255}, LABEL_MODULE_LIBRARY_SHORT, 0.85f);
     draw_button(menu_x, btn_y, menu_w, control_h, Color{50,50,62,255}, LABEL_MODULE_MENU, 0.85f);
 
     // Module action buttons: Clone / Clear / Destroy / Commit / Export (right-aligned)
@@ -2596,78 +2743,6 @@ static CanvasBounds update_canvas_scroll_state(GP_CanvasContextImpl* ctx, bool p
     return b;
 }
 
-enum CanvasActionId {
-    CANVAS_ACT_SIM_SEGS_DEC = 2000,
-    CANVAS_ACT_SIM_SEGS_INC = 2001,
-    CANVAS_ACT_SIM_SLACK_DEC = 2002,
-    CANVAS_ACT_SIM_SLACK_INC = 2003,
-    CANVAS_ACT_SAVE = 2004,
-    CANVAS_ACT_CLEAR = 2005,
-    CANVAS_ACT_TOOL_CANVAS_0 = 2010,
-    CANVAS_ACT_TOOL_CANVAS_1 = 2011,
-    CANVAS_ACT_TOOL_CANVAS_2 = 2012,
-    CANVAS_ACT_TOOL_CANVAS_3 = 2013,
-    CANVAS_ACT_TOOL_EDGE_0 = 2014,
-    CANVAS_ACT_TOOL_EDGE_1 = 2015,
-    CANVAS_ACT_TOOL_EDGE_2 = 2016,
-    CANVAS_ACT_TOOL_EDGE_3 = 2017,
-    CANVAS_ACT_TOOL_EDGE_4 = 2018, // Meta-Edge Lasso (toolbar edge-group button)
-    CANVAS_ACT_EDGE_ORDER_DEC = 2019,
-    CANVAS_ACT_EDGE_ORDER_INC = 2020,
-    CANVAS_ACT_EDGE_ORDER_TOOL = 2021,
-    CANVAS_ACT_TOOL_TABLE_0 = 2030,
-    CANVAS_ACT_TOOL_TABLE_1 = 2031,
-    CANVAS_ACT_TOOL_TABLE_2 = 2032,
-    CANVAS_ACT_IO_COUNT_DEC = 2040,
-    CANVAS_ACT_IO_COUNT_INC = 2041,
-    CANVAS_ACT_IO_CONSUMER_ADD = 2042,
-    CANVAS_ACT_IO_PRODUCER_ADD = 2043,
-    CANVAS_ACT_TABLE_TOOL_NUM_DEC = 2044,
-    CANVAS_ACT_TABLE_TOOL_NUM_INC = 2045,
-    CANVAS_ACT_META_CHAN_DEC = 2500,
-    CANVAS_ACT_META_CHAN_INC = 2501,
-    CANVAS_ACT_MODULE_LED = 2050,
-    CANVAS_ACT_FRAME_PAIRS_DEC = 2200,
-    CANVAS_ACT_FRAME_PAIRS_INC = 2201,
-    CANVAS_ACT_TOOL_KPN_0 = 2060,
-    CANVAS_ACT_TOOL_KPN_1 = 2061,
-    CANVAS_ACT_TOOL_KPN_2 = 2062,
-    CANVAS_ACT_THREAD_TOGGLE = 2070,
-    CANVAS_ACT_KPN_GLOBAL_TOGGLE = 2079,
-    CANVAS_ACT_THREAD_SIM_TOGGLE = 2078,
-    CANVAS_ACT_CANVAS_ROOT_SIM_TOGGLE = 2088,
-    CANVAS_ACT_THREAD_DELAY_DEC = 2071,
-    CANVAS_ACT_THREAD_DELAY_INC = 2072,
-    CANVAS_ACT_MODULE_CLONE = 2073,
-    CANVAS_ACT_MODULE_CLEAR = 2074,
-    CANVAS_ACT_MODULE_DESTROY = 2075,
-    CANVAS_ACT_MODULE_EXPORT = 2076,
-    CANVAS_ACT_MODULE_COMMIT = 2077,
-    CANVAS_ACT_TOOL_SUBGROUP_0 = 2080,
-    CANVAS_ACT_TOOL_SUBGROUP_1 = 2081,
-    CANVAS_ACT_TOOL_SUBGROUP_2 = 2082,
-    CANVAS_ACT_TOOL_SUBGROUP_3 = 2083,
-    CANVAS_ACT_TOOL_SUBGROUP_4 = 2084,
-    CANVAS_ACT_TOOL_SUBGROUP_5 = 2085,
-    CANVAS_ACT_TOOL_SUBGROUP_6 = 2086,
-    CANVAS_ACT_TOOL_SUBGROUP_7 = 2087,
-    CANVAS_ACT_SPAWN_ROOT = 2090, // explicit spawn-root toolbar button
-    CANVAS_ACT_MENU_TOOL_ADD = 2101,
-    CANVAS_ACT_MENU_TOOL_SUB = 2102,
-    CANVAS_ACT_MENU_TOOL_MUL = 2103,
-    CANVAS_ACT_MENU_TOOL_DIV = 2104,
-    CANVAS_ACT_MENU_TOOL_MOD = 2105,
-    CANVAS_ACT_MENU_TOOL_KEYBOARD = 2106,
-    CANVAS_ACT_MENU_TOOL_MOUSE = 2107,
-    CANVAS_ACT_MENU_TOOL_STACK = 2108,
-    CANVAS_ACT_MENU_TOOL_CLONE = 2109,
-    CANVAS_ACT_MENU_TOOL_RECT = 2110,
-    CANVAS_ACT_MENU_TOOL_NUMBER = 2111,
-    CANVAS_ACT_ROPE_MENU_TOGGLE = 2112,
-    CANVAS_ACT_ROPE_MODE_SIMPLE = 2113,
-    CANVAS_ACT_ROPE_MODE_FULL = 2114,
-};
-
 struct InputRayLight {
     float cx = 0.0f;
     float cy = 0.0f;
@@ -2952,6 +3027,229 @@ static bool parse_tool_kind_from_id(const std::string& tool_id, ModuleToolKind& 
     return true;
 }
 
+// Clear module frame pointers and action bindings for a module without destroying it.
+static void canvas_clear_module_bindings(GP_CanvasContextImpl* ctx, int module_idx) {
+    if (!ctx) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_frame_links.size())) return;
+    {
+        std::lock_guard<std::mutex> lk(ctx->action_subscribers_mu);
+        for (auto it = ctx->action_port_bindings.begin(); it != ctx->action_port_bindings.end(); ) {
+            auto &vec = it->second;
+            for (auto vit = vec.begin(); vit != vec.end(); ) {
+                if (vit->module_idx == module_idx) {
+                    vit = vec.erase(vit);
+                } else {
+                    ++vit;
+                }
+            }
+            if (vec.empty()) it = ctx->action_port_bindings.erase(it); else ++it;
+        }
+    }
+    auto &links = ctx->module_frame_links[static_cast<size_t>(module_idx)];
+    for (int row = 0; row < kModuleExtraLedRows; ++row) {
+        for (int li = 0; li < kModuleExtraLedCount; ++li) {
+            links.ptrs[static_cast<size_t>(row)][static_cast<size_t>(li)] = nullptr;
+        }
+    }
+}
+
+static std::string canvas_module_label(const GP_CanvasModuleDesc& desc) {
+    std::string label(desc.label, desc.label + sizeof(desc.label));
+    size_t null_pos = label.find('\0');
+    if (null_pos != std::string::npos) label.resize(null_pos);
+    return label;
+}
+
+static std::string module_library_manifest_path(const std::string& module_id) {
+    namespace fs = std::filesystem;
+    fs::path root = gp_module_library_default_root();
+    fs::path manifest = root / "serialized" / (module_id + std::string(".modlib"));
+    return manifest.generic_string();
+}
+
+static bool canvas_build_module_library_for_module(GP_CanvasContextImpl* ctx,
+                                                  int module_idx,
+                                                  bool convert_to_tool,
+                                                  GP_ModuleLibrary* out_lib) {
+    if (!ctx || !out_lib) return false;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return false;
+    ensure_module_row_order(ctx, module_idx);
+    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) return false;
+
+    GP_ModuleLibrary lib{};
+    lib.root_dir = gp_module_library_default_root();
+
+    std::map<int, GP_ModuleLibraryTool> tool_registry_by_kind;
+    std::map<std::string, GP_ModuleLibraryTool> plugin_registry_by_id;
+    auto normalize_source = [&](const std::string& source_path) -> std::string {
+        if (source_path.empty()) return {};
+        namespace fs = std::filesystem;
+        try {
+            fs::path src = fs::path(source_path);
+            if (!src.is_absolute()) return src.generic_string();
+            fs::path root = fs::absolute(fs::path(lib.root_dir));
+            fs::path abs_src = fs::absolute(src);
+            std::error_code ec;
+            fs::path rel = fs::relative(abs_src, root, ec);
+            if (!ec) {
+                std::string rel_str = rel.generic_string();
+                if (!rel_str.empty() && rel_str.rfind("..", 0) != 0) {
+                    return rel_str;
+                }
+            }
+            return abs_src.generic_string();
+        } catch (...) {
+            return source_path;
+        }
+    };
+    const auto &rows = ctx->module_io_rows[module_idx];
+    for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
+        const auto &row = rows[row_idx];
+        if (row.kind != ModuleRowKind::Tool) continue;
+        if (row.tool_origin == ModuleToolOrigin::Builtin) {
+            ModuleToolKind tool_kind = row.tool;
+            if (tool_kind == ModuleToolKind::None) continue;
+            auto tool_it = tool_registry_by_kind.find(static_cast<int>(tool_kind));
+            if (tool_it == tool_registry_by_kind.end()) {
+                GP_ModuleLibraryTool tool{};
+                tool.kind = tool_kind;
+                tool.id = gp_module_library_tool_id(tool_kind);
+                tool.name = gp_module_tool_kind_name(tool_kind);
+                tool.source_path = gp_module_library_tool_source_path(std::string(), tool.id);
+                tool_registry_by_kind.emplace(static_cast<int>(tool_kind), std::move(tool));
+            }
+        } else if (row.tool_origin == ModuleToolOrigin::Plugin && !row.plugin_id.empty()) {
+            if (plugin_registry_by_id.find(row.plugin_id) == plugin_registry_by_id.end()) {
+                GP_ModuleLibraryTool tool{};
+                tool.kind = ModuleToolKind::None;
+                tool.id = row.plugin_id;
+                const auto *entry = tool_registry_global().find(row.plugin_id);
+                tool.name = entry ? entry->name : row.plugin_id;
+                if (entry) {
+                    tool.source_path = normalize_source(entry->source_path);
+                }
+                plugin_registry_by_id.emplace(tool.id, std::move(tool));
+            }
+        }
+    }
+
+    GP_ModuleLibraryModule module{};
+    module.module_idx = module_idx;
+    module.id = gp_module_library_module_id(module_idx);
+    module.label = canvas_module_label(ctx->modules[module_idx]);
+    module.serialized_path = gp_module_library_module_serialized_path(std::string(), module.id);
+    module.source_path = gp_module_library_module_source_path(std::string(), module.id);
+    module.convert_to_tool = convert_to_tool;
+    module.tool_caps = 0;
+    module.input_count = 0;
+    module.output_count = 0;
+
+    for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
+        const auto &row = rows[row_idx];
+        if (row.kind == ModuleRowKind::Input) {
+            module.input_count += std::clamp(row.attachment_count, 1, 32);
+            continue;
+        }
+        if (row.kind == ModuleRowKind::Output) {
+            module.output_count += std::clamp(row.attachment_count, 1, 32);
+            continue;
+        }
+        if (row.kind != ModuleRowKind::Tool) continue;
+        GP_ModuleToolInstance instance{};
+        instance.row_idx = static_cast<int>(row_idx);
+        instance.attachment_count = row.attachment_count;
+        if (row.tool_origin == ModuleToolOrigin::Builtin) {
+            ModuleToolKind tool_kind = row.tool;
+            if (tool_kind == ModuleToolKind::None) continue;
+            instance.tool_id = gp_module_library_tool_id(tool_kind);
+            module.tool_instances.push_back(std::move(instance));
+        } else if (row.tool_origin == ModuleToolOrigin::Plugin && !row.plugin_id.empty()) {
+            instance.tool_id = row.plugin_id;
+            module.tool_instances.push_back(std::move(instance));
+        }
+    }
+
+    lib.modules.push_back(std::move(module));
+    for (auto &entry : tool_registry_by_kind) {
+        lib.tool_registry.push_back(std::move(entry.second));
+    }
+    for (auto &entry : plugin_registry_by_id) {
+        lib.tool_registry.push_back(std::move(entry.second));
+    }
+
+    *out_lib = std::move(lib);
+    return true;
+}
+
+static bool canvas_write_module_library_manifest(GP_CanvasContextImpl* ctx, int module_idx) {
+    GP_ModuleLibrary lib{};
+    if (!canvas_build_module_library_for_module(ctx, module_idx, false, &lib)) return false;
+    const std::string module_id = gp_module_library_module_id(module_idx);
+    const std::string manifest_path = module_library_manifest_path(module_id);
+    try {
+        std::filesystem::path p = manifest_path;
+        if (!p.empty()) std::filesystem::create_directories(p.parent_path());
+    } catch (...) {
+        return false;
+    }
+    return gp_module_library_write_to_file(lib, manifest_path.c_str()) != 0;
+}
+
+static void canvas_refresh_module_library(GP_CanvasContextImpl* ctx) {
+    if (!ctx) return;
+    namespace fs = std::filesystem;
+    ctx->module_library_ids.clear();
+    ctx->module_library_labels.clear();
+    ctx->module_library_serialized.clear();
+    ctx->module_library_manifests.clear();
+
+    fs::path root = gp_module_library_default_root();
+    fs::path ser_dir = root / "serialized";
+    if (!fs::exists(ser_dir)) return;
+
+    std::vector<std::string> ids;
+    std::vector<std::string> labels;
+    std::vector<std::string> serialized;
+    std::vector<std::string> manifests;
+
+    for (const auto &entry : fs::directory_iterator(ser_dir, fs::directory_options::skip_permission_denied)) {
+        if (!entry.is_regular_file()) continue;
+        const fs::path &path = entry.path();
+        if (path.extension() != ".gpmod") continue;
+        std::string id = path.stem().string();
+        std::string manifest = module_library_manifest_path(id);
+        std::string label = id;
+        if (fs::exists(manifest)) {
+            GP_ModuleLibrary lib{};
+            if (gp_module_library_read_from_file(manifest.c_str(), &lib)) {
+                for (const auto &mod : lib.modules) {
+                    if (mod.id == id) {
+                        if (!mod.label.empty()) label = mod.label;
+                        break;
+                    }
+                }
+            }
+        }
+        ids.push_back(id);
+        labels.push_back(label);
+        serialized.push_back(path.generic_string());
+        manifests.push_back(fs::exists(manifest) ? manifest : std::string());
+    }
+
+    // stable order by id
+    std::vector<size_t> order(ids.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return ids[a] < ids[b];
+    });
+    for (size_t idx : order) {
+        ctx->module_library_ids.push_back(ids[idx]);
+        ctx->module_library_labels.push_back(labels[idx]);
+        ctx->module_library_serialized.push_back(serialized[idx]);
+        ctx->module_library_manifests.push_back(manifests[idx]);
+    }
+}
+
 static std::vector<ModuleToolKind> discover_compiled_plugin_tools() {
     namespace fs = std::filesystem;
     std::vector<ModuleToolKind> out;
@@ -3046,6 +3344,17 @@ struct PluginMenuLayout {
     int item_count = 0;
 };
 
+struct ModuleMenuLayout {
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+    int header_h = 0;
+    int row_h = 0;
+    int item_start_y = 0;
+    int item_count = 0;
+};
+
 struct RopeMenuLayout {
     int x = 0;
     int y = 0;
@@ -3103,6 +3412,35 @@ static ToolMenuLayout compute_tool_menu_layout(const GP_CanvasContextImpl* ctx) 
     layout.table_section_y = table_start_y;
     layout.table_control_y = table_start_y + header_h;
     layout.table_control_h = row_h;
+    return layout;
+}
+
+static ModuleMenuLayout compute_module_menu_layout(const GP_CanvasContextImpl* ctx, int module_idx, int item_count) {
+    ModuleMenuLayout layout{};
+    if (!ctx || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return layout;
+    const auto& m = ctx->modules[module_idx];
+    ModuleLayout mod_layout = module_layout_for(ctx, module_idx, m);
+    const int padding = 8;
+    const int margin = 12;
+    const int header_h = 18;
+    const int row_h = 22;
+    const int w = 220;
+    const int rows = std::max(1, item_count);
+    int h = padding * 2 + header_h + rows * row_h;
+    int sx = m.x - ctx->offset_x;
+    int sy = m.y - ctx->offset_y;
+    int x = sx + m.w - w - margin;
+    x = std::clamp(x, margin, std::max(margin, ctx->width - w - margin));
+    int y = sy + mod_layout.table_y + margin;
+    y = std::clamp(y, margin, std::max(margin, ctx->height - h - margin));
+    layout.x = x;
+    layout.y = y;
+    layout.w = w;
+    layout.h = h;
+    layout.header_h = header_h;
+    layout.row_h = row_h;
+    layout.item_start_y = y + padding + header_h;
+    layout.item_count = rows;
     return layout;
 }
 
@@ -3253,6 +3591,100 @@ static void canvas_refresh_plugin_tools(GP_CanvasContextImpl* ctx) {
     ctx->plugin_tool_ids.swap(ids_unique);
     ctx->plugin_tool_labels.swap(labels_unique);
     ctx->plugin_tool_kinds.swap(kinds_unique);
+}
+
+static bool canvas_apply_module_library_entry(GP_CanvasContextImpl* ctx,
+                                              int module_idx,
+                                              const std::string &manifest_path,
+                                              const std::string &serialized_path) {
+    if (!ctx) return false;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return false;
+    ensure_module_row_order(ctx, module_idx);
+
+    bool applied = false;
+    if (!manifest_path.empty()) {
+        GP_ModuleLibrary lib{};
+        if (gp_module_library_read_from_file(manifest_path.c_str(), &lib)) {
+            const GP_ModuleLibraryModule* match = nullptr;
+            for (const auto &mod : lib.modules) {
+                if (mod.id == gp_module_library_module_id(module_idx)) {
+                    match = &mod;
+                    break;
+                }
+            }
+            if (!match && !lib.modules.empty()) match = &lib.modules.front();
+            if (match) {
+                std::vector<ModuleIORow> rows;
+                if (module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+                    const auto &current = ctx->module_io_rows[module_idx];
+                    for (const auto &row : current) {
+                        if (row.kind == ModuleRowKind::Input) {
+                            rows.push_back({ModuleRowKind::Input, 0, ModuleToolKind::None, row.attachment_count});
+                        }
+                    }
+                }
+                std::vector<GP_ModuleToolInstance> sorted = match->tool_instances;
+                std::sort(sorted.begin(), sorted.end(), [](const GP_ModuleToolInstance& a, const GP_ModuleToolInstance& b) {
+                    return a.row_idx < b.row_idx;
+                });
+                for (const auto &instance : sorted) {
+                    ModuleToolKind kind = ModuleToolKind::None;
+                    if (parse_tool_kind_from_id(instance.tool_id, kind)) {
+                        rows.push_back({ModuleRowKind::Tool, -1, kind, instance.attachment_count, ModuleToolOrigin::Builtin, std::string()});
+                    } else if (!instance.tool_id.empty()) {
+                        rows.push_back({ModuleRowKind::Tool, -1, ModuleToolKind::None, instance.attachment_count, ModuleToolOrigin::Plugin, instance.tool_id});
+                    }
+                }
+                if (module_idx < static_cast<int>(ctx->module_io_rows.size())) {
+                    const auto &current = ctx->module_io_rows[module_idx];
+                    for (const auto &row : current) {
+                        if (row.kind == ModuleRowKind::Output) {
+                            rows.push_back({ModuleRowKind::Output, 0, ModuleToolKind::None, row.attachment_count});
+                        }
+                    }
+                }
+                canvas_apply_io_rows(ctx, module_idx, rows);
+                sync_module_table_io_layout(ctx, module_idx);
+                if (!match->label.empty()) {
+                    auto &m = ctx->modules[module_idx];
+                    std::snprintf(m.label, sizeof(m.label), "%s", match->label.c_str());
+                    m.label[sizeof(m.label) - 1] = '\0';
+                }
+                applied = true;
+            }
+        }
+    }
+
+    if (!serialized_path.empty()) {
+        try {
+            std::filesystem::path full = serialized_path;
+            if (std::filesystem::exists(full) && std::filesystem::file_size(full) > 0) {
+                if (module_idx >= static_cast<int>(ctx->module_tables.size()) || !ctx->module_tables[module_idx]) {
+                    gp_canvas_create_table(reinterpret_cast<GP_CanvasContext*>(ctx), module_idx);
+                }
+                GP_TableContext* t = (module_idx < static_cast<int>(ctx->module_tables.size()))
+                    ? ctx->module_tables[module_idx]
+                    : nullptr;
+                if (t) {
+                    std::ifstream ifs(full, std::ios::binary);
+                    if (ifs.good()) {
+                        std::vector<char> buf((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+                        ifs.close();
+                        if (!buf.empty()) {
+                            gp_table_deserialize(t, buf.data(), static_cast<int32_t>(buf.size()));
+                            applied = true;
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+        }
+    }
+
+    if (applied) {
+        update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
+    }
+    return applied;
 }
 
 struct ToolMenuCounterLayout {
@@ -3693,6 +4125,8 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                     c->tool_menu_open = false;
                     c->plugin_menu_open = false;
                     c->plugin_menu_module_idx = -1;
+                    c->module_menu_open = false;
+                    c->module_menu_module_idx = -1;
                 }
                 printf("gp_canvas_on_click: rope_menu_open -> %d\n", c->rope_menu_open ? 1 : 0);
                 break;
@@ -3779,6 +4213,8 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 }
                 c->plugin_menu_open = false;
                 c->plugin_menu_module_idx = -1;
+                c->module_menu_open = false;
+                c->module_menu_module_idx = -1;
                 c->rope_menu_open = false;
                 printf("gp_canvas_on_click: table tool %d toggled -> selected_tool_table=%d\n", tool, c->selected_tool_table);
                 break;
@@ -3992,50 +4428,9 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
             case CANVAS_ACT_MODULE_COMMIT: {
                 int focused = c->focused_module;
                 if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
-                    // Export module sources to the module library root, actualize it as a tool, then perform a per-module scratch build
-                    gp_canvas_export_module_to_root(reinterpret_cast<GP_CanvasContext*>(c), focused, nullptr);
-                    // Ensure the exported module is actualized as a tool (generate full tool source including create_tool)
-                    GP_ModuleLibrary lib{};
-                    lib.root_dir = gp_module_library_default_root();
-                    GP_ModuleLibraryModule mod{};
-                    mod.module_idx = focused;
-                    mod.id = gp_module_library_module_id(focused);
-                    mod.source_path = gp_module_library_module_source_path(std::string(), mod.id);
-                    mod.convert_to_tool = true;
-                    lib.modules.push_back(std::move(mod));
-                    gp_module_library_actualize_sources(lib, lib.root_dir.c_str());
-
-                    std::string module_id = gp_module_library_module_id(focused);
-                    std::string dest = gp_module_library_default_root();
-                    // find the newest generated versioned tool source for this module in the tools dir
-                    std::filesystem::path tools_dir = std::filesystem::path(dest) / "source" / "tools";
-                    std::string prefix = ("tool_" + module_id) + std::string("_ver_");
-                    std::filesystem::path chosen;
-                    std::filesystem::file_time_type latest;
-                    if (std::filesystem::exists(tools_dir)) {
-                        for (auto &ent : std::filesystem::directory_iterator(tools_dir)) {
-                            if (!ent.is_regular_file()) continue;
-                            std::string name = ent.path().filename().string();
-                            if (name.rfind(prefix, 0) != 0) continue;
-                            auto ftime = std::filesystem::last_write_time(ent.path());
-                            if (chosen.empty() || ftime > latest) {
-                                latest = ftime;
-                                chosen = ent.path();
-                            }
-                        }
-                    }
-                    std::string module_src;
-                    if (!chosen.empty()) module_src = chosen.generic_string();
-                    else module_src = std::filesystem::path(gp_module_library_module_source_path(std::string(), module_id)).generic_string();
-                    char out_id[256];
-                    int ok = gp_plugin_build_module_and_load(module_src.c_str(), ".", dest.c_str(), nullptr, out_id, static_cast<int>(sizeof(out_id)));
-                    if (ok) {
-                        printf("module commit: scratch-built+loaded id=%s (module=%s src=%s)\n", out_id, module_id.c_str(), module_src.c_str());
-                        // Refresh the in-memory plugin tool list so the UI reflects the newly loaded plugin
-                        canvas_refresh_plugin_tools(c);
-                    } else {
-                        printf("module commit: build+load failed for module=%s\n", module_id.c_str());
-                    }
+                    // Queue commit/build; processed later in gp_canvas_step to avoid running during input callbacks.
+                    canvas_clear_module_bindings(c, focused);
+                    c->pending_module_commits.push_back(focused);
                 }
                 break;
             }
@@ -4044,6 +4439,7 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 int focused = c->focused_module;
                 if (focused >= 0 && focused < static_cast<int>(c->modules.size())) {
                     gp_canvas_export_module_to_root(reinterpret_cast<GP_CanvasContext*>(c), focused, nullptr);
+                    (void)canvas_write_module_library_manifest(c, focused);
                 }
                 break;
             }
@@ -4122,6 +4518,8 @@ static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx) {
     return ctx->container_table;
 }
 
+// Bind up to `max_ports` currently-empty receive frame ports on `module_idx` to the
+// specified action id. Returns how many were bound.
 static RopeSim* canvas_root_sim(GP_CanvasContextImpl* ctx) {
     if (!ctx || !ctx->container_table) return nullptr;
     return gp_table_get_rope_sim(ctx->container_table);
@@ -4824,16 +5222,15 @@ static void canvas_push_tool_to_focused(GP_CanvasContextImpl* ctx, ModuleToolKin
     update_canvas_scroll_state(ctx, /*pull_from_container=*/false);
     ctx->tool_menu_open = false;
     ctx->rope_menu_open = false;
+    ctx->plugin_menu_open = false;
+    ctx->plugin_menu_module_idx = -1;
+    ctx->module_menu_open = false;
+    ctx->module_menu_module_idx = -1;
     ctx->selected_tool_table = 0;
-    // If the mouse tool was enabled for this module, programmatically bind
-    // a small set of receive ports so the module's frame LEDs reflect that
-    // the tool intends to receive mouse events. We bind four slots (up,
-    // down, y, x) into the left receive column by default.
+    // When the mouse tool is explicitly added to a module, auto-bind the first
+    // available four receive ports so it can start receiving events immediately.
     if (tool == ModuleToolKind::MouseListener) {
-        // Bind led indices 0..3 in the receive (is_send=0), left column (col=0)
-        for (int li = 0; li < 4; ++li) {
-            (void)gp_canvas_bind_action_enum_to_module_port(reinterpret_cast<GP_CanvasContext*>(ctx), focused, 0 /*receive*/, 0 /*left*/, li, CANVAS_ACT_MENU_TOOL_MOUSE);
-        }
+        gp_canvas_autobind_mouse_ports(reinterpret_cast<GP_CanvasContext*>(ctx), focused, 4);
     }
 }
 
@@ -4862,10 +5259,22 @@ static void canvas_push_plugin_tool_to_focused(GP_CanvasContextImpl* ctx, const 
         auto inst = tool_registry_global().create(plugin_id);
         if (inst) {
             // store instance in parallel vector at same index as the pushed row
+            ToolInitContext tctx{};
+            tctx.user = reinterpret_cast<void*>(static_cast<intptr_t>(focused));
+            try { inst->initialize(tctx); } catch (...) {}
             ctx->module_plugin_instances[focused][rows.size() - 1] = std::move(inst);
         }
     } catch (...) {
         // creation failed; leave null instance
+    }
+    // Apply host-driven autobind hints advertised by the plugin.
+    if (const auto* entry = tool_registry_global().find(plugin_id)) {
+        if (entry->auto_mouse_ports > 0) {
+            gp_canvas_autobind_mouse_ports(reinterpret_cast<GP_CanvasContext*>(ctx), focused, entry->auto_mouse_ports);
+        }
+        if (entry->auto_keyboard_ports > 0) {
+            gp_canvas_autobind_keyboard_ports(reinterpret_cast<GP_CanvasContext*>(ctx), focused, entry->auto_keyboard_ports);
+        }
     }
 
     auto &tools = ctx->module_tool_stack[focused];
