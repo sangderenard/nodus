@@ -188,7 +188,7 @@ extern "C" int32_t gp_table_ring_get_subgroup_flags(GP_TableContext* ctx, int32_
     return 1;
 }
 
-extern "C" int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, const GP_TableEdgeTensorSpec* spec) {
+extern "C" int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, const GP_TableEdgeTensorSpecTyped* spec) {
     if (!ctx || !spec) return 0;
     if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
     auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
@@ -204,12 +204,14 @@ extern "C" int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t r
     }
     size_t slots = spec->slots > 0 ? static_cast<size_t>(spec->slots) : size_t(1);
     size_t topk = spec->top_k > 0 ? static_cast<size_t>(spec->top_k) : size_t(0);
-    re.fifo.configure(dims, slots, topk);
+    size_t elem_size = spec->elem_size > 0 ? static_cast<size_t>(spec->elem_size) : sizeof(float);
+    int32_t type_id = spec->type_id;
+    re.fifo.configure(dims, slots, topk, elem_size, type_id);
     re.batch_metadata = GP_TableEdgeBatchMetadata();
     return 1;
 }
 
-extern "C" int32_t gp_table_ring_get_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, GP_TableEdgeTensorSpec* out_spec) {
+extern "C" int32_t gp_table_ring_get_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, GP_TableEdgeTensorSpecTyped* out_spec) {
     if (!ctx || !out_spec) return 0;
     if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
     *out_spec = ctx->rings[static_cast<size_t>(ring_entry_idx)].fifo.to_spec();
@@ -265,9 +267,9 @@ extern "C" int32_t gp_table_ring_unsubscribe(GP_TableContext* ctx, int32_t ring_
     return 1;
 }
 
-extern "C" int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped) {
+extern "C" int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped) {
     if (out_dropped) *out_dropped = 0;
-    if (!ctx || !sample || sample_len < 0) return 0;
+    if (!ctx || !sample_bytes || sample_len_bytes < 0) return 0;
     if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
     auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
     bool dropped = false;
@@ -275,18 +277,18 @@ extern "C" int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entr
     uint32_t flags = re.subgroup_flags;
     bool ok = false;
     if (flags_imply_byref(flags)) {
-        size_t sample_bytes = static_cast<size_t>(sample_len) * sizeof(float);
-        size_t alloc_sz = sizeof(BoxedSample) + sample_bytes;
+        size_t sb = static_cast<size_t>(sample_len_bytes);
+        size_t alloc_sz = sizeof(BoxedSample) + sb;
         uint8_t* buf = static_cast<uint8_t*>(std::malloc(alloc_sz));
         if (!buf) { if (out_dropped) *out_dropped = 1; return 0; }
         BoxedSample* box = reinterpret_cast<BoxedSample*>(buf);
         box->magic = BOXED_SAMPLE_MAGIC;
-        box->sample_len = sample_len;
+        box->sample_len = sample_len_bytes;
         uint8_t* payload = buf + sizeof(BoxedSample);
-        std::memcpy(payload, sample, sample_bytes);
+        std::memcpy(payload, sample_bytes, sb);
         ok = re.fifo.push_ptr(rid, writer_key, static_cast<void*>(box), &dropped);
     } else {
-        ok = re.fifo.push(rid, writer_key, sample, static_cast<size_t>(sample_len), &dropped);
+        ok = re.fifo.push(rid, writer_key, sample_bytes, static_cast<size_t>(sample_len_bytes), &dropped);
     }
     if (out_dropped && dropped) *out_dropped = 1;
     ThreadManager* tm = ThreadManager::global();
@@ -321,7 +323,7 @@ int32_t gp_table_get_edge(const GP_TableContext* ctx, int32_t idx, unsigned long
     return 1;
 }
 
-int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpec* spec) {
+int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpecTyped* spec) {
     if (!ctx || !spec) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
@@ -343,7 +345,9 @@ int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, co
     }
     size_t slots = spec->slots > 0 ? static_cast<size_t>(spec->slots) : size_t(1);
     size_t topk = spec->top_k > 0 ? static_cast<size_t>(spec->top_k) : size_t(0);
-    ctx->edge_fifos[static_cast<size_t>(edge_idx)].configure(dims, slots, topk);
+    size_t elem_size = spec->elem_size > 0 ? static_cast<size_t>(spec->elem_size) : sizeof(float);
+    int32_t type_id = spec->type_id;
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].configure(dims, slots, topk, elem_size, type_id);
     sync_edge_tensor_for_idx(ctx, static_cast<size_t>(edge_idx));
     // If a ThreadManager is present, update registered reader slots with
     // the freshly-initialized sequence (usually zero) so manager state
@@ -365,7 +369,7 @@ int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, co
     return 1;
 }
 
-int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpec* out_spec) {
+int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpecTyped* out_spec) {
     if (!ctx || !out_spec) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
@@ -422,9 +426,9 @@ int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsign
     return 1;
 }
 
-int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped) {
+int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped) {
     if (out_dropped) *out_dropped = 0;
-    if (!ctx || !sample || sample_len < 0) return 0;
+    if (!ctx || !sample_bytes || sample_len_bytes < 0) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
@@ -437,21 +441,21 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
     bool ok = false;
     if (flags_imply_byref(flags)) {
-        // BYREF: box the float sample and publish its pointer instead so
-        // consumers receive by-reference payloads. Box format: [BoxedSample][float data]
-        size_t sample_bytes = static_cast<size_t>(sample_len) * sizeof(float);
-        size_t alloc_sz = sizeof(BoxedSample) + sample_bytes;
+        // BYREF: box the raw sample bytes and publish its pointer instead so
+        // consumers receive by-reference payloads. Box format: [BoxedSample][raw bytes]
+        size_t sb = static_cast<size_t>(sample_len_bytes);
+        size_t alloc_sz = sizeof(BoxedSample) + sb;
         uint8_t* buf = static_cast<uint8_t*>(std::malloc(alloc_sz));
         if (!buf) { if (out_dropped) *out_dropped = 1; return 0; }
         BoxedSample* box = reinterpret_cast<BoxedSample*>(buf);
         box->magic = BOXED_SAMPLE_MAGIC;
-        box->sample_len = sample_len;
+        box->sample_len = sample_len_bytes;
         uint8_t* payload = buf + sizeof(BoxedSample);
-        std::memcpy(payload, sample, sample_bytes);
+        std::memcpy(payload, sample_bytes, sb);
         ok = fifo.push_ptr(edge_id, writer_key, static_cast<void*>(box), &dropped);
     } else {
-        // Normal float path
-        ok = fifo.push(edge_id, writer_key, sample, static_cast<size_t>(sample_len), &dropped);
+        // Normal byte-path
+        ok = fifo.push(edge_id, writer_key, sample_bytes, static_cast<size_t>(sample_len_bytes), &dropped);
     }
     if (out_dropped && dropped) *out_dropped = 1;
     // After a publish, the FIFO implementation may have advanced reader sequences
@@ -478,15 +482,15 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     return ok ? 1 : 0;
 }
 
-int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms) {
+int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped, int32_t timeout_ms) {
     if (out_dropped) *out_dropped = 0;
-    if (!ctx || !sample || sample_len < 0) return 0;
+    if (!ctx || !sample_bytes || sample_len_bytes < 0) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     bool dropped = false;
     uint64_t edge_id = ctx->edge_ids[static_cast<size_t>(edge_idx)];
-    bool ok = fifo.push_blocking(edge_id, writer_key, sample, static_cast<size_t>(sample_len), &dropped, timeout_ms);
+    bool ok = fifo.push_blocking(edge_id, writer_key, sample_bytes, static_cast<size_t>(sample_len_bytes), &dropped, timeout_ms);
     if (out_dropped && dropped) *out_dropped = 1;
     if (!ok) return 0;
     ThreadManager* tm = ThreadManager::global();
@@ -542,11 +546,11 @@ int32_t gp_table_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
 // Generic wrappers to provide a neutral edge API surface. These forward to
 // the table-specific implementations so callers outside the table system can
 // use a stable `gp_edge_*` API while we evolve internals.
-int32_t gp_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped) {
-    return gp_table_edge_publish(ctx, edge_idx, writer_key, sample, sample_len, out_dropped);
+int32_t gp_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped) {
+    return gp_table_edge_publish(ctx, edge_idx, writer_key, sample_bytes, sample_len_bytes, out_dropped);
 }
-int32_t gp_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms) {
-    return gp_table_edge_publish_blocking(ctx, edge_idx, writer_key, sample, sample_len, out_dropped, timeout_ms);
+int32_t gp_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped, int32_t timeout_ms) {
+    return gp_table_edge_publish_blocking(ctx, edge_idx, writer_key, sample_bytes, sample_len_bytes, out_dropped, timeout_ms);
 }
 int32_t gp_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void* ptr, int32_t* out_dropped) {
     return gp_table_edge_publish_ptr(ctx, edge_idx, writer_key, ptr, out_dropped);
@@ -582,9 +586,9 @@ int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
     return 1;
 }
 
-int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written) {
+int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written) {
     if (out_written) *out_written = 0;
-    if (!ctx || !out_sample || out_len < 0) return 0;
+    if (!ctx || !out_sample_bytes || out_len_bytes < 0) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
@@ -610,15 +614,15 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
                 if (!fifo.pop_ptr(subscriber_key, &p)) return 0;
                 if (!p) return 0;
                 BoxedSample* box = reinterpret_cast<BoxedSample*>(p);
-                int need = box->sample_len;
-                if (out_len < need) {
+                int need_bytes = box->sample_len;
+                if (out_len_bytes < need_bytes) {
                     std::free(box);
                     return 0;
                 }
-                float* payload = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample));
-                std::memcpy(out_sample, payload, static_cast<size_t>(need) * sizeof(float));
+                uint8_t* payload = reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample);
+                std::memcpy(out_sample_bytes, payload, static_cast<size_t>(need_bytes));
                 std::free(box);
-                wrote = static_cast<size_t>(need);
+                wrote = static_cast<size_t>(need_bytes);
                 ok = true;
             } else {
                 // A raw pointer was delivered; do not consume here.
@@ -626,10 +630,10 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
             }
         } else {
             // No pointer available — try float path.
-            ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+            ok = fifo.pop(subscriber_key, out_sample_bytes, static_cast<size_t>(out_len_bytes), wrote);
         }
     } else {
-        ok = fifo.pop(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+        ok = fifo.pop(subscriber_key, out_sample_bytes, static_cast<size_t>(out_len_bytes), wrote);
     }
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
@@ -650,9 +654,9 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     return 1;
 }
 
-int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written) {
+int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written) {
     if (out_written) *out_written = 0;
-    if (!ctx || !out_sample || out_len < 0) return 0;
+    if (!ctx || !out_sample_bytes || out_len_bytes < 0) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
@@ -666,14 +670,14 @@ int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long
         if (!p) return 0;
         BoxedSample* box = reinterpret_cast<BoxedSample*>(p);
         if (box->magic != BOXED_SAMPLE_MAGIC) return 0;
-        int need = box->sample_len;
-        if (out_len < need) return 0;
-        float* payload = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample));
-        std::memcpy(out_sample, payload, static_cast<size_t>(need) * sizeof(float));
-        wrote = static_cast<size_t>(need);
+        int need_bytes = box->sample_len;
+        if (out_len_bytes < need_bytes) return 0;
+        uint8_t* payload = reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample);
+        std::memcpy(out_sample_bytes, payload, static_cast<size_t>(need_bytes));
+        wrote = static_cast<size_t>(need_bytes);
         ok = true;
     } else {
-        ok = fifo.peek(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote);
+        ok = fifo.peek(subscriber_key, out_sample_bytes, static_cast<size_t>(out_len_bytes), wrote);
     }
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
@@ -681,9 +685,9 @@ int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long
     return 1;
 }
 
-int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written, int32_t timeout_ms) {
+int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written, int32_t timeout_ms) {
     if (out_written) *out_written = 0;
-    if (!ctx || !out_sample || out_len < 0) return 0;
+    if (!ctx || !out_sample_bytes || out_len_bytes < 0) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
@@ -709,12 +713,12 @@ int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, u
                     if (!fifo.pop_ptr(subscriber_key, &p)) return 0;
                     if (!p) return 0;
                     BoxedSample* box = reinterpret_cast<BoxedSample*>(p);
-                    int need = box->sample_len;
-                    if (out_len < need) { std::free(box); return 0; }
-                    float* payload = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample));
-                    std::memcpy(out_sample, payload, static_cast<size_t>(need) * sizeof(float));
+                    int need_bytes = box->sample_len;
+                    if (out_len_bytes < need_bytes) { std::free(box); return 0; }
+                    uint8_t* payload = reinterpret_cast<uint8_t*>(box) + sizeof(BoxedSample);
+                    std::memcpy(out_sample_bytes, payload, static_cast<size_t>(need_bytes));
                     std::free(box);
-                    wrote = static_cast<size_t>(need);
+                    wrote = static_cast<size_t>(need_bytes);
                     ok = true;
                     break;
                 } else {
@@ -728,7 +732,7 @@ int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, u
             if (now >= deadline) break;
             int remaining_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
             if (remaining_ms <= 0) break;
-            if (fifo.pop_blocking(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote, remaining_ms)) {
+            if (fifo.pop_blocking(subscriber_key, out_sample_bytes, static_cast<size_t>(out_len_bytes), wrote, remaining_ms)) {
                 ok = true;
                 break;
             }
@@ -736,7 +740,7 @@ int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, u
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     } else {
-        ok = fifo.pop_blocking(subscriber_key, out_sample, static_cast<size_t>(out_len), wrote, timeout_ms);
+        ok = fifo.pop_blocking(subscriber_key, out_sample_bytes, static_cast<size_t>(out_len_bytes), wrote, timeout_ms);
     }
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;

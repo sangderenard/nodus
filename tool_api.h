@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <string>
+#include "value_types.h"
 
 struct ToolInitContext {
     const char* root_dir = nullptr;
@@ -92,6 +94,11 @@ struct ToolStackFrame {
     int32_t capacity = 0;
 };
 
+// Raw (byte-oriented) stack frame support is provided in `value_types.h`.
+// `RawStackFrame` and the `ValueTypeRegistry` are intended for use by
+// table/edge code that must carry arbitrary typed payloads. The typed
+// raw stack helpers allow single-op memcpy push/pop and are stride-aware.
+
 struct ToolStackContext {
     ToolStackFrame stack{};
     const ToolInputState* input = nullptr;
@@ -108,6 +115,49 @@ inline void tool_stack_push(ToolStackFrame& frame, float v) {
     if (!frame.values || frame.count >= frame.capacity) return;
     frame.values[frame.count] = v;
     frame.count += 1;
+}
+
+// Pop up to `n` values from the stack into `out` preserving the
+// semantics of successive single `tool_stack_pop` calls: i.e. the
+// first element written to `out[0]` is the top-most stack element.
+// Returns the number of values actually popped.
+inline int tool_stack_pop_n(ToolStackFrame& frame, float* out, int n) {
+    if (!frame.values || frame.count <= 0 || n <= 0) return 0;
+    int avail = frame.count;
+    int to = (n < avail) ? n : avail;
+    // Write in pop order: out[0] = top, out[to-1] = bottom of popped block.
+    for (int i = 0; i < to; ++i) {
+        out[i] = frame.values[frame.count - 1 - i];
+    }
+    frame.count -= to;
+    return to;
+}
+
+// Pop a contiguous block of up to `n` values from the stack into `out`
+// using a single memcpy operation (i.e. preserves the underlying memory
+// order from older->newer). This is useful when the consumer expects the
+// block in the same order it was pushed. Returns the number of values
+// actually popped.
+inline int tool_stack_pop_block(ToolStackFrame& frame, float* out, int n) {
+    if (!frame.values || frame.count <= 0 || n <= 0) return 0;
+    int avail = frame.count;
+    int to = (n < avail) ? n : avail;
+    float* src = frame.values + (frame.count - to);
+    std::memcpy(out, src, static_cast<size_t>(to) * sizeof(float));
+    frame.count -= to;
+    return to;
+}
+
+// Push up to `n` values from `in` onto the stack using a single memcpy
+// operation. Returns the number of values actually pushed.
+inline int tool_stack_push_n(ToolStackFrame& frame, const float* in, int n) {
+    if (!frame.values || n <= 0) return 0;
+    int free_space = frame.capacity - frame.count;
+    if (free_space <= 0) return 0;
+    int to = (n < free_space) ? n : free_space;
+    std::memcpy(frame.values + frame.count, in, static_cast<size_t>(to) * sizeof(float));
+    frame.count += to;
+    return to;
 }
 
 struct OutputArchive {
@@ -164,8 +214,18 @@ public:
 struct ITool {
     virtual ~ITool() noexcept = default;
 
-    virtual std::string id() const = 0;
-    virtual std::string name() const = 0;
+    // Prefer stable C-style string accessors for cross-DLL safety.
+    // Default implementations return empty C string and are noexcept.
+    virtual const char* id_cstr() const noexcept { return ""; }
+    virtual const char* name_cstr() const noexcept { return ""; }
+
+    // Backwards-compatible string-returning accessors; they construct
+    // an std::string from the safe C string accessors. These are
+    // intentionally non-virtual so implementations in plugins should
+    // only provide `id_cstr()`/`name_cstr()` to avoid cross-DLL
+    // std::string construction/destruction issues.
+    std::string id() const { return std::string(id_cstr()); }
+    std::string name() const { return std::string(name_cstr()); }
     virtual ToolCaps caps() const { return ToolCaps::None; }
 
     virtual void initialize(const ToolInitContext& ctx) = 0;

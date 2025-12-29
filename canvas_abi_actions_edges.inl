@@ -328,6 +328,21 @@ extern "C" int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx_, int* ou
     return 1;
 }
 
+extern "C" int gp_canvas_get_thread_manager_paused(GP_CanvasContext* ctx_, int* out_paused) {
+    if (!ctx_ || !out_paused) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    *out_paused = c->thread_mgr_paused ? 1 : 0;
+    return 1;
+}
+
+extern "C" int gp_canvas_set_thread_manager_paused(GP_CanvasContext* ctx_, int paused) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->thread_mgr_paused = (paused != 0);
+    c->thread_mgr_delay_accum_s = c->thread_mgr_paused ? 0.0 : static_cast<double>(std::max(0, c->thread_mgr_delay_ms)) / 1000.0;
+    return 1;
+}
+
 extern "C" int gp_canvas_detach_table(GP_CanvasContext* ctx_, int module_idx) {
     if (!ctx_ || module_idx < 0) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);

@@ -23,8 +23,9 @@ public:
     EdgeIntrospectTool() {}
     ~EdgeIntrospectTool() noexcept override {}
 
-    std::string id() const override { return "edge_introspect"; }
-    std::string name() const override { return "Edge Introspect"; }
+    const char* id_cstr() const noexcept override { return "edge_introspect"; }
+    const char* name_cstr() const noexcept override { return "Edge Introspect"; }
+    // rely on base `id()`/`name()` which call `id_cstr()`/`name_cstr()`
     ToolCaps caps() const override { return ToolCaps::Table | ToolCaps::Text; }
 
     void initialize(const ToolInitContext& ctx) override {

@@ -12,8 +12,8 @@
 
 class Tool_tool_3 : public ITool {
 public:
-    std::string id() const override { return "tool_3"; }
-    std::string name() const override { return "Multiply"; }
+    const char* id_cstr() const noexcept override { return "tool_3"; }
+    const char* name_cstr() const noexcept override { return "Multiply"; }
     ToolCaps caps() const override { return static_cast<ToolCaps>(0); }
 
     void initialize(const ToolInitContext& ctx) override {

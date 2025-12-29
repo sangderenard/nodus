@@ -528,8 +528,10 @@ struct EdgeTensorFifo {
         std::atomic<uint64_t> write_seq{0}; // next sequence to write
         std::atomic<uint64_t> writer{0};    // bound writer key (0 => unbound)
         std::unique_ptr<std::atomic<uint64_t>[]> slot_seq; // published tag per slot (seq+1), 0 => empty
-        std::unique_ptr<uint8_t[]> storage_bytes;          // raw bytes: slots * stride * sizeof(float)
-        float* storage_f = nullptr;                        // typed view for float samples
+        std::unique_ptr<uint8_t[]> storage_bytes;          // raw bytes: slots * stride * elem_size
+        float* storage_f = nullptr;                        // typed view for float samples (only valid when elem_size==sizeof(float))
+        size_t elem_size = sizeof(float);                  // bytes per element
+        int32_t type_id = -1;                              // schema id
         std::unique_ptr<ReaderEntry[]> readers;
         size_t stride = 1;
         size_t slots = 1;
@@ -570,7 +572,7 @@ struct EdgeTensorFifo {
 
     void configure_default() { configure(std::vector<int32_t>{1}, 16, 0); }
 
-    void configure(const std::vector<int32_t>& dims, size_t slot_count, size_t topk) {
+    void configure(const std::vector<int32_t>& dims, size_t slot_count, size_t topk, size_t elem_size_bytes = sizeof(float), int32_t type_id_in = -1) {
         if (!impl) impl.reset(new Impl());
         shape = dims;
         if (shape.empty()) shape.push_back(1);
@@ -581,6 +583,8 @@ struct EdgeTensorFifo {
         impl->stride = std::max<size_t>(1, stride_local);
         impl->slots = std::max<size_t>(1, slot_count);
         impl->top_k = topk;
+        impl->elem_size = std::max<size_t>(1, elem_size_bytes);
+        impl->type_id = type_id_in;
 
         last_sample.assign(impl->stride, 0.0f);
         last_sample_valid = false;
@@ -591,8 +595,8 @@ struct EdgeTensorFifo {
         order_history_count = 0;
         order_history_cursor = 0;
 
-        impl->storage_bytes.reset(new uint8_t[impl->stride * impl->slots * sizeof(float)]);
-        impl->storage_f = reinterpret_cast<float*>(impl->storage_bytes.get());
+        impl->storage_bytes.reset(new uint8_t[impl->stride * impl->slots * impl->elem_size]);
+        if (impl->elem_size == sizeof(float)) impl->storage_f = reinterpret_cast<float*>(impl->storage_bytes.get()); else impl->storage_f = nullptr;
         impl->slot_seq.reset(new std::atomic<uint64_t>[impl->slots]);
         std::memset(impl->storage_bytes.get(), 0, static_cast<size_t>(impl->stride * impl->slots * sizeof(float)));
         for (size_t i = 0; i < impl->slots; ++i) impl->slot_seq[i].store(0, std::memory_order_relaxed);
@@ -828,10 +832,10 @@ struct EdgeTensorFifo {
         return used < static_cast<uint64_t>(impl->slots);
     }
 
-    bool push(uint64_t edge_id, uint64_t writer_id, const float* sample, size_t sample_len, bool* out_dropped) {
+    bool push(uint64_t edge_id, uint64_t writer_id, const void* sample_bytes, size_t sample_len_bytes, bool* out_dropped) {
         if (!impl || !impl->configured) return false;
-        if (!sample) return false;
-        if (sample_len != impl->stride) return false;
+        if (!sample_bytes) return false;
+        if (sample_len_bytes != impl->stride * impl->elem_size) return false;
         uint64_t bound = impl->writer.load(std::memory_order_relaxed);
         if (bound == 0) {
             (void)impl->writer.compare_exchange_strong(bound, writer_id, std::memory_order_relaxed);
@@ -839,12 +843,15 @@ struct EdgeTensorFifo {
         bound = impl->writer.load(std::memory_order_relaxed);
         if (bound != 0 && bound != writer_id) return false;
 
-        const float* effective_sample = sample;
-        if (order_mode != 0 && scratch.size() == impl->stride) {
+        const uint8_t* sample_bytes_u = reinterpret_cast<const uint8_t*>(sample_bytes);
+        const float* effective_sample_f = nullptr;
+        std::vector<float> temp_scratch;
+        if (impl->elem_size == sizeof(float) && order_mode != 0 && scratch.size() == impl->stride) {
+            const float* sample_f = reinterpret_cast<const float*>(sample_bytes);
             int32_t mode = std::clamp(order_mode, -kMaxOrder, kMaxOrder);
             if (mode > 0) {
                 for (size_t i = 0; i < impl->stride; ++i) {
-                    float acc = sample[i];
+                    float acc = sample_f[i];
                     order_integrator[i] += acc;
                     for (int32_t level = 1; level < mode; ++level) {
                         size_t idx = static_cast<size_t>(level) * impl->stride + i;
@@ -853,11 +860,12 @@ struct EdgeTensorFifo {
                     }
                     scratch[i] = order_integrator[static_cast<size_t>(mode - 1) * impl->stride + i];
                 }
+                effective_sample_f = scratch.data();
             } else {
                 int32_t order = -mode;
                 if (order_history_count >= order) {
                     for (size_t i = 0; i < impl->stride; ++i) {
-                        float sum = sample[i];
+                        float sum = sample_f[i];
                         int32_t coef = 1;
                         for (int32_t k = 1; k <= order; ++k) {
                             coef = (coef * (order - (k - 1))) / k;
@@ -869,17 +877,22 @@ struct EdgeTensorFifo {
                         }
                         scratch[i] = sum;
                     }
+                    effective_sample_f = scratch.data();
                 } else {
-                    std::memcpy(scratch.data(), sample, impl->stride * sizeof(float));
+                    temp_scratch.resize(impl->stride);
+                    std::memcpy(temp_scratch.data(), sample_bytes, impl->stride * impl->elem_size);
+                    effective_sample_f = reinterpret_cast<const float*>(temp_scratch.data());
                 }
             }
-            effective_sample = scratch.data();
         }
 
-        if (delta_mode && last_sample_valid && last_sample.size() == impl->stride) {
-            if (std::memcmp(last_sample.data(), effective_sample, impl->stride * sizeof(float)) == 0) {
-                if (out_dropped) *out_dropped = 0;
-                return true;
+        if (delta_mode && last_sample_valid) {
+            size_t byte_count = impl->stride * impl->elem_size;
+            if (last_sample.size() * sizeof(float) == byte_count) {
+                if (std::memcmp(last_sample.data(), sample_bytes, byte_count) == 0) {
+                    if (out_dropped) *out_dropped = 0;
+                    return true;
+                }
             }
         }
 
@@ -891,20 +904,26 @@ struct EdgeTensorFifo {
         }
 
         size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
-        float* dst = impl->storage_f + slot * impl->stride;
-        std::memcpy(dst, effective_sample, impl->stride * sizeof(float));
+        uint8_t* dst = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
+        const void* effective_sample_ptr = (effective_sample_f ? reinterpret_cast<const void*>(effective_sample_f) : reinterpret_cast<const void*>(sample_bytes_u));
+        std::memcpy(dst, effective_sample_ptr, impl->stride * impl->elem_size);
         impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
         impl->write_seq.store(seq + 1, std::memory_order_release);
         note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
         if (!order_history.empty()) {
             size_t base = static_cast<size_t>(order_history_cursor) * impl->stride;
-            std::memcpy(order_history.data() + base, sample, impl->stride * sizeof(float));
+            if (impl->elem_size == sizeof(float)) std::memcpy(order_history.data() + base, sample_bytes, impl->stride * impl->elem_size);
             order_history_cursor = (order_history_cursor + 1) % kMaxOrder;
             order_history_count = std::min(order_history_count + 1, kMaxOrder);
         }
         if (last_sample.size() == impl->stride) {
-            std::memcpy(last_sample.data(), effective_sample, impl->stride * sizeof(float));
-            last_sample_valid = true;
+            if (impl->elem_size == sizeof(float)) {
+                std::memcpy(last_sample.data(), (effective_sample_f ? effective_sample_f : reinterpret_cast<const float*>(sample_bytes)), impl->stride * sizeof(float));
+                last_sample_valid = true;
+            } else {
+                // For non-float element sizes we keep last_sample invalid (or zeroed)
+                last_sample_valid = false;
+            }
         }
         impl->cv.notify_all();
         if (out_dropped) *out_dropped = dropped ? 1 : 0;
@@ -933,10 +952,10 @@ struct EdgeTensorFifo {
         // through the same stride-based FIFO storage as float samples. The
         // consumer is expected to interpret the slot according to the edge
         // metadata (pointer vs float).
-        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * sizeof(float);
+        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
         // Zero the slot first to avoid leaving stale bytes in trailing area
-        std::memset(base, 0, impl->stride * sizeof(float));
-        std::memcpy(base, &ptr, std::min<size_t>(sizeof(void*), impl->stride * sizeof(float)));
+        std::memset(base, 0, impl->stride * impl->elem_size);
+        std::memcpy(base, &ptr, std::min<size_t>(sizeof(void*), impl->stride * impl->elem_size));
         impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
         impl->write_seq.store(seq + 1, std::memory_order_release);
         note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
@@ -957,9 +976,9 @@ struct EdgeTensorFifo {
         if (observed != (rseq + 1)) return false;
 
         // Read pointer bytes from the slot's storage and return as opaque pointer.
-        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * sizeof(float);
+        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
         void* p = nullptr;
-        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * sizeof(float)));
+        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * impl->elem_size));
         *out_ptr = p;
         r->seq.store(rseq + 1, std::memory_order_relaxed);
         note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
@@ -981,9 +1000,9 @@ struct EdgeTensorFifo {
         uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
         if (observed != (rseq + 1)) return false;
 
-        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * sizeof(float);
+        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
         void* p = nullptr;
-        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * sizeof(float)));
+        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * impl->elem_size));
         *out_ptr = p;
         return true;
     }
@@ -1011,24 +1030,24 @@ struct EdgeTensorFifo {
         }
     }
 
-    bool pop(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written) {
-        out_written = 0;
+    bool pop(uint64_t reader_id, void* out_sample_bytes, size_t out_cap_bytes, size_t& out_written_bytes) {
+        out_written_bytes = 0;
         if (!impl || !impl->configured) return false;
         ReaderEntry* r = find_reader(reader_id);
         if (!r) return false;
-        if (!out_sample || out_cap < impl->stride) return false;
+        if (!out_sample_bytes || out_cap_bytes < impl->stride * impl->elem_size) return false;
 
         uint64_t rseq = r->seq.load(std::memory_order_relaxed);
         size_t slot = static_cast<size_t>(rseq % static_cast<uint64_t>(impl->slots));
         uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
         if (observed != (rseq + 1)) return false;
 
-        const float* src = impl->storage_f + slot * impl->stride;
-        std::memcpy(out_sample, src, impl->stride * sizeof(float));
+        uint8_t* src = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
+        std::memcpy(out_sample_bytes, src, impl->stride * impl->elem_size);
         r->seq.store(rseq + 1, std::memory_order_relaxed);
         note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
         impl->cv.notify_all();
-        out_written = impl->stride;
+        out_written_bytes = impl->stride * impl->elem_size;
         return true;
     }
 
@@ -1036,37 +1055,37 @@ struct EdgeTensorFifo {
     // into `out_sample` without advancing the reader sequence. Returns true
     // if a sample was available and copied. Contract matches `pop` with the
     // requirement that out_cap >= impl->stride.
-    bool peek(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written) {
-        out_written = 0;
+    bool peek(uint64_t reader_id, void* out_sample_bytes, size_t out_cap_bytes, size_t& out_written_bytes) {
+        out_written_bytes = 0;
         if (!impl || !impl->configured) return false;
         ReaderEntry* r = find_reader(reader_id);
         if (!r) return false;
-        if (!out_sample || out_cap < impl->stride) return false;
+        if (!out_sample_bytes || out_cap_bytes < impl->stride * impl->elem_size) return false;
 
         uint64_t rseq = r->seq.load(std::memory_order_relaxed);
         size_t slot = static_cast<size_t>(rseq % static_cast<uint64_t>(impl->slots));
         uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
         if (observed != (rseq + 1)) return false;
 
-        const float* src = impl->storage_f + slot * impl->stride;
-        std::memcpy(out_sample, src, impl->stride * sizeof(float));
+        uint8_t* src = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
+        std::memcpy(out_sample_bytes, src, impl->stride * impl->elem_size);
         // Note: do NOT advance r->seq and do NOT call note_activity / notify.
-        out_written = impl->stride;
+        out_written_bytes = impl->stride * impl->elem_size;
         return true;
     }
 
-    bool push_blocking(uint64_t edge_id, uint64_t writer_id, const float* sample, size_t sample_len, bool* out_dropped, int timeout_ms) {
+    bool push_blocking(uint64_t edge_id, uint64_t writer_id, const void* sample_bytes, size_t sample_len_bytes, bool* out_dropped, int timeout_ms) {
         if (!impl || !impl->configured) return false;
-        if (!sample || sample_len != impl->stride) return false;
+        if (!sample_bytes || sample_len_bytes != impl->stride * impl->elem_size) return false;
         uint64_t bound = impl->writer.load(std::memory_order_relaxed);
         if (bound != 0 && bound != writer_id) return false;
-        if (timeout_ms == 0) return push(edge_id, writer_id, sample, sample_len, out_dropped);
+        if (timeout_ms == 0) return push(edge_id, writer_id, sample_bytes, sample_len_bytes, out_dropped);
         using clock = std::chrono::steady_clock;
         auto deadline = (timeout_ms < 0) ? clock::time_point::max() : (clock::now() + std::chrono::milliseconds(timeout_ms));
         std::unique_lock<std::mutex> lk(impl->cv_mu);
         while (true) {
             lk.unlock();
-            bool ok = push(edge_id, writer_id, sample, sample_len, out_dropped);
+            bool ok = push(edge_id, writer_id, sample_bytes, sample_len_bytes, out_dropped);
             lk.lock();
             if (ok) return true;
             uint64_t seq = impl->write_seq.load(std::memory_order_relaxed);
@@ -1086,26 +1105,26 @@ struct EdgeTensorFifo {
     // without destroying the FIFO object.
     bool ensure_stride_for_bytes(size_t min_bytes) {
         if (!impl || !impl->configured) return false;
-        size_t cur_bytes = impl->stride * sizeof(float);
+        size_t cur_bytes = impl->stride * impl->elem_size;
         if (cur_bytes >= min_bytes) return true;
-        size_t needed_floats = (min_bytes + sizeof(float) - 1) / sizeof(float);
-        size_t new_stride = std::max(impl->stride, needed_floats);
+        size_t needed_elems = (min_bytes + impl->elem_size - 1) / impl->elem_size;
+        size_t new_stride = std::max(impl->stride, needed_elems);
 
         // allocate new storage
-        std::unique_ptr<uint8_t[]> new_bytes(new uint8_t[new_stride * impl->slots * sizeof(float)]);
-        std::memset(new_bytes.get(), 0, new_stride * impl->slots * sizeof(float));
+        std::unique_ptr<uint8_t[]> new_bytes(new uint8_t[new_stride * impl->slots * impl->elem_size]);
+        std::memset(new_bytes.get(), 0, new_stride * impl->slots * impl->elem_size);
 
-        // copy per-slot existing float bytes into the new layout (preserve min region)
+        // copy per-slot existing bytes into the new layout (preserve min region)
         for (size_t s = 0; s < impl->slots; ++s) {
-            uint8_t* src = impl->storage_bytes.get() + s * impl->stride * sizeof(float);
-            uint8_t* dst = new_bytes.get() + s * new_stride * sizeof(float);
-            size_t copy_bytes = impl->stride * sizeof(float);
+            uint8_t* src = impl->storage_bytes.get() + s * impl->stride * impl->elem_size;
+            uint8_t* dst = new_bytes.get() + s * new_stride * impl->elem_size;
+            size_t copy_bytes = impl->stride * impl->elem_size;
             std::memcpy(dst, src, copy_bytes);
         }
 
         // swap in new storage and update typed view
         impl->storage_bytes.swap(new_bytes);
-        impl->storage_f = reinterpret_cast<float*>(impl->storage_bytes.get());
+        impl->storage_f = (impl->elem_size == sizeof(float)) ? reinterpret_cast<float*>(impl->storage_bytes.get()) : nullptr;
         impl->stride = new_stride;
 
         // update our cached scratch/last_sample sizes to match new stride
@@ -1116,17 +1135,17 @@ struct EdgeTensorFifo {
         return true;
     }
 
-    bool pop_blocking(uint64_t reader_id, float* out_sample, size_t out_cap, size_t& out_written, int timeout_ms) {
+    bool pop_blocking(uint64_t reader_id, void* out_sample_bytes, size_t out_cap_bytes, size_t& out_written, int timeout_ms) {
         if (!impl || !impl->configured) return false;
         if (!find_reader(reader_id)) return false;
-        if (!out_sample || out_cap < impl->stride) return false;
-        if (timeout_ms == 0) return pop(reader_id, out_sample, out_cap, out_written);
+        if (!out_sample_bytes || out_cap_bytes < impl->stride * impl->elem_size) return false;
+        if (timeout_ms == 0) return pop(reader_id, out_sample_bytes, out_cap_bytes, out_written);
         using clock = std::chrono::steady_clock;
         auto deadline = (timeout_ms < 0) ? clock::time_point::max() : (clock::now() + std::chrono::milliseconds(timeout_ms));
         std::unique_lock<std::mutex> lk(impl->cv_mu);
         while (true) {
             lk.unlock();
-            bool ok = pop(reader_id, out_sample, out_cap, out_written);
+            bool ok = pop(reader_id, out_sample_bytes, out_cap_bytes, out_written);
             lk.lock();
             if (ok) return true;
             if (timeout_ms < 0) {
@@ -1149,12 +1168,14 @@ struct EdgeTensorFifo {
         return (head >= tail) ? (head - tail) : 0;
     }
 
-    GP_TableEdgeTensorSpec to_spec() const {
-        GP_TableEdgeTensorSpec s{};
+    GP_TableEdgeTensorSpecTyped to_spec() const {
+        GP_TableEdgeTensorSpecTyped s{};
         s.dim_count = static_cast<int32_t>(std::min<size_t>(shape.size(), sizeof(s.dims) / sizeof(s.dims[0])));
         for (int32_t i = 0; i < s.dim_count; ++i) s.dims[i] = shape[static_cast<size_t>(i)];
         s.slots = impl ? static_cast<int32_t>(impl->slots) : 0;
         s.top_k = impl ? static_cast<int32_t>(impl->top_k) : 0;
+        s.elem_size = impl ? static_cast<int32_t>(impl->elem_size) : static_cast<int32_t>(sizeof(float));
+        s.type_id = impl ? impl->type_id : -1;
         return s;
     }
 };

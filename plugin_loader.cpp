@@ -150,9 +150,15 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
     bool tmp_valid = (tmp != nullptr) && (reinterpret_cast<uintptr_t>(tmp) != static_cast<uintptr_t>(~0ull));
     if (tmp_valid) {
         try {
-            base_id = tmp->id();
-            name = tmp->name();
-            caps = tmp->caps();
+            // Prefer C-style stable pointers to avoid cross-DLL C++ ABI/allocator issues.
+            const char* idc = nullptr;
+            const char* namec = nullptr;
+            try { idc = tmp->id_cstr(); } catch (...) { idc = nullptr; }
+            try { namec = tmp->name_cstr(); } catch (...) { namec = nullptr; }
+            if (idc && idc[0] != '\0') base_id = idc; else base_id = fallback_id;
+            if (namec && namec[0] != '\0') name = namec; else name = base_id;
+            // caps stays as before
+            try { caps = tmp->caps(); } catch (...) { caps = ToolCaps::None; }
         } catch (...) {
             tmp_valid = false;
             base_id = fallback_id;

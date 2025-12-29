@@ -14,8 +14,8 @@
 
 class Tool_tool_7 : public ITool {
 public:
-    std::string id() const override { return "tool_7"; }
-    std::string name() const override { return "MouseListener"; }
+    const char* id_cstr() const noexcept override { return "tool_7"; }
+    const char* name_cstr() const noexcept override { return "MouseListener"; }
     ToolCaps caps() const override { return static_cast<ToolCaps>(0); }
 
     void initialize(const ToolInitContext& ctx) override {

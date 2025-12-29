@@ -20,6 +20,15 @@ extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     return reinterpret_cast<GP_CanvasContext*>(c);
 }
 
+extern "C" int gp_canvas_set_size(GP_CanvasContext* ctx_, int width, int height) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->width = width;
+    c->height = height;
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
+    return 1;
+}
+
 extern "C" void gp_canvas_destroy(GP_CanvasContext* ctx) {
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
     if (!c) return;
@@ -337,6 +346,13 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         }
         // spawn-root hit handling (to the right of subgroup colors)
         int bx_spawn = subgroup_left + subgroup_group_w + spacing;
+        // Compute exec-mode cluster positions so we can test the global TIME button click.
+        int mode_count_tmp = 4;
+        int mode_w_tmp = bw;
+        int mode_gap_tmp = 4;
+        int total_w_tmp = mode_count_tmp * mode_w_tmp + (mode_count_tmp - 1) * mode_gap_tmp;
+        int bx_mode_left_tmp = bx_action_left - total_w_tmp - action_btn_gap;
+        int bx_clock = bx_mode_left_tmp - mode_gap_tmp - mode_w_tmp;
         if (view_y >= by1 && view_y < by1 + bh) {
             if (bx_spawn + bw < bx_delay_plus) {
                 if (view_x >= bx_spawn && view_x < bx_spawn + bw) {
@@ -348,30 +364,35 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         // as module LED hits on the canvas-root-reflection module so they
         // can act as rope anchors.
         if (!c->toolbar_leds.empty()) {
-            int root_mod = canvas_ensure_root_module(c);
-            if (root_mod >= 0) {
-                for (const auto &tb : c->toolbar_leds) {
-                    if (view_x >= tb.x0 && view_x < tb.x1 && view_y >= tb.y0 && view_y < tb.y1) {
-                        GP_TableHitBox hb{};
-                        // convert world coords into module-local coords
-                        hb.x0 = tb.wx0 - c->modules[root_mod].x;
-                        hb.x1 = tb.wx1 - c->modules[root_mod].x;
-                        hb.y0 = tb.wy0 - c->modules[root_mod].y;
-                        hb.y1 = tb.wy1 - c->modules[root_mod].y;
-                        hb.row_idx = -1; hb.col_idx = -1;
-                        // Convert toolbar LED hit into a distinct module-frame-style
-                        // LED that does not collide with regular frame LEDs. Use
-                        // a separate toolbar contact base so connectors are unique.
-                        int toolbar_base = kModuleFrameContactBase + kModuleExtraLedCount * 2;
-                        // mark as frame receive (consumer)
-                        hb.row_idx = kModuleFrameRowReceive;
-                        hb.col_idx = 0;
-                        hb.part = GP_TABLE_HIT_LED;
-                        hb.aux0 = toolbar_base + tb.subgroup_idx;
-                        hb.aux1 = 0;
-                        if (canvas_handle_module_led_hit(c, root_mod, hb)) return 1;
+            // NOTE: toolbar LED -> module-frame conversion (which creates ropes)
+            // is intentionally disabled by default. This was planned as a
+            // special connect mode gated by Ctrl; for now we avoid accidental
+            // rope creation from toolbar clicks and present a stub note.
+            for (const auto &tb : c->toolbar_leds) {
+                if (view_x >= tb.x0 && view_x < tb.x1 && view_y >= tb.y0 && view_y < tb.y1) {
+                    // Exec-mode cluster buttons are mapped into subgroup slots starting at 8
+                    if (tb.subgroup_idx >= 8 && tb.subgroup_idx < 8 + 4) {
+                        int mode_idx = tb.subgroup_idx - 8;
+                        // Directly toggle the canvas-global exec-mode override so
+                        // the UI highlights update immediately (avoid relying on
+                        // root table dispatch which may not map these actions).
+                        if (c->thread_mgr_global_exec_mode == mode_idx) c->thread_mgr_global_exec_mode = -1;
+                        else c->thread_mgr_global_exec_mode = mode_idx;
+                        printf("gp_canvas_on_click: GLOBAL exec_mode_override -> %d\n", c->thread_mgr_global_exec_mode);
+                        return 1;
                     }
+                    // Other toolbar LEDs (e.g. subgroup LEDs) previously converted into
+                    // module-frame hits to support connect mode. That connect mode is
+                    // intentionally disabled for now to avoid accidental rope creation.
+                    printf("gp_canvas_on_click: toolbar LED hit - connect mode disabled (hold Ctrl to enable)\n");
+                    return 1;
                 }
+            }
+        }
+        // Global TIME button (left of exec-mode SEQ button)
+        if (view_y >= by1 && view_y < by1 + bh) {
+            if (view_x >= bx_clock && view_x < bx_clock + bw) {
+                if (canvas_dispatch_root_action(c, CANVAS_ACT_TIMING_TOGGLE)) return 1;
             }
         }
         if (view_y >= by1 && view_y < by1 + bh) {
@@ -692,6 +713,23 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     int btns_left = btns_right - btns_total_w;
                     int bx = btns_left;
                     if (world_y >= btn_y && world_y < btn_y + control_h) {
+                        // Per-module exec-mode button hit regions (left of module buttons)
+                        int exec_mode_count = 4;
+                        int exec_mode_w = module_btn_w;
+                        int exec_mode_gap = 4;
+                        int exec_total_w = exec_mode_count * exec_mode_w + (exec_mode_count - 1) * exec_mode_gap;
+                        int bx_exec_left = btns_left - exec_total_w - module_gap;
+                        for (int mbi = 0; mbi < exec_mode_count; ++mbi) {
+                            int bx_e = bx_exec_left + mbi * (exec_mode_w + exec_mode_gap);
+                            if (world_x >= bx_e && world_x < bx_e + exec_mode_w) {
+                                int action_id = CANVAS_ACT_EXEC_MODE_MODULE_SEQ + mbi; // order matches enum
+                                c->dispatch_module_idx = mi;
+                                bool handled = canvas_dispatch_root_action(c, action_id);
+                                c->dispatch_module_idx = -1;
+                                if (handled) return 1;
+                            }
+                        }
+
                         // Clone
                         if (world_x >= bx && world_x < bx + module_btn_w) {
                             if (canvas_dispatch_root_action(c, CANVAS_ACT_MODULE_CLONE)) return 1;

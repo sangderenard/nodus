@@ -406,16 +406,33 @@ typedef struct GP_TableEdgeTensorSpec {
     int32_t top_k;      // if >0, keep this many of the newest samples when overwriting; 0 = hold until readers consume
 } GP_TableEdgeTensorSpec;
 
+// Extended tensor spec: element size (bytes) and type/schema id must be
+// supplied so FIFOs are byte-oriented and typed. `elem_size` is the size
+// in bytes of a single element; `type_id` indexes the ValueTypeRegistry.
+typedef struct GP_TableEdgeTensorSpecTyped {
+    int32_t dims[8];
+    int32_t dim_count;
+    int32_t slots;
+    int32_t top_k;
+    int32_t elem_size; // bytes per element
+    int32_t type_id;   // schema id (ValueTypeRegistry)
+} GP_TableEdgeTensorSpecTyped;
+
 typedef struct GP_TableEdgeBatchMetadata {
     uint64_t batch_id;
     double timestamp;
+    // `sample_count` is the number of elements per sample; `stride` is
+    // reserved for compatibility but callers should use `elem_size` on
+    // the edge spec for byte size. `schema_id` is now `type_id`.
     uint32_t sample_count;
     uint32_t stride;
-    uint32_t schema_id;
+    uint32_t type_id;
 } GP_TableEdgeBatchMetadata;
 
-int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpec* spec);
-int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpec* out_spec);
+// Typed spec setters/getters. Old float-centric spec is removed in favor
+// of typed tensor spec. Callers must provide `elem_size` and `type_id`.
+int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeTensorSpecTyped* spec);
+int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeTensorSpecTyped* out_spec);
 
 // Enable or disable simulator stepping for this table. When disabled the
 // table's `RopeSim` will not be advanced by table-side ticks. Defaults to enabled (1).
@@ -446,19 +463,18 @@ int32_t gp_table_edge_subscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned
 // earliest sample still addressable within the ring capacity (best-effort).
 int32_t gp_table_edge_subscribe_ex(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t start_at_head);
 int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key);
-// Publish one tensor sample into the FIFO for an edge. Returns 1 on success.
-// If the buffer advanced slow readers to admit the write (top-k overwrite),
-// `out_dropped` is set to 1; otherwise 0. Returns 0 if no write occurred.
-int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped);
-// Blocking publish with optional timeout (ms). timeout_ms < 0 waits forever.
-// Returns 1 on success, 0 on failure/timeout.
-int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms);
-// Consume the next available tensor sample for a subscriber. Returns 1 if a
-// sample was written to `out_sample` (length must match the tensor stride).
-int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written);
-// Non-destructive peek: copy the next available sample into out_sample without
-// advancing the subscriber head. Returns 1 on success and sets out_written.
-int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written);
+// Typed byte-oriented FIFO APIs. Samples are passed as raw bytes and lengths
+// are in bytes. Callers must ensure the provided byte length matches the
+// per-edge `elem_size * sample_count` configured in the tensor spec.
+// Returns 1 on success; `out_dropped` is set to 1 when old unread samples
+// were advanced to admit the write.
+int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped);
+int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped, int32_t timeout_ms);
+// Consume the next available sample as raw bytes. `out_len_bytes` must be
+// large enough to hold the sample; `out_written` is set to the number of
+// bytes written.
+int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written);
+int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written);
 
 // Pointer-oriented edge publish/consume helpers.
 // These mirror the float-based APIs but carry opaque pointers across the
@@ -467,7 +483,7 @@ int32_t gp_table_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
 int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr);
 // Blocking consume with optional timeout (ms). timeout_ms < 0 waits forever.
 // Returns 1 on success, 0 on failure/timeout.
-int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, float* out_sample, int32_t out_len, int32_t* out_written, int32_t timeout_ms);
+int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written, int32_t timeout_ms);
 // Query unread sample count for a subscriber on an edge.
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count);
 int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata);
@@ -499,13 +515,13 @@ int32_t gp_table_get_ring_edge_count(const GP_TableContext* ctx);
 int32_t gp_table_get_ring_edge(const GP_TableContext* ctx, int32_t idx, int32_t* out_ring_id, unsigned long long* out_key);
 int32_t gp_table_ring_set_subgroup_flags(GP_TableContext* ctx, int32_t ring_entry_idx, uint32_t flags);
 int32_t gp_table_ring_get_subgroup_flags(GP_TableContext* ctx, int32_t ring_entry_idx, uint32_t* out_flags);
-int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, const GP_TableEdgeTensorSpec* spec);
+int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, const GP_TableEdgeTensorSpecTyped* spec);
 // Ring FIFO publish/subscribe APIs (mirror per-edge APIs)
 int32_t gp_table_ring_subscribe(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key);
 int32_t gp_table_ring_subscribe_ex(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key, int32_t start_at_head);
 int32_t gp_table_ring_unsubscribe(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long subscriber_key);
-int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped);
-int32_t gp_table_ring_get_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, GP_TableEdgeTensorSpec* out_spec);
+int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entry_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped);
+int32_t gp_table_ring_get_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, GP_TableEdgeTensorSpecTyped* out_spec);
 
 // Queued UI operations: enqueue structural edits from UI threads to be applied
 // by the manager thread. These mirror immediate APIs but defer application.
@@ -768,8 +784,8 @@ int32_t gp_table_get_library_dir(char* out_buf, int32_t out_len);
 
 // Generic edge API wrappers (convenience). These forward to the table-specific
 // implementations so external callers can use a stable gp_edge_* surface.
-int32_t gp_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped);
-int32_t gp_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const float* sample, int32_t sample_len, int32_t* out_dropped, int32_t timeout_ms);
+int32_t gp_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped);
+int32_t gp_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped, int32_t timeout_ms);
 int32_t gp_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void* ptr, int32_t* out_dropped);
 int32_t gp_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr);
 

@@ -401,8 +401,10 @@ std::string generate_tool_source(const GP_ModuleLibraryModule& module,
     }
     ss << "class " << class_name << " : public ITool {\n";
     ss << "public:\n";
-    ss << "    std::string id() const override { return \"" << tool_id << "\"; }\n";
-    ss << "    std::string name() const override { return \"" << tool_name << "\"; }\n";
+    ss << "    const char* id_cstr() const noexcept override { return \"" << tool_id << "\"; }\n";
+    ss << "    const char* name_cstr() const noexcept override { return \"" << tool_name << "\"; }\n";
+    // `id()`/`name()` are provided by the base class and will call the
+    // plugin's `id_cstr()`/`name_cstr()` implementation.
     ss << "    ToolCaps caps() const override { return static_cast<ToolCaps>(" << module.tool_caps << "); }\n\n";
     ss << "    void initialize(const ToolInitContext& ctx) override {\n";
     ss << "        if (ctx.serialized_path && ctx.serialized_path[0] != '\\0') {\n";

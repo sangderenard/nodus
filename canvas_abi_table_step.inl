@@ -290,6 +290,16 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                     // propagate per-module execution cadence (skip count). 0 => run every frame.
                     if (mi >= 0 && mi < static_cast<int>(c->module_exec_skip_count.size())) mod.exec_skip_count = c->module_exec_skip_count[mi];
                     else mod.exec_skip_count = 0;
+                    // Determine exec_mode: module-local override supersedes global override.
+                    // Canvas values: -1 = no selection, 0=Sequential,1=Pooled,2=Slip,3=Free
+                    int chosen_mode = -1;
+                    if (mi >= 0 && mi < static_cast<int>(c->module_exec_mode.size())) chosen_mode = c->module_exec_mode[mi];
+                    if (chosen_mode == -1 && c->thread_mgr_global_exec_mode != -1) chosen_mode = c->thread_mgr_global_exec_mode;
+                    if (chosen_mode == 0) mod.exec_mode = ThreadManager::ExecMode::Sequential;
+                    else if (chosen_mode == 1) mod.exec_mode = ThreadManager::ExecMode::Pooled;
+                    else if (chosen_mode == 2) mod.exec_mode = ThreadManager::ExecMode::Slip;
+                    // value 3 (Free) is a canvas-only toggle handled elsewhere (manager mode),
+                    // so leave ModuleContract::exec_mode as the default for that value.
                 req.modules.push_back(mod);
             }
             // Update global sim frame-skip count so table stepping decisions
@@ -478,7 +488,7 @@ static std::vector<float>& stage_get_integrator_buffer(GP_CanvasContextImpl* ctx
 
 static uint32_t stage_integrator_stride(GP_TableContext* table, int edge_idx) {
     if (!table || edge_idx < 0) return kStageIntegratorDefaultStride;
-    GP_TableEdgeTensorSpec spec{};
+    GP_TableEdgeTensorSpecTyped spec{};
     if (!gp_table_edge_get_tensor_spec(table, edge_idx, &spec)) return kStageIntegratorDefaultStride;
     uint64_t stride = 1;
     for (int32_t di = 0; di < spec.dim_count; ++di) {
@@ -515,10 +525,10 @@ static void render_stage_integrator_image(GP_CanvasContextImpl* ctx, int module_
             int to_read = std::min<int>(std::max(0, unread), kStageIntegratorSampleBudget);
             for (int ri = 0; ri < to_read; ++ri) {
                 int32_t written = 0;
-                if (!gp_table_edge_consume(table, edge_idx, kStageInputLedKey, sample.data(), static_cast<int>(stride), &written) || written <= 0) {
+                if (!gp_table_edge_consume(table, edge_idx, kStageInputLedKey, sample.data(), static_cast<int>(stride * sizeof(float)), &written) || written <= 0) {
                     break;
                 }
-                size_t plen = static_cast<size_t>(written);
+                size_t plen = static_cast<size_t>(written) / sizeof(float);
                 if (plen < 17) continue;
                 float px = sample[0];
                 float py = sample[1];

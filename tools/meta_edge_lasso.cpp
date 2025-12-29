@@ -10,8 +10,9 @@ public:
     MetaEdgeLassoTool() {}
     ~MetaEdgeLassoTool() noexcept override {}
 
-    std::string id() const override { return "meta_edge_lasso"; }
-    std::string name() const override { return "Meta-Edge Lasso"; }
+    const char* id_cstr() const noexcept override { return "meta_edge_lasso"; }
+    const char* name_cstr() const noexcept override { return "Meta-Edge Lasso"; }
+    // rely on base `id()`/`name()` which call `id_cstr()`/`name_cstr()`
     ToolCaps caps() const override { return ToolCaps::Table | ToolCaps::Text; }
 
     void initialize(const ToolInitContext& ctx) override { (void)ctx; }

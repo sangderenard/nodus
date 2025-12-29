@@ -1460,13 +1460,10 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 ctx->toolbar_leds.push_back(tb);
             }
         }
-        // Spawn-root button: place to the right of subgroup colors/LEDs
+        // Spawn-root button and delay numeric control will be positioned
+        // after the exec-mode/action group layout so they sit to the left
+        // of the new buttons and avoid overlap.
         int bx_spawn = subgroup_left + subgroup_group_w + spacing;
-        // ensure we don't draw off-screen; clamp to reasonable area near action group
-        if (bx_spawn + bw < bx_delay_plus) {
-            draw_action_button(bx_spawn, kpn_by, "ROOT", Color{70,70,90,255});
-        }
-        draw_io_group(bx_delay_plus, kpn_by, std::max(0, ctx->thread_mgr_delay_ms), LABEL_THREAD_DELAY_SHORT);
 
         int bx_clone = bx_action_left;
         int bx_clear = bx_clone + bw + action_btn_gap;
@@ -1474,6 +1471,77 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         draw_action_button(bx_clone, kpn_by, LABEL_MODULE_CLONE_SHORT, Color{58,58,70,255});
         draw_action_button(bx_clear, kpn_by, LABEL_MODULE_CLEAR_SHORT, Color{64,56,52,255});
         draw_action_button(bx_destroy, kpn_by, LABEL_MODULE_DESTROY_SHORT, Color{70,52,52,255});
+
+        // Execution mode cluster (4 small buttons) to the left of the action group.
+        // Use toolbar LED slots mapped into subgroup indices to receive clicks.
+        {
+            int mode_count = 4;
+            int mode_w = bw;
+            int mode_gap = 4;
+            int total_w = mode_count * mode_w + (mode_count - 1) * mode_gap;
+            int bx_mode_left = bx_action_left - total_w - action_btn_gap;
+            // Draw global timing toggle button immediately left of the exec-mode cluster
+            int bx_clock = bx_mode_left - mode_gap - mode_w;
+            bool timing_on_global = false;
+            if (ThreadManager::global()) timing_on_global = ThreadManager::global()->timing_enabled();
+            Color clock_fill = timing_on_global ? Color{64,120,60,255} : Color{48,48,62,255};
+            draw_action_button(bx_clock, kpn_by, "TIME", clock_fill);
+            const char* mode_labels[4] = {"SEQ","POOL","SLIP","FREE"};
+            for (int mi = 0; mi < mode_count; ++mi) {
+                int bx_i = bx_mode_left + mi * (mode_w + mode_gap);
+                bool selected = (ctx->thread_mgr_global_exec_mode == mi);
+                Color fill = selected ? Color{80,90,110,255} : Color{48,48,62,255};
+                draw_action_button(bx_i, kpn_by, mode_labels[mi], fill);
+                if (selected) {
+                    int y_top = kpn_by;
+                    int y_bot = kpn_by + bh - 1;
+                    for (int xx = 0; xx < mode_w; ++xx) {
+                        int xh = bx_i + xx;
+                        if (xh < 0 || xh >= w) continue;
+                        if (y_top >= 0 && y_top < h) {
+                            uint8_t* pt = out_rgba + y_top * pitch + xh * 4;
+                            pt[0]=240; pt[1]=240; pt[2]=240; pt[3]=255;
+                        }
+                        if (y_bot >= 0 && y_bot < h) {
+                            uint8_t* pb = out_rgba + y_bot * pitch + xh * 4;
+                            pb[0]=240; pb[1]=240; pb[2]=240; pb[3]=255;
+                        }
+                    }
+                }
+                // register small toolbar LED hitbox so root-module hitboxes include these
+                GP_CanvasContextImpl::ToolbarLedBox tb;
+                int led_r = std::max(2, bw / 6);
+                int led_cx = bx_i + mode_w / 2;
+                int led_cy = kpn_by + bh / 2;
+                tb.x0 = led_cx - (led_r + 2);
+                tb.y0 = led_cy - (led_r + 2);
+                tb.x1 = led_cx + (led_r + 2);
+                tb.y1 = led_cy + (led_r + 2);
+                tb.wx0 = tb.x0 + ctx->offset_x; tb.wy0 = tb.y0 + ctx->offset_y;
+                tb.wx1 = tb.x1 + ctx->offset_x; tb.wy1 = tb.y1 + ctx->offset_y;
+                // map these exec-mode buttons into toolbar subgroup slots starting at 8
+                tb.subgroup_idx = 8 + mi;
+                ctx->toolbar_leds.push_back(tb);
+            }
+        }
+
+        // Now that the exec-mode/action group position is known, place the
+        // numeric delay control to the left of the exec-mode cluster so it
+        // does not get visually overlapped by the new buttons.
+        {
+            int mode_count = 4;
+            int mode_w = bw;
+            int mode_gap = 4;
+            int total_w = mode_count * mode_w + (mode_count - 1) * mode_gap;
+            int bx_mode_left = bx_action_left - total_w - action_btn_gap;
+            int bx_delay_new = bx_mode_left - delay_total_w - action_btn_gap;
+            // draw numeric delay control at new location
+            draw_io_group(bx_delay_new, kpn_by, std::max(0, ctx->thread_mgr_delay_ms), LABEL_THREAD_DELAY_SHORT);
+            // spawn root button sits to the right of subgroup colors but left of numeric control
+            if (bx_spawn + bw < bx_delay_new) {
+                draw_action_button(bx_spawn, kpn_by, "ROOT", Color{70,70,90,255});
+            }
+        }
 
         // Split the former play button into a small SIM button (left half)
         // and a reduced play button (right half).
@@ -2049,6 +2117,46 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             }
         }
         draw_module_top_ui(ctx, mi, m, out_rgba, w, h, pitch);
+        // Add hitbox for the timing toggle button so clicks get dispatched.
+        // Recompute the control geometry used by draw_module_top_ui to derive the timing button rect.
+        {
+            int sx = m.x - ctx->offset_x;
+            int sy = m.y - ctx->offset_y;
+            int cursor_y = sy + kModuleTopPadding;
+            cursor_y += kModuleTitleRowH;
+            cursor_y += kModuleThumbRowH + kModuleTopGap;
+            int control_y = cursor_y;
+            int control_h = std::max(1, kModuleControlRowH - 2);
+            int gap = 6;
+            int nbw = control_h;
+            int btn_y = control_y + 1;
+            int right_x = sx + m.w - kModuleTopPadding;
+            int menu_w = std::max(30, control_h);
+            int lib_w = menu_w;
+            int pause_w = std::max(42, control_h * 2);
+            int menu_x = right_x - menu_w;
+            int lib_x = menu_x - gap - lib_w;
+            int pause_x = lib_x - gap - pause_w;
+            int module_btn_count = 5;
+            int module_btn_w = nbw;
+            int module_gap = 6;
+            int btns_total_w = module_btn_count * (module_btn_w + module_gap) - module_gap;
+            int btns_right = pause_x - module_gap;
+            int btns_left = btns_right - btns_total_w;
+            int timing_btn_w = nbw;
+            int timing_x = btns_left - module_gap - timing_btn_w;
+            GP_TableHitBox thb{};
+            thb.x0 = timing_x - sx;
+            thb.x1 = thb.x0 + timing_btn_w;
+            thb.y0 = btn_y - sy;
+            thb.y1 = thb.y0 + control_h;
+            thb.cell_kind = GP_TABLE_CELL_TEXT;
+            thb.part = GP_TABLE_HIT_CELL;
+            thb.row_idx = kModuleFrameRowSend;
+            thb.col_idx = kModuleColText;
+            thb.aux0 = 0;
+            module_hitboxes[mi].push_back(thb);
+        }
         if (mi == ctx->focused_module) {
             Color fb{60,120,220,255};
             int t = 2;

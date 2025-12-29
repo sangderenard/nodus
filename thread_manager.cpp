@@ -101,13 +101,13 @@ static bool point_in_rounded_rect(float px, float py, float w, float h, float r)
 // Helper: check whether an edge's tensor stride is large enough to safely carry a pointer value.
 static bool edge_stride_allows_pointer(GP_TableContext* table, int edge_idx) {
     if (!table || edge_idx < 0) return false;
-    GP_TableEdgeTensorSpec spec{};
+    GP_TableEdgeTensorSpecTyped spec{};
     if (!gp_table_edge_get_tensor_spec(table, edge_idx, &spec)) return false;
     uint64_t stride = 1;
     for (int32_t di = 0; di < spec.dim_count; ++di) {
         stride *= static_cast<uint64_t>(std::max(1, spec.dims[di]));
     }
-    uint64_t bytes = stride * static_cast<uint64_t>(sizeof(float));
+    uint64_t bytes = stride * static_cast<uint64_t>(spec.elem_size);
     return bytes >= static_cast<uint64_t>(sizeof(void*));
 }
 
@@ -120,6 +120,11 @@ static bool is_valid_event_payload_ptr(void* p) {
     return true;
 }
 
+static inline int32_t clamp_size_to_int32(size_t value) {
+    constexpr size_t kMaxInt32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    return static_cast<int32_t>(std::min(value, kMaxInt32));
+}
+
 } // namespace
 
 
@@ -127,6 +132,26 @@ ThreadManager::ThreadManager() = default;
 
 ThreadManager::~ThreadManager() {
     stop();
+}
+
+void ThreadManager::set_module_sleep_delay(int module_idx, uint64_t delay_ticks, double delay_seconds) {
+    if (module_idx < 0) return;
+    uint64_t until_tick = 0;
+    uint64_t until_time_us = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // next_tick_id_ is the id that will be assigned to the next submitted tick.
+        // Use that as a baseline for relative tick delays.
+        until_tick = next_tick_id_ + delay_ticks;
+        if (delay_seconds > 0.0) {
+            using namespace std::chrono;
+            until_time_us = static_cast<uint64_t>(duration_cast<microseconds>(high_resolution_clock::now().time_since_epoch()).count() + static_cast<int64_t>(std::lround(delay_seconds * 1e6)));
+        }
+        if (static_cast<size_t>(module_idx) >= module_ledger_.size()) module_ledger_.resize(static_cast<size_t>(module_idx) + 1);
+        auto &ledger = module_ledger_[static_cast<size_t>(module_idx)];
+        ledger.sleep_until_tick.store(until_tick, std::memory_order_relaxed);
+        ledger.sleep_until_time_us.store(until_time_us, std::memory_order_relaxed);
+    }
 }
 
 std::shared_ptr<ThreadManager::NetworkSnapshot> ThreadManager::get_table_snapshot(GP_TableContext* table) const {
@@ -143,7 +168,7 @@ int32_t ThreadManager::find_node_index(GP_TableContext* table, uint64_t key) con
     const auto &snap = it->second;
     auto nit = snap->node_index_map.find(key);
     if (nit == snap->node_index_map.end()) return -1;
-    return static_cast<int32_t>(nit->second);
+    return clamp_size_to_int32(nit->second);
 }
 
 void ThreadManager::start() {
@@ -311,6 +336,20 @@ static ThreadManager* g_thread_manager_instance = nullptr;
 void ThreadManager::set_global(ThreadManager* mgr) { g_thread_manager_instance = mgr; }
 ThreadManager* ThreadManager::global() { return g_thread_manager_instance; }
 
+bool ThreadManager::get_module_timing(int module_idx, ModuleTiming* out) const {
+    if (!out) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (module_idx < 0 || static_cast<size_t>(module_idx) >= module_ledger_.size()) return false;
+    const auto &ledger = module_ledger_[static_cast<size_t>(module_idx)];
+    out->run_count = ledger.run_count.load(std::memory_order_relaxed);
+    // convert microseconds back to seconds
+    uint64_t last_us = ledger.last_run_wall_time_us.load(std::memory_order_relaxed);
+    uint64_t total_us = ledger.total_run_wall_time_us.load(std::memory_order_relaxed);
+    out->last_run_wall_time = static_cast<double>(last_us) / 1e6;
+    out->total_run_wall_time = static_cast<double>(total_us) / 1e6;
+    return true;
+}
+
 void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         // Apply any queued UI ops on each module's table before building the successor
         // adjacency. This ensures UI-side edits are applied on the manager thread
@@ -361,11 +400,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         auto itc = edge_stride_cache_.find(edge_idx);
                         if (itc != edge_stride_cache_.end()) stride = itc->second;
                         else {
-                            GP_TableEdgeTensorSpec spec{};
-                            if (gp_table_edge_get_tensor_spec(req.root_table, edge_idx, &spec)) {
-                                stride = 1;
-                                for (int di = 0; di < spec.dim_count; ++di) stride *= std::max(1, spec.dims[di]);
-                            } else stride = 1;
+                                GP_TableEdgeTensorSpecTyped spec{};
+                                if (gp_table_edge_get_tensor_spec(req.root_table, edge_idx, &spec)) {
+                                    stride = 1;
+                                    for (int di = 0; di < spec.dim_count; ++di) stride *= std::max(1, spec.dims[di]);
+                                } else stride = 1;
                             edge_stride_cache_[edge_idx] = stride;
                         }
 
@@ -382,10 +421,10 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         if (stride == 4) {
                             float sample[4] = {0.0f,0.0f,0.0f,0.0f};
                             int32_t written = 0;
-                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample, 4, &written) && written >= 4) {
+                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample, static_cast<int32_t>(4 * sizeof(float)), &written) && written >= static_cast<int32_t>(4 * sizeof(float))) {
                                 float rgba[4];
                                 int32_t written2 = 0;
-                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, rgba, 4, &written2) && written2 >= 4) {
+                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, rgba, static_cast<int32_t>(4 * sizeof(float)), &written2) && written2 >= static_cast<int32_t>(4 * sizeof(float))) {
                                     bool changed = false;
                                     auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
                                     if (it == last_applied_rgba_subgroup_.end()) changed = true;
@@ -422,7 +461,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 }
                                 int32_t written = 0;
                                 float s[1] = {0.0f};
-                                if (!(gp_table_edge_consume(req.root_table, edge_idx, reader_key, s, 1, &written) && written == 1)) break;
+                                if (!(gp_table_edge_consume(req.root_table, edge_idx, reader_key, s, static_cast<int32_t>(sizeof(float)), &written) && written == static_cast<int32_t>(sizeof(float)))) break;
                                 auto &buf = edge_assemble_buf_[edge_idx];
                                 buf.push_back(s[0]);
                                 if (buf.size() >= 4) {
@@ -450,11 +489,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             int cap = std::max(1, std::min(4, stride));
                             std::vector<float> sample(cap, 0.0f);
                             int32_t written = 0;
-                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample.data(), cap, &written) && written > 0) {
+                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample.data(), static_cast<int32_t>(cap * sizeof(float)), &written) && written > 0) {
                                 // consume only if we can read the full stride
                                 std::vector<float> consumed(stride, 0.0f);
                                 int32_t consumed_written = 0;
-                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, consumed.data(), stride, &consumed_written) && consumed_written == stride) {
+                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, consumed.data(), static_cast<int32_t>(stride * sizeof(float)), &consumed_written) && consumed_written == static_cast<int32_t>(stride * sizeof(float))) {
                                     float rgba[4] = {0.0f,0.0f,0.0f,1.0f};
                                     for (int i = 0; i < std::min(4, stride); ++i) rgba[i] = consumed[i];
                                     bool changed = false;
@@ -477,8 +516,10 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         }
 
     // Prefer topological order when acyclic, otherwise use ASAP/ALAP slack heuristic.
+    bool acyclic = true;
     std::vector<int> order = topo_kahn(succ);
     if (order.empty()) {
+        acyclic = false;
         // cyclic: compute asap/alap and order by slack
         auto asap = compute_asap_iter(N, succ);
         int max_asap = 0; for (int v : asap) max_asap = std::max(max_asap, v);
@@ -511,12 +552,12 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
     }
     // Per-module, row-sequential, stack-based tool pipeline execution
     // For each module, wire up IO row metadata and FIFO consume/publish
-    for (int mod_idx : order) {
-        if (mod_idx < 0 || mod_idx >= (int)req.modules.size()) continue;
+    auto execute_module = [&](int mod_idx) {
+        if (mod_idx < 0 || mod_idx >= (int)req.modules.size()) return;
         const auto& mod = req.modules[static_cast<size_t>(mod_idx)];
         // Skip modules that have no table or are marked to skip entirely by canvas UI
-        if (!mod.table) continue;
-        if (mod.module_skip != 0) continue;
+        if (!mod.table) return;
+        if (mod.module_skip != 0) return;
         // Handle per-module execution cadence (exec_skip_count): manager maintains a persistent
         // counter per module and only executes the module once every (exec_skip_count+1) frames.
         if (mod.module_idx >= 0) {
@@ -540,7 +581,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                 // module has no ledger index; fall back to executing every frame
                 should_execute = true;
             }
-            if (!should_execute) continue;
+            if (!should_execute) return;
         }
         std::vector<ModuleIORow> io_rows;
         {
@@ -581,6 +622,30 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             tool_cycle = module_ledger_[static_cast<size_t>(ledger_idx)].tool_cycle;
             has_ledger = true;
         }
+        // If module requested a sleep/delay, honor it and skip execution until
+        // either the tick threshold or the wall-time threshold has passed.
+        if (has_ledger && mod.module_idx >= 0) {
+            uint64_t sleep_tick = 0;
+            uint64_t sleep_time_us = 0;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (static_cast<size_t>(ledger_idx) < module_ledger_.size()) {
+                    const auto &ledger = module_ledger_[static_cast<size_t>(ledger_idx)];
+                    sleep_tick = ledger.sleep_until_tick.load(std::memory_order_relaxed);
+                    sleep_time_us = ledger.sleep_until_time_us.load(std::memory_order_relaxed);
+                }
+            }
+            bool tick_block = (sleep_tick > req.tick_id);
+            bool time_block = false;
+            if (sleep_time_us > 0) {
+                using namespace std::chrono;
+                uint64_t now_us = static_cast<uint64_t>(duration_cast<microseconds>(high_resolution_clock::now().time_since_epoch()).count());
+                time_block = (now_us < sleep_time_us);
+            }
+            if (tick_block || time_block) {
+                return; // skip module while sleeping
+            }
+        }
         auto load_input_state = [&]() -> bool {
             if (!input_state_loaded) {
                 input_state_loaded = canvas_get_module_input_state(mod_idx, &input_state);
@@ -594,6 +659,14 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             return v;
         };
         GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
+        // Optional timing measurement for this module execution
+        bool _tm_measured = false;
+        double _tm_last_run_secs = 0.0;
+        bool _tm_enabled = timing_enabled_.load(std::memory_order_relaxed);
+        std::chrono::high_resolution_clock::time_point _tm_start;
+        if (_tm_enabled) {
+            _tm_start = std::chrono::high_resolution_clock::now();
+        }
         for (int row = 0; row < row_count; ++row) {
             ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None, 0};
             if (meta.kind == ModuleRowKind::Input) {
@@ -644,7 +717,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             } else {
                                 float sample[1] = {0.0f};
                                 int32_t written = 0;
-                                if (gp_table_edge_consume(fifo_table, edge_idx, reader_key, sample, 1, &written) && written > 0) {
+                                if (gp_table_edge_consume(fifo_table, edge_idx, reader_key, sample, static_cast<int32_t>(sizeof(float)), &written) && written > 0) {
                                     val = sample[0];
                                 }
                             }
@@ -898,11 +971,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 gp_edge_publish_ptr(fifo_table, edge_idx, writer_key, reinterpret_cast<void*>(ep), &dropped);
                             } else {
                                 float payload[1] = {val};
-                                gp_edge_publish(fifo_table, edge_idx, writer_key, payload, 1, &dropped);
+                                gp_edge_publish(fifo_table, edge_idx, writer_key, payload, static_cast<int32_t>(sizeof(payload)), &dropped);
                             }
                         } else {
                             float payload[1] = {val};
-                            gp_edge_publish(fifo_table, edge_idx, writer_key, payload, 1, &dropped);
+                            gp_edge_publish(fifo_table, edge_idx, writer_key, payload, static_cast<int32_t>(sizeof(payload)), &dropped);
                         }
                     }
                 }
@@ -912,7 +985,14 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             canvas_clear_module_input_pulses(mod_idx);
         }
         canvas_set_module_stack_tail(mod_idx, stack.data(), static_cast<int>(stack.size()));
+        if (_tm_enabled) {
+            auto _tm_end = std::chrono::high_resolution_clock::now();
+            _tm_last_run_secs = std::chrono::duration<double>(_tm_end - _tm_start).count();
+            _tm_measured = true;
+        }
         if (mod.module_idx >= 0) {
+            // We must hold the mutex to safely resize/access the ledger vector,
+            // but timing value updates use atomics to avoid prolonged locking.
             std::lock_guard<std::mutex> lk(mu_);
             if (static_cast<size_t>(mod.module_idx) >= module_ledger_.size()) {
                 module_ledger_.resize(static_cast<size_t>(mod.module_idx) + 1);
@@ -924,6 +1004,99 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             if (has_ledger) {
                 ledger.tool_cycle = tool_cycle;
             }
+            if (_tm_measured) {
+                // store times as integer microseconds to allow atomic fetch_add
+                uint64_t us = static_cast<uint64_t>(std::lround(_tm_last_run_secs * 1e6));
+                ledger.run_count.fetch_add(1, std::memory_order_relaxed);
+                ledger.last_run_wall_time_us.store(us, std::memory_order_relaxed);
+                ledger.total_run_wall_time_us.fetch_add(us, std::memory_order_relaxed);
+            }
         }
-    }
+    };
+
+    auto run_sequential = [&]() {
+        for (int mod_idx : order) {
+            execute_module(mod_idx);
+        }
+    };
+
+    auto run_parallel = [&]() {
+        std::vector<std::atomic<int>> pred_count(N);
+        for (int i = 0; i < N; ++i) pred_count[i].store(0, std::memory_order_relaxed);
+        for (int from = 0; from < N; ++from) {
+            for (int to : succ[from]) {
+                if (to >= 0 && to < N) pred_count[to].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        std::deque<int> ready;
+        for (int i = 0; i < N; ++i) {
+            // Slip modules are enqueued immediately regardless of predecessor
+            // counts. Pooled modules join the ready set when their predecessors
+            // are satisfied. Sequential modules remain manager-thread-only
+            // unless forced into parallel by other policies.
+            if (pred_count[i].load(std::memory_order_relaxed) == 0 || req.modules[static_cast<size_t>(i)].exec_mode == ThreadManager::ExecMode::Slip) {
+                ready.push_back(i);
+            }
+        }
+        if (ready.empty()) {
+            run_sequential();
+            return;
+        }
+        int hw = static_cast<int>(std::thread::hardware_concurrency());
+        if (hw <= 0) hw = 1;
+        int thread_count = std::min(hw, std::max(1, static_cast<int>(order.size())));
+        std::mutex ready_mu;
+        std::condition_variable ready_cv;
+        std::atomic<int> remaining(static_cast<int>(order.size()));
+        auto worker = [&]() {
+            while (true) {
+                int idx = -1;
+                {
+                    std::unique_lock<std::mutex> lk(ready_mu);
+                    ready_cv.wait(lk, [&]() { return !ready.empty() || remaining.load(std::memory_order_relaxed) == 0; });
+                    if (ready.empty()) {
+                        if (remaining.load(std::memory_order_relaxed) == 0) break;
+                        continue;
+                    }
+                    idx = ready.front();
+                    ready.pop_front();
+                }
+                execute_module(idx);
+                for (int succ_idx : succ[idx]) {
+                    if (succ_idx < 0 || succ_idx >= N) continue;
+                    int prev = pred_count[succ_idx].fetch_sub(1, std::memory_order_relaxed);
+                    if (prev == 1) {
+                        std::lock_guard<std::mutex> lk(ready_mu);
+                        ready.push_back(succ_idx);
+                        ready_cv.notify_one();
+                    }
+                }
+                if (remaining.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                    std::lock_guard<std::mutex> lk(ready_mu);
+                    ready_cv.notify_all();
+                }
+            }
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(thread_count);
+        for (int ti = 0; ti < thread_count; ++ti) {
+            workers.emplace_back(worker);
+        }
+        {
+            std::lock_guard<std::mutex> lk(ready_mu);
+            ready_cv.notify_all();
+        }
+        for (auto& worker_thread : workers) {
+            if (worker_thread.joinable()) worker_thread.join();
+        }
+    };
+
+        // Parallel execution enabled when scheduled+acyclic or if the
+        // manager is in FreeSpinning mode.
+        auto cur_mode = mode_.load(std::memory_order_relaxed);
+        if ((cur_mode == Mode::Scheduled && acyclic && order.size() > 1) || (cur_mode == Mode::FreeSpinning)) {
+            run_parallel();
+        } else {
+            run_sequential();
+        }
 }

@@ -66,6 +66,8 @@ struct GP_CanvasContextImpl {
     std::vector<int> module_sim_enabled; // per-module sim enable flag (1=simulate,0=skip)
     std::vector<int> module_skip; // per-module full-skip flag (1=skip entire module work)
     std::vector<int> module_exec_skip_count; // per-module execution cadence skip count (0 = every frame)
+    // per-module execution mode override: -1 = use global/default, 0=Sequential, 1=Pooled, 2=Slip, 3=Free
+    std::vector<int> module_exec_mode;
     std::vector<std::vector<int>> module_io_input_rows;
     std::vector<std::vector<int>> module_io_output_rows;
     std::vector<MolexLayoutInfo> module_input_layout;
@@ -254,6 +256,9 @@ struct GP_CanvasContextImpl {
     int table_tool_number = 1;
     // which module (if any) has keyboard/focus for table editing
     int focused_module = -1;
+    // optional global execution mode override for thread manager: -1 = no override
+    // 0=Sequential,1=Pooled,2=Slip,3=Free
+    int thread_mgr_global_exec_mode = -1;
     // registered host windows (opaque pointers)
     std::vector<void*> windows;
     // mapping from window pointer to stable node id for backing graph

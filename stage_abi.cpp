@@ -84,6 +84,11 @@ struct GP_StageContextImpl {
 
 namespace {
 
+static inline int32_t clamp_size_to_int32(size_t value) {
+    constexpr size_t kMaxInt32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    return static_cast<int32_t>(std::min(value, kMaxInt32));
+}
+
 static inline uint32_t mix_u32(uint32_t x) {
     x ^= x >> 16;
     x *= 0x7FEB352Du;
@@ -279,7 +284,7 @@ int32_t gp_stage_get_dims(const GP_StageContext* st, GP_StageDims* out_dims) {
     out_dims->height_px = s->h;
     out_dims->internal_width_px = s->w * std::max(1, s->oversample);
     out_dims->internal_height_px = s->h * std::max(1, s->oversample);
-    out_dims->layer_count = static_cast<int32_t>(s->layers.size());
+    out_dims->layer_count = clamp_size_to_int32(s->layers.size());
     out_dims->oversample = s->oversample;
     out_dims->downsample = s->downsample;
     return 1;
@@ -293,7 +298,9 @@ int32_t gp_stage_push_layer(GP_StageContext* st) {
     if (!s->layers.empty()) std::memcpy(nl.tint, s->layers.back().tint, 4);
     s->layers.push_back(nl);
     ensure_buffers(s);
-    return static_cast<int32_t>(s->layers.size() - 1);
+    size_t remaining = s->layers.size();
+    size_t result = remaining ? (remaining - 1) : 0;
+    return clamp_size_to_int32(result);
 }
 
 int32_t gp_stage_pop_layer(GP_StageContext* st) {
@@ -337,7 +344,7 @@ int32_t gp_stage_set_layer_depths(GP_StageContext* st, const float* layer_center
         s->layer_centers_z.clear();
         return 1;
     }
-    if (count != static_cast<int32_t>(s->layers.size())) return 0;
+    if (count != clamp_size_to_int32(s->layers.size())) return 0;
     s->layer_centers_z.assign(layer_centers_z, layer_centers_z + count);
     return 1;
 }
@@ -377,7 +384,7 @@ int32_t gp_stage_set_exposure(GP_StageContext* st, float exposure) {
 int32_t gp_stage_set_layer_tint(GP_StageContext* st, int32_t layer, const uint8_t rgba[4]) {
     if (!st || !rgba) return 0;
     auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
-    if (layer < 0 || layer >= static_cast<int32_t>(s->layers.size())) return 0;
+    if (layer < 0 || layer >= clamp_size_to_int32(s->layers.size())) return 0;
     std::memcpy(s->layers[static_cast<size_t>(layer)].tint, rgba, 4);
     return 1;
 }
@@ -405,7 +412,7 @@ int32_t gp_stage_clear_lights(GP_StageContext* st) {
 int32_t gp_stage_add_light(GP_StageContext* st, const GP_StageLight* light) {
     if (!st || !light) return 0;
     auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
-    if (light->layer < 0 || light->layer >= static_cast<int32_t>(s->layers.size())) return 0;
+    if (light->layer < 0 || light->layer >= clamp_size_to_int32(s->layers.size())) return 0;
     s->lights.push_back(*light);
     return 1;
 }
@@ -455,7 +462,7 @@ int32_t gp_stage_get_field_desc(const GP_StageContext* st, GP_StageFieldDesc* ou
     out_desc->channels = (s->field_mode == GP_STAGE_FIELD_VECTOR6) ? 6 : 0;
     out_desc->width_px = s->w;
     out_desc->height_px = s->h;
-    out_desc->layer_count = static_cast<int32_t>(s->layers.size());
+    out_desc->layer_count = clamp_size_to_int32(s->layers.size());
     return 1;
 }
 
@@ -471,7 +478,8 @@ int32_t gp_stage_copy_field_f32(const GP_StageContext* st, float* out_field_f32,
     if (!st || !out_field_f32) return 0;
     const auto* s = reinterpret_cast<const GP_StageContextImpl*>(st);
     if (s->field_mode != GP_STAGE_FIELD_VECTOR6) return 0;
-    const int32_t need = static_cast<int32_t>(s->field_temporal.size());
+    const size_t need_size = s->field_temporal.size();
+    const int32_t need = clamp_size_to_int32(need_size);
     if (need <= 0) return 0;
     if (out_len_floats < need) return 0;
     std::memcpy(out_field_f32, s->field_temporal.data(), static_cast<size_t>(need) * sizeof(float));
@@ -589,7 +597,7 @@ int32_t gp_stage_set_negative_emission_volume(GP_StageContext* st, const uint8_t
 int32_t gp_stage_get_value(const GP_StageContext* st, int32_t layer, int32_t x, int32_t y, float* out_value) {
     if (!st || !out_value) return 0;
     const auto* s = reinterpret_cast<const GP_StageContextImpl*>(st);
-    if (layer < 0 || layer >= static_cast<int32_t>(s->layers.size())) return 0;
+    if (layer < 0 || layer >= clamp_size_to_int32(s->layers.size())) return 0;
     if (x < 0 || y < 0 || x >= s->w || y >= s->h) return 0;
     const auto& l = s->layers[static_cast<size_t>(layer)];
     *out_value = l.temporal[idx2(s->w, x, y)];
@@ -599,7 +607,7 @@ int32_t gp_stage_get_value(const GP_StageContext* st, int32_t layer, int32_t x, 
 int32_t gp_stage_set_value(GP_StageContext* st, int32_t layer, int32_t x, int32_t y, float value) {
     if (!st) return 0;
     auto* s = reinterpret_cast<GP_StageContextImpl*>(st);
-    if (layer < 0 || layer >= static_cast<int32_t>(s->layers.size())) return 0;
+    if (layer < 0 || layer >= clamp_size_to_int32(s->layers.size())) return 0;
     if (x < 0 || y < 0 || x >= s->w || y >= s->h) return 0;
     auto& l = s->layers[static_cast<size_t>(layer)];
     l.temporal[idx2(s->w, x, y)] = value;
@@ -705,7 +713,7 @@ int32_t gp_stage_render(GP_StageContext* st) {
                 raytrace3d_set_seed(s->rt3, seed);
                 raytrace3d_set_wave(s->rt3, E.frequency, E.phase0);
                 raytrace3d_set_light(s->rt3, E.x, E.y, E.z, std::max(0.0f, E.radius));
-                if (!raytrace3d_render_field_f32(s->rt3, lc, centers, s->rt_field_hi.data(), static_cast<int32_t>(s->rt_field_hi.size()))) continue;
+                if (!raytrace3d_render_field_f32(s->rt3, lc, centers, s->rt_field_hi.data(), clamp_size_to_int32(s->rt_field_hi.size()))) continue;
                 accumulate_field_hi_to_lo(E.intensity);
             }
 
@@ -717,7 +725,7 @@ int32_t gp_stage_render(GP_StageContext* st) {
                 raytrace3d_set_seed(s->rt3, seed);
                 raytrace3d_set_wave(s->rt3, /*frequency=*/0.0f, /*phase0=*/0.0f);
                 raytrace3d_set_light(s->rt3, L.x, L.y, L.z, std::max(0.0f, L.radius));
-                if (!raytrace3d_render_field_f32(s->rt3, lc, centers, s->rt_field_hi.data(), static_cast<int32_t>(s->rt_field_hi.size()))) continue;
+                if (!raytrace3d_render_field_f32(s->rt3, lc, centers, s->rt_field_hi.data(), clamp_size_to_int32(s->rt_field_hi.size()))) continue;
                 accumulate_field_hi_to_lo(L.intensity);
             }
 
@@ -738,7 +746,7 @@ int32_t gp_stage_render(GP_StageContext* st) {
                     raytrace3d_set_seed(s->rt3, mix_u32(rng ^ static_cast<uint32_t>(spawned)));
                     raytrace3d_set_wave(s->rt3, s->emission_frequency, s->emission_phase0);
                     raytrace3d_set_light(s->rt3, float(x) + 0.5f, float(y) + 0.5f, s->emission_z, s->emission_radius);
-                    if (!raytrace3d_render_field_f32(s->rt3, lc, centers, s->rt_field_hi.data(), static_cast<int32_t>(s->rt_field_hi.size()))) continue;
+                    if (!raytrace3d_render_field_f32(s->rt3, lc, centers, s->rt_field_hi.data(), clamp_size_to_int32(s->rt_field_hi.size()))) continue;
                     accumulate_field_hi_to_lo(s->emission_intensity);
                 }
             }
@@ -749,7 +757,7 @@ int32_t gp_stage_render(GP_StageContext* st) {
                 desc.channels = 6;
                 desc.width_px = s->w;
                 desc.height_px = s->h;
-                desc.layer_count = static_cast<int32_t>(layer_count);
+                desc.layer_count = clamp_size_to_int32(layer_count);
                 s->occlusion_field_cb(s->occlusion_field_user, &desc, s->field_frame.data());
             }
 
@@ -826,7 +834,7 @@ int32_t gp_stage_render(GP_StageContext* st) {
             seed = mix_u32(seed);
             raytrace3d_set_seed(s->rt3, seed);
             raytrace3d_set_light(s->rt3, L.x, L.y, L.z, std::max(0.0f, L.radius));
-            if (!raytrace3d_render_layers_f32(s->rt3, lc, centers, s->rt_layers_hi.data(), static_cast<int32_t>(s->rt_layers_hi.size()))) continue;
+            if (!raytrace3d_render_layers_f32(s->rt3, lc, centers, s->rt_layers_hi.data(), clamp_size_to_int32(s->rt_layers_hi.size()))) continue;
 
             for (size_t layer = 0; layer < layer_count; ++layer) {
                 const size_t base_out = layer * px;
@@ -859,7 +867,7 @@ int32_t gp_stage_render(GP_StageContext* st) {
 
             raytrace2d_set_seed(s->rt, seed);
             raytrace2d_set_light(s->rt, L.x, L.y, std::max(0.0f, L.radius));
-            if (!raytrace2d_render_rgba(s->rt, s->rt_rgba_hi.data(), static_cast<int32_t>(s->rt_rgba_hi.size()))) continue;
+            if (!raytrace2d_render_rgba(s->rt, s->rt_rgba_hi.data(), clamp_size_to_int32(s->rt_rgba_hi.size()))) continue;
 
             const size_t base = static_cast<size_t>(L.layer) * px;
             for (int y = 0; y < s->h; ++y) {
@@ -876,9 +884,9 @@ int32_t gp_stage_render(GP_StageContext* st) {
         }
     }
 
-    if (s->occlusion_cb) {
-        s->occlusion_cb(s->occlusion_user, s->w, s->h, static_cast<int32_t>(s->layers.size()), s->frame_accum.data());
-    }
+        if (s->occlusion_cb) {
+            s->occlusion_cb(s->occlusion_user, s->w, s->h, clamp_size_to_int32(s->layers.size()), s->frame_accum.data());
+        }
 
     // Temporal accumulate per layer.
     for (size_t layer = 0; layer < layer_count; ++layer) {
@@ -990,12 +998,12 @@ int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx,
     sample_limit = static_cast<uint32_t>(std::min<size_t>(sample_limit, s->staged_hits.size()));
 
     // Query tensor spec for debugging
-    GP_TableEdgeTensorSpec spec{};
+    GP_TableEdgeTensorSpecTyped spec{};
     (void)gp_table_edge_get_tensor_spec(table_ctx, edge_idx, &spec);
 
     // If tensor stride doesn't match our payload stride, try to set it to match.
     if ((spec.dim_count == 0 || spec.dims[0] != static_cast<int32_t>(stride))) {
-        GP_TableEdgeTensorSpec new_spec{};
+        GP_TableEdgeTensorSpecTyped new_spec{};
         new_spec.dim_count = 1;
         new_spec.dims[0] = static_cast<int32_t>(stride);
         // Choose a sensible slot count: prefer sample_limit if small, otherwise cap.
@@ -1003,6 +1011,8 @@ int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx,
         const uint32_t kMaxSlots = 4096u;
         new_spec.slots = static_cast<int32_t>(std::max<uint32_t>(16u, std::min<uint32_t>(desired_slots, kMaxSlots)));
         new_spec.top_k = 0;
+        new_spec.elem_size = static_cast<int32_t>(sizeof(float));
+        new_spec.type_id = -1;
         if (gp_table_edge_set_tensor_spec(table_ctx, edge_idx, &new_spec)) {
             gp_table_edge_get_tensor_spec(table_ctx, edge_idx, &spec);
         }
@@ -1014,7 +1024,7 @@ int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx,
     for (size_t i = 0; i < sample_limit; ++i) {
         fill_sample_payload(s->staged_hits[i], payload.data(), stride);
         int32_t dropped = 0;
-        if (!gp_table_edge_publish(table_ctx, edge_idx, led_key, payload.data(), static_cast<int32_t>(stride), &dropped)) {
+        if (!gp_table_edge_publish(table_ctx, edge_idx, led_key, payload.data(), static_cast<int32_t>(stride * sizeof(float)), &dropped)) {
             ok = false;
             break;
         }
@@ -1026,7 +1036,7 @@ int32_t gp_stage_stream_samples(GP_StageContext* st, GP_TableContext* table_ctx,
     meta.timestamp = s->pending_batch_time;
     meta.sample_count = static_cast<uint32_t>(pushed);
     meta.stride = stride;
-    meta.schema_id = opts->schema_id;
+    meta.type_id = opts->schema_id;
     gp_table_edge_set_batch_metadata(table_ctx, edge_idx, &meta);
 
     s->batch_committed = false;

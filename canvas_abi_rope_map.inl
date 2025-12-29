@@ -55,6 +55,7 @@ enum CanvasActionId {
     CANVAS_ACT_TOOL_KPN_1 = 2061,
     CANVAS_ACT_TOOL_KPN_2 = 2062,
     CANVAS_ACT_THREAD_TOGGLE = 2070,
+    CANVAS_ACT_TIMING_TOGGLE = 2089,
     CANVAS_ACT_KPN_GLOBAL_TOGGLE = 2079,
     CANVAS_ACT_THREAD_SIM_TOGGLE = 2078,
     CANVAS_ACT_CANVAS_ROOT_SIM_TOGGLE = 2088,
@@ -74,6 +75,16 @@ enum CanvasActionId {
     CANVAS_ACT_TOOL_SUBGROUP_6 = 2086,
     CANVAS_ACT_TOOL_SUBGROUP_7 = 2087,
     CANVAS_ACT_SPAWN_ROOT = 2090, // explicit spawn-root toolbar button
+    // Execution mode toolbar actions (per-module or global override)
+    CANVAS_ACT_EXEC_MODE_SEQ = 2091,
+    CANVAS_ACT_EXEC_MODE_POOLED = 2092,
+    CANVAS_ACT_EXEC_MODE_SLIP = 2093,
+    CANVAS_ACT_EXEC_MODE_FREE = 2094,
+    // Per-module execution mode actions (module-local buttons)
+    CANVAS_ACT_EXEC_MODE_MODULE_SEQ = 2095,
+    CANVAS_ACT_EXEC_MODE_MODULE_POOLED = 2096,
+    CANVAS_ACT_EXEC_MODE_MODULE_SLIP = 2097,
+    CANVAS_ACT_EXEC_MODE_MODULE_FREE = 2098,
     CANVAS_ACT_MENU_TOOL_ADD = 2101,
     CANVAS_ACT_MENU_TOOL_SUB = 2102,
     CANVAS_ACT_MENU_TOOL_MUL = 2103,
@@ -2300,6 +2311,9 @@ static void build_module_preview_input(const GP_CanvasContextImpl* ctx, int modu
     module_stack_tail_read(ctx, module_idx, out.stack_tail, &out.stack_tail_count);
 }
 
+// forward-declare helper used by draw routines
+static std::string canvas_module_label(const GP_CanvasModuleDesc& desc);
+
 static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const GP_CanvasModuleDesc& m, uint8_t* out_rgba, int w, int h, int pitch) {
     if (!ctx || !out_rgba) return;
     ModuleLayout layout = module_layout_for(ctx, module_idx, m);
@@ -2333,8 +2347,21 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
     };
 
     int cursor_y = sy + kModuleTopPadding;
-    const char* title = (m.label[0] != '\0') ? m.label : "Module";
-    blit_text(title, sx + kModuleTopPadding, cursor_y, 1.05f, Color{220,220,230,255});
+    std::string title = canvas_module_label(m);
+    // append timing info when timing mode enabled
+    if (ThreadManager::global() && ThreadManager::global()->timing_enabled()) {
+        ThreadManager::ModuleTiming mt{};
+        if (ThreadManager::global()->get_module_timing(module_idx, &mt)) {
+            char buf[128];
+            // show counts and times in milliseconds
+            int n = snprintf(buf, sizeof(buf), "  [%llu runs last=%.3fms total=%.3fms]",
+                             (unsigned long long)mt.run_count,
+                             mt.last_run_wall_time * 1000.0,
+                             mt.total_run_wall_time * 1000.0);
+            if (n > 0) title += std::string(buf, static_cast<size_t>(std::max(0, n)));
+        }
+    }
+    blit_text(title.c_str(), sx + kModuleTopPadding, cursor_y, 1.05f, Color{220,220,230,255});
     cursor_y += kModuleTitleRowH;
 
     int thumb_y = cursor_y;
@@ -2422,14 +2449,56 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
     int module_btn_w = nbw;
     int module_gap = 6;
     int btns_total_w = module_btn_count * (module_btn_w + module_gap) - module_gap;
-        int btns_right = pause_x - module_gap;
-        int btns_left = btns_right - btns_total_w;
-        int bx_btn = btns_left;
+    int btns_right = pause_x - module_gap;
+    int btns_left = btns_right - btns_total_w;
+    int bx_btn = btns_left;
+    // Timing toggle button placed between pause and exec-mode group
+    int timing_btn_w = nbw;
+    int timing_x = btns_left - module_gap - timing_btn_w;
+    bool timing_on = false;
+    if (ThreadManager::global()) timing_on = ThreadManager::global()->timing_enabled();
+    Color timing_col = timing_on ? Color{64,120,60,255} : Color{52,52,64,255};
+    draw_button(timing_x, btn_y, timing_btn_w, control_h, timing_col, "TIME", 0.75f);
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_CLONE_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_CLEAR_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{52,52,64,255}, LABEL_MODULE_DESTROY_SHORT, 0.9f); bx_btn += module_btn_w + module_gap;
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{48,48,56,255}, "CMT", 0.9f); bx_btn += module_btn_w + module_gap;
     draw_button(bx_btn, btn_y, module_btn_w, control_h, Color{44,60,48,255}, "EXP", 0.9f);
+
+    // Per-module exec-mode buttons (SEQ / POOL / SLIP / FREE) placed left of module action buttons
+    int exec_mode_count = 4;
+    int exec_mode_w = module_btn_w;
+    int exec_mode_gap = 4;
+    int exec_total_w = exec_mode_count * exec_mode_w + (exec_mode_count - 1) * exec_mode_gap;
+    int bx_exec_left = btns_left - exec_total_w - module_gap;
+    const char* exec_labels[4] = {"SEQ","POOL","SLIP","FREE"};
+    for (int emi = 0; emi < exec_mode_count; ++emi) {
+        int bx_e = bx_exec_left + emi * (exec_mode_w + exec_mode_gap);
+        // draw base button
+        draw_button(bx_e, btn_y, exec_mode_w, control_h, Color{46,46,56,255}, exec_labels[emi], 0.85f);
+        // Render per-module selected state if module has a local override.
+        bool local_selected = false;
+        if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_exec_mode.size())) {
+            int mval = ctx->module_exec_mode[module_idx];
+            if (mval == emi) local_selected = true;
+        }
+        if (local_selected) {
+            int y_top = btn_y;
+            int y_bot = btn_y + control_h - 1;
+                for (int xx = 0; xx < exec_mode_w; ++xx) {
+                int xh = bx_e + xx;
+                if (xh < 0 || xh >= w) continue;
+                if (y_top >= 0 && y_top < h) {
+                    uint8_t* pt = out_rgba + y_top * pitch + xh * 4;
+                    pt[0]=240; pt[1]=240; pt[2]=240; pt[3]=255;
+                }
+                if (y_bot >= 0 && y_bot < h) {
+                    uint8_t* pb = out_rgba + y_bot * pitch + xh * 4;
+                    pb[0]=240; pb[1]=240; pb[2]=240; pb[3]=255;
+                }
+            }
+        }
+    }
 
     cursor_y += kModuleControlRowH + kModuleTopGap;
     constexpr float kLedLabelScale = 0.7f;
@@ -3884,6 +3953,7 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_KPN_1, CANVAS_ACT_TOOL_KPN_1 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_KPN_2, CANVAS_ACT_TOOL_KPN_2 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_TOGGLE, CANVAS_ACT_THREAD_TOGGLE },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TIMING_TOGGLE, CANVAS_ACT_TIMING_TOGGLE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_THREAD_SIM_TOGGLE, CANVAS_ACT_THREAD_SIM_TOGGLE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_CANVAS_ROOT_SIM_TOGGLE, CANVAS_ACT_CANVAS_ROOT_SIM_TOGGLE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_KPN_GLOBAL_TOGGLE, CANVAS_ACT_KPN_GLOBAL_TOGGLE },
@@ -3902,6 +3972,10 @@ static const GP_TableAction kCanvasRootActions[] = {
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_5, CANVAS_ACT_TOOL_SUBGROUP_5 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_6, CANVAS_ACT_TOOL_SUBGROUP_6 },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_TOOL_SUBGROUP_7, CANVAS_ACT_TOOL_SUBGROUP_7 },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_EXEC_MODE_MODULE_SEQ, CANVAS_ACT_EXEC_MODE_MODULE_SEQ },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_EXEC_MODE_MODULE_POOLED, CANVAS_ACT_EXEC_MODE_MODULE_POOLED },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_EXEC_MODE_MODULE_SLIP, CANVAS_ACT_EXEC_MODE_MODULE_SLIP },
+    { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_EXEC_MODE_MODULE_FREE, CANVAS_ACT_EXEC_MODE_MODULE_FREE },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_ADD, CANVAS_ACT_MENU_TOOL_ADD },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_SUB, CANVAS_ACT_MENU_TOOL_SUB },
     { GP_TABLE_ACTION_ANY, GP_TABLE_ACTION_ANY, GP_TABLE_HIT_CELL, CANVAS_ACT_MENU_TOOL_MUL, CANVAS_ACT_MENU_TOOL_MUL },
@@ -4024,7 +4098,7 @@ static void canvas_install_key_recorder_table(GP_CanvasContextImpl* ctx, int mod
             }
             float payload[1]; payload[0] = static_cast<float>(key);
             int dropped = 0;
-            int ok = gp_table_edge_publish(root, edge_idx, writer_key, payload, 1, &dropped);
+            int ok = gp_table_edge_publish(root, edge_idx, writer_key, payload, sizeof(payload), &dropped);
             printf("key-recorder publish: module=%d contact=%d edge=%d writer_key=%llu ok=%d dropped=%d payload=%f\n", ks->module_idx, ci, edge_idx, (unsigned long long)writer_key, ok, dropped, payload[0]);
             if (!ok) {
                 printf("key-recorder publish FAILED: module=%d contact=%d edge=%d writer_key=%llu\n", ks->module_idx, ci, edge_idx, (unsigned long long)writer_key);
@@ -4339,6 +4413,15 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                 }
                 break;
             }
+            case CANVAS_ACT_TIMING_TOGGLE: {
+                // Toggle global timing collection on ThreadManager
+                if (ThreadManager::global()) {
+                    bool nv = !ThreadManager::global()->timing_enabled();
+                    ThreadManager::global()->set_timing_enabled(nv);
+                    printf("gp_canvas_on_click: TIMING_TOGGLE -> %d\n", nv ? 1 : 0);
+                }
+                break;
+            }
             case CANVAS_ACT_KPN_GLOBAL_TOGGLE: {
                 c->thread_mgr_paused = !c->thread_mgr_paused;
                 if (c->thread_mgr_paused) {
@@ -4368,6 +4451,44 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                     // Toolbar-level SIM now uses CANVAS_ACT_CANVAS_ROOT_SIM_TOGGLE and
                     // is handled separately.
                 }
+                break;
+            }
+            // Per-module exec-mode actions (module-local buttons)
+            case CANVAS_ACT_EXEC_MODE_MODULE_SEQ:
+            case CANVAS_ACT_EXEC_MODE_MODULE_POOLED:
+            case CANVAS_ACT_EXEC_MODE_MODULE_SLIP:
+            case CANVAS_ACT_EXEC_MODE_MODULE_FREE: {
+                int mode = -1;
+                if (action_id == CANVAS_ACT_EXEC_MODE_MODULE_SEQ) mode = 0;
+                else if (action_id == CANVAS_ACT_EXEC_MODE_MODULE_POOLED) mode = 1;
+                else if (action_id == CANVAS_ACT_EXEC_MODE_MODULE_SLIP) mode = 2;
+                else if (action_id == CANVAS_ACT_EXEC_MODE_MODULE_FREE) mode = 3;
+                int target_module = -1;
+                if (c->dispatch_module_idx >= 0) target_module = c->dispatch_module_idx;
+                else if (c->focused_module >= 0) target_module = c->focused_module;
+                if (target_module >= 0 && target_module < static_cast<int>(c->modules.size())) {
+                    int mi = target_module;
+                    if (mi >= static_cast<int>(c->module_exec_mode.size())) c->module_exec_mode.resize(mi + 1, -1);
+                    // Toggle: clicking the already-selected mode will deselect (set -1)
+                    if (c->module_exec_mode[mi] == mode) c->module_exec_mode[mi] = -1;
+                    else c->module_exec_mode[mi] = mode;
+                    printf("gp_canvas_on_click: module %d exec_mode -> %d\n", mi, c->module_exec_mode[mi]);
+                }
+                break;
+            }
+            // Global exec-mode toolbar actions (override)
+            case CANVAS_ACT_EXEC_MODE_SEQ:
+            case CANVAS_ACT_EXEC_MODE_POOLED:
+            case CANVAS_ACT_EXEC_MODE_SLIP:
+            case CANVAS_ACT_EXEC_MODE_FREE: {
+                int mode = -1;
+                if (action_id == CANVAS_ACT_EXEC_MODE_SEQ) mode = 0;
+                else if (action_id == CANVAS_ACT_EXEC_MODE_POOLED) mode = 1;
+                else if (action_id == CANVAS_ACT_EXEC_MODE_SLIP) mode = 2;
+                else if (action_id == CANVAS_ACT_EXEC_MODE_FREE) mode = 3;
+                if (c->thread_mgr_global_exec_mode == mode) c->thread_mgr_global_exec_mode = -1;
+                else c->thread_mgr_global_exec_mode = mode;
+                printf("gp_canvas_on_click: GLOBAL exec_mode_override -> %d\n", c->thread_mgr_global_exec_mode);
                 break;
             }
             case CANVAS_ACT_CANVAS_ROOT_SIM_TOGGLE: {

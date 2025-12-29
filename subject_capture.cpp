@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 struct GP_Subject {
@@ -13,6 +14,11 @@ struct GP_Subject {
     float bmin[3] = {0,0,0};
     float bmax[3] = {0,0,0};
 };
+
+static inline int32_t clamp_size_to_int32(size_t value) {
+    constexpr size_t kMaxInt32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    return static_cast<int32_t>(std::min(value, kMaxInt32));
+}
 
 static void compute_bounds(GP_Subject* s) {
     if (!s || s->verts.empty()) return;
@@ -115,18 +121,19 @@ int32_t gp_subject_add_event(GP_Subject* s, const GP_SubjectRayEvent* ev) {
 
 int32_t gp_subject_copy_events(const GP_Subject* s, GP_SubjectRayEvent* out_events, int32_t max_events) {
     if (!s || !out_events || max_events <= 0) return 0;
-    int32_t n = static_cast<int32_t>(std::min<size_t>(s->events.size(), static_cast<size_t>(max_events)));
+    size_t available = s->events.size();
+    size_t to_copy = std::min(available, static_cast<size_t>(max_events));
+    int32_t n = clamp_size_to_int32(to_copy);
     std::memcpy(out_events, s->events.data(), static_cast<size_t>(n) * sizeof(GP_SubjectRayEvent));
     return n;
 }
 
 int32_t gp_subject_get_counts(const GP_Subject* s, int32_t* out_vertices, int32_t* out_triangles, int32_t* out_events) {
     if (!s) return 0;
-    if (out_vertices) *out_vertices = static_cast<int32_t>(s->verts.size());
-    if (out_triangles) *out_triangles = static_cast<int32_t>(s->tris.size());
-    if (out_events) *out_events = static_cast<int32_t>(s->events.size());
+    if (out_vertices) *out_vertices = clamp_size_to_int32(s->verts.size());
+    if (out_triangles) *out_triangles = clamp_size_to_int32(s->tris.size());
+    if (out_events) *out_events = clamp_size_to_int32(s->events.size());
     return 1;
 }
 
 } // extern "C"
-

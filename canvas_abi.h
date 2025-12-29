@@ -169,6 +169,10 @@ int gp_canvas_get_offset(GP_CanvasContext* ctx, int* out_offx, int* out_offy);
 // Query whether content overflows the viewport (useful for drawing scrollbars).
 int gp_canvas_get_scroll_flags(GP_CanvasContext* ctx, int* out_has_h, int* out_has_v);
 
+// Set the canvas logical pixel size (background/work area). This updates
+// internal viewport sizes used by rasterization and scroll calculations.
+int gp_canvas_set_size(GP_CanvasContext* ctx, int width, int height);
+
 // Create/destroy a canvas-owned table attached to module. The created table
 // will be owned by the canvas and destroyed when detached or when canvas
 // is destroyed. Returns 1 on success.
@@ -377,6 +381,8 @@ int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int
 // before returning, so raster/input can remain single-threaded and safe.
 int gp_canvas_set_thread_manager_mode(GP_CanvasContext* ctx, int mode);
 int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx, int* out_mode);
+int gp_canvas_get_thread_manager_paused(GP_CanvasContext* ctx, int* out_paused);
+int gp_canvas_set_thread_manager_paused(GP_CanvasContext* ctx, int paused);
 
 #ifdef __cplusplus
 }

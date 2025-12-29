@@ -1,0 +1,4 @@
+ACTIVE 0
+CANVAS 0 canvas_workspace.txt
+CANVAS 1 canvas_workspace_1.txt
+CANVAS 2 canvas_workspace_2.txt

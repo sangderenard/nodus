@@ -97,6 +97,17 @@ public:
         Scheduled = 1,
     };
 
+    // Per-module execution mode hints. 'Slip' allows the module to be
+    // executed immediately on worker threads regardless of predecessor
+    // readiness (use at your own risk). 'Pooled' permits dispatch into
+    // the worker pool when ready. 'Sequential' forces manager-thread
+    // execution.
+    enum class ExecMode : int8_t {
+        Sequential = 0,
+        Pooled = 1,
+        Slip = 2,
+    };
+
         struct ModuleContract {
             int32_t module_idx = -1;
             GP_TableContext* table = nullptr; // non-owning
@@ -105,6 +116,7 @@ public:
             int32_t sim_enabled = 1; // 1 = simulate, 0 = skip (rope sim enabled)
             int32_t module_skip = 0; // 1 = skip entire module (no tool/table work)
             int32_t exec_skip_count = 0; // number of frames to skip between executions (0 = every frame)
+            ExecMode exec_mode = ExecMode::Pooled;
         };
 
     struct EdgeContract {
@@ -169,6 +181,17 @@ public:
     // Global accessor: set/get the process-global ThreadManager instance.
     static void set_global(ThreadManager* mgr);
     static ThreadManager* global();
+    // Optional per-module timing snapshot structure
+    struct ModuleTiming {
+        uint64_t run_count = 0;
+        double last_run_wall_time = 0.0; // seconds
+        double total_run_wall_time = 0.0; // seconds
+    };
+    // Enable/disable the optional per-module timing database
+    void set_timing_enabled(bool v) { timing_enabled_.store(v, std::memory_order_relaxed); }
+    bool timing_enabled() const { return timing_enabled_.load(std::memory_order_relaxed); }
+    // Retrieve timing snapshot for a module (returns false if index invalid)
+    bool get_module_timing(int module_idx, ModuleTiming* out) const;
     // Per-table immutable network snapshots published by the manager thread.
     struct NetworkSnapshot {
         std::vector<uint64_t> nodes;
@@ -187,7 +210,88 @@ private:
         double last_dt = 0.0;
         uint64_t tool_cycle = 0;
         uint64_t exec_tick_counter = 0; // persistent counter used to implement exec cadence
+        // timing DB fields (updated when timing enabled). Use atomics so updates
+        // can be performed without taking the ThreadManager mutex.
+        std::atomic<uint64_t> run_count{0};
+        // Store wall-time values as integer microseconds to allow atomic adds.
+        std::atomic<uint64_t> last_run_wall_time_us{0}; // microseconds
+        std::atomic<uint64_t> total_run_wall_time_us{0}; // microseconds
+        // Sleep control: until which tick id or until what wall-time (us) this module should be dormant.
+        std::atomic<uint64_t> sleep_until_tick{0};
+        std::atomic<uint64_t> sleep_until_time_us{0};
+        // Provide copy/move semantics for container use (atomics are not copyable by default).
+        ModuleLedger() = default;
+        ModuleLedger(const ModuleLedger& o) {
+            ticks = o.ticks;
+            last_tick_id = o.last_tick_id;
+            last_dt = o.last_dt;
+            tool_cycle = o.tool_cycle;
+            exec_tick_counter = o.exec_tick_counter;
+            run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        ModuleLedger& operator=(const ModuleLedger& o) {
+            if (this == &o) return *this;
+            ticks = o.ticks;
+            last_tick_id = o.last_tick_id;
+            last_dt = o.last_dt;
+            tool_cycle = o.tool_cycle;
+            exec_tick_counter = o.exec_tick_counter;
+            run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+        ModuleLedger(ModuleLedger&& o) noexcept {
+            ticks = o.ticks;
+            last_tick_id = o.last_tick_id;
+            last_dt = o.last_dt;
+            tool_cycle = o.tool_cycle;
+            exec_tick_counter = o.exec_tick_counter;
+            run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            // leave source in a valid zeroed state
+            o.ticks = 0; o.last_tick_id = 0; o.last_dt = 0.0; o.tool_cycle = 0; o.exec_tick_counter = 0;
+            o.run_count.store(0, std::memory_order_relaxed);
+            o.last_run_wall_time_us.store(0, std::memory_order_relaxed);
+            o.total_run_wall_time_us.store(0, std::memory_order_relaxed);
+            o.sleep_until_tick.store(0, std::memory_order_relaxed);
+            o.sleep_until_time_us.store(0, std::memory_order_relaxed);
+        }
+        ModuleLedger& operator=(ModuleLedger&& o) noexcept {
+            if (this == &o) return *this;
+            ticks = o.ticks;
+            last_tick_id = o.last_tick_id;
+            last_dt = o.last_dt;
+            tool_cycle = o.tool_cycle;
+            exec_tick_counter = o.exec_tick_counter;
+            run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            o.ticks = 0; o.last_tick_id = 0; o.last_dt = 0.0; o.tool_cycle = 0; o.exec_tick_counter = 0;
+            o.run_count.store(0, std::memory_order_relaxed);
+            o.last_run_wall_time_us.store(0, std::memory_order_relaxed);
+            o.total_run_wall_time_us.store(0, std::memory_order_relaxed);
+            o.sleep_until_tick.store(0, std::memory_order_relaxed);
+            o.sleep_until_time_us.store(0, std::memory_order_relaxed);
+            return *this;
+        }
     };
+
+    // Put a module to sleep for a combination of ticks and/or seconds.
+    // If delay_ticks > 0, the module will be skipped until current-next-tick + delay_ticks.
+    // If delay_seconds > 0.0, the module will be skipped until the specified wall time has passed.
+    void set_module_sleep_delay(int module_idx, uint64_t delay_ticks, double delay_seconds);
 
     void run_loop();
     void run_scheduled_tick(const TickRequest& req);
@@ -218,6 +322,8 @@ private:
 
     // "Time cards": per-module tick ledger.
     std::vector<ModuleLedger> module_ledger_;
+    // Optional timing enable flag (controls whether we record wall-time per run)
+    std::atomic<bool> timing_enabled_{false};
     // Reader-table scaffold: map slot -> edge_id and per-edge min seq snapshot.
     int next_reader_slot_ = 0;
     std::unordered_map<int, uint64_t> reader_slot_to_edge_;
