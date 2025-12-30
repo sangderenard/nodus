@@ -84,6 +84,13 @@ struct ToolInputState {
     float mouse_y = 0.0f;
     int32_t mouse_down = 0;
     int32_t mouse_up = 0;
+    float mouse_dx = 0.0f;
+    float mouse_dy = 0.0f;
+    int32_t mouse_button = 0;
+    float mouse_scroll = 0.0f;
+    uint32_t mouse_button_mask_down = 0u;
+    uint32_t mouse_button_mask_up = 0u;
+    int32_t mouse_device_id = 0;
     int32_t key = 0;
     int32_t key_event = 0;
 };
@@ -158,6 +165,17 @@ inline int tool_stack_push_n(ToolStackFrame& frame, const float* in, int n) {
     std::memcpy(frame.values + frame.count, in, static_cast<size_t>(to) * sizeof(float));
     frame.count += to;
     return to;
+}
+
+// Integer stack helpers (32-bit signed). These use the float stack storage
+// but present an explicit int API for built-ins that require integer types.
+inline int32_t tool_stack_pop_int(ToolStackFrame& frame) {
+    float v = tool_stack_pop(frame);
+    return static_cast<int32_t>(std::lround(v));
+}
+
+inline void tool_stack_push_int(ToolStackFrame& frame, int32_t v) {
+    tool_stack_push(frame, static_cast<float>(v));
 }
 
 struct OutputArchive {

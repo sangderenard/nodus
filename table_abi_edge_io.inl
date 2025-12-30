@@ -1,4 +1,11 @@
 // Edge list helpers
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
 int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b) {
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);
@@ -349,6 +356,8 @@ int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, co
     int32_t type_id = spec->type_id;
     ctx->edge_fifos[static_cast<size_t>(edge_idx)].configure(dims, slots, topk, elem_size, type_id);
     sync_edge_tensor_for_idx(ctx, static_cast<size_t>(edge_idx));
+    // Invalidate type-id snapshot after edge reconfigure so readers will refresh.
+    std::atomic_store(&ctx->type_ids_snapshot, std::shared_ptr<std::vector<int32_t>>(nullptr));
     // If a ThreadManager is present, update registered reader slots with
     // the freshly-initialized sequence (usually zero) so manager state
     // remains consistent after reconfigure.
@@ -543,6 +552,12 @@ int32_t gp_table_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
     return ok ? 1 : 0;
 }
 
+// Forward declarations for table-specific "many" pointer helpers so the
+// generic gp_edge_* wrappers below can call them even though their
+// implementations appear later in this file.
+int32_t gp_table_edge_consume_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptrs, int32_t max_out);
+int32_t gp_table_edge_publish_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void** ptrs, int32_t count, int32_t* out_dropped);
+
 // Generic wrappers to provide a neutral edge API surface. These forward to
 // the table-specific implementations so callers outside the table system can
 // use a stable `gp_edge_*` API while we evolve internals.
@@ -558,6 +573,20 @@ int32_t gp_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned lon
 int32_t gp_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr) {
     return gp_table_edge_consume_ptr(ctx, edge_idx, subscriber_key, out_ptr);
 }
+
+int32_t gp_edge_consume_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptrs, int32_t max_out) {
+    return gp_table_edge_consume_ptr_many(ctx, edge_idx, subscriber_key, out_ptrs, max_out);
+}
+
+int32_t gp_edge_publish_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void** ptrs, int32_t count, int32_t* out_dropped) {
+    return gp_table_edge_publish_ptr_many(ctx, edge_idx, writer_key, ptrs, count, out_dropped);
+}
+
+// Forward declarations for many-pointer table-edge helpers. These are
+// implemented later in this translation unit but declared here so the
+// gp_edge_* wrapper functions above can call them.
+int32_t gp_table_edge_consume_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptrs, int32_t max_out);
+int32_t gp_table_edge_publish_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void** ptrs, int32_t count, int32_t* out_dropped);
 
 int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr) {
     if (out_ptr) *out_ptr = nullptr;
@@ -584,6 +613,54 @@ int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
         }
     }
     return 1;
+}
+
+int32_t gp_table_edge_consume_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptrs, int32_t max_out) {
+    if (out_ptrs) {
+        for (int i = 0; i < max_out; ++i) out_ptrs[i] = nullptr;
+    }
+    if (!ctx || !out_ptrs || max_out <= 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    int consumed = 0;
+    void* p = nullptr;
+    for (int i = 0; i < max_out; ++i) {
+        bool ok = fifo.pop_ptr(subscriber_key, &p);
+        if (!ok) break;
+        out_ptrs[consumed++] = p;
+    }
+    if (consumed == 0) return 0;
+    // Notify ThreadManager of read advancement using reader seq from fifo
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        auto it = m.find(subscriber_key);
+        if (it != m.end()) {
+            int slot = it->second;
+            auto *r = fifo.find_reader(subscriber_key);
+            if (r && slot > 0) {
+                uint64_t seq = r->seq.load(std::memory_order_relaxed);
+                tm->update_reader_seq(slot, seq);
+            }
+        }
+    }
+    return consumed;
+}
+
+int32_t gp_table_edge_publish_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void** ptrs, int32_t count, int32_t* out_dropped) {
+    if (out_dropped) *out_dropped = 0;
+    if (!ctx || !ptrs || count <= 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    int total_dropped = 0;
+    for (int i = 0; i < count; ++i) {
+        int dropped = 0;
+        gp_table_edge_publish_ptr(ctx, edge_idx, writer_key, ptrs[i], &dropped);
+        total_dropped += dropped;
+    }
+    if (out_dropped) *out_dropped = total_dropped;
+    return count;
 }
 
 int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written) {
@@ -849,6 +926,11 @@ extern "C" int gp_table_bind_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t
     if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
         gp_canvas_mark_rope_map_dirty(cvs);
     }
+    // Diagnostic: report binding activity and associated sim pointer
+    {
+        RopeSim* rs = gp_table_get_rope_sim(ctx);
+        printf("gp_table_bind_rope_id_to_sim_index: ctx=%p id=%llu rope_idx=%d sim=%p\n", (void*)ctx, (unsigned long long)id, (int)rope_idx, (void*)rs);
+    }
     return 1;
 }
 
@@ -875,6 +957,19 @@ extern "C" int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint
     uint64_t mx = 1;
     for (auto v : ctx->rope_ids) if (v >= mx) mx = v + 1;
     ctx->next_rope_id = mx;
+    // Diagnostic: report table->rope_sim and a few sample id->index->vert counts
+    {
+        RopeSim* rs = gp_table_get_rope_sim(ctx);
+        printf("gp_table_set_rope_ids_from_array: ctx=%p sim=%p count=%d\n", (void*)ctx, (void*)rs, count);
+        int sample = std::min(count, 5);
+        for (int i = 0; i < sample; ++i) {
+            uint64_t uid = ids[static_cast<size_t>(i)];
+            int ridx = gp_table_resolve_rope_id_to_sim_index(ctx, uid);
+            int vc = -1;
+            if (rs && ridx >= 0) vc = rope_sim_get_vertex_count(rs, ridx);
+            printf("  id[%d]=%llu -> idx=%d verts=%d\n", i, (unsigned long long)uid, ridx, vc);
+        }
+    }
     if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
         gp_canvas_mark_rope_map_dirty(cvs);
     }
@@ -1026,6 +1121,8 @@ int32_t gp_table_set_key_type_hint(GP_TableContext* ctx, unsigned long long key,
     ctx->key_type_hint[key] = type_id;
     if (is_input) ctx->key_is_input.insert(key); else ctx->key_is_input.erase(key);
     if (is_output) ctx->key_is_output.insert(key); else ctx->key_is_output.erase(key);
+    // Invalidate snapshot so readers rebuild without locking on next access.
+    std::atomic_store(&ctx->type_ids_snapshot, std::shared_ptr<std::vector<int32_t>>(nullptr));
     return 1;
 }
 
@@ -1058,6 +1155,41 @@ int32_t gp_table_enumerate_io_keys(GP_TableContext* ctx, int32_t direction, unsi
         }
     }
     return written;
+}
+
+int32_t gp_table_get_type_ids(GP_TableContext* ctx, int32_t* out_ids, int32_t cap) {
+    if (!ctx || !out_ids || cap <= 0) return 0;
+    // Try fast path: load existing snapshot atomically
+    auto snap = std::atomic_load(&ctx->type_ids_snapshot);
+    if (!snap) {
+        // Build local snapshot (no locks), then install it atomically.
+        std::vector<int32_t> types;
+        for (const auto &kv : ctx->key_type_hint) {
+            if (kv.second >= 0) {
+                bool found = false;
+                for (int32_t x : types) if (x == kv.second) { found = true; break; }
+                if (!found) types.push_back(kv.second);
+            }
+        }
+        for (const auto &ef : ctx->edge_fifos) {
+            if (ef.impl && ef.impl->type_id >= 0) {
+                int32_t t = ef.impl->type_id;
+                bool found = false;
+                for (int32_t x : types) if (x == t) { found = true; break; }
+                if (!found) types.push_back(t);
+            }
+        }
+        auto v = std::make_shared<std::vector<int32_t>>(types.begin(), types.end());
+        // Install snapshot for readers. Use atomic_store overload for shared_ptr.
+        std::atomic_store(&ctx->type_ids_snapshot, v);
+        snap = v;
+    }
+    int written = 0;
+    for (int32_t id : *snap) {
+        if (written >= cap) break;
+        out_ids[written++] = id;
+    }
+    return static_cast<int32_t>(snap->size());
 }
 
 int32_t gp_table_set_side_reading_direction(GP_TableContext* ctx, int32_t side, int32_t dir) {

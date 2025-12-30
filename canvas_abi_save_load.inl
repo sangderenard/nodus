@@ -1,6 +1,39 @@
+static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
+    std::ostringstream ss;
+    ss << cc->modules.size() << ":";
+    for (size_t i = 0; i < cc->modules.size(); ++i) {
+        const auto &m = cc->modules[i];
+        ss << m.x << ',' << m.y << ',' << m.w << ',' << m.h << ',';
+        std::string lbl(m.label, m.label + sizeof(m.label));
+        size_t z = lbl.find('\0'); if (z != std::string::npos) lbl.resize(z);
+        ss << lbl.size() << ',';
+    }
+    ss << "|E:" << cc->edges.size() << ":";
+    for (const auto &e : cc->edges) {
+        ss << e.desc.a_module << ',' << e.desc.a_contact_idx << ',' << e.desc.b_module << ',' << e.desc.b_contact_idx << ',' << e.type_id << ',' << e.subgroup_flags << ';';
+    }
+    ss << "|O:" << cc->overlays.size();
+    return ss.str();
+}
+
 extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) {
+    #include "console_logger.h"
+    #ifndef printf
+    #define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+    #endif
+    #ifndef fprintf
+    #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+    #endif
+    #include <sstream>
     if (!ctx_ || !path) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    // quick-change signature to avoid serializing -> disk when nothing changed
+    std::string sig = gp_canvas_compute_signature(c);
+    // compare against active buffer slot
+    int cur_idx = c->last_save_idx.load(std::memory_order_acquire);
+    if (!c->last_save_buf[cur_idx].empty() && c->last_save_buf[cur_idx] == sig) {
+        try { if (std::filesystem::exists(path)) return 1; } catch (...) { /* fallthrough */ }
+    }
     std::ofstream ofs(path);
     if (!ofs.good()) return 0;
     // Ensure the canvas root/container table exists so we can detect
@@ -366,6 +399,22 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
         ofs << "\n";
     }
     ofs.close();
+    // Update in-memory signature to reflect this successful save using atomic flip
+    try {
+        int other = (c->last_save_idx.load(std::memory_order_acquire) ^ 1);
+        c->last_save_buf[other] = sig;
+        c->last_save_idx.store(other, std::memory_order_release);
+    } catch (...) { }
+    return 1;
+}
+
+extern "C" int gp_canvas_update_last_save_signature(GP_CanvasContext* ctx_) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    std::string sig = gp_canvas_compute_signature(c);
+    int other = (c->last_save_idx.load(std::memory_order_acquire) ^ 1);
+    c->last_save_buf[other] = sig;
+    c->last_save_idx.store(other, std::memory_order_release);
     return 1;
 }
 

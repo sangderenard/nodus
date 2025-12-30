@@ -1,3 +1,12 @@
+// Deferred console logging
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+
 extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     GP_CanvasContextImpl* c = new GP_CanvasContextImpl(width, height);
     if (!g_canvas_context_singleton) g_canvas_context_singleton = c;
@@ -26,6 +35,23 @@ extern "C" int gp_canvas_set_size(GP_CanvasContext* ctx_, int width, int height)
     c->width = width;
     c->height = height;
     update_canvas_scroll_state(c, /*pull_from_container=*/false);
+    return 1;
+}
+
+extern "C" int gp_canvas_on_mouse_scroll(GP_CanvasContext* ctx_, float x, float y, float dx, float dy, float scroll) {
+    if (!ctx_) return 0;
+    if (scroll == 0.0f) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    canvas_record_mouse_input(c, x, y, dx, dy, /*down=*/false, /*up=*/false, /*button=*/0, scroll);
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
+    float world_fx = x + static_cast<float>(c->offset_x);
+    float world_fy = y + static_cast<float>(c->offset_y);
+    int world_x = static_cast<int>(std::lround(world_fx));
+    int world_y = static_cast<int>(std::lround(world_fy));
+    fprintf(stderr, "[DBG] on_mouse_scroll entry world=%d,%d dx=%f dy=%f scroll=%f\n", world_x, world_y, dx, dy, scroll);
+    int32_t action = scroll > 0.0f ? CANVAS_ACT_MOUSE_SCROLL_UP : CANVAS_ACT_MOUSE_SCROLL_DOWN;
+    fprintf(stderr, "[DBG] on_mouse_scroll action=%d world=%d,%d dx=%f dy=%f scroll=%f\n", action, world_x, world_y, dx, dy, scroll);
+    canvas_dispatch_event_to_bound_ports(c, action, world_x, world_y, false, false, dx, dy, 0, scroll);
     return 1;
 }
 
@@ -138,7 +164,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     int world_x = x + c->offset_x;
     int world_y = y + c->offset_y;
     // Dispatch mouse-up event to any bound ports for CANVAS_ACT_MOUSE_UP
-    canvas_dispatch_event_to_bound_ports(c, CANVAS_ACT_MOUSE_UP, world_x, world_y, false, true);
+    canvas_dispatch_event_to_bound_ports(c, CANVAS_ACT_MOUSE_UP, world_x, world_y, false, true, 0.0f, 0.0f, 0, 0.0f);
     printf("gp_canvas_on_click: click view=%d,%d world=%d,%d selected_module=%d selected_contact=%d selected_left=%d prospective_rope=%d\n", view_x, view_y, world_x, world_y, c->selected.module, c->selected.contact_idx, c->selected.left, c->prospective_rope_idx);
     // find contact under point
     const int pick_r = 8;
@@ -825,13 +851,15 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     return 0;
 }
 
-extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
+extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, float x, float y, float dx, float dy, int button) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    canvas_record_mouse_input(c, x, y, /*down=*/true, /*up=*/false);
-    if (gp_canvas_on_click(ctx_, x, y)) return 1;
-    int world_x = x + c->offset_x;
-    int world_y = y + c->offset_y;
+    canvas_record_mouse_input(c, x, y, dx, dy, /*down=*/true, /*up=*/false, button, /*scroll=*/0.0f);
+    if (gp_canvas_on_click(ctx_, static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)))) return 1;
+    float world_fx = x + static_cast<float>(c->offset_x);
+    float world_fy = y + static_cast<float>(c->offset_y);
+    int world_x = static_cast<int>(std::lround(world_fx));
+    int world_y = static_cast<int>(std::lround(world_fy));
     // otherwise check for module hit to start dragging
     for (int mi = static_cast<int>(c->modules.size()) - 1; mi >= 0; --mi) {
         const auto &m = c->modules[mi];
@@ -977,27 +1005,30 @@ extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
             c->drag.dragging = 1;
             c->drag.panning = 1;
             c->drag.module = -1;
-            c->drag.pan_last_x = x;
-            c->drag.pan_last_y = y;
-            printf("gp_canvas_on_mouse_down: start pan canvas=%p at view=%d,%d world=%d,%d\n", (void*)c, x, y, world_x, world_y);
+            c->drag.pan_last_x = static_cast<int>(std::lround(x));
+            c->drag.pan_last_y = static_cast<int>(std::lround(y));
+            printf("gp_canvas_on_mouse_down: start pan canvas=%p at view=%d,%d world=%d,%d\n", (void*)c, static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)), world_x, world_y);
             return 1;
         }
     }
     // Dispatch mouse-down event to any bound ports for CANVAS_ACT_MOUSE_DOWN
-    canvas_dispatch_event_to_bound_ports(c, CANVAS_ACT_MOUSE_DOWN, world_x, world_y, true, false);
+    fprintf(stderr, "[DBG] on_mouse_down action=%d world=%d,%d dx=%f dy=%f button=%d\n", CANVAS_ACT_MOUSE_DOWN, world_x, world_y, dx, dy, button);
+    canvas_dispatch_event_to_bound_ports(c, CANVAS_ACT_MOUSE_DOWN, world_x, world_y, true, false, dx, dy, button, 0.0f);
     return 0;
 }
 
-extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
+extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, float x, float y, float dx, float dy) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    canvas_record_mouse_input(c, x, y, /*down=*/false, /*up=*/false);
+    canvas_record_mouse_input(c, x, y, dx, dy, /*down=*/false, /*up=*/false, /*button=*/0, /*scroll=*/0.0f);
     if (!c->drag.panning) {
         update_canvas_scroll_state(c, /*pull_from_container=*/true);
     }
     bool handled = false;
-    int world_x = x + c->offset_x;
-    int world_y = y + c->offset_y;
+    float world_fx = x + static_cast<float>(c->offset_x);
+    float world_fy = y + static_cast<float>(c->offset_y);
+    int world_x = static_cast<int>(std::lround(world_fx));
+    int world_y = static_cast<int>(std::lround(world_fy));
     // update provisional rope endpoint to follow mouse — only if anchor known
     if (c->prospective_rope_idx >= 0 && c->selected.module >= 0) {
         if (c->selected.anchor_x >= 0 && c->selected.anchor_y >= 0) {
@@ -1012,12 +1043,12 @@ extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
     }
     // handle viewport pan
     if (c->drag.dragging && c->drag.panning) {
-        int dx = x - c->drag.pan_last_x;
-        int dy = y - c->drag.pan_last_y;
-        c->offset_x -= dx;
-        c->offset_y -= dy;
-        c->drag.pan_last_x = x;
-        c->drag.pan_last_y = y;
+        float dxf = x - static_cast<float>(c->drag.pan_last_x);
+        float dyf = y - static_cast<float>(c->drag.pan_last_y);
+        c->offset_x -= static_cast<int>(std::lround(dxf));
+        c->offset_y -= static_cast<int>(std::lround(dyf));
+        c->drag.pan_last_x = static_cast<int>(std::lround(x));
+        c->drag.pan_last_y = static_cast<int>(std::lround(y));
         update_canvas_scroll_state(c, /*pull_from_container=*/false);
         handled = true;
     }
@@ -1058,20 +1089,23 @@ extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
         return 1;
     }
     // Dispatch mouse-move event to any bound ports for CANVAS_ACT_MOUSE_MOVE
-    canvas_dispatch_event_to_bound_ports(c, CANVAS_ACT_MOUSE_MOVE, world_x, world_y, false, false);
+    fprintf(stderr, "[DBG] on_mouse_move action=%d world=%d,%d dx=%f dy=%f\n", CANVAS_ACT_MOUSE_MOVE, world_x, world_y, dx, dy);
+    canvas_dispatch_event_to_bound_ports(c, CANVAS_ACT_MOUSE_MOVE, world_x, world_y, false, false, dx, dy, 0, 0.0f);
     return 0;
 }
 
-extern "C" int gp_canvas_on_mouse_up(GP_CanvasContext* ctx_, int x, int y) {
+extern "C" int gp_canvas_on_mouse_up(GP_CanvasContext* ctx_, float x, float y, float dx, float dy, int button) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    printf("gp_canvas_on_mouse_up: called canvas=%p x=%d y=%d\n", (void*)c, x, y);
-    canvas_record_mouse_input(c, x, y, /*down=*/false, /*up=*/true);
+    printf("gp_canvas_on_mouse_up: called canvas=%p x=%d y=%d (f=%f,%f dx=%f,dy=%f)\n", (void*)c, static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)), x, y, dx, dy);
+    canvas_record_mouse_input(c, x, y, dx, dy, /*down=*/false, /*up=*/true, button, /*scroll=*/0.0f);
     (void)c->overlays.size();
     (void)c;
     // Check for overlay mode-button clicks even when not dragging
-    int world_x = x + c->offset_x;
-    int world_y = y + c->offset_y;
+    float world_fx = x + static_cast<float>(c->offset_x);
+    float world_fy = y + static_cast<float>(c->offset_y);
+    int world_x = static_cast<int>(std::lround(world_fx));
+    int world_y = static_cast<int>(std::lround(world_fy));
     for (const auto &kv : c->overlays) {
         const auto &ov = kv.second;
         int rx0 = static_cast<int>(std::floor(std::min(ov.x1, ov.x2)));

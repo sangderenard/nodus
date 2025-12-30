@@ -1,4 +1,11 @@
 // Forward declare meta-group type so helpers can accept pointers without needing the full definition here.
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
 struct GP_MetaGroup;
 // Local copy of LassoConfig layout (header only forward-declares it).
 typedef struct LassoConfig {
@@ -96,6 +103,7 @@ enum CanvasActionId {
     CANVAS_ACT_MENU_TOOL_CLONE = 2109,
     CANVAS_ACT_MENU_TOOL_RECT = 2110,
     CANVAS_ACT_MENU_TOOL_NUMBER = 2111,
+    CANVAS_ACT_MENU_TOOL_ALLOCATOR = 2115,
     CANVAS_ACT_ROPE_MENU_TOGGLE = 2112,
     CANVAS_ACT_ROPE_MODE_SIMPLE = 2113,
     CANVAS_ACT_ROPE_MODE_FULL = 2114,
@@ -108,14 +116,31 @@ static int canvas_autobind_action_ports(GP_CanvasContext* ctx_, int module_idx, 
     if (module_idx >= static_cast<int>(c->module_frame_links.size())) return 0;
     int bound = 0;
     const int rows_to_try[2] = {2, 3};
+    // If caller requested the menu-tool for mouse, bind the concrete mouse
+    // action group (down/up/move/scroll up/scroll down) so each event type
+    // has its own distinct module-frame port.
+    int bind_action_id = action_id;
+    if (action_id == CANVAS_ACT_MENU_TOOL_MOUSE) bind_action_id = CANVAS_ACT_MOUSE_DOWN;
     for (int row_idx : rows_to_try) {
         for (int li = 0; li < kModuleExtraLedCount && bound < max_ports; ++li) {
             void* existing = c->module_frame_links[static_cast<size_t>(module_idx)].ptrs[static_cast<size_t>(row_idx)][static_cast<size_t>(li)];
             if (existing) continue;
             int col = (row_idx == 2) ? 0 : 1;
-            if (gp_canvas_bind_action_enum_to_module_port(ctx_, module_idx, /*is_send=*/0, col, li, action_id)) {
+            if (gp_canvas_bind_action_enum_to_module_port(ctx_, module_idx, /*is_send=*/0, col, li, bind_action_id)) {
                 void* now_bound = c->module_frame_links[static_cast<size_t>(module_idx)].ptrs[static_cast<size_t>(row_idx)][static_cast<size_t>(li)];
-                if (now_bound) ++bound;
+                if (now_bound) {
+                    // If the bind created a group (e.g., mouse group), we may have
+                    // consumed multiple LED slots; count how many new non-null
+                    // pointers exist at this column starting at `li`.
+                    int newly = 0;
+                    for (int k = li; k < kModuleExtraLedCount && newly + bound < max_ports; ++k) {
+                        void* check = c->module_frame_links[static_cast<size_t>(module_idx)].ptrs[static_cast<size_t>(row_idx)][static_cast<size_t>(k)];
+                        if (check) ++newly; else break;
+                    }
+                    bound += newly;
+                    // Advance li past the newly bound slots so we don't rebind them
+                    li += std::max(0, newly - 1);
+                }
             }
         }
         if (bound >= max_ports) break;
@@ -567,7 +592,7 @@ static CanvasBounds update_canvas_scroll_state(GP_CanvasContextImpl* ctx, bool p
 
 // Forward declarations for symbols defined later but referenced earlier.
 struct KeyRecorderState;
-static void canvas_dispatch_event_to_bound_ports(GP_CanvasContextImpl* c, int32_t action_id, int x, int y, bool down, bool up);
+static void canvas_dispatch_event_to_bound_ports(GP_CanvasContextImpl* c, int32_t action_id, int x, int y, bool down, bool up, float dx, float dy, int button, float scroll);
 
 // forward declaration: write the tail values into a module's stack snapshot
 static void module_stack_tail_write(GP_CanvasContextImpl* ctx, int module_idx, const float* values, int count);
@@ -1081,11 +1106,11 @@ static void canvas_sync_root_rope_endpoints(GP_CanvasContextImpl* ctx, const GP_
     rope_sim_move_endpoints3(sim, rsi, ax, ay, plug_z, bx, by, plug_z);
 }
 
-static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, bool down, bool up) {
+static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, float x, float y, float dx, float dy, bool down, bool up, int button, float scroll) {
     if (!ctx) return;
-    // compute canvas/world coords for events
-    float fx = static_cast<float>(x + ctx->offset_x);
-    float fy = static_cast<float>(y + ctx->offset_y);
+    // compute canvas/world coords for events (floating point)
+    float fx = x + static_cast<float>(ctx->offset_x);
+    float fy = y + static_cast<float>(ctx->offset_y);
 
     // Click-drag tracking: independent of tool state. Dispatch start/move/end
     // events to any registered callback so other systems can subscribe.
@@ -1552,6 +1577,13 @@ static void canvas_record_mouse_input(GP_CanvasContextImpl* ctx, int x, int y, b
         state.mouse_y = static_cast<float>(y);
         if (down) state.mouse_down = 1;
         if (up) state.mouse_up = 1;
+        state.mouse_dx = dx;
+        state.mouse_dy = dy;
+        state.mouse_button = button;
+        state.mouse_scroll = scroll;
+        state.mouse_button_mask_down = down ? (button > 0 ? (1u << static_cast<uint32_t>(button)) : 0u) : 0u;
+        state.mouse_button_mask_up = up ? (button > 0 ? (1u << static_cast<uint32_t>(button)) : 0u) : 0u;
+        state.mouse_device_id = 0;
     }
 }
 
@@ -2361,6 +2393,29 @@ static void draw_module_top_ui(GP_CanvasContextImpl* ctx, int module_idx, const 
             if (n > 0) title += std::string(buf, static_cast<size_t>(std::max(0, n)));
         }
     }
+    // append attached-table type names for diagnostics via public API
+    if (module_idx >= 0 && module_idx < static_cast<int>(ctx->module_tables.size()) && ctx->module_tables[module_idx]) {
+        GP_TableContext* tbl = ctx->module_tables[module_idx];
+        const int kCap = 64;
+        int ids[kCap];
+        int total = gp_table_get_type_ids(tbl, ids, kCap);
+        if (total > 0) {
+            std::string ts;
+            int take = std::min<int>(total, kCap);
+            for (int i = 0; i < take; ++i) {
+                const ValueType* vt = ValueTypeRegistry::global().get(ids[i]);
+                if (vt) {
+                    if (!ts.empty()) ts += ",";
+                    // vt->name is a char array
+                    ts += std::string(vt->name, vt->name + std::strlen(vt->name));
+                } else {
+                    if (!ts.empty()) ts += ",";
+                    ts += std::to_string(static_cast<int>(ids[i]));
+                }
+            }
+            title += std::string("  [table=") + ts + "]";
+        }
+    }
     blit_text(title.c_str(), sx + kModuleTopPadding, cursor_y, 1.05f, Color{220,220,230,255});
     cursor_y += kModuleTitleRowH;
 
@@ -3090,7 +3145,7 @@ static bool parse_tool_kind_from_id(const std::string& tool_id, ModuleToolKind& 
         if (ch < '0' || ch > '9') return false;
         value = value * 10 + (ch - '0');
     }
-    const int max_kind = static_cast<int>(ModuleToolKind::Clone);
+    const int max_kind = static_cast<int>(ModuleToolKind::FontRenderer);
     if (value <= 0 || value > max_kind) return false;
     out_kind = static_cast<ModuleToolKind>(value);
     return true;
@@ -3379,6 +3434,7 @@ static const ToolMenuItem kToolMenuItems[] = {
     { CANVAS_ACT_MENU_TOOL_MUL, LABEL_TOOL_MUL, ModuleToolKind::Multiply },
     { CANVAS_ACT_MENU_TOOL_DIV, LABEL_TOOL_DIV, ModuleToolKind::Divide },
     { CANVAS_ACT_MENU_TOOL_MOD, LABEL_TOOL_MOD, ModuleToolKind::Modulo },
+    { CANVAS_ACT_MENU_TOOL_ALLOCATOR, LABEL_TOOL_ALLOCATOR, ModuleToolKind::TensorAllocator },
     { CANVAS_ACT_MENU_TOOL_KEYBOARD, LABEL_TOOL_KEYBOARD, ModuleToolKind::KeyboardListener },
     { CANVAS_ACT_MENU_TOOL_MOUSE, LABEL_TOOL_MOUSE, ModuleToolKind::MouseListener },
     { CANVAS_ACT_MENU_TOOL_STACK, LABEL_TOOL_STACK, ModuleToolKind::StackDisplay },
@@ -3909,11 +3965,39 @@ static void canvas_reinstantiate_all_ropes(GP_CanvasContextImpl* ctx) {
     RopeSim* sim = rope_sim_create(1024, segs);
     GP_TableContext* root = ctx->container_table;
     if (root) gp_table_attach_rope_sim(root, sim, 1);
+    // diagnostic: report sim creation and attachment
+    printf("canvas_reinstantiate_all_ropes: created sim=%p root=%p segs=%d\n", (void*)sim, (void*)root, segs);
     for (GP_TableContext* t : ctx->module_tables) {
         if (t && t != root) gp_table_attach_rope_sim(t, sim, 0);
     }
+    // Clear ephemeral overlay-created rope indices (no persistent rope_uid)
+    // so the overlay raster will recreate ropes in the freshly-created sim.
+    for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+        if (ctx->edges[ei].rope_uid == 0ull) ctx->edges[ei].rope_idx = -1;
+    }
     if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
         gp_canvas_mark_rope_map_dirty(cvs);
+        // Immediately refresh the canvas rope->sim mapping so canvas edge
+        // entries get rebound to the newly-created RopeSim indices.
+        // Without this, overlay rendering may hold stale/empty indices that
+        // point to no vertices (seen as verts==0 in logs).
+        canvas_refresh_rope_map(ctx);
+        // Deterministic rebind: for any canvas edge that has a persistent
+        // `rope_uid`, consult the canvas `rope_id_map` to find the table
+        // that owns that id and ask the table to resolve the id to the
+        // current sim index. This avoids leaving stale numeric indices
+        // (from the previous RopeSim instance) on canvas edges.
+        for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
+            uint64_t uid = ctx->edges[ei].rope_uid;
+            if (uid == 0ull) continue;
+            auto it = ctx->rope_id_map.find(uid);
+            if (it == ctx->rope_id_map.end()) continue;
+            GP_TableContext* t = it->second.table;
+            if (!t) continue;
+            int resolved = gp_table_resolve_rope_id_to_sim_index(t, uid);
+            if (resolved >= 0) ctx->edges[ei].rope_idx = resolved;
+            else ctx->edges[ei].rope_idx = -1;
+        }
     }
 }
 
@@ -4444,6 +4528,8 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                     if (mi >= 0 && mi < static_cast<int>(c->module_tables.size()) && c->module_tables[mi]) {
                         gp_table_set_sim_enabled(c->module_tables[mi], c->module_sim_enabled[mi]);
                     }
+                    // ensure canvas re-renders rope visuals after sim toggle
+                    gp_canvas_mark_rope_map_dirty(reinterpret_cast<GP_CanvasContext*>(c));
                     printf("gp_canvas_on_click: module %d sim_enabled -> %d\n", mi, c->module_sim_enabled[mi]);
                 } else {
                     // No module target — treat as canvas-root simulator toggle (toolbar SIM)
@@ -4499,6 +4585,8 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
                     int next = cur ? 0 : 1;
                     // Toggle per-table sim enable as before
                     gp_table_set_sim_enabled(root, next);
+                    // ensure canvas rope visuals are refreshed immediately when root sim toggles
+                    gp_canvas_mark_rope_map_dirty(reinterpret_cast<GP_CanvasContext*>(c));
                     // Also toggle a toolbar-level global pause so the canvas root sim
                     // (and all attached table sims) defer to the global skip decision.
                     c->sim_root_paused = next ? 0 : 1;
@@ -4686,6 +4774,10 @@ static RopeSim* canvas_require_root_sim(GP_CanvasContextImpl* ctx) {
         sim = rope_sim_create(1024, max_segs);
         gp_table_attach_rope_sim(root, sim, 1);
     }
+    // diagnostic: report when a sim is returned (helps detect root-sim lifecycle)
+#if defined(GP_CANVAS_DEBUG_PRINTF)
+    printf("canvas_require_root_sim: root=%p sim=%p\n", (void*)root, (void*)sim);
+#endif
     return sim;
 }
 
@@ -4999,7 +5091,8 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
             uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(row_idx)) << 32) |
                 (static_cast<uint64_t>(static_cast<uint32_t>(led_col_idx)) << 16) | // LED column index
                 static_cast<uint64_t>(0); // single LED
-            gp_table_set_key_type_hint(t, key, /*type_id=*/0, is_output ? 0 : 1, is_output ? 1 : 0);
+            int float_tid = ValueTypeRegistry::global().builtin(VT_FLOAT32);
+            gp_table_set_key_type_hint(t, key, /*type_id=*/float_tid, is_output ? 0 : 1, is_output ? 1 : 0);
             if (st) gp_table_enqueue_bind_stage_port(t, key, st, is_output ? 1 : 0, channel);
         };
         bind_port(0, /*led_col_idx=*/1, /*is_output=*/false, /*channel=*/0);
@@ -5282,7 +5375,8 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
         }
         for (int li = 0; li < led_count; ++li) {
             uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(ri)) << 32) | (static_cast<uint64_t>(static_cast<uint32_t>(col_idx)) << 16) | static_cast<uint64_t>(static_cast<uint32_t>(li));
-            gp_table_set_key_type_hint(t, key, 0, is_input ? 1 : 0, is_input ? 0 : 1);
+            int float_tid = ValueTypeRegistry::global().builtin(VT_FLOAT32);
+            gp_table_set_key_type_hint(t, key, float_tid, is_input ? 1 : 0, is_input ? 0 : 1);
         }
     }
     

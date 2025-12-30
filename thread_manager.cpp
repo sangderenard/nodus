@@ -4,12 +4,22 @@
 #include "stage_abi.h"
 #include "canvas_abi.h"
 #include "tool_api.h"
+#include "value_types.h"
+#include "tools/sdlttf_to_torch.h"
 #include <chrono>
 #include "stage_abi.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <cstdio>
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
 
 // EventPayload is declared in canvas_abi.h and used for pointer-mode FIFO
 // events published by the canvas.
@@ -652,10 +662,19 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             }
             return input_state_loaded;
         };
-        auto pop_value = [&stack]() -> float {
-            if (stack.empty()) return 0.0f;
+        auto pop_value = [&]() -> float {
+            if (stack.empty()) {
+#if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
+                fprintf(stderr, "[DEBUG] pop_value mod=%d stack_empty\n", mod_idx);
+#endif
+                return 0.0f;
+            }
+            size_t before = stack.size();
             float v = stack.back();
             stack.pop_back();
+#if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
+            fprintf(stderr, "[DEBUG] pop_value mod=%d popped=%f stack_before=%zu stack_after=%zu\n", mod_idx, v, before, stack.size());
+#endif
             return v;
         };
         GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
@@ -700,16 +719,31 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             if (tried_row && tbl_row.reserved0 > 0) {
                                 // Pointer mode: consume opaque EventPayload when the FIFO stride can safely hold a pointer.
                                 if (edge_stride_allows_pointer(fifo_table, edge_idx)) {
-                                    void* maybe_p = nullptr;
-                                    if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p)) {
+                                    // Consume all available pointer-mode EventPayloads for bulk handling.
+                                    while (true) {
+                                        void* maybe_p = nullptr;
+                                        if (!(gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p))) break;
                                         EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
                                         void* pa = ep->pending;
                                         GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-                                        if (canvas_single) {
-                                            gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
-                                            gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
-                                            gp_canvas_invoke_pending_action(canvas_single, pa);
-                                            gp_canvas_free_pending_action(canvas_single, pa);
+                                        if (canvas_single && pa) {
+                                            // If this pending action encodes a text/tensor action
+                                            // deliver its payload into the module frame port and
+                                            // stash it for the tool to consume and free.
+                                            struct MinimalPending { int32_t action_id; };
+                                            auto *ptest = reinterpret_cast<MinimalPending*>(pa);
+                                            if (ptest && (ptest->action_id == CANVAS_ACT_TEXT_RENDER || ptest->action_id == CANVAS_ACT_TENSOR_ALLOC)) {
+                                                // set module receive frame ptr to pending payload
+                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, pa);
+                                                // stash under managed map so tool can pop and free
+                                                gp_canvas_stash_managed_event_payload(canvas_single, ep->src_module, ep->frame_idx, pa);
+                                                // do not invoke or free here; tool will handle
+                                            } else {
+                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                                gp_canvas_invoke_pending_action(canvas_single, pa);
+                                                gp_canvas_free_pending_action(canvas_single, pa);
+                                            }
                                         }
                                         delete ep;
                                     }
@@ -741,6 +775,13 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             tinp.mouse_y = input_state.mouse_y;
                             tinp.mouse_down = input_state.mouse_down;
                             tinp.mouse_up = input_state.mouse_up;
+                            tinp.mouse_dx = input_state.mouse_dx;
+                            tinp.mouse_dy = input_state.mouse_dy;
+                            tinp.mouse_button = input_state.mouse_button;
+                            tinp.mouse_scroll = input_state.mouse_scroll;
+                            tinp.mouse_button_mask_down = input_state.mouse_button_mask_down;
+                            tinp.mouse_button_mask_up = input_state.mouse_button_mask_up;
+                            tinp.mouse_device_id = input_state.mouse_device_id;
                             tinp.key = input_state.key;
                             tinp.key_event = input_state.key_event;
                             tctx.input = &tinp;
@@ -776,72 +817,140 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     case ModuleToolKind::MouseListener: {
                         float mx = 0.0f;
                         float my = 0.0f;
-                        float down = 0.0f;
-                        float up = 0.0f;
+                        float mdx = 0.0f;
+                        float mdy = 0.0f;
+                        float scroll = 0.0f;
+                        uint32_t button_mask_down = 0u;
+                        uint32_t button_mask_up = 0u;
+                        int32_t device_id = 0;
                         // Prefer FIFO-backed events published into root table FIFOs
                         // for module-frame bindings. If none available, fall back
                         // to the GUI-captured input_state as a last resort.
                         bool handled_fifo = false;
                         GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
                         if (fifo_table) {
-                            const int frame_base = kModuleFrameContactBase;
-                            const int frame_end = frame_base + kModuleExtraLedCount * kModuleExtraLedRows;
-                            for (int contact_idx = frame_base; contact_idx < frame_end; ++contact_idx) {
-                                int edge_idx = -1;
-                                for (const auto& e : req.edges) {
-                                    if (e.b_module == mod_idx && e.b_contact_idx == contact_idx) {
-                                        edge_idx = e.edge_idx;
-                                        break;
-                                    }
-                                }
-                                if (edge_idx < 0) continue;
+                            // Only consider module-frame contacts that actually have
+                            // an edge bound to this module (respect the binding)
+                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                            for (const auto &e : req.edges) {
+                                if (e.b_module != mod_idx) continue;
+                                int contact_idx = e.b_contact_idx;
+                                int edge_idx = e.edge_idx;
+                                // Check whether this contact has a bound pending action
+                                void* bound_ptr = canvas_single ? gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, contact_idx) : nullptr;
+                                if (!bound_ptr) continue;
+                                struct MinimalPending { int32_t action_id; };
+                                auto *bound_min = reinterpret_cast<MinimalPending*>(bound_ptr);
+                                int32_t bound_action = bound_min ? bound_min->action_id : 0;
+                                // Only process contacts bound to mouse actions
+                                if (!(bound_action >= CANVAS_ACT_MOUSE_DOWN && bound_action <= CANVAS_ACT_MOUSE_SCROLL_DOWN)) continue;
+
                                 uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
                                 if (reader_key == 0) reader_key = 0x8000000000000000ull;
+                                // Debug: report computed reader_key and target edge so we can
+                                // compare it with the writer_key printed at publish time.
+                                fprintf(stderr, "[DBG] sub edge=%d -> mod=%d contact=%d reader_key=%llu (0x%llx)\n", edge_idx, mod_idx, contact_idx, (unsigned long long)reader_key, (unsigned long long)reader_key);
                                 int32_t unread = 0;
                                 gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
                                 gp_table_edge_unread(fifo_table, edge_idx, reader_key, &unread);
+                                fprintf(stderr, "[DBG] unread edge=%d reader_key=%llu -> %d\n", edge_idx, (unsigned long long)reader_key, unread);
                                 if (unread <= 0) continue;
-                                if (edge_stride_allows_pointer(fifo_table, edge_idx)) {
+                                if (!edge_stride_allows_pointer(fifo_table, edge_idx)) continue;
+
+                                // Consume all pointer-mode EventPayloads for this bound contact
+                                bool any = false;
+                                while (true) {
                                     void* maybe_p = nullptr;
-                                    if (gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p)) {
-                                        // Pointer-mode EventPayload expected
-                                        EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
-                                        if (ep) {
-                                            void* pa_void = ep->pending;
-                                            struct LocalPendingAction { int32_t action_id; GP_TableHitBox hit; };
-                                            auto *pa = reinterpret_cast<LocalPendingAction*>(pa_void);
-                                            if (pa) {
-                                                if (pa->action_id == CANVAS_ACT_MOUSE_DOWN) down = 1.0f;
-                                                else if (pa->action_id == CANVAS_ACT_MOUSE_UP) up = 1.0f;
-                                                mx = static_cast<float>(pa->hit.x0);
-                                                my = static_cast<float>(pa->hit.y0);
-                                                GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-                                                if (canvas_single) {
-                                                    gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
-                                                    gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
-                                                    gp_canvas_free_pending_action(canvas_single, pa_void);
-                                                }
-                                            }
-                                            delete ep;
-                                        }
-                                        handled_fifo = true;
-                                        input_state_used = true;
-                                        break;
+                                    if (!(gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p))) break;
+                                    any = true;
+                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                    if (!ep) { delete ep; continue; }
+                                    void* pa_void = ep->pending;
+                                    struct LocalPendingAction { int32_t action_id; GP_TableHitBox hit; float dx; float dy; int32_t button; float scroll; uint32_t button_mask_down; uint32_t button_mask_up; int32_t device_id; };
+                                    auto *pa = reinterpret_cast<LocalPendingAction*>(pa_void);
+                                    if (!pa) {
+                                        // nothing to do
+                                        if (ep) delete ep;
+                                        continue;
                                     }
+                                    // Only deliver payloads that match the contact's bound action
+                                    if (pa->action_id != bound_action) {
+                                        // Not our action: log and stash it back as managed payload
+                                        fprintf(stderr, "[DBG] stash not-matching action=%d bound=%d mod=%d contact=%d edge=%d src_mod=%d frame=%d\n", pa->action_id, bound_action, mod_idx, contact_idx, edge_idx, ep->src_module, ep->frame_idx);
+                                        GP_CanvasContext* c_single = gp_canvas_get_singleton();
+                                        if (c_single) {
+                                            gp_canvas_set_module_frame_ptr(c_single, ep->src_module, 0, ep->frame_idx, pa_void);
+                                            gp_canvas_stash_managed_event_payload(c_single, ep->src_module, ep->frame_idx, pa_void);
+                                        }
+                                        if (ep) delete ep;
+                                        continue;
+                                    }
+
+                                    // extract payload fields into locals
+                                    if (pa->action_id == CANVAS_ACT_MOUSE_SCROLL_UP || pa->action_id == CANVAS_ACT_MOUSE_SCROLL_DOWN) scroll = pa->scroll;
+                                    mx = static_cast<float>(pa->hit.x0);
+                                    my = static_cast<float>(pa->hit.y0);
+                                    mdx = pa->dx;
+                                    mdy = pa->dy;
+                                    if (pa->button_mask_down) button_mask_down = pa->button_mask_down;
+                                    else if (pa->button > 0) button_mask_down = (1u << static_cast<uint32_t>(pa->button));
+                                    if (pa->button_mask_up) button_mask_up = pa->button_mask_up;
+                                    else if (pa->button > 0) button_mask_up = (1u << static_cast<uint32_t>(pa->button));
+                                    device_id = pa->device_id;
+
+                                    // deliver this payload to the module's MouseListener stack
+                                    fprintf(stderr, "[DBG] deliver action=%d -> mod=%d contact=%d edge=%d src_mod=%d frame=%d mx=%f my=%f mdx=%f mdy=%f scroll=%f dev=%d down=0x%X up=0x%X\n", pa->action_id, mod_idx, contact_idx, edge_idx, ep->src_module, ep->frame_idx, mx, my, mdx, mdy, scroll, device_id, button_mask_down, button_mask_up);
+
+                                    // Push typed values into the module's raw byte stack
+                                    // (the single canonical stack). We require a RawStackFrame
+                                    // to be present for this contact; otherwise the event is
+                                    // dropped. Use the registry builtin id for float32.
+                                    GP_CanvasContext* canvas_for_push = gp_canvas_get_singleton();
+                                    RawStackFrame* rs_for_push = nullptr;
+                                    if (canvas_for_push) {
+                                        void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_for_push, mod_idx, meta.contact_idx);
+                                        rs_for_push = reinterpret_cast<RawStackFrame*>(maybe_raw);
+                                    }
+                                    if (!rs_for_push) {
+                                        fprintf(stderr, "[DBG] no raw stack frame for mod=%d contact=%d -> dropping event\n", mod_idx, contact_idx);
+                                    } else {
+                                        ValueTypeId vt_float = ValueTypeRegistry::global().builtin(VT_FLOAT32);
+                                        ValueTypeId vt_uint32 = ValueTypeRegistry::global().builtin(VT_UINT32);
+                                        ValueTypeId vt_int32 = ValueTypeRegistry::global().builtin(VT_INT32);
+
+                                        uint32_t up_v = button_mask_up;
+                                        uint32_t down_v = button_mask_down;
+                                        int32_t dev_v = device_id;
+
+                                        bool ok = raw_stack_push_typed(*rs_for_push, &up_v, vt_uint32)
+                                               && raw_stack_push_typed(*rs_for_push, &down_v, vt_uint32)
+                                               && raw_stack_push_typed(*rs_for_push, &dev_v, vt_int32)
+                                               && raw_stack_push_typed(*rs_for_push, &scroll, vt_float)
+                                               && raw_stack_push_typed(*rs_for_push, &my, vt_float)
+                                               && raw_stack_push_typed(*rs_for_push, &mx, vt_float)
+                                               && raw_stack_push_typed(*rs_for_push, &mdx, vt_float)
+                                               && raw_stack_push_typed(*rs_for_push, &mdy, vt_float);
+                                        if (!ok) {
+                                            fprintf(stderr, "[DBG] raw_stack_push_typed failed for mod=%d contact=%d\n", mod_idx, contact_idx);
+                                        }
+                                    }
+
+                                    if (canvas_single) {
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                        gp_canvas_free_pending_action(canvas_single, pa_void);
+                                    }
+
+                                    if (ep) delete ep;
+                                }
+                                if (any) {
+                                    handled_fifo = true;
+                                    input_state_used = true;
+                                    break;
                                 }
                             }
                         }
-                        if (!handled_fifo && load_input_state()) {
-                            mx = input_state.mouse_x;
-                            my = input_state.mouse_y;
-                            down = input_state.mouse_down ? 1.0f : 0.0f;
-                            up = input_state.mouse_up ? 1.0f : 0.0f;
-                            input_state_used = true;
-                        }
-                        stack.push_back(up);
-                        stack.push_back(down);
-                        stack.push_back(my);
-                        stack.push_back(mx);
+                        // Nothing further: per-payload pushes delivered inside the FIFO loop.
                         break;
                     }
                     case ModuleToolKind::StackDisplay: {
@@ -859,6 +968,232 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         int count = std::max(0, static_cast<int>(std::lround(count_f)));
                         for (int i = 0; i < count; ++i) {
                             stack.push_back(value);
+                        }
+                        break;
+                    }
+                    case ModuleToolKind::TensorAllocator: {
+                        // Built-in tensor allocator: operate on a RawStackFrame
+                        // stored in the module frame pointer for this contact.
+                        GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                        if (!canvas_single) break;
+                        void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, meta.contact_idx);
+                        if (!maybe_raw) break;
+                        RawStackFrame* rs = reinterpret_cast<RawStackFrame*>(maybe_raw);
+                        if (!rs) break;
+
+                        // Collect old pointers and shapes
+                        std::vector<torch::Tensor*> old_ptrs;
+                        std::vector<std::vector<int64_t>> shapes;
+
+                        ValueTypeId top_tid = kInvalidValueTypeId;
+                        while (true) {
+                            if (!raw_stack_peek_type(*rs, top_tid)) break;
+                            if (top_tid != ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR)) break;
+
+                            // Pop the tensor pointer
+                            torch::Tensor* tptr = nullptr;
+                            if (!raw_stack_pop_torch(*rs, tptr)) break;
+                            old_ptrs.push_back(tptr);
+
+                            // Pop consecutive int64 dims below the pointer (top-first order)
+                            std::vector<int64_t> dims;
+                            raw_stack_pop_int64s_while(*rs, dims);
+                            std::reverse(dims.begin(), dims.end()); // restore original push order
+                            shapes.push_back(std::move(dims));
+                        }
+
+                        if (old_ptrs.empty()) break;
+
+                        // Destroy old tensors
+                        for (auto p : old_ptrs) if (p) delete p;
+
+                        // Allocate new tensors for each recorded shape (same logical order)
+                        std::vector<torch::Tensor*> new_ptrs;
+                        new_ptrs.reserve(shapes.size());
+                        bool alloc_ok = true;
+                        try {
+                            for (const auto& s : shapes) {
+                                torch::Tensor* nptr = new torch::Tensor(torch::empty(s, torch::kFloat32));
+                                new_ptrs.push_back(nptr);
+                            }
+                        } catch (...) {
+                            alloc_ok = false;
+                        }
+                        if (!alloc_ok) {
+                            for (auto p : new_ptrs) delete p;
+                            break;
+                        }
+
+                        // Push new pointers back onto the raw stack in reverse so top ordering preserved
+                        for (auto it = new_ptrs.rbegin(); it != new_ptrs.rend(); ++it) {
+                            if (!raw_stack_push_torch(*rs, *it)) {
+                                // push failed: cleanup and abort
+                                for (auto p : new_ptrs) delete p;
+                                alloc_ok = false;
+                                break;
+                            }
+                        }
+                        // Clear and free any managed event payload that delivered this frame
+                        {
+                            int led_idx = (meta.contact_idx - kModuleFrameContactBase) % kModuleExtraLedCount;
+                            GP_CanvasContext* canvas_single2 = gp_canvas_get_singleton();
+                            if (canvas_single2) {
+                                gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 1, led_idx, nullptr);
+                                gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 0, led_idx, nullptr);
+                                void* mp = gp_canvas_pop_managed_event_payload(canvas_single2, mod_idx, led_idx);
+                                if (mp) {
+                                    // payload for tensor allocator is expected to be a RawStackFrame*
+                                    raw_stack_destroy_frame(reinterpret_cast<RawStackFrame*>(mp));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    case ModuleToolKind::FontRenderer: {
+                        // Row tool: consume integer codepoints until a torch tensor pointer
+                        // is encountered; then render the collected codepoints into the
+                        // provided tensor using SDL_ttf helper and push the tensor back.
+                        GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                        if (!canvas_single) break;
+                        void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, meta.contact_idx);
+                        if (!maybe_raw) break;
+                        RawStackFrame* rs = reinterpret_cast<RawStackFrame*>(maybe_raw);
+                        if (!rs) break;
+
+                        // Collect consecutive integer codepoints (preserve original types)
+                        struct IntItem { ValueTypeId tid; int64_t v; };
+                        std::vector<IntItem> popped_ints;
+                        ValueTypeId top_tid = kInvalidValueTypeId;
+                        while (rs->count > 0) {
+                            if (!raw_stack_peek_type(*rs, top_tid)) break;
+                            // If we hit a tensor pointer, stop collecting
+                            if (top_tid == ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR)) break;
+                            // If integer types, pop preserving size
+                            if (top_tid == ValueTypeRegistry::global().builtin(VT_INT64) || top_tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
+                                int64_t v = 0;
+                                if (!raw_stack_pop_typed(*rs, &v, top_tid)) break;
+                                popped_ints.push_back({top_tid, v});
+                                continue;
+                            } else if (top_tid == ValueTypeRegistry::global().builtin(VT_INT32) || top_tid == ValueTypeRegistry::global().builtin(VT_UINT32)) {
+                                int32_t v32 = 0;
+                                if (!raw_stack_pop_typed(*rs, &v32, top_tid)) break;
+                                popped_ints.push_back({top_tid, static_cast<int64_t>(v32)});
+                                continue;
+                            }
+                            // Non-integer and non-tensor encountered: stop scanning
+                            break;
+                        }
+
+                        // Next element must be a tensor pointer for a render target
+                        if (popped_ints.empty()) break; // nothing to render
+                        if (!raw_stack_peek_type(*rs, top_tid)) {
+                            // restore popped ints
+                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
+                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
+                                    int64_t v = it->v;
+                                    raw_stack_push_typed(*rs, &v, it->tid);
+                                } else {
+                                    int32_t v32 = static_cast<int32_t>(it->v);
+                                    raw_stack_push_typed(*rs, &v32, it->tid);
+                                }
+                            }
+                            break;
+                        }
+                        if (top_tid != ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR)) {
+                            // restore popped ints
+                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
+                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
+                                    int64_t v = it->v;
+                                    raw_stack_push_typed(*rs, &v, it->tid);
+                                } else {
+                                    int32_t v32 = static_cast<int32_t>(it->v);
+                                    raw_stack_push_typed(*rs, &v32, it->tid);
+                                }
+                            }
+                            break;
+                        }
+
+                        // Pop the tensor pointer
+                        torch::Tensor* target_ptr = nullptr;
+                        if (!raw_stack_pop_torch(*rs, target_ptr) || !target_ptr) {
+                            // restore popped ints
+                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
+                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
+                                    int64_t v = it->v;
+                                    raw_stack_push_typed(*rs, &v, it->tid);
+                                } else {
+                                    int32_t v32 = static_cast<int32_t>(it->v);
+                                    raw_stack_push_typed(*rs, &v32, it->tid);
+                                }
+                            }
+                            break;
+                        }
+
+                        // Reconstruct codepoint sequence in original push order
+                        std::vector<uint32_t> codepoints;
+                        codepoints.reserve(popped_ints.size());
+                        for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
+                            codepoints.push_back(static_cast<uint32_t>(it->v));
+                        }
+
+                        // Convert to UTF-16 string
+                        std::u16string utf16;
+                        utf16.reserve(codepoints.size());
+                        for (uint32_t cp : codepoints) {
+                            if (cp <= 0xFFFFu) {
+                                utf16.push_back(static_cast<char16_t>(cp));
+                            } else if (cp <= 0x10FFFFu) {
+                                uint32_t v = cp - 0x10000u;
+                                char16_t hi = static_cast<char16_t>((v >> 10) + 0xD800u);
+                                char16_t lo = static_cast<char16_t>((v & 0x3FFu) + 0xDC00u);
+                                utf16.push_back(hi);
+                                utf16.push_back(lo);
+                            } else {
+                                // invalid codepoint -> replace with U+FFFD
+                                utf16.push_back(static_cast<char16_t>(0xFFFD));
+                            }
+                        }
+
+                        // Perform rendering using a default font (delegating to the font module).
+                        try {
+                            SdlTtfGuard guard;
+                            // TODO: replace with global font-server cache; use demo font path as default
+                            FontHandle fh("assets/fonts/NotoSans-Regular.ttf", 24);
+                            SdlColor white{255,255,255,255};
+                            auto rendered = render_text_utf16_rgba_u8(fh.font, utf16, white, 0);
+                            // Assign into provided tensor pointer (replace contents)
+                            *target_ptr = rendered;
+                            // Push the tensor pointer back to indicate success
+                            if (!raw_stack_push_torch(*rs, target_ptr)) {
+                                // push failed: leave as-is but do not delete
+                            }
+                            // After rendering, clear and free managed payload if any
+                            {
+                                int led_idx = (meta.contact_idx - kModuleFrameContactBase) % kModuleExtraLedCount;
+                                GP_CanvasContext* canvas_single2 = gp_canvas_get_singleton();
+                                if (canvas_single2) {
+                                    gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 1, led_idx, nullptr);
+                                    gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 0, led_idx, nullptr);
+                                    void* mp = gp_canvas_pop_managed_event_payload(canvas_single2, mod_idx, led_idx);
+                                    if (mp) {
+                                        raw_stack_destroy_frame(reinterpret_cast<RawStackFrame*>(mp));
+                                    }
+                                }
+                            }
+                        } catch (...) {
+                            // On failure, restore popped ints and push target back unchanged
+                            if (target_ptr) {
+                                raw_stack_push_torch(*rs, target_ptr);
+                            }
+                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
+                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
+                                    int64_t v = it->v;
+                                    raw_stack_push_typed(*rs, &v, it->tid);
+                                } else {
+                                    int32_t v32 = static_cast<int32_t>(it->v);
+                                    raw_stack_push_typed(*rs, &v32, it->tid);
+                                }
+                            }
                         }
                         break;
                     }

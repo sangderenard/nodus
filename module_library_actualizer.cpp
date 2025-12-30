@@ -159,29 +159,29 @@ void emit_stack_step(std::ostringstream& ss, ModuleToolKind kind, int attachment
     switch (kind) {
         case ModuleToolKind::KeyboardListener:
             ss << "        {\n";
-            ss << "            float val = 0.0f;\n";
+            ss << "            int key = 0;\n";
             ss << "            if (input && input->key_event) {\n";
-            ss << "                val = static_cast<float>(input->key);\n";
+            ss << "                key = input->key;\n";
             ss << "            }\n";
-            ss << "            tool_stack_push(stack, val);\n";
+            ss << "            tool_stack_push_int(stack, key);\n";
             ss << "        }\n";
             break;
         case ModuleToolKind::MouseListener:
             ss << "        {\n";
-            ss << "            float mx = 0.0f;\n";
-            ss << "            float my = 0.0f;\n";
-            ss << "            float down = 0.0f;\n";
-            ss << "            float up = 0.0f;\n";
+            ss << "            int mx = 0;\n";
+            ss << "            int my = 0;\n";
+            ss << "            int down = 0;\n";
+            ss << "            int up = 0;\n";
             ss << "            if (input) {\n";
-            ss << "                mx = input->mouse_x;\n";
-            ss << "                my = input->mouse_y;\n";
-            ss << "                down = input->mouse_down ? 1.0f : 0.0f;\n";
-            ss << "                up = input->mouse_up ? 1.0f : 0.0f;\n";
+            ss << "                mx = static_cast<int>(input->mouse_x);\n";
+            ss << "                my = static_cast<int>(input->mouse_y);\n";
+            ss << "                down = input->mouse_down ? 1 : 0;\n";
+            ss << "                up = input->mouse_up ? 1 : 0;\n";
             ss << "            }\n";
-            ss << "            tool_stack_push(stack, up);\n";
-            ss << "            tool_stack_push(stack, down);\n";
-            ss << "            tool_stack_push(stack, my);\n";
-            ss << "            tool_stack_push(stack, mx);\n";
+            ss << "            tool_stack_push_int(stack, up);\n";
+            ss << "            tool_stack_push_int(stack, down);\n";
+            ss << "            tool_stack_push_int(stack, my);\n";
+            ss << "            tool_stack_push_int(stack, mx);\n";
             ss << "        }\n";
             break;
         case ModuleToolKind::StackDisplay:
@@ -191,15 +191,15 @@ void emit_stack_step(std::ostringstream& ss, ModuleToolKind kind, int attachment
             break;
         case ModuleToolKind::TableNumber:
             ss << "        {\n";
-            ss << "            float val = static_cast<float>(std::max(0, " << attachment_count << "));\n";
-            ss << "            tool_stack_push(stack, val);\n";
+            ss << "            int val = std::max(0, " << attachment_count << ");\n";
+            ss << "            tool_stack_push_int(stack, val);\n";
             ss << "        }\n";
             break;
         case ModuleToolKind::Clone:
             ss << "        {\n";
-            ss << "            float count_f = tool_stack_pop(stack);\n";
+            ss << "            int count = tool_stack_pop_int(stack);\n";
             ss << "            float value = tool_stack_pop(stack);\n";
-            ss << "            int count = std::max(0, static_cast<int>(std::lround(count_f)));\n";
+            ss << "            count = std::max(0, count);\n";
             ss << "            for (int i = 0; i < count; ++i) {\n";
             ss << "                tool_stack_push(stack, value);\n";
             ss << "            }\n";

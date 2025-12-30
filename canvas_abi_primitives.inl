@@ -1,3 +1,12 @@
+// Deferred console logging
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+
 // C-linkage prototypes for spline drawer implemented in table_abi.cpp
 extern "C" void table_draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, const float* hues, int hue_count, int samples_per_segment, float hue_intensity);
 extern "C" void table_draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca, int samples_per_segment);

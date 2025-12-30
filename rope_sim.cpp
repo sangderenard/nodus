@@ -6,6 +6,13 @@
 #include <cstring>
 #include <cstddef>
 #include <algorithm>
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
 
 // Optional compile-time Eigen path: define EIGEN_SIM to enable Eigen-accelerated paths.
 #ifdef EIGEN_SIM

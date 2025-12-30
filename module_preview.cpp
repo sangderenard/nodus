@@ -40,9 +40,11 @@ void gp_module_preview_build(const GP_ModulePreviewInput* input, GP_ModulePrevie
     }
 
     // Determine largest square we can form from the tail values
-    int available = std::clamp(input->stack_tail_count, 0, 64);
-    int s = static_cast<int>(std::floor(std::sqrt(static_cast<float>(available))));
-    if (s <= 0) {
+        // Determine square side to render from tail values. Use ceil so small
+        // counts are padded up to the next square and visible in preview.
+        int available = std::clamp(input->stack_tail_count, 0, 64);
+        int s = static_cast<int>(std::ceil(std::sqrt(static_cast<float>(std::max(1, available)))));
+        if (available <= 0 || s <= 0) {
         const int cols = out_w * 4;
         for (int y = 0; y < out_h; ++y) {
             std::memset(output->rgba + y * out_pitch, 0, static_cast<size_t>(std::min(cols, out_pitch)));
@@ -57,15 +59,17 @@ void gp_module_preview_build(const GP_ModulePreviewInput* input, GP_ModulePrevie
     int start_idx = 0;
     if (available > src_pixels) start_idx = available - src_pixels;
 
-    // find min/max in the used tail slice
-    float vmin = input->stack_tail[start_idx];
-    float vmax = input->stack_tail[start_idx];
-    for (int i = 0; i < src_pixels; ++i) {
-        float v = input->stack_tail[start_idx + i];
-        if (v < vmin) vmin = v;
-        if (v > vmax) vmax = v;
-    }
-    float denom = vmax - vmin;
+        // find min/max in the used tail slice (pad missing values with 0)
+        float vmin = std::numeric_limits<float>::infinity();
+        float vmax = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < src_pixels; ++i) {
+            int src_i = start_idx + i;
+            float v = 0.0f;
+            if (src_i >= 0 && src_i < available) v = input->stack_tail[src_i];
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+        float denom = vmax - vmin;
 
     // fill source square as grayscale RGBA; if flat signal, render mid-gray
     if (std::fabs(denom) < 1e-6f) {

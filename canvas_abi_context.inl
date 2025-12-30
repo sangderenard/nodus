@@ -1,4 +1,7 @@
 // Minimal internal canvas context implementation
+#include <thread>
+#include <atomic>
+#include <array>
 // Central ID hook type used by canvas-wide ID generation.
 typedef uint64_t (*GP_CanvasIdHookFn)(GP_CanvasContext* ctx, uint64_t hint);
 struct GP_CanvasContextImpl {
@@ -100,6 +103,9 @@ struct GP_CanvasContextImpl {
     std::vector<int> module_chat_ttl; // frames remaining to show chat highlight
     // pending module commit/build requests to process outside of input callbacks
     std::vector<int> pending_module_commits;
+    // Managed event payloads stashed by the manager when delivering action
+    // events to module frame ports. Keyed by (module_idx<<32)|led_idx.
+    std::unordered_map<uint64_t, void*> managed_event_payloads;
     // cable style/hues
     int jacket_px = 4;
     int jacket_border = 2;
@@ -112,7 +118,7 @@ struct GP_CanvasContextImpl {
     // click-listen: when true, root-table click actions are captured rather
     // than immediately dispatched. `pending_action` holds an allocated
     // copy of the action intent and can be bound into module frame ptrs.
-    struct PendingAction { int32_t action_id = 0; GP_TableHitBox hit{}; uint64_t aux_uid = 0ull; };
+    struct PendingAction { int32_t action_id = 0; GP_TableHitBox hit{}; uint64_t aux_uid = 0ull; float dx = 0.0f; float dy = 0.0f; int32_t button = 0; float scroll = 0.0f; uint32_t button_mask_down = 0u; uint32_t button_mask_up = 0u; int32_t device_id = 0; };
     bool click_listen_mode = false;
     PendingAction* pending_action = nullptr; // owned when non-null
     // transient module index used by root-table action dispatch
@@ -215,6 +221,28 @@ struct GP_CanvasContextImpl {
     std::unordered_map<unsigned long long, int> overlay_key_map;
     // pending snapshots waiting for overlays or backing tables to exist
     std::vector<CanvasMetaSnapshot> pending_meta_snapshots;
+    // Autosave policy: control whether autosave uses timer or action-listener.
+    enum AutosavePolicy { AUTOSAVE_DISABLED = 0, AUTOSAVE_TIMER = 1, AUTOSAVE_ACTION = 2 };
+    int autosave_policy = AUTOSAVE_TIMER;
+    // Per-canvas autosave parameters (path may be empty to disable)
+    std::string autosave_path;
+    double autosave_interval_s = 0.0;
+    double autosave_accum_s = 0.0;
+    // In-memory last serialized save signature buffer (double-buffered) to avoid unnecessary disk writes.
+    std::array<std::string, 2> last_save_buf{};
+    std::atomic<int> last_save_idx{0}; // index of the currently active signature
+    // Action-driven autosave controls
+    std::vector<int> autosave_action_whitelist; // actions that may trigger autosave when policy==ACTION
+    double autosave_action_delay_s = 0.1; // delay after action completion before saving
+    double autosave_action_cooldown_s = 1.0; // minimum time between autosaves
+    std::atomic<long long> autosave_last_action_ts_ms{0};
+    std::atomic<long long> autosave_last_save_ts_ms{0};
+    // Background autosave worker control (no mutex usage; use atomics)
+    std::unique_ptr<std::thread> autosave_thread;
+    std::atomic<int> autosave_thread_stop{0};
+    std::atomic<int> autosave_save_requested{0}; // set to 1 to request a save
+    std::atomic<long long> autosave_save_request_when_ms{0}; // ms timestamp when save may be performed
+    std::atomic<int> autosave_save_in_progress{0};
     // Post-load pending meta groups that need deterministic finalize pass
     struct PostLoadMetaPending { GP_TableContext* table; GP_MetaGroup* mg; float ring_u; int ring_mode; unsigned long long overlay_a; unsigned long long overlay_b; };
     std::vector<PostLoadMetaPending> post_load_meta_pending;
@@ -289,10 +317,7 @@ struct GP_CanvasContextImpl {
     int container_table_owned = 0;
     int root_actions_installed = 0;
     int root_module_idx = -1; // synthetic module that mirrors the canvas root table
-    // autosave parameters (path may be empty to disable)
-    std::string autosave_path;
-    double autosave_interval_s = 0.0;
-    double autosave_accum_s = 0.0;
+    
     bool thread_mgr_paused = true;
     int thread_mgr_delay_ms = 0;
     double thread_mgr_delay_accum_s = 0.0;
@@ -396,6 +421,61 @@ static void canvas_refresh_rope_map(GP_CanvasContextImpl* c) {
         if (got > 0) {
             gp_table_set_rope_ids_from_array(table, tmp.data(), got);
             printf("canvas: refreshed rope map for table=%p entries=%d\n", (void*)table, got);
+            // Diagnostic: inspect the table's sim and a few rope entries
+            {
+                RopeSim* rs = gp_table_get_rope_sim(table);
+                if (rs) {
+                    int sample = std::min(got, 5);
+                    for (int i = 0; i < sample; ++i) {
+                        uint64_t rid = tmp[static_cast<size_t>(i)];
+                        int ridx = gp_table_resolve_rope_id_to_sim_index(table, rid);
+                        int vc = -1;
+                        if (ridx >= 0) vc = rope_sim_get_vertex_count(rs, ridx);
+                        printf("  canvas_refresh: table=%p sim=%p id[%d]=%llu -> idx=%d verts=%d\n", (void*)table, (void*)rs, i, (unsigned long long)rid, ridx, vc);
+                    }
+                    // Also report any canvas edges that map to this table+sim and their vertex counts
+                    for (size_t ei = 0; ei < c->edges.size(); ++ei) {
+                        int eridx = c->edges[ei].rope_idx;
+                        if (eridx < 0) continue;
+                        uint64_t found = canvas_find_rope_id_for_sim(c, table, eridx);
+                        if (found == 0ull) continue;
+                        int vc2 = rope_sim_get_vertex_count(rs, eridx);
+                        printf("  canvas.edge[%zu] rope_idx=%d table=%p rope_id=%llu verts=%d\n", ei, eridx, (void*)table, (unsigned long long)found, vc2);
+                    }
+                } else {
+                    printf("  canvas_refresh: table=%p has no rope sim attached\n", (void*)table);
+                }
+            }
+            // Ensure canvas edges that have persistent rope UIDs are updated
+            // to reference the current sim index. This prevents stale numeric
+            // indices (from a previous RopeSim instance) from being used
+            // against the newly-attached simulator.
+            for (size_t ei = 0; ei < c->edges.size(); ++ei) {
+                uint64_t uid = c->edges[ei].rope_uid;
+                if (uid == 0ull) continue;
+                // Only update edges that are associated with this table
+                // (edge endpoints must map into the table).
+                const auto &e = c->edges[ei];
+                uint64_t ka = (static_cast<uint64_t>(static_cast<uint32_t>(e.desc.a_module)) << 32) |
+                              (static_cast<uint64_t>(static_cast<uint32_t>(e.desc.a_contact_idx)) << 16) |
+                              static_cast<uint64_t>(0);
+                uint64_t kb = (static_cast<uint64_t>(static_cast<uint32_t>(e.desc.b_module)) << 32) |
+                              (static_cast<uint64_t>(static_cast<uint32_t>(e.desc.b_contact_idx)) << 16) |
+                              static_cast<uint64_t>(0);
+                int edge_idx = -1;
+                if (!gp_table_edge_index_for_pair(table, ka, kb, &edge_idx)) continue;
+                if (edge_idx < 0) continue;
+                // resolve persistent id -> sim index for this table
+                int resolved = canvas_resolve_rope_id_to_sim_index(table, uid);
+                if (resolved >= 0) {
+                    if (c->edges[ei].rope_idx != resolved) {
+                        c->edges[ei].rope_idx = resolved;
+                    }
+                } else {
+                    // Clear stale indices so overlay/rendering will recreate ropes
+                    c->edges[ei].rope_idx = -1;
+                }
+            }
         }
     }
     c->rope_map_dirty = false;

@@ -1,4 +1,11 @@
 // Relaxation control
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
 int32_t gp_table_relax_set_mode(GP_TableContext* ctx, int32_t mode) {
     if (!ctx) return 0;
     ctx->relax_mode = mode;
@@ -905,6 +912,21 @@ int32_t gp_table_render_rgba_with_state(
                 }
             }
             bool reverse_phases = info_b.is_output && !info_a.is_output;
+            // If table sim is disabled, draw a unified fallback curve (default: 3-point sag)
+            int sim_on = 1; gp_table_get_sim_enabled(ctx, &sim_on);
+            if (!sim_on) {
+                int ax = info_a.x;
+                int ay = info_a.y;
+                int bx = info_b.x;
+                int by = info_b.y;
+                uint32_t flags = 0u;
+                if (ei < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[ei];
+                // Table code does not have canvas color helpers; pick a neutral tint when subgroup present.
+                Color pcol = (flags != 0u) ? Color{200,160,80,220} : Color{200,200,200, static_cast<uint8_t>(std::lround(180.0f))};
+                draw_fallback_rope(out_rgba, w_local, h_local, pitch_local, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), ctx->st.cable_jacket_px, ctx->st.cable_jacket_border, pcol, 1);
+                continue;
+            }
+
             // resolve sim index from persistent rope id mapping
             uint64_t rope_id = (ei < ctx->rope_ids.size()) ? ctx->rope_ids[ei] : 0ull;
             int rope_idx = -1;

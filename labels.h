@@ -111,6 +111,7 @@
 #define LABEL_TOOL_CLONE "Clone"
 #define LABEL_TOOL_RECT "RectRGBA"
 #define LABEL_TOOL_NUMBER "Number"
+#define LABEL_TOOL_ALLOCATOR "TensorAllocator"
 
 // Module labels
 #define LABEL_MODULE_TABLE "Table"

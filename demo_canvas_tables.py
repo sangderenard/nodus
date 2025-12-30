@@ -143,16 +143,26 @@ def load_canvas_lib():
     # prefer the real on_mouse_down symbol if exported; otherwise fall back to on_click
     try:
         lib.gp_canvas_on_mouse_down.restype = ctypes.c_int
-        lib.gp_canvas_on_mouse_down.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+        lib.gp_canvas_on_mouse_down.argtypes = (ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int)
     except AttributeError:
-        # fallback: alias to gp_canvas_on_click so older builds still work
+        # fallback: alias to gp_canvas_on_click so older builds still work (coords rounded)
         lib.gp_canvas_on_mouse_down = lib.gp_canvas_on_click
         lib.gp_canvas_on_mouse_down.restype = ctypes.c_int
         lib.gp_canvas_on_mouse_down.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
     lib.gp_canvas_on_mouse_move.restype = ctypes.c_int
-    lib.gp_canvas_on_mouse_move.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+    lib.gp_canvas_on_mouse_move.argtypes = (ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float)
     lib.gp_canvas_on_mouse_up.restype = ctypes.c_int
-    lib.gp_canvas_on_mouse_up.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+    try:
+        lib.gp_canvas_on_mouse_up.argtypes = (ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int)
+    except AttributeError:
+        # alias fallback handled below
+        lib.gp_canvas_on_mouse_up.argtypes = (ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float)
+    try:
+        lib.gp_canvas_on_mouse_scroll.restype = ctypes.c_int
+        lib.gp_canvas_on_mouse_scroll.argtypes = (ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float)
+    except AttributeError:
+        # older builds may not export scroll API — ignore
+        pass
     lib.gp_canvas_set_offset.restype = ctypes.c_int
     lib.gp_canvas_set_offset.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
     lib.gp_canvas_get_offset.restype = ctypes.c_int
@@ -232,14 +242,28 @@ class CanvasBackend:
         with self.lock:
             self.lib.gp_canvas_destroy(self.ctx)
 
-    def handle_mouse(self, kind: str, x: int, y: int) -> bool:
+    def handle_mouse(self, kind: str, x: int, y: int, dx: float = 0.0, dy: float = 0.0, button: int = 0, scroll: float = 0.0) -> bool:
         with self.lock:
             if kind == "down":
-                return bool(self.lib.gp_canvas_on_mouse_down(self.ctx, x, y))
+                try:
+                    return bool(self.lib.gp_canvas_on_mouse_down(self.ctx, ctypes.c_float(x), ctypes.c_float(y), ctypes.c_float(dx), ctypes.c_float(dy), ctypes.c_int(button)))
+                except Exception:
+                    return bool(self.lib.gp_canvas_on_click(self.ctx, int(x), int(y)))
             if kind == "up":
-                return bool(self.lib.gp_canvas_on_mouse_up(self.ctx, x, y))
+                try:
+                    return bool(self.lib.gp_canvas_on_mouse_up(self.ctx, ctypes.c_float(x), ctypes.c_float(y), ctypes.c_float(dx), ctypes.c_float(dy), ctypes.c_int(button)))
+                except Exception:
+                    return bool(self.lib.gp_canvas_on_click(self.ctx, int(x), int(y)))
             if kind == "move":
-                return bool(self.lib.gp_canvas_on_mouse_move(self.ctx, x, y))
+                try:
+                    return bool(self.lib.gp_canvas_on_mouse_move(self.ctx, ctypes.c_float(x), ctypes.c_float(y), ctypes.c_float(dx), ctypes.c_float(dy)))
+                except Exception:
+                    return False
+            if kind == "scroll":
+                try:
+                    return bool(self.lib.gp_canvas_on_mouse_scroll(self.ctx, ctypes.c_float(x), ctypes.c_float(y), ctypes.c_float(dx), ctypes.c_float(dy), ctypes.c_float(scroll)))
+                except Exception:
+                    return False
             if kind == "click":
                 return bool(self.lib.gp_canvas_on_click(self.ctx, x, y))
         return False
@@ -571,6 +595,10 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
             kind = str(payload.get("type", ""))
             x = int(payload.get("x", -1))
             y = int(payload.get("y", -1))
+            dx = float(payload.get("dx", 0.0))
+            dy = float(payload.get("dy", 0.0))
+            button = int(payload.get("button", 0))
+            scroll = float(payload.get("scroll", 0.0))
         except Exception:
             self.send_error(400, "Malformed JSON")
             return
@@ -582,7 +610,7 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response(503, body, "application/json")
                 return
             if 0 <= x < self.server.backend.width and 0 <= y < self.server.backend.height:  # type: ignore[attr-defined]
-                handled = self.server.backend.handle_mouse(kind, x, y)  # type: ignore[attr-defined]
+                handled = self.server.backend.handle_mouse(kind, x, y, dx, dy, button, scroll)  # type: ignore[attr-defined]
         body = json.dumps({"handled": handled}).encode("utf-8")
         self._send_response(200, body, "application/json")
 
@@ -677,17 +705,38 @@ def run_pygame_demo(width: int, height: int) -> int:
                     lib.gp_canvas_on_key(cctx, int(ev.key), int(sc), 0, int(mods))
                 except Exception:
                     pass
-            elif ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
-                mx, my = ev.pos
+            elif ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION, pygame.MOUSEWHEEL):
+                if ev.type == pygame.MOUSEWHEEL:
+                    mx, my = pygame.mouse.get_pos()
+                else:
+                    mx, my = ev.pos
                 if my >= table_h and my < table_h + canvas_h:
                     cx = int(mx)
                     cy = int(my - table_h)
                     if ev.type == pygame.MOUSEBUTTONDOWN:
-                        lib.gp_canvas_on_mouse_down(cctx, cx, cy)
+                        btn = getattr(ev, 'button', 0)
+                        try:
+                            lib.gp_canvas_on_mouse_down(cctx, ctypes.c_float(cx), ctypes.c_float(cy), ctypes.c_float(0.0), ctypes.c_float(0.0), ctypes.c_int(btn))
+                        except Exception:
+                            lib.gp_canvas_on_click(cctx, cx, cy)
                     elif ev.type == pygame.MOUSEBUTTONUP:
-                        lib.gp_canvas_on_mouse_up(cctx, cx, cy)
+                        btn = getattr(ev, 'button', 0)
+                        try:
+                            lib.gp_canvas_on_mouse_up(cctx, ctypes.c_float(cx), ctypes.c_float(cy), ctypes.c_float(0.0), ctypes.c_float(0.0), ctypes.c_int(btn))
+                        except Exception:
+                            lib.gp_canvas_on_click(cctx, cx, cy)
                     elif ev.type == pygame.MOUSEMOTION:
-                        lib.gp_canvas_on_mouse_move(cctx, cx, cy)
+                        rel = getattr(ev, 'rel', (0, 0))
+                        try:
+                            lib.gp_canvas_on_mouse_move(cctx, ctypes.c_float(cx), ctypes.c_float(cy), ctypes.c_float(rel[0]), ctypes.c_float(rel[1]))
+                        except Exception:
+                            pass
+                    elif ev.type == pygame.MOUSEWHEEL:
+                        scroll = getattr(ev, 'y', 0)
+                        try:
+                            lib.gp_canvas_on_mouse_scroll(cctx, ctypes.c_float(cx), ctypes.c_float(cy), ctypes.c_float(0.0), ctypes.c_float(0.0), ctypes.c_float(scroll))
+                        except Exception:
+                            pass
 
         surf_table = None
         if table_h <= 0:

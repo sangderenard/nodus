@@ -40,20 +40,20 @@ public:
         (void)input;
         // step 0: MouseListener
         {
-            float mx = 0.0f;
-            float my = 0.0f;
-            float down = 0.0f;
-            float up = 0.0f;
+            int mx = 0;
+            int my = 0;
+            int down = 0;
+            int up = 0;
             if (input) {
-                mx = input->mouse_x;
-                my = input->mouse_y;
-                down = input->mouse_down ? 1.0f : 0.0f;
-                up = input->mouse_up ? 1.0f : 0.0f;
+                mx = static_cast<int>(input->mouse_x);
+                my = static_cast<int>(input->mouse_y);
+                down = input->mouse_down ? 1 : 0;
+                up = input->mouse_up ? 1 : 0;
             }
-            tool_stack_push(stack, up);
-            tool_stack_push(stack, down);
-            tool_stack_push(stack, my);
-            tool_stack_push(stack, mx);
+            tool_stack_push_int(stack, up);
+            tool_stack_push_int(stack, down);
+            tool_stack_push_int(stack, my);
+            tool_stack_push_int(stack, mx);
         }
     }
 

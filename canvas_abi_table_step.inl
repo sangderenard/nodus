@@ -1,4 +1,11 @@
 extern "C" int gp_canvas_create_table(GP_CanvasContext* ctx_, int module_idx) {
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return 0;
@@ -360,11 +367,13 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
         }
     }
     // autosave: accumulate dt and write canvas file when interval reached
-    if (!c->autosave_path.empty() && c->autosave_interval_s > 0.0) {
+    if (c->autosave_policy == GP_CanvasContextImpl::AUTOSAVE_TIMER && !c->autosave_path.empty() && c->autosave_interval_s > 0.0) {
         c->autosave_accum_s += static_cast<double>(dt);
         if (c->autosave_accum_s >= c->autosave_interval_s) {
             // attempt save; ignore failures
-            gp_canvas_save_to_file(ctx_, c->autosave_path.c_str());
+            if (gp_canvas_save_to_file(ctx_, c->autosave_path.c_str())) {
+                (void)gp_canvas_update_last_save_signature(ctx_);
+            }
             c->autosave_accum_s = 0.0;
         }
     }

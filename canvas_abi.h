@@ -156,9 +156,14 @@ int gp_canvas_get_root_module_idx();
 int gp_canvas_on_click(GP_CanvasContext* ctx, int x, int y);
 
 // Mouse drag handlers to support click-and-dragging modules.
-int gp_canvas_on_mouse_down(GP_CanvasContext* ctx, int x, int y);
-int gp_canvas_on_mouse_move(GP_CanvasContext* ctx, int x, int y);
-int gp_canvas_on_mouse_up(GP_CanvasContext* ctx, int x, int y);
+// Mouse event APIs now use floating-point coordinates and deltas (SDL3 provides
+// higher-precision mouse values). Each event supplies local canvas coords and
+// motion deltas (dx, dy).
+int gp_canvas_on_mouse_down(GP_CanvasContext* ctx, float x, float y, float dx, float dy, int button);
+int gp_canvas_on_mouse_move(GP_CanvasContext* ctx, float x, float y, float dx, float dy);
+int gp_canvas_on_mouse_up(GP_CanvasContext* ctx, float x, float y, float dx, float dy, int button);
+// Scroll events: `scroll` positive for up, negative for down.
+int gp_canvas_on_mouse_scroll(GP_CanvasContext* ctx, float x, float y, float dx, float dy, float scroll);
 // Deliver a keyboard event to the canvas host. Returns 1 if handled.
 int gp_canvas_on_key(GP_CanvasContext* ctx, int key, int scancode, int action, int mods);
 // Set/get the canvas viewport offset (world origin mapped to local (0,0)).
@@ -275,6 +280,18 @@ int gp_canvas_bind_action_ptr_to_module_port(GP_CanvasContext* ctx, int module_i
 // Convenience: create-and-bind in one call from an action enum id.
 int gp_canvas_bind_action_enum_to_module_port(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx, int32_t action_id);
 
+// Convenience: unbind a previously-bound action from a module frame port.
+// This will clear the frame ptr, clear visual LED glow, remove the
+// action->port binding, and free the pending action pointer. Returns 1
+// on success, 0 on failure.
+int gp_canvas_unbind_action_from_module_port(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx);
+// Pop a managed event payload previously stashed by the manager for a
+// delivered action. Returns the payload pointer or NULL if none. Caller
+// is responsible for freeing the returned payload as appropriate for its
+// type.
+void* gp_canvas_pop_managed_event_payload(GP_CanvasContext* ctx, int module_idx, int led_idx);
+// Stash a managed event payload pointer for later popping by the tool.
+int gp_canvas_stash_managed_event_payload(GP_CanvasContext* ctx, int module_idx, int led_idx, void* payload);
 // Per-module background rasterizer hook. Returns 1 on success.
 int gp_canvas_set_module_bg_callback(GP_CanvasContext* ctx, int module_idx, GP_CanvasModuleBgFn cb, void* user);
 int gp_canvas_clear_module_bg_callback(GP_CanvasContext* ctx, int module_idx);
@@ -293,6 +310,15 @@ int gp_canvas_set_module_table_alpha(GP_CanvasContext* ctx, int module_idx, floa
 #define CANVAS_ACT_MOUSE_DOWN (3001)
 #define CANVAS_ACT_MOUSE_UP (3002)
 #define CANVAS_ACT_MOUSE_MOVE (3003)
+// Mouse wheel actions
+#define CANVAS_ACT_MOUSE_SCROLL_UP (3004)
+#define CANVAS_ACT_MOUSE_SCROLL_DOWN (3005)
+
+// Action IDs for module-side event bindings: text render and tensor allocation
+// These are published as pointer-mode EventPayloads into the root table FIFO
+// so module-frame bound ports can observe and react to them.
+#define CANVAS_ACT_TEXT_RENDER (3101)
+#define CANVAS_ACT_TENSOR_ALLOC (3102)
 
 // Register a host window pointer with the canvas so the canvas can retain
 // references to windows it will handle (opaque pointer). Returns 1 on success.
@@ -364,6 +390,14 @@ GP_TableContext* gp_canvas_get_container_table(GP_CanvasContext* ctx);
 // `gp_canvas_step` when enough time has accumulated.
 int gp_canvas_set_autosave(GP_CanvasContext* ctx, const char* path, double interval_s);
 int gp_canvas_get_autosave(GP_CanvasContext* ctx, char* out_path, int out_len, double* out_interval_s);
+// Control autosave policy: 0=disabled,1=timer,2=action-listener
+int gp_canvas_set_autosave_policy(GP_CanvasContext* ctx, int policy);
+int gp_canvas_get_autosave_policy(GP_CanvasContext* ctx, int* out_policy);
+// Update the in-memory last-save signature from current canvas state.
+int gp_canvas_update_last_save_signature(GP_CanvasContext* ctx);
+// Configure action-list autosave: whitelist actions and timing (delay before acting, cooldown between saves)
+int gp_canvas_set_autosave_action_whitelist(GP_CanvasContext* ctx, const int* action_ids, int count);
+int gp_canvas_set_autosave_action_timing(GP_CanvasContext* ctx, double delay_s, double cooldown_s);
 
 // Table tool number control (tool menu). Value is clamped to 0..99.
 int gp_canvas_set_table_tool_number(GP_CanvasContext* ctx, int value);

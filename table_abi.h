@@ -718,6 +718,12 @@ int32_t gp_table_has_io_sections(GP_TableContext* ctx);
 // direction (0 = inputs, 1 = outputs). Returns number written.
 int32_t gp_table_enumerate_io_keys(GP_TableContext* ctx, int32_t direction, unsigned long long* out_keys, int32_t cap);
 
+// Return per-table detected type ids. Writes up to `cap` ints into `out_ids` and
+// returns the total number of unique type ids present on the table (may be
+// greater than `cap`). This API is safe for lock-free reads (uses an internal
+// snapshot mechanism) and is intended for diagnostics/UI only.
+int32_t gp_table_get_type_ids(GP_TableContext* ctx, int32_t* out_ids, int32_t cap);
+
 // Reading direction for input/output sides. `dir` is one of:
 // 0 = LeftToRight, 1 = TopToBottom, 2 = RightToLeft, 3 = BottomToTop
 int32_t gp_table_set_side_reading_direction(GP_TableContext* ctx, int32_t side /*0=input,1=output*/, int32_t dir);
@@ -788,6 +794,12 @@ int32_t gp_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long lo
 int32_t gp_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped, int32_t timeout_ms);
 int32_t gp_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void* ptr, int32_t* out_dropped);
 int32_t gp_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptr);
+// Bulk pointer-mode FIFO operations: consume up to `max_out` pointers into
+// `out_ptrs` (returns number consumed), and publish an array of `ptrs`
+// of length `count` (returns number published). These are convenience
+// wrappers for callers that want to operate in batches.
+int32_t gp_edge_consume_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void** out_ptrs, int32_t max_out);
+int32_t gp_edge_publish_ptr_many(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, void** ptrs, int32_t count, int32_t* out_dropped);
 
 // Configure mapping from subgroup color index (0..4) to FIFO flags.
 // This lets users map UI subgroup colors to edge FIFO behavior (e.g. BYREF).

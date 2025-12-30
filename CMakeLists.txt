@@ -8,6 +8,19 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW) # honor DOWNLOAD_EXTRACT_TIMESTAMP when provided
 endif()
 
+# Prefer SDL3_ttf canonical imported target name when available.
+# Alias a variety of possible target names (SDL3/legacy) to a single
+# canonical target `SDL_TTF::SDL_TTF` used by this project. This allows
+# downstream code to link to a single name regardless of the system's
+# packaging/FetchContent layout.
+if(NOT TARGET SDL_TTF::SDL_TTF)
+  if(TARGET SDL3_ttf::SDL3_ttf)
+    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf)
+  elseif(TARGET SDL3_ttf)
+    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf)
+  endif()
+endif()
+
 # FetchContent_Populate() deprecation warning control on newer CMake.
 # We intentionally use Populate for "download-only" archives (no CMakeLists).
 if(POLICY CMP0169)
@@ -36,7 +49,17 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Disable FetchContent update
 # ---------------------------------------------------------------------------
 # Options / overrides for fully-automatic dependency acquisition
 # ---------------------------------------------------------------------------
-option(NODUS_ALLOW_NETWORK_FETCH "Allow CMake to download dependencies (Torch/SDL2/NVTX) when not found locally" ON)
+option(NODUS_ALLOW_NETWORK_FETCH "Allow CMake to download dependencies (Torch/SDL3/NVTX) when not found locally" ON)
+
+# Allow override of SDL3/SDL_ttf git tags (use real SDL3/SDL3_ttf releases by default)
+set(NODUS_SDL3_GIT_TAG "release-3.2.28" CACHE STRING "SDL3 git tag to fetch when NODUS_ALLOW_NETWORK_FETCH=ON")
+set(NODUS_SDLTTF_GIT_TAG "release-3.2.2" CACHE STRING "SDL_ttf (SDL3-capable) git tag to fetch when NODUS_ALLOW_NETWORK_FETCH=ON")
+
+# Option: enable legacy canvas printf debug output (default OFF)
+option(GP_CANVAS_DEBUG_PRINTF "Enable legacy canvas printf debug output" OFF)
+if(GP_CANVAS_DEBUG_PRINTF)
+  add_compile_definitions(GP_CANVAS_DEBUG_PRINTF)
+endif()
 
 # If Torch must be downloaded, these can be set to force the exact libtorch ZIP.
 # Example:
@@ -261,21 +284,62 @@ endif()
 
 
 # ---------------------------------------------------------------------------
-# SDL2
+# SDL3
 # ---------------------------------------------------------------------------
-if(NOT TARGET SDL2::SDL2)
-  find_package(SDL2 CONFIG QUIET)
-  if(NOT SDL2_FOUND)
+if(NOT TARGET SDL3::SDL3)
+  find_package(SDL3 CONFIG QUIET)
+  if(NOT SDL3_FOUND)
     if(NODUS_ALLOW_NETWORK_FETCH)
-      message(STATUS "SDL2 not found; fetching SDL2 2.28.5 as a dependency.")
-      FetchContent_Declare(SDL2
+      message(STATUS "SDL3 not found; fetching SDL 3.x as a dependency.")
+      FetchContent_Declare(SDL3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG release-2.28.5
+        GIT_TAG ${NODUS_SDL3_GIT_TAG}
         GIT_SHALLOW TRUE
       )
-      FetchContent_MakeAvailable(SDL2)
+      FetchContent_MakeAvailable(SDL3)
     else()
-      message(FATAL_ERROR "SDL2 not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL2 (CONFIG package) or enable network fetch.")
+      message(FATAL_ERROR "SDL3 not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL3 (CONFIG package) or enable network fetch.")
+    endif()
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# SDL_ttf (prefer SDL3_ttf) + HarfBuzz (required for shaping when building)
+# ---------------------------------------------------------------------------
+if(NOT TARGET SDL_TTF::SDL_TTF)
+  # Require SDL3-aware SDL_ttf package (no SDL2 fallback)
+  find_package(SDL3_ttf CONFIG QUIET)
+
+  if(NOT SDL3_ttf_FOUND)
+    if(NODUS_ALLOW_NETWORK_FETCH)
+      message(STATUS "SDL_ttf (SDL3-capable) not found; fetching SDL_ttf and HarfBuzz as dependencies.")
+      # HarfBuzz (used for shaping)
+      FetchContent_Declare(harfbuzz
+        GIT_REPOSITORY https://github.com/harfbuzz/harfbuzz.git
+        GIT_TAG 8.2.0
+        GIT_SHALLOW TRUE
+      )
+      # SDL_ttf (source repo supports building against SDL3 when configured)
+      FetchContent_Declare(SDL_ttf
+        GIT_REPOSITORY https://github.com/libsdl-org/SDL_ttf.git
+        GIT_TAG ${NODUS_SDLTTF_GIT_TAG}
+        GIT_SHALLOW TRUE
+      )
+      FetchContent_GetProperties(harfbuzz)
+      if(NOT harfbuzz_POPULATED)
+        FetchContent_Populate(harfbuzz)
+      endif()
+      # Expose harfbuzz to the CMake prefix so SDL_ttf can find it
+      list(APPEND CMAKE_PREFIX_PATH "${harfbuzz_SOURCE_DIR}")
+
+      FetchContent_GetProperties(SDL_ttf)
+      if(NOT SDL_ttf_POPULATED)
+        FetchContent_Populate(SDL_ttf)
+      endif()
+      # Make available (will configure and build if necessary)
+      FetchContent_MakeAvailable(harfbuzz SDL_ttf)
+    else()
+      message(FATAL_ERROR "SDL_ttf (SDL3) not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL3_ttf or enable network fetch.")
     endif()
   endif()
 endif()
@@ -383,6 +447,8 @@ add_library(canvas_tables SHARED
   text_render_helper.cpp
   tool_registry.cpp
   thread_manager.cpp
+  console_logger.cpp
+  tools/sdlttf_to_torch.cpp
 )
 
 # Small helper executable to run the module actualizer from the built project
@@ -390,6 +456,17 @@ add_executable(modlib_actualize tools/modlib_actualize_main.cpp)
 target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(modlib_actualize PRIVATE canvas_tables)
 target_compile_features(modlib_actualize PUBLIC cxx_std_17)
+
+# (sdlttf_demo removed)
+
+# sdlttf_demo has been removed; use `frontend_shell` and `canvas_tables` for runtime.
+
+# Fallback: if SDL_ttf/SDL3_ttf was populated via FetchContent, ensure its
+# include dir is provided to the main library even if the imported target
+# does not expose INTERFACE_INCLUDE_DIRECTORIES.
+if(DEFINED SDL3_ttf_SOURCE_DIR AND EXISTS "${SDL3_ttf_SOURCE_DIR}/include")
+  target_include_directories(canvas_tables PUBLIC "${SDL3_ttf_SOURCE_DIR}/include")
+endif()
 
 # Small helper to build/load modules at runtime for development
 add_executable(modloader tools/modloader_main.cpp)
@@ -403,21 +480,26 @@ add_executable(frontend_shell tools/frontend_shell.cpp)
 target_include_directories(frontend_shell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(frontend_shell PRIVATE
   canvas_tables
-  SDL2::SDL2
-  SDL2::SDL2main
   Torch::Torch
   OpenGL::GL
 )
+if(TARGET SDL3::SDL3)
+  target_link_libraries(frontend_shell PRIVATE SDL3::SDL3)
+else()
+  message(FATAL_ERROR "SDL3 is required (SDL2 support removed). Please install SDL3 or enable network fetch to fetch it.")
+endif()
 target_compile_features(frontend_shell PUBLIC cxx_std_17)
 
-if(TARGET SDL2::SDL2)
+if(TARGET SDL3::SDL3)
   add_custom_command(TARGET frontend_shell POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "$<TARGET_FILE_DIR:SDL2::SDL2>/SDL2.dll"
-      "$<TARGET_FILE_DIR:frontend_shell>/SDL2.dll"
-    COMMENT "Copy SDL2 runtime DLL beside frontend_shell"
+      "$<TARGET_FILE:SDL3::SDL3>"
+      "$<TARGET_FILE_DIR:frontend_shell>/$<TARGET_FILE_NAME:SDL3::SDL3>"
+    COMMENT "Copy SDL3 runtime DLL beside frontend_shell"
     VERBATIM
   )
+else()
+  message(FATAL_ERROR "SDL3 runtime target not available to copy DLL. Ensure SDL3 is found/built.")
 endif()
 
 if(DEFINED Torch_DIR)
@@ -442,6 +524,22 @@ find_package(Eigen3 REQUIRED)
 
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen)
+if(TARGET Torch::Torch)
+  target_link_libraries(canvas_tables PUBLIC Torch::Torch)
+endif()
+if(TARGET SDL_TTF::SDL_TTF)
+  target_link_libraries(canvas_tables PRIVATE SDL_TTF::SDL_TTF)
+endif()
+
+if(TARGET SDL3::SDL3)
+  target_include_directories(canvas_tables PUBLIC $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)
+else()
+  message(FATAL_ERROR "SDL3 not available; SDL2 support removed. Install SDL3 or enable network fetch.")
+endif()
+
+if(TARGET SDL_TTF::SDL_TTF)
+  target_include_directories(canvas_tables PUBLIC $<TARGET_PROPERTY:SDL_TTF::SDL_TTF,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
 target_compile_features(canvas_tables PUBLIC cxx_std_17)
 
 enable_testing()

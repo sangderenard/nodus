@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "table_abi.h"
+#include "value_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,8 @@ typedef struct GP_ModulePreviewInput {
     const void* receive_ptrs[16];
     float stack_tail[64];
     int32_t stack_tail_count;
+    // Optional pointer to the module-local raw stack (typed values).
+    RawStackFrame* raw_stack;
 } GP_ModulePreviewInput;
 
 // Output buffer for module preview generation.

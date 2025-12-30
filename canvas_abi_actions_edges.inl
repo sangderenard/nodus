@@ -1,9 +1,66 @@
+// Deferred console logging
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#include <thread>
+#include <chrono>
+#include <atomic>
+
+static void autosave_worker_loop(GP_CanvasContextImpl* c) {
+    using namespace std::chrono;
+    while (c->autosave_thread_stop.load(std::memory_order_acquire) == 0) {
+        if (c->autosave_save_requested.load(std::memory_order_acquire) != 0) {
+            long long when_ms = c->autosave_save_request_when_ms.load(std::memory_order_acquire);
+            long long now_ms = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+            if (now_ms >= when_ms) {
+                long long last_save = c->autosave_last_save_ts_ms.load(std::memory_order_acquire);
+                long long cooldown_ms = static_cast<long long>(c->autosave_action_cooldown_s * 1000.0);
+                if ((now_ms - last_save) >= cooldown_ms) {
+                    int expected = 0;
+                    if (c->autosave_save_in_progress.compare_exchange_strong(expected, 1)) {
+                        // perform save in background
+                        std::string path = c->autosave_path;
+                        if (!path.empty()) {
+                            gp_canvas_save_to_file(reinterpret_cast<GP_CanvasContext*>(c), path.c_str());
+                            c->autosave_last_save_ts_ms.store(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count(), std::memory_order_release);
+                        }
+                        c->autosave_save_in_progress.store(0, std::memory_order_release);
+                        c->autosave_save_requested.store(0, std::memory_order_release);
+                    }
+                }
+            }
+        }
+        std::this_thread::sleep_for(milliseconds(40));
+    }
+}
+
+static void ensure_autosave_thread_started(GP_CanvasContextImpl* c) {
+    int stop = c->autosave_thread_stop.load(std::memory_order_acquire);
+    if (stop == 0 && c->autosave_thread && c->autosave_thread->joinable()) return;
+    c->autosave_thread_stop.store(0, std::memory_order_release);
+    c->autosave_thread = std::make_unique<std::thread>([c]() { autosave_worker_loop(c); });
+}
+
+static void stop_autosave_thread(GP_CanvasContextImpl* c) {
+    c->autosave_thread_stop.store(1, std::memory_order_release);
+    if (c->autosave_thread && c->autosave_thread->joinable()) {
+        c->autosave_thread->join();
+    }
+    c->autosave_thread.reset();
+}
+
 extern "C" void* gp_canvas_create_action_from_enum(GP_CanvasContext* ctx_, int32_t action_id) {
     if (!ctx_) return nullptr;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     auto *pa = new GP_CanvasContextImpl::PendingAction();
     pa->action_id = action_id;
     std::memset(&pa->hit, 0, sizeof(pa->hit));
+    pa->dx = 0.0f;
+    pa->dy = 0.0f;
     return reinterpret_cast<void*>(pa);
 }
 
@@ -13,6 +70,13 @@ extern "C" int gp_canvas_bind_action_ptr_to_module_port(GP_CanvasContext* ctx_, 
     if (col < 0 || col > 1) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (module_idx >= static_cast<int>(c->module_frame_links.size())) return 0;
+    // Enforce single-writer rule: refuse to bind additional send ports
+    // if a send binding already exists for this LED index.
+    if (is_send) {
+        if (c->module_frame_links[module_idx].ptrs[0][static_cast<size_t>(led_idx)] || c->module_frame_links[module_idx].ptrs[1][static_cast<size_t>(led_idx)]) {
+            return 0;
+        }
+    }
     // map to logical row: send-left=0, send-right=1, receive-left=2, receive-right=3
     int row = is_send ? (col == 0 ? 0 : 1) : (col == 0 ? 2 : 3);
     c->module_frame_links[module_idx].ptrs[static_cast<size_t>(row)][static_cast<size_t>(led_idx)] = pending_ptr;
@@ -45,6 +109,8 @@ extern "C" int gp_canvas_bind_action_ptr_to_module_port(GP_CanvasContext* ctx_, 
             if (gp_table_edge_index_for_key(root, ka, &idx) && idx >= 0) {
                 ab.root_edge_idx = idx;
                 ab.writer_key = ka;
+                    // Debug: report created root edge / writer key for this binding
+                    fprintf(stderr, "[DBG] bind module=%d row=%d led=%d action=%d root_edge=%d writer_key=%llu\n", module_idx, row, led_idx, aid, ab.root_edge_idx, (unsigned long long)ab.writer_key);
             }
         }
         c->action_port_bindings[aid].push_back(std::move(ab));
@@ -75,6 +141,41 @@ extern "C" int gp_canvas_bind_action_ptr_to_module_port(GP_CanvasContext* ctx_, 
 
 extern "C" int gp_canvas_bind_action_enum_to_module_port(GP_CanvasContext* ctx_, int module_idx, int is_send, int col, int led_idx, int32_t action_id) {
     if (!ctx_) return 0;
+    // Backwards-friendly convenience: if caller requests binding for any of
+    // the mouse action enums, bind the whole mouse action group (down/up/move/scroll up/scroll down)
+    // into consecutive LED slots starting at `led_idx`. This ensures frontends
+    // that expect separate ports per mouse action get them automatically.
+    if (action_id >= CANVAS_ACT_MOUSE_DOWN && action_id <= CANVAS_ACT_MOUSE_SCROLL_DOWN) {
+        const int32_t mouse_actions[] = { CANVAS_ACT_MOUSE_DOWN, CANVAS_ACT_MOUSE_UP, CANVAS_ACT_MOUSE_MOVE, CANVAS_ACT_MOUSE_SCROLL_UP, CANVAS_ACT_MOUSE_SCROLL_DOWN };
+        const int count = static_cast<int>(sizeof(mouse_actions)/sizeof(mouse_actions[0]));
+        // Ensure led range fits
+        for (int i = 0; i < count; ++i) {
+            int li = led_idx + i;
+            if (li < 0 || li >= kModuleExtraLedCount) return 0;
+        }
+        // Create and bind each pending action; if any fail, rollback previous binds
+        std::vector<void*> created;
+        created.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            int32_t aid = mouse_actions[i];
+            void* pa = gp_canvas_create_action_from_enum(ctx_, aid);
+            if (!pa) { // rollback
+                for (void* p : created) gp_canvas_free_pending_action(ctx_, p);
+                return 0;
+            }
+            int li = led_idx + i;
+            if (!gp_canvas_bind_action_ptr_to_module_port(ctx_, module_idx, is_send, col, li, pa)) {
+                // cleanup on failure
+                gp_canvas_free_pending_action(ctx_, pa);
+                for (void* p : created) gp_canvas_free_pending_action(ctx_, p);
+                return 0;
+            }
+            created.push_back(pa);
+        }
+        return 1;
+    }
+
+    // Default: bind single requested action
     void* pa = gp_canvas_create_action_from_enum(ctx_, action_id);
     if (!pa) return 0;
     if (!gp_canvas_bind_action_ptr_to_module_port(ctx_, module_idx, is_send, col, led_idx, pa)) {
@@ -84,6 +185,59 @@ extern "C" int gp_canvas_bind_action_enum_to_module_port(GP_CanvasContext* ctx_,
     }
     return 1;
 }
+
+    extern "C" int gp_canvas_unbind_action_from_module_port(GP_CanvasContext* ctx_, int module_idx, int is_send, int col, int led_idx) {
+        if (!ctx_) return 0;
+        auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+        if (module_idx < 0 || module_idx >= static_cast<int>(c->module_frame_links.size())) return 0;
+        if (led_idx < 0 || led_idx >= kModuleExtraLedCount) return 0;
+        if (col < 0 || col > 1) return 0;
+        int row = is_send ? (col == 0 ? 0 : 1) : (col == 0 ? 2 : 3);
+
+        void* ptr = c->module_frame_links[module_idx].ptrs[static_cast<size_t>(row)][static_cast<size_t>(led_idx)];
+        if (!ptr) return 0;
+
+        // Remove any action_port_bindings entries that reference this ptr
+        auto *pa = reinterpret_cast<GP_CanvasContextImpl::PendingAction*>(ptr);
+        if (pa) {
+            int32_t aid = pa->action_id;
+            std::lock_guard<std::mutex> lk(c->action_subscribers_mu);
+            auto it = c->action_port_bindings.find(aid);
+            if (it != c->action_port_bindings.end()) {
+                auto &vec = it->second;
+                for (auto vit = vec.begin(); vit != vec.end();) {
+                    if (vit->module_idx == module_idx && vit->row == row && vit->led_idx == led_idx && vit->pending_ptr == ptr) {
+                        vit = vec.erase(vit);
+                    } else ++vit;
+                }
+                if (vec.empty()) c->action_port_bindings.erase(it);
+            }
+        }
+
+        // Clear the frame ptr and visual markers
+        c->module_frame_links[module_idx].ptrs[static_cast<size_t>(row)][static_cast<size_t>(led_idx)] = nullptr;
+        GP_TableCell* cell = module_frame_led_cell(c, module_idx, row, led_idx);
+        if (cell) cell->reserved0 = 0;
+
+        if (module_idx < static_cast<int>(c->module_tables.size())) {
+            GP_TableContext* t = c->module_tables[module_idx];
+            if (t && module_idx < static_cast<int>(c->module_table_rows.size()) && !c->module_table_rows[module_idx].empty()) {
+                const auto &rows = c->module_table_rows[module_idx];
+                int target_col = is_send ? kModuleColRightLed : kModuleColLeftLed;
+                for (int ri = 0; ri < static_cast<int>(rows.size()); ++ri) {
+                    const auto &meta = rows[ri];
+                    if ((is_send && meta.kind != ModuleRowKind::Output) || (!is_send && meta.kind != ModuleRowKind::Input)) continue;
+                    if (meta.attachment_count <= led_idx) continue;
+                    (void)gp_table_set_led_glow(t, ri, target_col, led_idx, 0.0f);
+                    (void)gp_table_set_led_selected(t, ri, target_col, led_idx, 0);
+                }
+            }
+        }
+
+        // Free the pending action pointer
+        gp_canvas_free_pending_action(ctx_, ptr);
+        return 1;
+    }
 
 extern "C" int gp_canvas_invoke_pending_action(GP_CanvasContext* ctx_, void* pending_ptr) {
     if (!ctx_ || !pending_ptr) return 0;
@@ -140,6 +294,22 @@ extern "C" int gp_canvas_invoke_pending_action(GP_CanvasContext* ctx_, void* pen
         }
     }
     c->click_listen_mode = old_listen;
+    // Schedule autosave after actions if policy==ACTION and action is whitelisted
+    if (c->autosave_policy == GP_CanvasContextImpl::AUTOSAVE_ACTION && !c->autosave_path.empty()) {
+        bool allowed = false;
+        if (c->autosave_action_whitelist.empty()) allowed = true;
+        else {
+            for (int aid : c->autosave_action_whitelist) if (aid == pa->action_id) { allowed = true; break; }
+        }
+        if (allowed) {
+            using namespace std::chrono;
+            auto now = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+            c->autosave_last_action_ts_ms.store(static_cast<long long>(now), std::memory_order_release);
+            long long when = static_cast<long long>(now + static_cast<long long>(c->autosave_action_delay_s * 1000.0));
+            c->autosave_save_request_when_ms.store(when, std::memory_order_release);
+            c->autosave_save_requested.store(1, std::memory_order_release);
+        }
+    }
     return 1;
 }
 
@@ -148,7 +318,7 @@ extern "C" int gp_canvas_invoke_pending_action(GP_CanvasContext* ctx_, void* pen
 // manager using normal FIFO pointer-mode semantics.
 
 // Deliver a synthesized event to all ports bound to `action_id`.
-static void canvas_dispatch_event_to_bound_ports(GP_CanvasContextImpl* c, int32_t action_id, int x, int y, bool down, bool up) {
+static void canvas_dispatch_event_to_bound_ports(GP_CanvasContextImpl* c, int32_t action_id, int x, int y, bool down, bool up, float dx, float dy, int button, float scroll) {
     if (!c) return;
     auto is_valid_pending_ptr = [](void* p) -> bool {
         uintptr_t v = reinterpret_cast<uintptr_t>(p);
@@ -180,14 +350,27 @@ static void canvas_dispatch_event_to_bound_ports(GP_CanvasContextImpl* c, int32_
         h.part = GP_TABLE_HIT_LED; h.aux0 = b.led_idx; h.aux1 = 0; h.flags = 0;
         copy_pa->hit = h;
         copy_pa->aux_uid = 0ull;
+        // carry motion deltas, button and scroll into pending action so manager can expose them
+        copy_pa->dx = dx;
+        copy_pa->dy = dy;
+        copy_pa->button = button;
+        copy_pa->scroll = scroll;
+        // synthesize per-button masks and default device id if caller provided a single button index
+        copy_pa->button_mask_down = down ? (button > 0 ? (1u << static_cast<uint32_t>(button)) : 0u) : 0u;
+        copy_pa->button_mask_up = up ? (button > 0 ? (1u << static_cast<uint32_t>(button)) : 0u) : 0u;
+        copy_pa->device_id = 0; // frontend may populate this later if device awareness is added
         // Publish a pointer-mode EventPayload into the root table FIFO for
         // this binding's edge so external tools can observe and route the event.
         if (root && b.root_edge_idx >= 0) {
+            // Debug: report publish target
+            fprintf(stderr, "[DBG] publish action=%d -> target_mod=%d row=%d led=%d root_edge=%d writer_key=%llu\n", action_id, b.module_idx, b.row, b.led_idx, b.root_edge_idx, (unsigned long long)b.writer_key);
             EventPayload* ep = new EventPayload{reinterpret_cast<void*>(copy_pa), b.module_idx, b.led_idx};
             int dropped = 0;
             (void)gp_edge_publish_ptr(root, b.root_edge_idx, b.writer_key, reinterpret_cast<void*>(ep), &dropped);
+            if (dropped) fprintf(stderr, "[DBG] publish dropped=%d action=%d root_edge=%d\n", dropped, action_id, b.root_edge_idx);
         } else {
             // If no root FIFO exists for this binding, drop the copy to avoid leaks.
+            fprintf(stderr, "[DBG] publish no-root action=%d -> mod=%d row=%d led=%d\n", action_id, b.module_idx, b.row, b.led_idx);
             delete copy_pa;
         }
     }
@@ -237,6 +420,27 @@ extern "C" int gp_canvas_free_pending_action(GP_CanvasContext* ctx_, void* pendi
     return 1;
 }
 
+extern "C" void* gp_canvas_pop_managed_event_payload(GP_CanvasContext* ctx_, int module_idx, int led_idx) {
+    if (!ctx_) return nullptr;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) | static_cast<uint64_t>(static_cast<uint32_t>(led_idx));
+    std::lock_guard<std::mutex> lk(c->action_subscribers_mu);
+    auto it = c->managed_event_payloads.find(key);
+    if (it == c->managed_event_payloads.end()) return nullptr;
+    void* p = it->second;
+    c->managed_event_payloads.erase(it);
+    return p;
+}
+
+extern "C" int gp_canvas_stash_managed_event_payload(GP_CanvasContext* ctx_, int module_idx, int led_idx, void* payload) {
+    if (!ctx_ || !payload) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) | static_cast<uint64_t>(static_cast<uint32_t>(led_idx));
+    std::lock_guard<std::mutex> lk(c->action_subscribers_mu);
+    c->managed_event_payloads[key] = payload;
+    return 1;
+}
+
 extern "C" int gp_canvas_set_templates_dir(const char* dir) {
     // forward to table helper
     return gp_table_set_library_dir(dir) ? 1 : 0;
@@ -278,11 +482,18 @@ extern "C" int gp_canvas_set_autosave(GP_CanvasContext* ctx_, const char* path, 
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (!path || path[0] == '\0' || interval_s <= 0.0) {
-        c->autosave_path.clear(); c->autosave_interval_s = 0.0; c->autosave_accum_s = 0.0; return 1;
+        c->autosave_path.clear(); c->autosave_interval_s = 0.0; c->autosave_accum_s = 0.0; c->autosave_policy = GP_CanvasContextImpl::AUTOSAVE_DISABLED; 
+        stop_autosave_thread(c);
+        return 1;
     }
     c->autosave_path = std::string(path);
     c->autosave_interval_s = interval_s;
     c->autosave_accum_s = 0.0;
+    c->autosave_policy = GP_CanvasContextImpl::AUTOSAVE_TIMER;
+    // initialize last-save signature after enabling autosave (best-effort)
+    try { gp_canvas_update_last_save_signature(reinterpret_cast<GP_CanvasContext*>(c)); } catch (...) { }
+    // ensure background worker is running for asynchronous saves
+    ensure_autosave_thread_started(c);
     return 1;
 }
 
@@ -294,6 +505,40 @@ extern "C" int gp_canvas_get_autosave(GP_CanvasContext* ctx_, char* out_path, in
         if (to_write > 0) memcpy(out_path, c->autosave_path.data(), static_cast<size_t>(to_write));
     }
     if (out_interval_s) *out_interval_s = c->autosave_interval_s;
+    return 1;
+}
+
+extern "C" int gp_canvas_set_autosave_policy(GP_CanvasContext* ctx_, int policy) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (policy < GP_CanvasContextImpl::AUTOSAVE_DISABLED || policy > GP_CanvasContextImpl::AUTOSAVE_ACTION) return 0;
+    c->autosave_policy = policy;
+    if (policy == GP_CanvasContextImpl::AUTOSAVE_ACTION && !c->autosave_path.empty()) ensure_autosave_thread_started(c);
+    if (policy == GP_CanvasContextImpl::AUTOSAVE_DISABLED) stop_autosave_thread(c);
+    return 1;
+}
+
+extern "C" int gp_canvas_set_autosave_action_whitelist(GP_CanvasContext* ctx_, const int* action_ids, int count) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->autosave_action_whitelist.clear();
+    if (!action_ids || count <= 0) return 1;
+    for (int i = 0; i < count; ++i) c->autosave_action_whitelist.push_back(action_ids[i]);
+    return 1;
+}
+
+extern "C" int gp_canvas_set_autosave_action_timing(GP_CanvasContext* ctx_, double delay_s, double cooldown_s) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->autosave_action_delay_s = std::max(0.0, delay_s);
+    c->autosave_action_cooldown_s = std::max(0.0, cooldown_s);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_autosave_policy(GP_CanvasContext* ctx_, int* out_policy) {
+    if (!ctx_ || !out_policy) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    *out_policy = c->autosave_policy;
     return 1;
 }
 

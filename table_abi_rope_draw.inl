@@ -396,6 +396,32 @@ static void draw_rope_curve_blend(uint8_t* img, int w, int h, int pitch, const f
     }
 }
 
+// Unified simple fallback rope renderer used when the simulator is disabled.
+// fallback_mode: 0 = straight segment, 1 = 3-point arctan-sag curve (default)
+// Unified simple fallback rope renderer used when the simulator is disabled.
+// Accepts a ready `rope_col` so callers can choose subgroup coloring.
+void draw_fallback_rope(uint8_t* out_rgba, int w, int h, int pitch, float ax, float ay, float bx, float by, int jacket_px, int jacket_border, Color rope_col, int fallback_mode) {
+    if (!out_rgba) return;
+    if (fallback_mode == 0) {
+        float seg[4] = { ax, ay, bx, by };
+        draw_rope_curve_blend(out_rgba, w, h, pitch, seg, 2, jacket_px, jacket_border, rope_col, 3);
+        return;
+    }
+
+    // Default: 3-point arctan-style sag curve
+    float dx = bx - ax;
+    float dy = by - ay;
+    float len = std::sqrt(dx*dx + dy*dy);
+    float nx = 0.0f, ny = 0.0f;
+    if (len > 1e-6f) { nx = -dy / len; ny = dx / len; }
+    // arctan-based sag: gentle, saturating with distance
+    float sag = std::atan(len * 0.02f) * len * 0.12f;
+    float midx = 0.5f * (ax + bx) + nx * sag;
+    float midy = 0.5f * (ay + by) + ny * sag;
+    float verts[6] = { ax, ay, midx, midy, bx, by };
+    draw_rope_curve_blend(out_rgba, w, h, pitch, verts, 3, jacket_px, jacket_border, rope_col, 3);
+}
+
 static void build_rope_samples_with_tangents(const float* verts, int count, int jacket_px, std::vector<std::pair<float,float>>& samples, std::vector<std::pair<float,float>>& tangents) {
     samples.clear();
     tangents.clear();

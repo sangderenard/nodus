@@ -34,6 +34,8 @@ enum class ModuleToolKind : int8_t {
     RectRgba = 9,
     TableNumber = 10,
     Clone = 11,
+    TensorAllocator = 12,
+    FontRenderer = 13,
 };
 
 enum class ModuleToolOrigin : int8_t {
@@ -55,6 +57,13 @@ struct ModuleInputState {
     float mouse_y = 0.0f;
     int32_t mouse_down = 0;
     int32_t mouse_up = 0;
+    float mouse_dx = 0.0f;
+    float mouse_dy = 0.0f;
+    int32_t mouse_button = 0;
+    float mouse_scroll = 0.0f;
+        uint32_t mouse_button_mask_down = 0u;
+        uint32_t mouse_button_mask_up = 0u;
+        int32_t mouse_device_id = 0;
     int32_t key = 0;
     int32_t key_event = 0;
 };
@@ -75,7 +84,8 @@ inline ToolStackSpec module_tool_stack_spec(ModuleToolKind tool) {
         case ModuleToolKind::KeyboardListener:
             return {0, 1};
         case ModuleToolKind::MouseListener:
-            return {0, 4};
+            // produces: button_up_mask, button_down_mask, device_id, up, down, y, x, mdx, mdy
+            return {0, 9};
         case ModuleToolKind::StackDisplay:
             return {0, 0};
         case ModuleToolKind::RectRgba:
@@ -84,6 +94,8 @@ inline ToolStackSpec module_tool_stack_spec(ModuleToolKind tool) {
             return {0, 1};
         case ModuleToolKind::Clone:
             return {2, 0};
+        case ModuleToolKind::TensorAllocator:
+            return {0, 0};
         case ModuleToolKind::None:
         default:
             return {0, 0};

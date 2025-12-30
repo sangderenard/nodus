@@ -1,3 +1,12 @@
+// Deferred console logging
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+
 extern "C" int gp_canvas_create_overlay_with_leds(GP_CanvasContext* ctx_, float x1, float y1, float x2, float y2, unsigned long long* out_key_a, unsigned long long* out_key_b) {
     if (!ctx_ || !out_key_a || !out_key_b) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
@@ -1933,13 +1942,35 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             continue;
         }
         int ridx = ctx->edges[ei].rope_idx;
-        if (ridx < 0) {
+            if (ridx < 0) {
             int segs = (ctx->debug_flags & GP_CANVAS_DEBUG_SEGMENTS_1) ? 1 : ctx->sim_segs;
             float slack = ctx->sim_slack;
             int newr = sim ? rope_sim_add_rope(sim, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), segs, slack) : -1;
             ctx->edges[ei].rope_idx = newr;
+            if (ei < 6) {
+#if defined(GP_CANVAS_DEBUG_PRINTF)
+                printf("canvas_raster: edge=%zu created rope sim=%p ridx=%d ax=%.2f,%.2f bx=%.2f,%.2f segs=%d slack=%.3f\n", ei, (void*)sim, newr, (float)ax, (float)ay, (float)bx, (float)by, segs, slack);
+                if (sim && newr >= 0) {
+                    int vc = rope_sim_get_vertex_count(sim, newr);
+                    std::vector<float> verts(static_cast<size_t>(std::max(0, vc) * 2));
+                    int got = rope_sim_get_vertices(sim, newr, verts.data(), static_cast<int>(verts.size()));
+                    if (got > 0) printf("canvas_raster: edge=%zu rope=%d verts=%d first=(%.2f,%.2f)\n", ei, newr, got, verts[0], verts[1]);
+                }
+#endif
+            }
         } else {
-            if (sim) rope_sim_move_endpoints(sim, ridx, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by));
+            if (sim) {
+                rope_sim_move_endpoints(sim, ridx, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by));
+                if (ei < 6) {
+#if defined(GP_CANVAS_DEBUG_PRINTF)
+                    int vc = rope_sim_get_vertex_count(sim, ridx);
+                    std::vector<float> verts(static_cast<size_t>(std::max(0, vc) * 2));
+                    int got = rope_sim_get_vertices(sim, ridx, verts.data(), static_cast<int>(verts.size()));
+                    printf("canvas_raster: edge=%zu moved rope sim=%p ridx=%d verts=%d\n", ei, (void*)sim, ridx, got);
+                    if (got > 0) printf("canvas_raster: edge=%zu rope=%d first=(%.2f,%.2f)\n", ei, ridx, verts[0], verts[1]);
+#endif
+                }
+            }
         }
     }
 
@@ -2647,11 +2678,47 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
     } else {
         // Fallback: legacy per-edge rope rendering using canvas-local rope sim/indices
+        // forward-declare shared fallback (implemented in table_abi_rope_draw.inl)
+        extern void draw_fallback_rope(uint8_t* out_rgba, int w, int h, int pitch, float ax, float ay, float bx, float by, int jacket_px, int jacket_border, Color rope_col, int fallback_mode);
         for (size_t ei = 0; ei < ctx->edges.size(); ++ei) {
             int ridx = ctx->edges[ei].rope_idx;
             if (ridx < 0) continue;
             int vc = sim ? rope_sim_get_vertex_count(sim, ridx) : 0;
-            if (vc < 2) continue;
+            if (vc < 2) {
+                // Simulator missing or too few verts: compute endpoints and draw unified fallback.
+                const auto &edge = ctx->edges[ei].desc;
+                // Resolve endpoints from module hitboxes (same logic as earlier)
+                int ax = 0, ay = 0, bx = 0, by = 0;
+                bool resolvedA = false, resolvedB = false;
+                if (edge.a_module >= 0 && edge.a_module < static_cast<int>(module_hitboxes.size()) && !module_hitboxes[edge.a_module].empty()) {
+                    for (const auto &hb : module_hitboxes[edge.a_module]) {
+                        if ((hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG || hb.part == GP_TABLE_HIT_LED_TABLE) && resolve_contact_index(ctx, edge.a_module, hb) == edge.a_contact_idx) {
+                            int local_x = (hb.x0 + hb.x1) / 2;
+                            int local_y = (hb.y0 + hb.y1) / 2;
+                            ax = ctx->modules[edge.a_module].x + local_x - ctx->offset_x;
+                            ay = ctx->modules[edge.a_module].y + local_y - ctx->offset_y;
+                            resolvedA = true; break;
+                        }
+                    }
+                }
+                if (edge.b_module >= 0 && edge.b_module < static_cast<int>(module_hitboxes.size()) && !module_hitboxes[edge.b_module].empty()) {
+                    for (const auto &hb : module_hitboxes[edge.b_module]) {
+                        if ((hb.part == GP_TABLE_HIT_LED || hb.part == GP_TABLE_HIT_LED_ARG || hb.part == GP_TABLE_HIT_LED_TABLE) && resolve_contact_index(ctx, edge.b_module, hb) == edge.b_contact_idx) {
+                            int local_x = (hb.x0 + hb.x1) / 2;
+                            int local_y = (hb.y0 + hb.y1) / 2;
+                            bx = ctx->modules[edge.b_module].x + local_x - ctx->offset_x;
+                            by = ctx->modules[edge.b_module].y + local_y - ctx->offset_y;
+                            resolvedB = true; break;
+                        }
+                    }
+                }
+                if (!resolvedA || !resolvedB) continue;
+                uint32_t flags = 0u;
+                if (ei < ctx->edges.size()) flags = ctx->edges[ei].subgroup_flags;
+                Color rope_col = (flags != 0u) ? subgroup_flags_to_color(ctx, flags, 220) : Color{200,200,200,220};
+                draw_fallback_rope(out_rgba, w, h, pitch, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), ctx->jacket_px, ctx->jacket_border, rope_col, 1);
+                continue;
+            }
             std::vector<float> verts(static_cast<size_t>(vc) * 2);
             int got = sim ? rope_sim_get_vertices(sim, ridx, verts.data(), static_cast<int>(verts.size())) : 0;
             if (got <= 0) continue;

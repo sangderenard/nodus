@@ -19,15 +19,20 @@
 #include <utility>
 #include <vector>
 
-#include <SDL.h>
-#include <SDL_opengl.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_opengl.h>
 #include <torch/torch.h>
 #include <filesystem>
 #include <system_error>
+#ifdef _WIN32
+#  include <windows.h>
+#endif
 
 #include "canvas_abi.h"
 
 namespace {
+
+// NOTE: no compatibility macros — use SDL3 API names directly.
 
 struct CanvasHead {
     GP_CanvasContext* context = nullptr;
@@ -80,6 +85,11 @@ struct FrontendResources {
         int left_space = 0; // positive: pixels between window left and canvas left; negative: canvas extends left
         int right_space = 0; // positive: pixels between canvas right and window right
         int bottom_space = 0; // positive: pixels between canvas bottom and window bottom
+        // high-precision mouse values (SDL3 provides floating-point coords/deltas)
+        float mouse_fx = 0.0f;
+        float mouse_fy = 0.0f;
+        float mouse_fdx = 0.0f;
+        float mouse_fdy = 0.0f;
     } layout;
 };
 
@@ -384,10 +394,8 @@ bool ensure_canvas_texture(FrontendResources& resources, int width, int height) 
         height
     );
     if (!resources.canvas_texture) return false;
-    // Log the actual pixel format SDL created so we can verify byte layout expectations.
-    Uint32 fmt = 0; int access = 0; int w = 0; int h = 0;
-    SDL_QueryTexture(resources.canvas_texture, &fmt, &access, &w, &h);
-    std::cerr << "Canvas texture format: " << SDL_GetPixelFormatName(fmt) << "\n";
+    // SDL3 texture querying differs across backends; skip detailed format
+    // probe here — we already requested RGBA32 and will assume that layout.
     resources.canvas_texture_width = width;
     resources.canvas_texture_height = height;
     return true;
@@ -410,9 +418,16 @@ bool update_active_canvas_texture(FrontendResources& resources) {
 }
 
 bool initialize_window(FrontendResources& resources) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
-        return false;
+    // Assume the caller (main) is responsible for primary SDL initialization.
+    // Only initialize the video/events subsystems here if they aren't already.
+    {
+        const Uint32 required = SDL_INIT_VIDEO | SDL_INIT_EVENTS;
+        if ((SDL_WasInit(required) & required) != required) {
+            if (!SDL_Init(required)) {
+                std::cerr << "SDL_Init (video/events) failed: " << SDL_GetError() << "\n";
+                return false;
+            }
+        }
     }
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -420,14 +435,27 @@ bool initialize_window(FrontendResources& resources) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
+    // Cast combined window flags to the integer type expected by SDL3 API.
+    uint32_t win_flags = static_cast<uint32_t>(SDL_WINDOW_OPENGL) |
+                         static_cast<uint32_t>(SDL_WINDOW_RESIZABLE) |
+                         static_cast<uint32_t>(SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    // SDL3 offers a bounds-based CreateWindow overload; construct a rect and call that variant.
+    SDL_Rect bounds;
+    bounds.x = SDL_WINDOWPOS_CENTERED;
+    bounds.y = SDL_WINDOWPOS_CENTERED;
+    bounds.w = 1280;
+    bounds.h = 720;
+    // SDL3 CreateWindow signature is (title, width, height, flags).
     resources.window = SDL_CreateWindow(
         "Canvas Frontend Shell",
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
-        1280,
-        720,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+        bounds.w,
+        bounds.h,
+        win_flags
     );
+    // position after creation if centering is desired
+    if (resources.window) {
+        SDL_SetWindowPosition(resources.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
 
     if (!resources.window) {
         std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
@@ -440,17 +468,92 @@ bool initialize_window(FrontendResources& resources) {
         return false;
     }
 
-    if (SDL_GL_MakeCurrent(resources.window, resources.gl_context) != 0) {
+    if (!SDL_GL_MakeCurrent(resources.window, resources.gl_context)) {
         std::cerr << "SDL_GL_MakeCurrent failed: " << SDL_GetError() << "\n";
         return false;
     }
 
     SDL_GL_SetSwapInterval(1);
-    resources.renderer = SDL_CreateRenderer(resources.window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // SDL3 renderer creation signature changed to accept an optional driver name.
+    // Pass nullptr to use the default accelerated renderer.
+    resources.renderer = SDL_CreateRenderer(resources.window, /*driver_name=*/nullptr);
     if (!resources.renderer) {
         std::cerr << "SDL_CreateRenderer failed: " << SDL_GetError() << "\n";
         return false;
     }
+
+    // Create a simple GL shader program to ensure GL functions are available.
+    // We load GL entry points with SDL_GL_GetProcAddress at runtime.
+    auto create_test_shader = [](FrontendResources& res) {
+        using PFN_glCreateShader = GLuint(*)(GLenum);
+        using PFN_glShaderSource = void(*)(GLuint, GLsizei, const GLchar* const*, const GLint*);
+        using PFN_glCompileShader = void(*)(GLuint);
+        using PFN_glGetShaderiv = void(*)(GLuint, GLenum, GLint*);
+        using PFN_glGetShaderInfoLog = void(*)(GLuint, GLsizei, GLsizei*, GLchar*);
+        using PFN_glCreateProgram = GLuint(*)();
+        using PFN_glAttachShader = void(*)(GLuint, GLuint);
+        using PFN_glLinkProgram = void(*)(GLuint);
+        using PFN_glGetProgramiv = void(*)(GLuint, GLenum, GLint*);
+        using PFN_glGetProgramInfoLog = void(*)(GLuint, GLsizei, GLsizei*, GLchar*);
+        using PFN_glDeleteShader = void(*)(GLuint);
+        using PFN_glUseProgram = void(*)(GLuint);
+
+        PFN_glCreateShader glCreateShaderFP = (PFN_glCreateShader)SDL_GL_GetProcAddress("glCreateShader");
+        PFN_glShaderSource glShaderSourceFP = (PFN_glShaderSource)SDL_GL_GetProcAddress("glShaderSource");
+        PFN_glCompileShader glCompileShaderFP = (PFN_glCompileShader)SDL_GL_GetProcAddress("glCompileShader");
+        PFN_glGetShaderiv glGetShaderivFP = (PFN_glGetShaderiv)SDL_GL_GetProcAddress("glGetShaderiv");
+        PFN_glGetShaderInfoLog glGetShaderInfoLogFP = (PFN_glGetShaderInfoLog)SDL_GL_GetProcAddress("glGetShaderInfoLog");
+        PFN_glCreateProgram glCreateProgramFP = (PFN_glCreateProgram)SDL_GL_GetProcAddress("glCreateProgram");
+        PFN_glAttachShader glAttachShaderFP = (PFN_glAttachShader)SDL_GL_GetProcAddress("glAttachShader");
+        PFN_glLinkProgram glLinkProgramFP = (PFN_glLinkProgram)SDL_GL_GetProcAddress("glLinkProgram");
+        PFN_glGetProgramiv glGetProgramivFP = (PFN_glGetProgramiv)SDL_GL_GetProcAddress("glGetProgramiv");
+        PFN_glGetProgramInfoLog glGetProgramInfoLogFP = (PFN_glGetProgramInfoLog)SDL_GL_GetProcAddress("glGetProgramInfoLog");
+        PFN_glDeleteShader glDeleteShaderFP = (PFN_glDeleteShader)SDL_GL_GetProcAddress("glDeleteShader");
+        PFN_glUseProgram glUseProgramFP = (PFN_glUseProgram)SDL_GL_GetProcAddress("glUseProgram");
+
+        if (!glCreateShaderFP || !glShaderSourceFP || !glCompileShaderFP || !glGetShaderivFP || !glGetShaderInfoLogFP ||
+            !glCreateProgramFP || !glAttachShaderFP || !glLinkProgramFP || !glGetProgramivFP || !glGetProgramInfoLogFP ||
+            !glDeleteShaderFP || !glUseProgramFP) {
+            std::cerr << "GL entry points not available; skipping shader test\n";
+            return;
+        }
+
+        const char* vs_src = "#version 330 core\nlayout(location=0) in vec2 aPos; void main(){gl_Position=vec4(aPos,0.0,1.0);}";
+        const char* fs_src = "#version 330 core\nout vec4 FragColor; void main(){FragColor=vec4(1.0,0.0,1.0,1.0);}";
+
+        GLuint vs = glCreateShaderFP(GL_VERTEX_SHADER);
+        glShaderSourceFP(vs, 1, &vs_src, nullptr);
+        glCompileShaderFP(vs);
+        GLint compiled = 0; glGetShaderivFP(vs, GL_COMPILE_STATUS, &compiled);
+        if (!compiled) {
+            char buf[512]; GLsizei len = 0; glGetShaderInfoLogFP(vs, sizeof(buf), &len, buf); std::cerr << "Vertex shader compile failed: " << buf << "\n";
+            glDeleteShaderFP(vs);
+            return;
+        }
+        GLuint fs = glCreateShaderFP(GL_FRAGMENT_SHADER);
+        glShaderSourceFP(fs, 1, &fs_src, nullptr);
+        glCompileShaderFP(fs);
+        glGetShaderivFP(fs, GL_COMPILE_STATUS, &compiled);
+        if (!compiled) {
+            char buf[512]; GLsizei len = 0; glGetShaderInfoLogFP(fs, sizeof(buf), &len, buf); std::cerr << "Fragment shader compile failed: " << buf << "\n";
+            glDeleteShaderFP(vs); glDeleteShaderFP(fs);
+            return;
+        }
+        GLuint prog = glCreateProgramFP();
+        glAttachShaderFP(prog, vs);
+        glAttachShaderFP(prog, fs);
+        glLinkProgramFP(prog);
+        GLint linked = 0; glGetProgramivFP(prog, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            char buf[512]; GLsizei len = 0; glGetProgramInfoLogFP(prog, sizeof(buf), &len, buf); std::cerr << "Program link failed: " << buf << "\n";
+            glDeleteShaderFP(vs); glDeleteShaderFP(fs);
+            return;
+        }
+        // Keep program bound for potential runtime usage.
+        glUseProgramFP(prog);
+        // Do not delete program now so it remains usable.
+    };
+    create_test_shader(resources);
     return true;
 }
 
@@ -465,7 +568,7 @@ void cleanup(FrontendResources& resources) {
         resources.renderer = nullptr;
     }
     if (resources.gl_context) {
-        SDL_GL_DeleteContext(resources.gl_context);
+        SDL_GL_DestroyContext(resources.gl_context);
     }
     if (resources.window) {
         SDL_DestroyWindow(resources.window);
@@ -482,7 +585,7 @@ struct InputFilters {
     bool mouse_filter_active = false;
     std::unordered_set<Uint8> mouse_buttons;
     bool gamepad_filter_active = false;
-    std::unordered_set<SDL_GameControllerButton> gamepad_buttons;
+    std::unordered_set<SDL_GamepadButton> gamepad_buttons;
 };
 
 struct CanvasSwitchCombo {
@@ -493,7 +596,7 @@ struct CanvasSwitchCombo {
 };
 
 struct GamepadInfo {
-    SDL_GameController* controller = nullptr;
+    SDL_Gamepad* gamepad = nullptr;
     SDL_JoystickID instance_id = -1;
 };
 
@@ -506,6 +609,7 @@ public:
 
     void handle_event(const SDL_Event& event);
     void update();
+    void refresh_layout_from_window();
     // notify dispatcher that window size changed (window coords)
     void on_window_resized(int window_w, int window_h);
 
@@ -529,6 +633,10 @@ private:
     bool shift_down_ = false;
     bool ctrl_down_ = false;
     bool alt_down_ = false;
+    // track previous mouse float position to derive deltas when SDL3 doesn't provide deltas
+    float prev_mouse_x_ = 0.0f;
+    float prev_mouse_y_ = 0.0f;
+    bool have_prev_mouse_ = false;
 };
 
 InputDispatcher::InputDispatcher(FrontendResources& resources, InputFilters filters)
@@ -536,9 +644,9 @@ InputDispatcher::InputDispatcher(FrontendResources& resources, InputFilters filt
 
 InputDispatcher::~InputDispatcher() {
     for (auto& info : gamepads_) {
-        if (info.controller) {
-            SDL_GameControllerClose(info.controller);
-            info.controller = nullptr;
+        if (info.gamepad) {
+            SDL_CloseGamepad(info.gamepad);
+            info.gamepad = nullptr;
         }
     }
 }
@@ -546,9 +654,9 @@ InputDispatcher::~InputDispatcher() {
 void InputDispatcher::handle_event(const SDL_Event& event) {
     maybe_complete_combo();
     switch (event.type) {
-        case SDL_KEYDOWN:
-        case SDL_KEYUP: {
-            update_modifier_state(event.key, event.type == SDL_KEYDOWN);
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP: {
+            update_modifier_state(event.key, event.type == SDL_EVENT_KEY_DOWN);
             if (handle_combo_key(event.key)) {
                 return;
             }
@@ -556,55 +664,111 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
             if (!should_forward_keyboard(event.key)) break;
             auto* ctx = resources_.canvas_heads[resources_.active_canvas_index].context;
             if (!ctx) break;
+            // SDL3 keyboard event exposes `scancode` on `event.key`.
+            int sc = event.key.scancode;
+            int keycode = 0;
+            int mods = SDL_GetModState();
             gp_canvas_on_key(
                 ctx,
-                event.key.keysym.sym,
-                event.key.keysym.scancode,
-                event.type == SDL_KEYDOWN ? 1 : 0,
-                event.key.keysym.mod
+                keycode,
+                sc,
+                event.type == SDL_EVENT_KEY_DOWN ? 1 : 0,
+                mods
             );
             break;
         }
-        case SDL_MOUSEBUTTONDOWN:
-        case SDL_MOUSEBUTTONUP: {
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP: {
             if (!filters_.mouse_enabled) break;
             if (!should_forward_mouse_button(event.button)) break;
             auto* ctx = resources_.canvas_heads[resources_.active_canvas_index].context;
             if (!ctx) break;
-            // translate window coords -> canvas-local coords using layout
-            int lx = event.button.x - resources_.layout.canvas_x;
-            int ly = event.button.y - resources_.layout.canvas_y;
-            if (event.type == SDL_MOUSEBUTTONDOWN) {
-                gp_canvas_on_mouse_down(ctx, lx, ly);
+            // Prefer high-precision stored coords when available; fall back to integer event values.
+            float fx = resources_.layout.mouse_fx;
+            float fy = resources_.layout.mouse_fy;
+            float fdx = resources_.layout.mouse_fdx;
+            float fdy = resources_.layout.mouse_fdy;
+            if (!have_prev_mouse_) {
+                fx = static_cast<float>(event.button.x);
+                fy = static_cast<float>(event.button.y);
+                fdx = 0.0f; fdy = 0.0f;
+            }
+            float lx = fx - static_cast<float>(resources_.layout.canvas_x);
+            float ly = fy - static_cast<float>(resources_.layout.canvas_y);
+            int button = static_cast<int>(event.button.button);
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                fprintf(stderr, "[DBG] frontend on_mouse_down ctx=%p lx=%f,ly=%f fdx=%f,fdy=%f btn=%d\n", (void*)ctx, lx, ly, fdx, fdy, button);
+                gp_canvas_on_mouse_down(ctx, lx, ly, fdx, fdy, button);
             } else {
-                gp_canvas_on_mouse_up(ctx, lx, ly);
+                fprintf(stderr, "[DBG] frontend on_mouse_up ctx=%p lx=%f,ly=%f fdx=%f,fdy=%f btn=%d\n", (void*)ctx, lx, ly, fdx, fdy, button);
+                gp_canvas_on_mouse_up(ctx, lx, ly, fdx, fdy, button);
             }
             break;
         }
-        case SDL_MOUSEMOTION: {
+        case SDL_EVENT_MOUSE_MOTION: {
             if (!filters_.mouse_enabled) break;
             auto* ctx = resources_.canvas_heads[resources_.active_canvas_index].context;
             if (!ctx) break;
-            int lx = event.motion.x - resources_.layout.canvas_x;
-            int ly = event.motion.y - resources_.layout.canvas_y;
-            gp_canvas_on_mouse_move(ctx, lx, ly);
+            // SDL3 exposes floating-point mouse coords; capture those and derive deltas.
+            float mx = static_cast<float>(event.motion.x);
+            float my = static_cast<float>(event.motion.y);
+            float mdx = 0.0f, mdy = 0.0f;
+            if (have_prev_mouse_) {
+                mdx = mx - prev_mouse_x_;
+                mdy = my - prev_mouse_y_;
+            }
+            prev_mouse_x_ = mx;
+            prev_mouse_y_ = my;
+            have_prev_mouse_ = true;
+            // store high-precision values into layout for consumers
+            resources_.layout.mouse_fx = mx;
+            resources_.layout.mouse_fy = my;
+            resources_.layout.mouse_fdx = mdx;
+            resources_.layout.mouse_fdy = mdy;
+            // translate to canvas-local float coords and forward deltas
+            float lx = mx - static_cast<float>(resources_.layout.canvas_x);
+            float ly = my - static_cast<float>(resources_.layout.canvas_y);
+            fprintf(stderr, "[DBG] frontend on_mouse_move ctx=%p lx=%f,ly=%f mdx=%f,mdy=%f\n", (void*)ctx, lx, ly, mdx, mdy);
+            gp_canvas_on_mouse_move(ctx, lx, ly, mdx, mdy);
             break;
         }
-        case SDL_CONTROLLERDEVICEADDED:
-            add_gamepad(event.cdevice.which);
+        case SDL_EVENT_MOUSE_WHEEL: {
+            if (!filters_.mouse_enabled) break;
+            auto* ctx = resources_.canvas_heads[resources_.active_canvas_index].context;
+            if (!ctx) break;
+            // Use stored high-precision cursor position when available
+            float mx = resources_.layout.mouse_fx;
+            float my = resources_.layout.mouse_fy;
+            if (!have_prev_mouse_) {
+                float fx = 0.0f, fy = 0.0f;
+                SDL_GetMouseState(&fx, &fy);
+                mx = fx;
+                my = fy;
+            }
+            float mdx = resources_.layout.mouse_fdx;
+            float mdy = resources_.layout.mouse_fdy;
+            float lx = mx - static_cast<float>(resources_.layout.canvas_x);
+            float ly = my - static_cast<float>(resources_.layout.canvas_y);
+            float scroll = static_cast<float>(event.wheel.y);
+            fprintf(stderr, "[DBG] frontend on_mouse_scroll ctx=%p lx=%f,ly=%f mdx=%f,mdy=%f scroll=%f\n", (void*)ctx, lx, ly, mdx, mdy, scroll);
+            gp_canvas_on_mouse_scroll(ctx, lx, ly, mdx, mdy, scroll);
             break;
-        case SDL_CONTROLLERDEVICEREMOVED:
-            remove_gamepad(event.cdevice.which);
+        }
+        case SDL_EVENT_GAMEPAD_ADDED:
+            add_gamepad(event.gdevice.which);
             break;
-        case SDL_CONTROLLERBUTTONDOWN:
-        case SDL_CONTROLLERBUTTONUP:
+        case SDL_EVENT_GAMEPAD_REMOVED:
+            remove_gamepad(event.gdevice.which);
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
             if (!filters_.gamepad_enabled) break;
             if (!filters_.gamepad_filter_active ||
-                filters_.gamepad_buttons.count(static_cast<SDL_GameControllerButton>(event.cbutton.button)) > 0) {
+                filters_.gamepad_buttons.count(static_cast<SDL_GamepadButton>(event.gbutton.button)) > 0) {
                 if (filters_.gamepad_filter_active) {
                     std::cout << "Gamepad button "
-                              << static_cast<int>(event.cbutton.button)
-                              << (event.type == SDL_CONTROLLERBUTTONDOWN ? " down" : " up")
+                              << static_cast<int>(event.gbutton.button)
+                              << (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ? " down" : " up")
                               << "\n";
                 }
             }
@@ -615,7 +779,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
 }
 
 void InputDispatcher::update_modifier_state(const SDL_KeyboardEvent& event, bool pressed) {
-    switch (event.keysym.scancode) {
+    switch (event.scancode) {
         case SDL_SCANCODE_LSHIFT:
         case SDL_SCANCODE_RSHIFT:
             shift_down_ = pressed;
@@ -633,9 +797,16 @@ void InputDispatcher::update_modifier_state(const SDL_KeyboardEvent& event, bool
     }
 }
 
+void InputDispatcher::refresh_layout_from_window() {
+    if (!resources_.window) return;
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(resources_.window, &ww, &wh);
+    on_window_resized(ww, wh);
+}
+
 bool InputDispatcher::should_forward_keyboard(const SDL_KeyboardEvent& event) const {
     if (!filters_.keyboard_filter_active) return true;
-    return filters_.keyboard_keys.count(event.keysym.scancode) > 0;
+    return filters_.keyboard_keys.count(event.scancode) > 0;
 }
 
 bool InputDispatcher::should_forward_mouse_button(const SDL_MouseButtonEvent& event) const {
@@ -684,9 +855,9 @@ void InputDispatcher::maybe_complete_combo() {
 }
 
 bool InputDispatcher::handle_combo_key(const SDL_KeyboardEvent& event) {
-    if (event.type != SDL_KEYDOWN) return false;
-    int digit = scancode_to_digit(event.keysym.scancode);
-    if (event.keysym.scancode == SDL_SCANCODE_TAB &&
+    if (event.type != SDL_EVENT_KEY_DOWN) return false;
+    int digit = scancode_to_digit(event.scancode);
+    if (event.scancode == SDL_SCANCODE_TAB &&
         shift_down_ && ctrl_down_) {
         if (!combo_.hunting) {
             start_combo(alt_down_);
@@ -699,12 +870,12 @@ bool InputDispatcher::handle_combo_key(const SDL_KeyboardEvent& event) {
     if (combo_.hunting && digit >= 0) {
         if (combo_.digits.size() < 3) {
             combo_.digits.push_back(static_cast<char>('0' + digit));
-            std::cout << "Canvas hunt saw digit " << digit << " (scancode " << event.keysym.scancode << " mods=" << event.keysym.mod << ")\n";
+            std::cout << "Canvas hunt saw digit " << digit << " (scancode " << event.scancode << " mods=" << SDL_GetModState() << ")\n";
         }
         return true;
     }
     if (combo_.hunting) {
-        std::cout << "Canvas hunt ignored key sym=" << event.keysym.sym << " sc=" << event.keysym.scancode << " mod=" << event.keysym.mod << "\n";
+        std::cout << "Canvas hunt ignored key sc=" << event.scancode << " mod=" << SDL_GetModState() << "\n";
     }
     return false;
 }
@@ -788,28 +959,28 @@ void InputDispatcher::switch_to_canvas(size_t index) {
 }
 
 void InputDispatcher::add_gamepad(int device_index) {
-    SDL_GameController* controller = SDL_GameControllerOpen(device_index);
-    if (!controller) {
+    SDL_Gamepad* gp = SDL_OpenGamepad(device_index);
+    if (!gp) {
         std::cerr << "Gamepad open failed: " << SDL_GetError() << "\n";
         return;
     }
-    SDL_Joystick* joy = SDL_GameControllerGetJoystick(controller);
+    SDL_Joystick* joy = SDL_GetGamepadJoystick(gp);
     if (!joy) {
-        SDL_GameControllerClose(controller);
+        SDL_CloseGamepad(gp);
         return;
     }
-    SDL_JoystickID instance_id = SDL_JoystickInstanceID(joy);
+    SDL_JoystickID instance_id = SDL_GetJoystickID(joy);
     if (instance_id < 0) {
-        SDL_GameControllerClose(controller);
+        SDL_CloseGamepad(gp);
         return;
     }
     for (const auto& info : gamepads_) {
         if (info.instance_id == instance_id) {
-            SDL_GameControllerClose(controller);
+            SDL_CloseGamepad(gp);
             return;
         }
     }
-    gamepads_.push_back({controller, instance_id});
+    gamepads_.push_back({gp, instance_id});
     std::cout << "Gamepad connected (instance " << instance_id << ")\n";
 }
 
@@ -817,8 +988,8 @@ void InputDispatcher::remove_gamepad(SDL_JoystickID instance_id) {
     auto it = std::find_if(gamepads_.begin(), gamepads_.end(),
         [instance_id](const GamepadInfo& info) { return info.instance_id == instance_id; });
     if (it == gamepads_.end()) return;
-    if (it->controller) {
-        SDL_GameControllerClose(it->controller);
+    if (it->gamepad) {
+        SDL_CloseGamepad(it->gamepad);
     }
     std::cout << "Gamepad disconnected (instance " << instance_id << ")\n";
     gamepads_.erase(it);
@@ -877,44 +1048,44 @@ static std::optional<Uint8> mouse_button_from_token(const std::string& raw) {
     if (auto it = kMouseButtonMap.find(lower); it != kMouseButtonMap.end()) {
         return it->second;
     }
-    if (lower.rfind("button", 0) == 0) {
+        if (lower.rfind("button", 0) == 0) {
         int parsed = 0;
         if (parse_positive_int(lower.substr(6), parsed)) {
             if (parsed > 0 && parsed <= 8) {
-                return SDL_BUTTON(parsed);
+                return static_cast<Uint8>(parsed);
             }
         }
     }
     int parsed = 0;
     if (parse_positive_int(lower, parsed) && parsed > 0 && parsed <= 8) {
-        return SDL_BUTTON(parsed);
+        return static_cast<Uint8>(parsed);
     }
     return std::nullopt;
 }
 
-static std::optional<SDL_GameControllerButton> gamepad_button_from_token(const std::string& raw) {
-    static const std::unordered_map<std::string, SDL_GameControllerButton> kGamepadButtonMap = {
-        {"a", SDL_CONTROLLER_BUTTON_A},
-        {"b", SDL_CONTROLLER_BUTTON_B},
-        {"x", SDL_CONTROLLER_BUTTON_X},
-        {"y", SDL_CONTROLLER_BUTTON_Y},
-        {"back", SDL_CONTROLLER_BUTTON_BACK},
-        {"guide", SDL_CONTROLLER_BUTTON_GUIDE},
-        {"start", SDL_CONTROLLER_BUTTON_START},
-        {"leftstick", SDL_CONTROLLER_BUTTON_LEFTSTICK},
-        {"rightstick", SDL_CONTROLLER_BUTTON_RIGHTSTICK},
-        {"leftshoulder", SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
-        {"rightshoulder", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
-        {"dpup", SDL_CONTROLLER_BUTTON_DPAD_UP},
-        {"dpdown", SDL_CONTROLLER_BUTTON_DPAD_DOWN},
-        {"dpleft", SDL_CONTROLLER_BUTTON_DPAD_LEFT},
-        {"dpright", SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
-        {"misc1", SDL_CONTROLLER_BUTTON_MISC1},
-        {"paddle1", SDL_CONTROLLER_BUTTON_PADDLE1},
-        {"paddle2", SDL_CONTROLLER_BUTTON_PADDLE2},
-        {"paddle3", SDL_CONTROLLER_BUTTON_PADDLE3},
-        {"paddle4", SDL_CONTROLLER_BUTTON_PADDLE4},
-        {"touchpad", SDL_CONTROLLER_BUTTON_TOUCHPAD},
+static std::optional<SDL_GamepadButton> gamepad_button_from_token(const std::string& raw) {
+    static const std::unordered_map<std::string, SDL_GamepadButton> kGamepadButtonMap = {
+        {"a", SDL_GAMEPAD_BUTTON_SOUTH},
+        {"b", SDL_GAMEPAD_BUTTON_EAST},
+        {"x", SDL_GAMEPAD_BUTTON_WEST},
+        {"y", SDL_GAMEPAD_BUTTON_NORTH},
+        {"back", SDL_GAMEPAD_BUTTON_BACK},
+        {"guide", SDL_GAMEPAD_BUTTON_GUIDE},
+        {"start", SDL_GAMEPAD_BUTTON_START},
+        {"leftstick", SDL_GAMEPAD_BUTTON_LEFT_STICK},
+        {"rightstick", SDL_GAMEPAD_BUTTON_RIGHT_STICK},
+        {"leftshoulder", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+        {"rightshoulder", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+        {"dpup", SDL_GAMEPAD_BUTTON_DPAD_UP},
+        {"dpdown", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+        {"dpleft", SDL_GAMEPAD_BUTTON_DPAD_LEFT},
+        {"dpright", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+        {"misc1", SDL_GAMEPAD_BUTTON_MISC1},
+        {"paddle1", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
+        {"paddle2", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
+        {"paddle3", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2},
+        {"paddle4", SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
+        {"touchpad", SDL_GAMEPAD_BUTTON_TOUCHPAD},
     };
     auto lower = to_lower(raw);
     if (auto it = kGamepadButtonMap.find(lower); it != kGamepadButtonMap.end()) {
@@ -1199,21 +1370,16 @@ void pump_events(bool& running, InputDispatcher& dispatcher) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
-            case SDL_QUIT:
+            case SDL_EVENT_QUIT:
                 running = false;
                 break;
-            case SDL_WINDOWEVENT:
-                if (event.window.event == SDL_WINDOWEVENT_CLOSE) {
-                    running = false;
-                } else if (event.window.event == SDL_WINDOWEVENT_RESIZED ||
-                           event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    SDL_Window* w = SDL_GetWindowFromID(event.window.windowID);
-                    if (w) {
-                        int ww = 0, wh = 0;
-                        SDL_GetWindowSize(w, &ww, &wh);
-                        dispatcher.on_window_resized(ww, wh);
-                    }
-                }
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                running = false;
+                break;
+            case SDL_EVENT_WINDOW_RESIZED:
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                // Let dispatcher query the window directly and update layout
+                dispatcher.refresh_layout_from_window();
                 break;
             default:
                 break;
@@ -1238,12 +1404,17 @@ void render_frame(FrontendResources& resources, CanvasTickController& controller
     SDL_RenderClear(resources.renderer);
     // Render canvas texture at computed top-centered position
     if (resources.canvas_texture) {
-        SDL_Rect dst;
-        dst.x = resources.layout.canvas_x;
-        dst.y = resources.layout.canvas_y;
-        dst.w = resources.layout.canvas_w > 0 ? resources.layout.canvas_w : resources.canvas_texture_width;
-        dst.h = resources.layout.canvas_h > 0 ? resources.layout.canvas_h : resources.canvas_texture_height;
-        SDL_RenderCopy(resources.renderer, resources.canvas_texture, nullptr, &dst);
+        SDL_Rect dsti;
+        dsti.x = resources.layout.canvas_x;
+        dsti.y = resources.layout.canvas_y;
+        dsti.w = resources.layout.canvas_w > 0 ? resources.layout.canvas_w : resources.canvas_texture_width;
+        dsti.h = resources.layout.canvas_h > 0 ? resources.layout.canvas_h : resources.canvas_texture_height;
+        SDL_FRect dstf;
+        dstf.x = static_cast<float>(dsti.x);
+        dstf.y = static_cast<float>(dsti.y);
+        dstf.w = static_cast<float>(dsti.w);
+        dstf.h = static_cast<float>(dsti.h);
+        SDL_RenderTexture(resources.renderer, resources.canvas_texture, nullptr, &dstf);
     }
     SDL_RenderPresent(resources.renderer);
 }
@@ -1298,11 +1469,25 @@ void prepare_torch(FrontendResources& resources, const FrontendOptions& opts) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
+        std::cerr << "SDL_Init failed: " << SDL_GetError();
+// Optionally include Win32 formatted/system-localized error text. Define
+// `NODUS_PRINT_WIN32_ERROR_TEXT` at build time to enable; otherwise only
+// SDL_GetError() is printed (safer for localization/CI environments).
+#if defined(_WIN32) && defined(NODUS_PRINT_WIN32_ERROR_TEXT)
+        DWORD err = GetLastError();
+        if (err != 0) {
+            char buf[512] = {0};
+            FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                           nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, sizeof(buf), nullptr);
+            std::cerr << " (GetLastError=" << err << ": " << buf << ")";
+        }
+#endif
+        std::cerr << "\n";
         return EXIT_FAILURE;
     }
-    SDL_GameControllerEventState(SDL_ENABLE);
+    // SDL3 uses SDL_INIT_GAMEPAD to enable gamepad support; explicit
+    // event state calls like SDL_GameControllerEventState are deprecated.
     FrontendOptions options = parse_frontend_options(argc, argv);
     if (options.show_help) {
         print_usage(argv && argv[0] ? argv[0] : "frontend_shell");

@@ -1,4 +1,11 @@
 // Serialization format (simple binary):
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
 // [8 bytes magic 'GPTBL001'][uint32_t version]
 // version 1: GP_TableStyle, cols, rows, edges, selected keys
 // version 2: same as v1, then int32 meta_group_count, followed by per-meta-group blob

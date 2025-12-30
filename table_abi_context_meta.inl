@@ -1,4 +1,14 @@
 // Stateful context ----------------------------------------------------------
+#include "console_logger.h"
+#ifndef printf
+#define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+#ifndef fprintf
+#define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
+#endif
+
+#include <atomic>
+#include <memory>
 
 struct GP_TableContext {
     GP_TableStyle style_raw{};
@@ -79,6 +89,10 @@ struct GP_TableContext {
     std::unordered_map<uint64_t,int32_t> key_type_hint; // key -> type_id
     std::unordered_set<uint64_t> key_is_input; // keys marked input
     std::unordered_set<uint64_t> key_is_output; // keys marked output
+    // Lock-free snapshot of detected type ids (diagnostic reader use).
+    // Use a plain shared_ptr and the free-function atomic_load/atomic_store
+    // overloads for `std::shared_ptr` to remain portable across MSVC.
+    std::shared_ptr<std::vector<int32_t>> type_ids_snapshot{nullptr};
     // reading direction for sides (0=input,1=output). 0=LTR,1=TTB,2=RTL,3=BTB
     int32_t side_reading_dir[2] = {0, 0};
     // LED grid preference (cols, rows, aspect)
