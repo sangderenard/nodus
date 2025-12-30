@@ -45,6 +45,20 @@ static void ensure_autosave_thread_started(GP_CanvasContextImpl* c) {
     c->autosave_thread = std::make_unique<std::thread>([c]() { autosave_worker_loop(c); });
 }
 
+// Lazily create/retrieve a stable tool-row id for a specific module/contact.
+// Stored in `module_binding_id_map` keyed by (module_idx<<32)|contact_idx.
+extern "C" uint64_t gp_canvas_get_tool_row_id(GP_CanvasContext* ctx_, int module_idx, int contact_idx) {
+    if (!ctx_ || module_idx < 0 || contact_idx < 0) return 0ull;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    uint64_t map_key = (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) | static_cast<uint64_t>(static_cast<uint32_t>(contact_idx));
+    auto it = c->module_binding_id_map.find(map_key);
+    if (it != c->module_binding_id_map.end()) return it->second;
+    uint64_t nid = gp_canvas_generate_id(ctx_, 0ull);
+    if (nid == 0ull) return 0ull;
+    c->module_binding_id_map[map_key] = nid;
+    return nid;
+}
+
 static void stop_autosave_thread(GP_CanvasContextImpl* c) {
     c->autosave_thread_stop.store(1, std::memory_order_release);
     if (c->autosave_thread && c->autosave_thread->joinable()) {
@@ -100,17 +114,26 @@ extern "C" int gp_canvas_bind_action_ptr_to_module_port(GP_CanvasContext* ctx_, 
         GP_TableContext* root = canvas_ensure_root_table(c);
         if (root) {
             int contact_idx = kModuleFrameContactBase + row * kModuleExtraLedCount + led_idx;
-            unsigned long long ka = (static_cast<unsigned long long>(static_cast<uint32_t>(module_idx)) << 32) |
-                                    (static_cast<unsigned long long>(static_cast<uint32_t>(contact_idx)) << 16) |
-                                    static_cast<unsigned long long>(0);
-            unsigned long long kb = ka + 1ull; // complementary endpoint
-            gp_table_add_edge(root, ka, kb);
-            int idx = -1;
-            if (gp_table_edge_index_for_key(root, ka, &idx) && idx >= 0) {
-                ab.root_edge_idx = idx;
-                ab.writer_key = ka;
-                    // Debug: report created root edge / writer key for this binding
+            // Generate/retrieve a stable tool-row id using the canvas common id generator.
+            // Do NOT fall back to any canonical composed key; if a tool-row id
+            // could not be generated, we do not create a root FIFO edge for
+            // this binding. This enforces the new-only id policy.
+            uint64_t binding_id = gp_canvas_get_tool_row_id(reinterpret_cast<GP_CanvasContext*>(c), module_idx, contact_idx);
+            if (binding_id) {
+                unsigned long long ka = binding_id;
+                unsigned long long kb = ka + 1ull;
+                gp_table_add_edge(root, ka, kb);
+                int idx = -1;
+                if (gp_table_edge_index_for_key(root, ka, &idx) && idx >= 0) {
+                    ab.root_edge_idx = idx;
+                    ab.writer_key = ka;
+                    // record binding id mapping so manager can discover it without touching port UUIDs
+                    uint64_t map_key = (static_cast<uint64_t>(static_cast<uint32_t>(module_idx)) << 32) | static_cast<uint64_t>(static_cast<uint32_t>(contact_idx));
+                    c->module_binding_id_map[map_key] = binding_id;
                     fprintf(stderr, "[DBG] bind module=%d row=%d led=%d action=%d root_edge=%d writer_key=%llu\n", module_idx, row, led_idx, aid, ab.root_edge_idx, (unsigned long long)ab.writer_key);
+                }
+            } else {
+                // No tool-row id available: leave root_edge_idx == -1 and writer_key == 0
             }
         }
         c->action_port_bindings[aid].push_back(std::move(ab));

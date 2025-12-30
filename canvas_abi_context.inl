@@ -85,6 +85,8 @@ struct GP_CanvasContextImpl {
     std::vector<ModulePreviewBuffer> module_preview_buffers;
     std::vector<ModuleStackTail> module_stack_tail;
     std::vector<std::unordered_map<int, std::vector<float>>> module_stack_snapshots;
+    // Per-module per-row stack item metadata: pair(type_id, element_count)
+    std::vector<std::unordered_map<int, std::vector<std::pair<int,int>>>> module_stack_snapshot_meta;
     std::vector<std::vector<ModuleToolKind>> module_tool_stack;
     // Action subscriber registry: map action_id -> list of (callback,user)
     std::unordered_map<int32_t, std::vector<std::pair<GP_CanvasActionSubscriberFn, void*>>> action_subscribers;
@@ -216,6 +218,8 @@ struct GP_CanvasContextImpl {
     std::unordered_map<uint64_t, std::pair<int,int>> overlay_port_uuid_map;
     // map module port UUID -> (module_idx, row, led_idx)
     std::unordered_map<uint64_t, std::array<int,3>> module_port_uuid_map;
+    // Mapping from (module_idx<<32)|contact_idx -> binding id generated at bind time.
+    std::unordered_map<uint64_t, uint64_t> module_binding_id_map;
     // map overlay sentinel keys -> overlay id for fast lookup and to
     // ensure we never create duplicate overlays for the same keys
     std::unordered_map<unsigned long long, int> overlay_key_map;

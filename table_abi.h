@@ -469,6 +469,9 @@ int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsign
 // Returns 1 on success; `out_dropped` is set to 1 when old unread samples
 // were advanced to admit the write.
 int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped);
+// Publish a single typed element by popping it from a RawStackFrame source.
+// This helper prefers in-backend transfers and will fall back to host copies.
+int32_t gp_table_edge_publish_from_frame(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, struct RawStackFrame* src_frame, int32_t type_id, int32_t* out_dropped);
 int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, const void* sample_bytes, int32_t sample_len_bytes, int32_t* out_dropped, int32_t timeout_ms);
 // Consume the next available sample as raw bytes. `out_len_bytes` must be
 // large enough to hold the sample; `out_written` is set to the number of

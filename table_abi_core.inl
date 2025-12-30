@@ -1,4 +1,6 @@
 extern "C" {
+#include "mem_backend.h"
+#include "value_types.h"
 
 
 int32_t gp_table_calc_size(const GP_TableStyle* style, int32_t row_count, int32_t col_count, GP_TableGeom* out_geom) {
@@ -528,8 +530,12 @@ struct EdgeTensorFifo {
         std::atomic<uint64_t> write_seq{0}; // next sequence to write
         std::atomic<uint64_t> writer{0};    // bound writer key (0 => unbound)
         std::unique_ptr<std::atomic<uint64_t>[]> slot_seq; // published tag per slot (seq+1), 0 => empty
-        std::unique_ptr<uint8_t[]> storage_bytes;          // raw bytes: slots * stride * elem_size
-        float* storage_f = nullptr;                        // typed view for float samples (only valid when elem_size==sizeof(float))
+        // Storage is now owned via a backend buffer handle. Backends may be
+        // host-backed or device-backed; operations should map or use vtable
+        // copy hooks when accessing data.
+        gp_mem_backend_handle_t storage_handle{nullptr};
+        // Typed view is not persisted; map on demand. Backends should be
+        // accessed via map/copy helpers — no cached typed pointer is kept.
         size_t elem_size = sizeof(float);                  // bytes per element
         int32_t type_id = -1;                              // schema id
         std::unique_ptr<ReaderEntry[]> readers;
@@ -548,6 +554,9 @@ struct EdgeTensorFifo {
         std::mutex cv_mu;
         std::condition_variable cv;
         bool configured = false;
+
+        // Optional memory backend handle attached to this FIFO
+        gp_mem_backend_handle_t backend{nullptr};
 
         Impl() : readers(new ReaderEntry[kMaxReaders]) {}
     };
@@ -595,10 +604,37 @@ struct EdgeTensorFifo {
         order_history_count = 0;
         order_history_cursor = 0;
 
-        impl->storage_bytes.reset(new uint8_t[impl->stride * impl->slots * impl->elem_size]);
-        if (impl->elem_size == sizeof(float)) impl->storage_f = reinterpret_cast<float*>(impl->storage_bytes.get()); else impl->storage_f = nullptr;
+        size_t total_bytes = impl->stride * impl->slots * impl->elem_size;
+        // Allocate a host-backed storage buffer by default. If a backend was
+        // previously attached via set_backend(), use that backend to host
+        // the allocation if the backend exposes alloc, otherwise fall back
+        // to creating a host buffer handle.
+        if (impl->backend) {
+            const gp_mem_backend_vtable_t* bvt = gp_mem_backend_get_vtable(impl->backend);
+            if (bvt && bvt->alloc) {
+                impl->storage_handle = bvt->alloc(impl->backend, total_bytes, /*alignment=*/0);
+            } else {
+                // backend doesn't provide alloc: create a generic host buffer
+                impl->storage_handle = gp_mem_backend_create_host(total_bytes);
+            }
+        } else {
+            impl->storage_handle = gp_mem_backend_create_host(total_bytes);
+        }
         impl->slot_seq.reset(new std::atomic<uint64_t>[impl->slots]);
-        std::memset(impl->storage_bytes.get(), 0, static_cast<size_t>(impl->stride * impl->slots * sizeof(float)));
+        if (impl->storage_handle) {
+            const gp_mem_backend_vtable_t* sh_vt = gp_mem_backend_get_vtable(impl->storage_handle);
+            if (sh_vt && sh_vt->copy_to_backend) {
+                std::vector<uint8_t> zeros;
+                try { zeros.resize(total_bytes); } catch(...) { }
+                if (zeros.size() == total_bytes) sh_vt->copy_to_backend(impl->storage_handle, 0, zeros.data(), total_bytes);
+            } else {
+                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+                if (m) {
+                    std::memset(m, 0, total_bytes);
+                    gp_mem_backend_unmap(impl->storage_handle);
+                }
+            }
+        }
         for (size_t i = 0; i < impl->slots; ++i) impl->slot_seq[i].store(0, std::memory_order_relaxed);
         impl->write_seq.store(0, std::memory_order_relaxed);
         impl->writer.store(0, std::memory_order_relaxed);
@@ -615,6 +651,18 @@ struct EdgeTensorFifo {
             impl->readers[i].seq.store(0, std::memory_order_relaxed);
         }
         impl->configured = true;
+    }
+
+    // Attach a memory backend to this FIFO. The FIFO will consult backend
+    // capabilities (e.g. BYREF safety) when deciding how to expose pointer
+    // semantics to consumers.
+    void set_backend(gp_mem_backend_handle_t h) {
+        if (!impl) return;
+        impl->backend = h;
+    }
+    gp_mem_backend_handle_t get_backend() const {
+        if (!impl) return nullptr;
+        return impl->backend;
     }
 
     size_t elem_count() const { return impl ? impl->stride : 0; }
@@ -904,9 +952,30 @@ struct EdgeTensorFifo {
         }
 
         size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
-        uint8_t* dst = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
+        size_t bytes = impl->stride * impl->elem_size;
         const void* effective_sample_ptr = (effective_sample_f ? reinterpret_cast<const void*>(effective_sample_f) : reinterpret_cast<const void*>(sample_bytes_u));
-        std::memcpy(dst, effective_sample_ptr, impl->stride * impl->elem_size);
+        // Write into the FIFO's backend-owned storage buffer.
+        gp_mem_backend_handle_t sh = impl->storage_handle;
+        if (!sh) {
+            if (out_dropped) *out_dropped = 1;
+            return false;
+        }
+        const gp_mem_backend_vtable_t* sh_vt = gp_mem_backend_get_vtable(sh);
+        size_t offset = slot * bytes;
+        if (sh_vt && sh_vt->copy_to_backend) {
+            if (!sh_vt->copy_to_backend(sh, offset, effective_sample_ptr, bytes)) {
+                if (out_dropped) *out_dropped = 1;
+                return false;
+            }
+        } else {
+            void* m = gp_mem_backend_map_or_null(sh);
+            if (!m) {
+                if (out_dropped) *out_dropped = 1;
+                return false;
+            }
+            std::memcpy(reinterpret_cast<uint8_t*>(m) + offset, effective_sample_ptr, bytes);
+            gp_mem_backend_unmap(sh);
+        }
         impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
         impl->write_seq.store(seq + 1, std::memory_order_release);
         note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
@@ -952,14 +1021,107 @@ struct EdgeTensorFifo {
         // through the same stride-based FIFO storage as float samples. The
         // consumer is expected to interpret the slot according to the edge
         // metadata (pointer vs float).
-        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
-        // Zero the slot first to avoid leaving stale bytes in trailing area
-        std::memset(base, 0, impl->stride * impl->elem_size);
-        std::memcpy(base, &ptr, std::min<size_t>(sizeof(void*), impl->stride * impl->elem_size));
+        size_t bytes = impl->stride * impl->elem_size;
+        // Write pointer bytes into storage buffer
+        gp_mem_backend_handle_t sh_ptr = impl->storage_handle;
+        if (!sh_ptr) { if (out_dropped) *out_dropped = 1; return false; }
+        const gp_mem_backend_vtable_t* shp_vt = gp_mem_backend_get_vtable(sh_ptr);
+        size_t poff = slot * bytes;
+        size_t pbytes = std::min<size_t>(sizeof(void*), bytes);
+        if (shp_vt && shp_vt->copy_to_backend) {
+            if (!shp_vt->copy_to_backend(sh_ptr, poff, &ptr, pbytes)) { if (out_dropped) *out_dropped = 1; return false; }
+        } else {
+            void* m = gp_mem_backend_map_or_null(sh_ptr);
+            if (!m) { if (out_dropped) *out_dropped = 1; return false; }
+            std::memset(reinterpret_cast<uint8_t*>(m) + poff, 0, bytes);
+            std::memcpy(reinterpret_cast<uint8_t*>(m) + poff, &ptr, pbytes);
+            gp_mem_backend_unmap(sh_ptr);
+        }
         impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
         impl->write_seq.store(seq + 1, std::memory_order_release);
         note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
         impl->cv.notify_all();
+        if (out_dropped) *out_dropped = dropped ? 1 : 0;
+        return true;
+    }
+
+    // Push a single typed element into the FIFO by popping it from a
+    // RawStackFrame source. This attempts an optimized backend-to-backend
+    // transfer when both source frame and FIFO storage expose backends and
+    // fallbacks to a host-mediated copy otherwise. On success the source
+    // frame has the element removed (popped). Returns true on success.
+    bool push_from_frame(uint64_t edge_id, uint64_t writer_id, RawStackFrame* src_frame, int32_t type_id, bool* out_dropped) {
+        if (!impl || !impl->configured || !src_frame) return false;
+        uint64_t bound = impl->writer.load(std::memory_order_relaxed);
+        if (bound == 0) {
+            (void)impl->writer.compare_exchange_strong(bound, writer_id, std::memory_order_relaxed);
+        }
+        bound = impl->writer.load(std::memory_order_relaxed);
+        if (bound != 0 && bound != writer_id) return false;
+
+        uint64_t seq = impl->write_seq.load(std::memory_order_relaxed);
+        bool dropped = false;
+        if (!ensure_space_for_write(seq, &dropped, edge_id)) {
+            if (out_dropped) *out_dropped = 1;
+            return false;
+        }
+
+        size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
+        size_t bytes = impl->stride * impl->elem_size;
+        size_t dst_offset = slot * bytes;
+
+        // Try direct backend-to-backend via raw_stack helper which knows how
+        // to pop from the frame and write into a destination backend.
+        if (src_frame->backend && impl->storage_handle) {
+            if (gp_raw_stack_frame_pop_into_backend(src_frame, impl->storage_handle, dst_offset, type_id)) {
+                impl->slot_seq[slot].store(seq + 1, std::memory_order_release);
+                impl->write_seq.store(seq + 1, std::memory_order_release);
+                note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
+                impl->cv.notify_all();
+                if (out_dropped) *out_dropped = dropped ? 1 : 0;
+                return true;
+            }
+        }
+
+        // Fallback host-mediated path: read element bytes into host tmp,
+        // push them into FIFO storage via existing push(), and then pop the
+        // element from the source frame. This duplicates a transfer but
+        // keeps correctness when optimized path unavailable.
+        const ValueType* vt = ValueTypeRegistry::global().get(type_id);
+        if (!vt || vt->size == 0) return false;
+        size_t need = vt->size;
+        std::vector<uint8_t> tmp;
+        try { tmp.resize(bytes); } catch(...) { return false; }
+        std::memset(tmp.data(), 0, bytes);
+
+        // Read source element into tmp_head without popping yet.
+        bool read_ok = false;
+        if (src_frame->backend) {
+            const gp_mem_backend_vtable_t* src_vt = gp_mem_backend_get_vtable(src_frame->backend);
+            size_t start = (src_frame->byte_count >= need) ? (src_frame->byte_count - need) : 0;
+            if (src_vt && src_vt->copy_from_backend) {
+                if (src_vt->copy_from_backend(src_frame->backend, start, tmp.data(), need)) read_ok = true;
+            }
+            if (!read_ok) {
+                void* m = gp_mem_backend_map_or_null(src_frame->backend);
+                if (m) {
+                    std::memcpy(tmp.data(), reinterpret_cast<uint8_t*>(m) + start, need);
+                    gp_mem_backend_unmap(src_frame->backend);
+                    read_ok = true;
+                }
+            }
+        }
+        if (!read_ok) return false;
+
+        // Use existing push() to write tmp into FIFO storage (will copy-to-backend)
+        if (!push(edge_id, writer_id, tmp.data(), bytes, &dropped)) return false;
+
+        // Now remove the element from source frame (pop) to reflect transfer.
+        // Pop into a throwaway buffer.
+        std::vector<uint8_t> throwaway;
+        try { throwaway.resize(need); } catch(...) { return false; }
+        if (!raw_stack_pop_block(*src_frame, throwaway.data(), 1, type_id)) return false;
+
         if (out_dropped) *out_dropped = dropped ? 1 : 0;
         return true;
     }
@@ -976,9 +1138,21 @@ struct EdgeTensorFifo {
         if (observed != (rseq + 1)) return false;
 
         // Read pointer bytes from the slot's storage and return as opaque pointer.
-        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
+        size_t bytes = impl->stride * impl->elem_size;
         void* p = nullptr;
-        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * impl->elem_size));
+        gp_mem_backend_handle_t shr = impl->storage_handle;
+        if (!shr) return false;
+        const gp_mem_backend_vtable_t* shr_vt = gp_mem_backend_get_vtable(shr);
+        size_t rbytes = std::min<size_t>(sizeof(void*), bytes);
+        if (shr_vt && shr_vt->copy_from_backend) {
+            size_t roff = slot * bytes;
+            if (!shr_vt->copy_from_backend(shr, roff, &p, rbytes)) return false;
+        } else {
+            void* m = gp_mem_backend_map_or_null(shr);
+            if (!m) return false;
+            std::memcpy(&p, reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size, rbytes);
+            gp_mem_backend_unmap(shr);
+        }
         *out_ptr = p;
         r->seq.store(rseq + 1, std::memory_order_relaxed);
         note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
@@ -1000,9 +1174,27 @@ struct EdgeTensorFifo {
         uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
         if (observed != (rseq + 1)) return false;
 
-        uint8_t* base = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
+        size_t bytes = impl->stride * impl->elem_size;
         void* p = nullptr;
-        std::memcpy(&p, base, std::min<size_t>(sizeof(void*), impl->stride * impl->elem_size));
+        if (impl->backend) {
+            const gp_mem_backend_vtable_t* vt = gp_mem_backend_get_vtable(impl->backend);
+            if (vt && vt->copy_from_backend) {
+                size_t offset = slot * bytes;
+                void* tmp = nullptr;
+                if (!vt->copy_from_backend(impl->backend, offset, &tmp, std::min<size_t>(sizeof(void*), bytes))) return false;
+                p = tmp;
+            } else {
+                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+                if (!m) return false;
+                std::memcpy(&p, reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size, std::min<size_t>(sizeof(void*), bytes));
+                gp_mem_backend_unmap(impl->storage_handle);
+            }
+            } else {
+                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+                if (!m) return false;
+                std::memcpy(&p, reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size, std::min<size_t>(sizeof(void*), bytes));
+                gp_mem_backend_unmap(impl->storage_handle);
+            }
         *out_ptr = p;
         return true;
     }
@@ -1042,8 +1234,26 @@ struct EdgeTensorFifo {
         uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
         if (observed != (rseq + 1)) return false;
 
-        uint8_t* src = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
-        std::memcpy(out_sample_bytes, src, impl->stride * impl->elem_size);
+        size_t bytes = impl->stride * impl->elem_size;
+        if (impl->backend) {
+            const gp_mem_backend_vtable_t* vt = gp_mem_backend_get_vtable(impl->backend);
+            if (vt && vt->copy_from_backend) {
+                size_t offset = slot * bytes;
+                if (!vt->copy_from_backend(impl->backend, offset, out_sample_bytes, bytes)) return false;
+            } else {
+                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+                if (!m) return false;
+                uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
+                std::memcpy(out_sample_bytes, src, bytes);
+                gp_mem_backend_unmap(impl->storage_handle);
+            }
+        } else {
+            void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+            if (!m) return false;
+            uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
+            std::memcpy(out_sample_bytes, src, bytes);
+            gp_mem_backend_unmap(impl->storage_handle);
+        }
         r->seq.store(rseq + 1, std::memory_order_relaxed);
         note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
         impl->cv.notify_all();
@@ -1067,8 +1277,26 @@ struct EdgeTensorFifo {
         uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
         if (observed != (rseq + 1)) return false;
 
-        uint8_t* src = impl->storage_bytes.get() + slot * impl->stride * impl->elem_size;
-        std::memcpy(out_sample_bytes, src, impl->stride * impl->elem_size);
+        size_t bytes = impl->stride * impl->elem_size;
+        if (impl->backend) {
+            const gp_mem_backend_vtable_t* vt = gp_mem_backend_get_vtable(impl->backend);
+            if (vt && vt->copy_from_backend) {
+                size_t offset = slot * bytes;
+                if (!vt->copy_from_backend(impl->backend, offset, out_sample_bytes, bytes)) return false;
+            } else {
+                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+                if (!m) return false;
+                uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
+                std::memcpy(out_sample_bytes, src, bytes);
+                gp_mem_backend_unmap(impl->storage_handle);
+            }
+        } else {
+            void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+            if (!m) return false;
+            uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
+            std::memcpy(out_sample_bytes, src, bytes);
+            gp_mem_backend_unmap(impl->storage_handle);
+        }
         // Note: do NOT advance r->seq and do NOT call note_activity / notify.
         out_written_bytes = impl->stride * impl->elem_size;
         return true;
@@ -1110,21 +1338,84 @@ struct EdgeTensorFifo {
         size_t needed_elems = (min_bytes + impl->elem_size - 1) / impl->elem_size;
         size_t new_stride = std::max(impl->stride, needed_elems);
 
-        // allocate new storage
-        std::unique_ptr<uint8_t[]> new_bytes(new uint8_t[new_stride * impl->slots * impl->elem_size]);
-        std::memset(new_bytes.get(), 0, new_stride * impl->slots * impl->elem_size);
-
-        // copy per-slot existing bytes into the new layout (preserve min region)
-        for (size_t s = 0; s < impl->slots; ++s) {
-            uint8_t* src = impl->storage_bytes.get() + s * impl->stride * impl->elem_size;
-            uint8_t* dst = new_bytes.get() + s * new_stride * impl->elem_size;
-            size_t copy_bytes = impl->stride * impl->elem_size;
-            std::memcpy(dst, src, copy_bytes);
+        // allocate a new backend buffer for the resized layout and copy
+        size_t new_total = new_stride * impl->slots * impl->elem_size;
+        gp_mem_backend_handle_t old_h = impl->storage_handle;
+        gp_mem_backend_handle_t new_h = nullptr;
+        if (impl->backend) {
+            const gp_mem_backend_vtable_t* bvt = gp_mem_backend_get_vtable(impl->backend);
+            if (bvt && bvt->alloc) new_h = bvt->alloc(impl->backend, new_total, /*alignment=*/0);
+            else new_h = gp_mem_backend_create_host(new_total);
+        } else {
+            new_h = gp_mem_backend_create_host(new_total);
+        }
+        if (!new_h) return false;
+        // zero initialize new buffer
+        const gp_mem_backend_vtable_t* new_vt = gp_mem_backend_get_vtable(new_h);
+        if (new_vt && new_vt->copy_to_backend) {
+            std::vector<uint8_t> zeros;
+            try { zeros.resize(new_total); } catch(...) { }
+            if (zeros.size() == new_total) new_vt->copy_to_backend(new_h, 0, zeros.data(), new_total);
+        } else {
+            void* nm = gp_mem_backend_map_or_null(new_h);
+            if (nm) { std::memset(nm, 0, new_total); gp_mem_backend_unmap(new_h); }
         }
 
-        // swap in new storage and update typed view
-        impl->storage_bytes.swap(new_bytes);
-        impl->storage_f = (impl->elem_size == sizeof(float)) ? reinterpret_cast<float*>(impl->storage_bytes.get()) : nullptr;
+        // copy per-slot from old_h -> new_h
+        const gp_mem_backend_vtable_t* old_vt = gp_mem_backend_get_vtable(old_h);
+        for (size_t s = 0; s < impl->slots; ++s) {
+            size_t copy_bytes = impl->stride * impl->elem_size;
+            size_t old_off = s * impl->stride * impl->elem_size;
+            size_t new_off = s * new_stride * impl->elem_size;
+            // attempt optimized transfer between buffers
+            if (old_vt && new_vt && old_vt->copy_between_backends) {
+                if (!old_vt->copy_between_backends(old_h, new_h, old_off, new_off, copy_bytes)) {
+                    // fallback to staged per-slot copy
+                    std::vector<uint8_t> tmp;
+                    try { tmp.resize(copy_bytes); } catch(...) { gp_mem_backend_release(new_h); return false; }
+                    if (old_vt && old_vt->copy_from_backend) {
+                        if (!old_vt->copy_from_backend(old_h, old_off, tmp.data(), copy_bytes)) { gp_mem_backend_release(new_h); return false; }
+                    } else {
+                        void* om = gp_mem_backend_map_or_null(old_h);
+                        if (!om) { gp_mem_backend_release(new_h); return false; }
+                        std::memcpy(tmp.data(), reinterpret_cast<uint8_t*>(om) + old_off, copy_bytes);
+                        gp_mem_backend_unmap(old_h);
+                    }
+                    if (new_vt && new_vt->copy_to_backend) {
+                        if (!new_vt->copy_to_backend(new_h, new_off, tmp.data(), copy_bytes)) { gp_mem_backend_release(new_h); return false; }
+                    } else {
+                        void* nm = gp_mem_backend_map_or_null(new_h);
+                        if (!nm) { gp_mem_backend_release(new_h); return false; }
+                        std::memcpy(reinterpret_cast<uint8_t*>(nm) + new_off, tmp.data(), copy_bytes);
+                        gp_mem_backend_unmap(new_h);
+                    }
+                }
+            } else {
+                // staged copy path
+                std::vector<uint8_t> tmp;
+                try { tmp.resize(copy_bytes); } catch(...) { gp_mem_backend_release(new_h); return false; }
+                if (old_vt && old_vt->copy_from_backend) {
+                    if (!old_vt->copy_from_backend(old_h, old_off, tmp.data(), copy_bytes)) { gp_mem_backend_release(new_h); return false; }
+                } else {
+                    void* om = gp_mem_backend_map_or_null(old_h);
+                    if (!om) { gp_mem_backend_release(new_h); return false; }
+                    std::memcpy(tmp.data(), reinterpret_cast<uint8_t*>(om) + old_off, copy_bytes);
+                    gp_mem_backend_unmap(old_h);
+                }
+                if (new_vt && new_vt->copy_to_backend) {
+                    if (!new_vt->copy_to_backend(new_h, new_off, tmp.data(), copy_bytes)) { gp_mem_backend_release(new_h); return false; }
+                } else {
+                    void* nm = gp_mem_backend_map_or_null(new_h);
+                    if (!nm) { gp_mem_backend_release(new_h); return false; }
+                    std::memcpy(reinterpret_cast<uint8_t*>(nm) + new_off, tmp.data(), copy_bytes);
+                    gp_mem_backend_unmap(new_h);
+                }
+            }
+        }
+
+        // free old storage handle and swap in new one
+        if (old_vt && old_vt->free) old_vt->free(old_h); else gp_mem_backend_release(old_h);
+        impl->storage_handle = new_h;
         impl->stride = new_stride;
 
         // update our cached scratch/last_sample sizes to match new stride

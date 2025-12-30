@@ -13,6 +13,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdio>
+#include <cstring>
 #include "console_logger.h"
 #ifndef printf
 #define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
@@ -28,6 +29,7 @@ extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx)
 extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
 extern void canvas_clear_module_input_pulses(int module_idx);
 extern void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count);
+extern void canvas_set_module_stack_snapshot_meta(int module_idx, int row_idx, const int* types, const int* counts, int count);
 extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
 extern ITool* canvas_get_plugin_instance(int module_idx, int row_idx);
 
@@ -118,7 +120,13 @@ static bool edge_stride_allows_pointer(GP_TableContext* table, int edge_idx) {
         stride *= static_cast<uint64_t>(std::max(1, spec.dims[di]));
     }
     uint64_t bytes = stride * static_cast<uint64_t>(spec.elem_size);
-    return bytes >= static_cast<uint64_t>(sizeof(void*));
+    if (bytes >= static_cast<uint64_t>(sizeof(void*))) return true;
+    // If the FIFO has an attached memory backend that explicitly supports
+    // BYREF/pointer semantics, allow pointer-sized payloads even if the
+    // configured elem_size is smaller than a host pointer.
+    gp_mem_backend_handle_t h = gp_table_edge_get_backend(table, edge_idx);
+    if (h && gp_mem_backend_supports_byref(h)) return true;
+    return false;
 }
 
 static bool is_valid_event_payload_ptr(void* p) {
@@ -135,13 +143,115 @@ static inline int32_t clamp_size_to_int32(size_t value) {
     return static_cast<int32_t>(std::min(value, kMaxInt32));
 }
 
+// Helper: compute canonical table key for a module/contact, preferring
+// the stable per-port UUID when the contact maps to a module frame port.
+static uint64_t canvas_contact_key(int module_idx, int contact_idx) {
+    // Fallback canonical composition
+    uint64_t composed = ((uint64_t)static_cast<uint32_t>(module_idx) << 32) | ((uint64_t)static_cast<uint32_t>(contact_idx) << 16) | 0ull;
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    if (!cvs) return composed;
+    // Only consider module frame contacts
+    const int frame_base = kModuleFrameContactBase;
+    const int frame_end = frame_base + kModuleExtraLedCount * kModuleExtraLedRows;
+    if (contact_idx < frame_base || contact_idx >= frame_end) return 0ull;
+    // Resolve the stable tool-row id only. Do NOT fall back to canonical
+    // composed keys — the system now relies exclusively on the generated ids.
+    uint64_t trid = gp_canvas_get_tool_row_id(cvs, module_idx, contact_idx);
+    return trid;
+}
+
+static float raw_stack_value_as_float(const uint8_t* bytes, size_t size) {
+    if (!bytes || size == 0) return 0.0f;
+    if (size == sizeof(float)) {
+        float v = 0.0f;
+        std::memcpy(&v, bytes, sizeof(float));
+        return v;
+    }
+    if (size == sizeof(double)) {
+        double d = 0.0;
+        std::memcpy(&d, bytes, sizeof(double));
+        return static_cast<float>(d);
+    }
+    return 0.0f;
+}
+
+static void raw_stack_to_float_values(const RawStackFrame& frame, ValueTypeId default_type, std::vector<float>& out) {
+    out.clear();
+    if (!frame.types_per_byte || frame.byte_count == 0) return;
+    // Read frame bytes into a host buffer via backend copy/map so we can
+    // safely interpret typed elements. If reading fails, treat bytes as zeros.
+    std::vector<uint8_t> tmp;
+    try { tmp.resize(frame.byte_count); } catch (...) { return; }
+    bool read_ok = false;
+    if (frame.backend) {
+        const gp_mem_backend_vtable_t* bvt = gp_mem_backend_get_vtable(frame.backend);
+        if (bvt && bvt->copy_from_backend) {
+            if (bvt->copy_from_backend(frame.backend, 0, tmp.data(), frame.byte_count)) read_ok = true;
+        }
+        if (!read_ok) {
+            void* m = gp_mem_backend_map_or_null(frame.backend);
+            if (m) {
+                std::memcpy(tmp.data(), m, frame.byte_count);
+                gp_mem_backend_unmap(frame.backend);
+                read_ok = true;
+            }
+        }
+    }
+    if (!read_ok) std::memset(tmp.data(), 0, tmp.size());
+
+    size_t idx = 0;
+    while (idx < frame.byte_count) {
+        ValueTypeId tid = frame.types_per_byte[idx];
+        if (tid == kInvalidValueTypeId) break;
+        const ValueType* vt = ValueTypeRegistry::global().get(tid);
+        if (!vt || vt->size == 0 || idx + vt->size > frame.byte_count) break;
+        if ((vt->size == sizeof(double) && tid == default_type) || vt->size == sizeof(float)) {
+            float value = raw_stack_value_as_float(tmp.data() + idx, vt->size);
+            out.push_back(value);
+        } else {
+            out.push_back(0.0f);
+        }
+        idx += vt->size;
+    }
+}
+
 } // namespace
 
 
-ThreadManager::ThreadManager() = default;
+ThreadManager::ThreadManager()
+    : module_tool_stack_default_type_(ValueTypeRegistry::global().builtin(VT_FLOAT64)) {}
 
 ThreadManager::~ThreadManager() {
     stop();
+}
+
+void ThreadManager::set_module_tool_stack_default_type(ValueTypeId tid) {
+    module_tool_stack_default_type_.store(tid, std::memory_order_relaxed);
+}
+
+ValueTypeId ThreadManager::module_tool_stack_default_type() const {
+    return module_tool_stack_default_type_.load(std::memory_order_relaxed);
+}
+
+RawStackFrame* ThreadManager::ensure_module_tool_stack(int module_idx) {
+    if (module_idx < 0) return nullptr;
+    std::lock_guard<std::mutex> lk(module_tool_stacks_mu_);
+    if (static_cast<size_t>(module_idx) >= module_tool_stacks_.size()) {
+        module_tool_stacks_.resize(static_cast<size_t>(module_idx) + 1);
+    }
+    auto& ptr = module_tool_stacks_[static_cast<size_t>(module_idx)];
+    if (!ptr) {
+        ptr.reset(new RawStackFrame());
+        if (!raw_stack_init_frame(*ptr, module_tool_stack_capacity_bytes_, module_tool_stack_default_type_.load(std::memory_order_relaxed))) {
+            ptr.reset();
+            return nullptr;
+        }
+    }
+    return ptr.get();
+}
+
+void ThreadManager::reset_module_tool_stack(RawStackFrame& frame) {
+    raw_stack_reset(frame);
 }
 
 void ThreadManager::set_module_sleep_delay(int module_idx, uint64_t delay_ticks, double delay_seconds) {
@@ -399,7 +509,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     if (e.b_module == root_mod) contact_idx = e.b_contact_idx;
                     else if (e.a_module == root_mod) contact_idx = e.a_contact_idx;
                     else continue;
-                    uint64_t reader_key = ((uint64_t)root_mod << 32) | ((uint64_t)static_cast<uint64_t>(contact_idx) << 16) | 0u;
+                    uint64_t reader_key = canvas_contact_key(root_mod, contact_idx);
                     if (reader_key == 0) reader_key = 0x8000000000000000ull;
                     gp_table_edge_subscribe_ex(req.root_table, edge_idx, reader_key, /*start_at_head=*/1);
                     int32_t unread = 0;
@@ -616,8 +726,39 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             }
         }
         int row_count = gp_table_get_row_count(mod.table);
-        std::vector<float> stack;
-        stack.reserve(256);
+        RawStackFrame* module_stack = (mod.module_idx >= 0) ? ensure_module_tool_stack(mod.module_idx) : nullptr;
+        if (!module_stack) return;
+        ValueTypeId stack_default_type = module_tool_stack_default_type();
+        const ValueType* stack_type_info = ValueTypeRegistry::global().get(stack_default_type);
+        size_t stack_elem_size = (stack_type_info && stack_type_info->size > 0) ? stack_type_info->size : sizeof(double);
+        reset_module_tool_stack(*module_stack);
+        std::vector<float> stack_snapshot;
+        auto push_value = [&](float value) {
+            double dv = static_cast<double>(value);
+            raw_stack_push_typed(*module_stack, &dv, stack_default_type);
+        };
+        auto pop_value = [&]() -> float {
+            if (!module_stack || module_stack->byte_count == 0) {
+#if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
+                fprintf(stderr, "[DEBUG] pop_value mod=%d stack_empty\n", mod_idx);
+#endif
+                return 0.0f;
+            }
+            ValueTypeId top_tid = kInvalidValueTypeId;
+            if (!raw_stack_peek_type(*module_stack, top_tid) || top_tid != stack_default_type) {
+                return 0.0f;
+            }
+            size_t before = module_stack->byte_count / (stack_elem_size ? stack_elem_size : 1);
+            double dv = 0.0;
+            if (!raw_stack_pop_typed(*module_stack, &dv, stack_default_type)) {
+                return 0.0f;
+            }
+#if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
+            size_t after = module_stack->byte_count / (stack_elem_size ? stack_elem_size : 1);
+            fprintf(stderr, "[DEBUG] pop_value mod=%d popped=%f stack_before=%zu stack_after=%zu\n", mod_idx, static_cast<float>(dv), before, after);
+#endif
+            return static_cast<float>(dv);
+        };
         ModuleInputState input_state{};
         bool input_state_loaded = false;
         bool input_state_used = false;
@@ -662,21 +803,6 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             }
             return input_state_loaded;
         };
-        auto pop_value = [&]() -> float {
-            if (stack.empty()) {
-#if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
-                fprintf(stderr, "[DEBUG] pop_value mod=%d stack_empty\n", mod_idx);
-#endif
-                return 0.0f;
-            }
-            size_t before = stack.size();
-            float v = stack.back();
-            stack.pop_back();
-#if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
-            fprintf(stderr, "[DEBUG] pop_value mod=%d popped=%f stack_before=%zu stack_after=%zu\n", mod_idx, v, before, stack.size());
-#endif
-            return v;
-        };
         GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
         // Optional timing measurement for this module execution
         bool _tm_measured = false;
@@ -696,7 +822,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     int contact_idx = meta.contact_idx + ai;
                     // Find the edge index for this input (mod_idx is the consumer)
                     int edge_idx = -1;
-                    uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
+                    uint64_t reader_key = canvas_contact_key(mod_idx, contact_idx);
                     if (reader_key == 0) reader_key = 0x8000000000000000ull;
                     // Find the edge in req.edges where b_module == mod_idx and b_contact_idx == contact_idx
                     for (const auto& e : req.edges) {
@@ -757,7 +883,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             }
                         }
                     }
-                    stack.push_back(val);
+                    push_value(val);
                 }
             }
             // Tool row: pass stack through (no-op for now)
@@ -766,7 +892,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                 if (meta.tool_origin == ModuleToolOrigin::Plugin) {
                     ITool* inst = canvas_get_plugin_instance(mod_idx, row);
                     if (inst) {
-                        ToolStackFrame frame{stack.empty() ? nullptr : stack.data(), static_cast<int>(stack.size()), static_cast<int>(stack.capacity())};
+                        ToolStackFrame frame{};
+                        frame.raw = module_stack;
+                        frame.default_type = stack_default_type;
                         ToolStackContext tctx;
                         tctx.stack = frame;
                         ToolInputState tinp;
@@ -791,16 +919,6 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         try {
                             inst->execute_stack(tctx);
                         } catch (...) {}
-                        // reflect any stack changes back into the std::vector
-                        if (frame.count >= 0) {
-                            size_t newsz = static_cast<size_t>(frame.count);
-                            if (newsz <= stack.capacity()) {
-                                stack.resize(newsz);
-                            } else {
-                                // clamp if plugin wrote out of bounds
-                                stack.resize(stack.capacity());
-                            }
-                        }
                         continue; // plugin handled this row
                     }
                 }
@@ -810,11 +928,12 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         if (load_input_state() && input_state.key_event) {
                             val = static_cast<float>(input_state.key);
                         }
-                        stack.push_back(val);
+                        push_value(val);
                         if (input_state_loaded) input_state_used = true;
                         break;
                     }
                     case ModuleToolKind::MouseListener: {
+                        fprintf(stderr, "[DBG] MouseListener: executing for mod=%d contact=%d\n", mod_idx, meta.contact_idx);
                         float mx = 0.0f;
                         float my = 0.0f;
                         float mdx = 0.0f;
@@ -838,14 +957,17 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 int edge_idx = e.edge_idx;
                                 // Check whether this contact has a bound pending action
                                 void* bound_ptr = canvas_single ? gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, contact_idx) : nullptr;
-                                if (!bound_ptr) continue;
+                                if (!bound_ptr) {
+                                    fprintf(stderr, "[DBG] MouseListener: no bound_ptr for mod=%d contact=%d\n", mod_idx, contact_idx);
+                                    continue;
+                                }
                                 struct MinimalPending { int32_t action_id; };
                                 auto *bound_min = reinterpret_cast<MinimalPending*>(bound_ptr);
                                 int32_t bound_action = bound_min ? bound_min->action_id : 0;
                                 // Only process contacts bound to mouse actions
                                 if (!(bound_action >= CANVAS_ACT_MOUSE_DOWN && bound_action <= CANVAS_ACT_MOUSE_SCROLL_DOWN)) continue;
 
-                                uint64_t reader_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
+                                uint64_t reader_key = canvas_contact_key(mod_idx, contact_idx);
                                 if (reader_key == 0) reader_key = 0x8000000000000000ull;
                                 // Debug: report computed reader_key and target edge so we can
                                 // compare it with the writer_key printed at publish time.
@@ -908,7 +1030,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                     GP_CanvasContext* canvas_for_push = gp_canvas_get_singleton();
                                     RawStackFrame* rs_for_push = nullptr;
                                     if (canvas_for_push) {
-                                        void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_for_push, mod_idx, meta.contact_idx);
+                                        void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_for_push, mod_idx, contact_idx);
                                         rs_for_push = reinterpret_cast<RawStackFrame*>(maybe_raw);
                                     }
                                     if (!rs_for_push) {
@@ -954,12 +1076,36 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         break;
                     }
                     case ModuleToolKind::StackDisplay: {
-                        canvas_set_module_stack_snapshot(mod_idx, row, stack.data(), static_cast<int>(stack.size()));
+                        // Build float snapshot (for legacy preview) and metadata (type id + element count per item)
+                        raw_stack_to_float_values(*module_stack, stack_default_type, stack_snapshot);
+                        const float* snap_ptr = stack_snapshot.empty() ? nullptr : stack_snapshot.data();
+                        canvas_set_module_stack_snapshot(mod_idx, row, snap_ptr, static_cast<int>(stack_snapshot.size()));
+
+                        // Build metadata by scanning the per-byte type mask
+                        std::vector<int> types;
+                        std::vector<int> counts;
+                        if (module_stack && module_stack->types_per_byte) {
+                            size_t idx = 0;
+                            while (idx < module_stack->byte_count) {
+                                int tid = static_cast<int>(module_stack->types_per_byte[idx]);
+                                // Lookup element size via registry
+                                const ValueType* vt = ValueTypeRegistry::global().get(module_stack->types_per_byte[idx]);
+                                if (!vt || vt->size == 0) break;
+                                int elem_size = static_cast<int>(vt->size);
+                                // Append type id and element count (in bytes/units: 1 element)
+                                types.push_back(tid);
+                                counts.push_back(elem_size);
+                                idx += static_cast<size_t>(elem_size);
+                            }
+                        }
+                        if (!types.empty()) {
+                            canvas_set_module_stack_snapshot_meta(mod_idx, row, types.data(), counts.data(), static_cast<int>(types.size()));
+                        }
                         break;
                     }
                     case ModuleToolKind::TableNumber: {
                         float val = static_cast<float>(std::max(0, meta.attachment_count));
-                        stack.push_back(val);
+                        push_value(val);
                         break;
                     }
                     case ModuleToolKind::Clone: {
@@ -967,7 +1113,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         float value = pop_value();
                         int count = std::max(0, static_cast<int>(std::lround(count_f)));
                         for (int i = 0; i < count; ++i) {
-                            stack.push_back(value);
+                        push_value(value);
                         }
                         break;
                     }
@@ -1064,7 +1210,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         struct IntItem { ValueTypeId tid; int64_t v; };
                         std::vector<IntItem> popped_ints;
                         ValueTypeId top_tid = kInvalidValueTypeId;
-                        while (rs->count > 0) {
+                        while (rs->byte_count > 0) {
                             if (!raw_stack_peek_type(*rs, top_tid)) break;
                             // If we hit a tensor pointer, stop collecting
                             if (top_tid == ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR)) break;
@@ -1237,7 +1383,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 }
                             }
                         }
-                        stack.push_back(out);
+                        push_value(out);
                         break;
                     }
                     case ModuleToolKind::Add:
@@ -1252,19 +1398,19 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         float a = (spec.consumes >= 2) ? pop_value() : 0.0f;
                         switch (meta.tool) {
                             case ModuleToolKind::Add:
-                                stack.push_back(a + b);
+                                push_value(a + b);
                                 break;
                             case ModuleToolKind::Subtract:
-                                stack.push_back(a - b);
+                                push_value(a - b);
                                 break;
                             case ModuleToolKind::Multiply:
-                                stack.push_back(a * b);
+                                push_value(a * b);
                                 break;
                             case ModuleToolKind::Divide:
-                                stack.push_back((b == 0.0f) ? 0.0f : (a / b));
+                                push_value((b == 0.0f) ? 0.0f : (a / b));
                                 break;
                             case ModuleToolKind::Modulo:
-                                stack.push_back((b == 0.0f) ? 0.0f : std::fmod(a, b));
+                                push_value((b == 0.0f) ? 0.0f : std::fmod(a, b));
                                 break;
                             case ModuleToolKind::None:
                             default:
@@ -1281,7 +1427,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                     float val = pop_value();
                     int contact_idx = meta.contact_idx + ai;
                     int edge_idx = -1;
-                    uint64_t writer_key = ((uint64_t)mod_idx << 32) | ((uint64_t)contact_idx << 16) | 0u;
+                    uint64_t writer_key = canvas_contact_key(mod_idx, contact_idx);
                     // Find the edge in req.edges where a_module == mod_idx and a_contact_idx == contact_idx
                     for (const auto& e : req.edges) {
                         if (e.a_module == mod_idx && e.a_contact_idx == contact_idx) {
@@ -1299,11 +1445,32 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             void* p = nullptr;
                             if (canvas_single) p = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, contact_idx);
                             if (p && edge_stride_allows_pointer(fifo_table, edge_idx) && is_valid_event_payload_ptr(p)) {
-                                int local = contact_idx - frame_base;
-                                int frame_idx = local % kModuleExtraLedCount;
-                                // Wrap into EventPayload so consumers can clear the frame slot after handling
-                                EventPayload* ep = new EventPayload{p, mod_idx, frame_idx};
-                                gp_edge_publish_ptr(fifo_table, edge_idx, writer_key, reinterpret_cast<void*>(ep), &dropped);
+                                // If pointer references a RawStackFrame and the FIFO has
+                                // an attached backend, attempt an optimized in-backend
+                                // transfer from the frame into the FIFO storage. Fall
+                                // back to the existing EventPayload pointer publishing
+                                // semantics if transfer not possible.
+                                RawStackFrame* rs = reinterpret_cast<RawStackFrame*>(p);
+                                gp_mem_backend_handle_t fifo_b = gp_table_edge_get_backend(fifo_table, edge_idx);
+                                bool transferred = false;
+                                if (rs && rs->backend && fifo_b) {
+                                    // Determine top type id and try to publish from frame
+                                    ValueTypeId top_tid = kInvalidValueTypeId;
+                                    if (raw_stack_peek_type(*rs, top_tid)) {
+                                        int dropped_local = 0;
+                                        if (gp_table_edge_publish_from_frame(fifo_table, edge_idx, writer_key, rs, static_cast<int32_t>(top_tid), &dropped_local)) {
+                                            transferred = true;
+                                            dropped = dropped_local;
+                                        }
+                                    }
+                                }
+                                if (!transferred) {
+                                    int local = contact_idx - frame_base;
+                                    int frame_idx = local % kModuleExtraLedCount;
+                                    // Wrap into EventPayload so consumers can clear the frame slot after handling
+                                    EventPayload* ep = new EventPayload{p, mod_idx, frame_idx};
+                                    gp_edge_publish_ptr(fifo_table, edge_idx, writer_key, reinterpret_cast<void*>(ep), &dropped);
+                                }
                             } else {
                                 float payload[1] = {val};
                                 gp_edge_publish(fifo_table, edge_idx, writer_key, payload, static_cast<int32_t>(sizeof(payload)), &dropped);
@@ -1319,7 +1486,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         if (input_state_used) {
             canvas_clear_module_input_pulses(mod_idx);
         }
-        canvas_set_module_stack_tail(mod_idx, stack.data(), static_cast<int>(stack.size()));
+        raw_stack_to_float_values(*module_stack, stack_default_type, stack_snapshot);
+        const float* tail_ptr = stack_snapshot.empty() ? nullptr : stack_snapshot.data();
+        canvas_set_module_stack_tail(mod_idx, tail_ptr, static_cast<int>(stack_snapshot.size()));
         if (_tm_enabled) {
             auto _tm_end = std::chrono::high_resolution_clock::now();
             _tm_last_run_secs = std::chrono::duration<double>(_tm_end - _tm_start).count();

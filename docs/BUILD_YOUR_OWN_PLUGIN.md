@@ -150,7 +150,7 @@ See `tools/edge_introspect_tool.cpp` for a concrete example of `render_table()` 
 ## Stack execution
 
 - Tools participate in the module stack VM by implementing `execute_stack(ToolStackContext& ctx)`.
-- Use `tool_stack_pop(ctx.stack)` to pop floats and `tool_stack_push(ctx.stack, value)` to push results. The order and meaning of stack values must match the `ToolPortSpec` layout your tool declares.
+- Use `tool_stack_pop(ctx.stack)` to pop floats and `tool_stack_push(ctx.stack, value)` to push results. The stack is now backed by the typed raw value stack (defaulting to 64-bit floats via `ctx.stack.default_type`), so the helper functions still operate on `float` values while keeping the underlying storage fully typed. The order and meaning of stack values must match the `ToolPortSpec` layout your tool declares.
 
 ## Serialization
 

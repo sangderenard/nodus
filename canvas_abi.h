@@ -356,6 +356,10 @@ void gp_canvas_mark_rope_map_dirty(GP_CanvasContext* ctx);
 uint64_t gp_canvas_find_persistent_rope_id(GP_CanvasContext* ctx, GP_TableContext* table, int sim_idx);
 // Generate a new stable port UUID for the canvas (monotonic 64-bit id).
 uint64_t gp_canvas_generate_port_uuid(GP_CanvasContext* ctx);
+// Get or lazily create a stable per-tool-row id for (module_idx, contact_idx).
+// This id is generated via `gp_canvas_generate_id` and is persisted in the
+// canvas' binding id map. Returns 0 on failure.
+uint64_t gp_canvas_get_tool_row_id(GP_CanvasContext* ctx, int module_idx, int contact_idx);
 // Query canvas for edges that belong entirely to `table` (both endpoints' modules map to the same table).
 // If `out_edges` or `out_rope_ids` are NULL, the function returns the required count without writing.
 // Returns the number of entries written (or required).

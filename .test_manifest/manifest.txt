@@ -1,0 +1,2 @@
+./.test_manifest/fb_2560_0.bin 1024
+./.test_manifest/fb_2560_1.bin 2048

@@ -315,9 +315,53 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
             // Advance the global sim tick once per canvas frame.
             gp_table_advance_global_sim_tick();
             req.edges.reserve(c->edges.size());
+            GP_TableContext* root_tbl = req.root_table;
             for (size_t ei = 0; ei < c->edges.size(); ++ei) {
                 ThreadManager::EdgeContract e{};
-                e.edge_idx = static_cast<int32_t>(ei);
+                // Map canvas edge index to root-table edge index when available.
+                int root_edge_idx = -1;
+                if (root_tbl) {
+                    const auto &desc = c->edges[ei].desc;
+                    // Resolve root-table edge key using overlay sentinel or
+                    // the per-tool-row id generated at bind time. If a tool-row
+                    // id exists for the contact, prefer it; otherwise fall back
+                    // to the canonical composed key so unbound edges still map.
+                    uint64_t ka = 0ull;
+                    uint64_t kb = 0ull;
+                    // overlay keys override normal port keys
+                    if (c->edges[ei].overlay_key_a != 0ull) {
+                        ka = c->edges[ei].overlay_key_a;
+                    } else if (desc.a_module >= 0) {
+                        // try tool-row id first
+                        ka = gp_canvas_get_tool_row_id(reinterpret_cast<GP_CanvasContext*>(c), desc.a_module, desc.a_contact_idx);
+                        if (ka == 0ull) {
+                            ka = (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_module)) << 32) |
+                                 (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_contact_idx)) << 16) |
+                                 static_cast<uint64_t>(0);
+                        }
+                    }
+                    if (c->edges[ei].overlay_key_b != 0ull) {
+                        kb = c->edges[ei].overlay_key_b;
+                    } else if (desc.b_module >= 0) {
+                        kb = gp_canvas_get_tool_row_id(reinterpret_cast<GP_CanvasContext*>(c), desc.b_module, desc.b_contact_idx);
+                        if (kb == 0ull) {
+                            kb = (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_module)) << 32) |
+                                 (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_contact_idx)) << 16) |
+                                 static_cast<uint64_t>(0);
+                        }
+                    }
+
+                    // Prefer direct pair lookup using the resolved keys. If that
+                    // fails, fall back to single-key lookup (ka then kb) so
+                    // canonical keys still resolve when present.
+                    if (!gp_table_edge_index_for_pair(root_tbl, ka, kb, &root_edge_idx)) {
+                        if (!gp_table_edge_index_for_key(root_tbl, ka, &root_edge_idx)) {
+                            // try reverse key as last resort
+                            gp_table_edge_index_for_key(root_tbl, kb, &root_edge_idx);
+                        }
+                    }
+                }
+                e.edge_idx = root_edge_idx >= 0 ? root_edge_idx : static_cast<int32_t>(ei);
                 e.type_id = c->edges[ei].type_id;
                 e.a_module = c->edges[ei].desc.a_module;
                 e.a_contact_idx = c->edges[ei].desc.a_contact_idx;

@@ -448,7 +448,9 @@ add_library(canvas_tables SHARED
   tool_registry.cpp
   thread_manager.cpp
   console_logger.cpp
+  mem_backend_host.cpp
   tools/sdlttf_to_torch.cpp
+  meta_edge_snapshot_wrapper.cpp
 )
 
 # Small helper executable to run the module actualizer from the built project
@@ -550,6 +552,30 @@ add_executable(test_thread_manager
 )
 target_link_libraries(test_thread_manager PRIVATE canvas_tables)
 add_test(NAME thread_manager_test COMMAND test_thread_manager)
+
+add_executable(test_frame_serialization
+  tests/frame_serialization_test.cpp
+)
+target_link_libraries(test_frame_serialization PRIVATE canvas_tables)
+add_test(NAME frame_serialization_test COMMAND test_frame_serialization)
+
+add_executable(test_edge_backend_coordination
+  tests/edge_backend_coordination_test.cpp
+)
+target_link_libraries(test_edge_backend_coordination PRIVATE canvas_tables)
+add_test(NAME edge_backend_coordination_test COMMAND test_edge_backend_coordination)
+
+add_executable(test_meta_edge_snapshot_wrapper
+  tests/meta_edge_snapshot_wrapper_test.cpp
+)
+target_link_libraries(test_meta_edge_snapshot_wrapper PRIVATE canvas_tables)
+add_test(NAME meta_edge_snapshot_wrapper_test COMMAND test_meta_edge_snapshot_wrapper)
+
+add_executable(test_mem_backend_manifest
+  tests/mem_backend_manifest_test.cpp
+)
+target_link_libraries(test_mem_backend_manifest PRIVATE canvas_tables)
+add_test(NAME mem_backend_manifest_test COMMAND test_mem_backend_manifest)
 
 add_test(NAME tool_dll_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_dll_test.py

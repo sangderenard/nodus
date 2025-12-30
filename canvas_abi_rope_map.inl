@@ -648,6 +648,21 @@ void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* 
     snapshots[row_idx] = std::move(data);
 }
 
+void canvas_set_module_stack_snapshot_meta(int module_idx, int row_idx, const int* types, const int* counts, int count) {
+    if (!g_canvas_context_singleton) return;
+    if (module_idx < 0) return;
+    if (module_idx >= static_cast<int>(g_canvas_context_singleton->module_stack_snapshot_meta.size())) {
+        g_canvas_context_singleton->module_stack_snapshot_meta.resize(module_idx + 1);
+    }
+    auto &meta_map = g_canvas_context_singleton->module_stack_snapshot_meta[module_idx];
+    std::vector<std::pair<int,int>> data;
+    if (types && counts && count > 0) {
+        data.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) data.emplace_back(types[i], counts[i]);
+    }
+    meta_map[row_idx] = std::move(data);
+}
+
 void canvas_set_module_stack_tail(int module_idx, const float* values, int count) {
     if (!g_canvas_context_singleton) return;
     module_stack_tail_write(g_canvas_context_singleton, module_idx, values, count);

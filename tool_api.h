@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cmath>
 #include <fstream>
 #include <string>
+#include <vector>
 #include "value_types.h"
 
 struct ToolInitContext {
@@ -96,9 +98,8 @@ struct ToolInputState {
 };
 
 struct ToolStackFrame {
-    float* values = nullptr;
-    int32_t count = 0;
-    int32_t capacity = 0;
+    RawStackFrame* raw = nullptr;
+    ValueTypeId default_type = kInvalidValueTypeId;
 };
 
 // Raw (byte-oriented) stack frame support is provided in `value_types.h`.
@@ -112,16 +113,16 @@ struct ToolStackContext {
 };
 
 inline float tool_stack_pop(ToolStackFrame& frame) {
-    if (!frame.values || frame.count <= 0) return 0.0f;
-    float v = frame.values[frame.count - 1];
-    frame.count -= 1;
-    return v;
+    if (!frame.raw || frame.default_type == kInvalidValueTypeId) return 0.0f;
+    double tmp = 0.0;
+    if (!raw_stack_pop_typed(*frame.raw, &tmp, frame.default_type)) return 0.0f;
+    return static_cast<float>(tmp);
 }
 
 inline void tool_stack_push(ToolStackFrame& frame, float v) {
-    if (!frame.values || frame.count >= frame.capacity) return;
-    frame.values[frame.count] = v;
-    frame.count += 1;
+    if (!frame.raw || frame.default_type == kInvalidValueTypeId) return;
+    double tmp = static_cast<double>(v);
+    raw_stack_push_typed(*frame.raw, &tmp, frame.default_type);
 }
 
 // Pop up to `n` values from the stack into `out` preserving the
@@ -129,15 +130,14 @@ inline void tool_stack_push(ToolStackFrame& frame, float v) {
 // first element written to `out[0]` is the top-most stack element.
 // Returns the number of values actually popped.
 inline int tool_stack_pop_n(ToolStackFrame& frame, float* out, int n) {
-    if (!frame.values || frame.count <= 0 || n <= 0) return 0;
-    int avail = frame.count;
-    int to = (n < avail) ? n : avail;
-    // Write in pop order: out[0] = top, out[to-1] = bottom of popped block.
-    for (int i = 0; i < to; ++i) {
-        out[i] = frame.values[frame.count - 1 - i];
+    if (!frame.raw || frame.default_type == kInvalidValueTypeId || !out || n <= 0) return 0;
+    int popped = 0;
+    for (; popped < n; ++popped) {
+        ValueTypeId top_tid = kInvalidValueTypeId;
+        if (!raw_stack_peek_type(*frame.raw, top_tid) || top_tid != frame.default_type) break;
+        out[popped] = tool_stack_pop(frame);
     }
-    frame.count -= to;
-    return to;
+    return popped;
 }
 
 // Pop a contiguous block of up to `n` values from the stack into `out`
@@ -146,25 +146,41 @@ inline int tool_stack_pop_n(ToolStackFrame& frame, float* out, int n) {
 // block in the same order it was pushed. Returns the number of values
 // actually popped.
 inline int tool_stack_pop_block(ToolStackFrame& frame, float* out, int n) {
-    if (!frame.values || frame.count <= 0 || n <= 0) return 0;
-    int avail = frame.count;
-    int to = (n < avail) ? n : avail;
-    float* src = frame.values + (frame.count - to);
-    std::memcpy(out, src, static_cast<size_t>(to) * sizeof(float));
-    frame.count -= to;
-    return to;
+    if (!frame.raw || frame.default_type == kInvalidValueTypeId || !out || n <= 0) return 0;
+    const ValueType* vt = ValueTypeRegistry::global().get(frame.default_type);
+    if (!vt) return 0;
+    size_t per = vt->size;
+    if (per == 0) return 0;
+    std::vector<uint8_t> temp(static_cast<size_t>(n) * per);
+    int popped = raw_stack_pop_block(*frame.raw, temp.data(), n, frame.default_type);
+    for (int i = 0; i < popped; ++i) {
+        float value = 0.0f;
+        const uint8_t* ptr = temp.data() + static_cast<size_t>(i) * per;
+        if (per == sizeof(float)) {
+            float fv = 0.0f;
+            std::memcpy(&fv, ptr, sizeof(float));
+            value = fv;
+        } else if (per == sizeof(double)) {
+            double dv = 0.0;
+            std::memcpy(&dv, ptr, sizeof(double));
+            value = static_cast<float>(dv);
+        }
+        out[i] = value;
+    }
+    return popped;
 }
 
 // Push up to `n` values from `in` onto the stack using a single memcpy
 // operation. Returns the number of values actually pushed.
 inline int tool_stack_push_n(ToolStackFrame& frame, const float* in, int n) {
-    if (!frame.values || n <= 0) return 0;
-    int free_space = frame.capacity - frame.count;
-    if (free_space <= 0) return 0;
-    int to = (n < free_space) ? n : free_space;
-    std::memcpy(frame.values + frame.count, in, static_cast<size_t>(to) * sizeof(float));
-    frame.count += to;
-    return to;
+    if (!frame.raw || !in || n <= 0 || frame.default_type == kInvalidValueTypeId) return 0;
+    int pushed = 0;
+    for (int i = 0; i < n; ++i) {
+        double tmp = static_cast<double>(in[i]);
+        if (!raw_stack_push_typed(*frame.raw, &tmp, frame.default_type)) break;
+        pushed += 1;
+    }
+    return pushed;
 }
 
 // Integer stack helpers (32-bit signed). These use the float stack storage

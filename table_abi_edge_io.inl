@@ -6,6 +6,231 @@
 #ifndef fprintf
 #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
+// Helper: determines whether a FIFO should be treated as BYREF-capable based
+// on subgroup flags OR an attached memory backend that advertises BYREF safety.
+static inline bool fifo_effective_byref(const EdgeTensorFifo& fifo, uint32_t flags) {
+    if (flags_imply_byref(flags)) return true;
+    gp_mem_backend_handle_t h = fifo.get_backend();
+    if (!h) return false;
+    return gp_mem_backend_supports_byref(h) != 0;
+}
+
+// Serialize a live EdgeTensorFifo snapshot into a contiguous buffer.
+// Format:
+// [uint64_t slots][uint64_t stride][uint64_t elem_size][int32_t type_id][uint32_t padding]
+// [uint64_t write_seq]
+// [uint64_t slot_seq[slots]]
+// [byte storage (stride * slots * elem_size)]
+extern "C" int32_t gp_table_edge_serialize_snapshot(GP_TableContext* ctx, int32_t edge_idx, void* out_buf, size_t out_len, size_t* out_written) {
+    if (!ctx || !out_buf || !out_written) return 0;
+    if (edge_idx < 0 || edge_idx >= static_cast<int>(ctx->edge_fifos.size())) return 0;
+    auto &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!fifo.impl || !fifo.impl->configured) return 0;
+    auto impl = fifo.impl.get();
+    // compute sizes
+    uint64_t slots = static_cast<uint64_t>(impl->slots);
+    uint64_t stride = static_cast<uint64_t>(impl->stride);
+    uint64_t elem_size = static_cast<uint64_t>(impl->elem_size);
+    int32_t type_id = impl->type_id;
+    uint64_t write_seq = impl->write_seq.load(std::memory_order_acquire);
+    size_t storage_bytes = static_cast<size_t>(stride * slots * elem_size);
+    size_t header_sz = sizeof(uint64_t) * 4 + sizeof(int32_t) + sizeof(uint32_t); // slots,stride,elem_size,write_seq,type_id+pad
+    size_t slot_seq_sz = static_cast<size_t>(slots) * sizeof(uint64_t);
+    size_t need = header_sz + slot_seq_sz + storage_bytes;
+    if (out_len < need) return 0;
+
+    uint8_t* dst = reinterpret_cast<uint8_t*>(out_buf);
+    size_t off = 0;
+    // write metadata under lock to ensure consistent snapshot
+    std::unique_lock<std::mutex> lk(impl->cv_mu);
+    std::memcpy(dst + off, &slots, sizeof(slots)); off += sizeof(slots);
+    std::memcpy(dst + off, &stride, sizeof(stride)); off += sizeof(stride);
+    std::memcpy(dst + off, &elem_size, sizeof(elem_size)); off += sizeof(elem_size);
+    std::memcpy(dst + off, &type_id, sizeof(type_id)); off += sizeof(type_id);
+    uint32_t pad = 0; std::memcpy(dst + off, &pad, sizeof(pad)); off += sizeof(pad);
+    std::memcpy(dst + off, &write_seq, sizeof(write_seq)); off += sizeof(write_seq);
+
+    // slot_seq array
+    for (uint64_t i = 0; i < slots; ++i) {
+        uint64_t s = impl->slot_seq[i].load(std::memory_order_acquire);
+        std::memcpy(dst + off, &s, sizeof(s)); off += sizeof(s);
+    }
+
+    // storage bytes: copy from backend/storage_handle
+    if (impl->storage_handle) {
+        const gp_mem_backend_vtable_t* svt = gp_mem_backend_get_vtable(impl->storage_handle);
+        bool ok = false;
+        if (svt && svt->copy_from_backend) {
+            if (svt->copy_from_backend(impl->storage_handle, 0, dst + off, storage_bytes)) ok = true;
+        }
+        if (!ok) {
+            void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+            if (!m) return 0;
+            std::memcpy(dst + off, m, storage_bytes);
+            gp_mem_backend_unmap(impl->storage_handle);
+        }
+        off += storage_bytes;
+    } else {
+        // no storage handle: nothing to copy, fill zeros
+        std::memset(dst + off, 0, storage_bytes);
+        off += storage_bytes;
+    }
+
+    *out_written = off;
+    return 1;
+}
+
+// Chunked serialization: writer callback will be invoked sequentially. The
+// first write contains the header + slot_seq blob; subsequent writes are the
+// storage bytes in order. The writer should return non-zero on success.
+typedef int (*gp_snapshot_writer_fn)(void* user, const void* data, size_t data_len, int is_final);
+extern "C" int32_t gp_table_edge_serialize_snapshot_chunked(GP_TableContext* ctx, int32_t edge_idx, size_t chunk_size, gp_snapshot_writer_fn writer, void* user) {
+    if (!ctx || !writer) return 0;
+    if (edge_idx < 0 || edge_idx >= static_cast<int>(ctx->edge_fifos.size())) return 0;
+    if (chunk_size == 0) chunk_size = 4 * 1024 * 1024; // default 4MB
+    auto &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!fifo.impl || !fifo.impl->configured) return 0;
+    auto impl = fifo.impl.get();
+
+    uint64_t slots = static_cast<uint64_t>(impl->slots);
+    uint64_t stride = static_cast<uint64_t>(impl->stride);
+    uint64_t elem_size = static_cast<uint64_t>(impl->elem_size);
+    int32_t type_id = impl->type_id;
+    uint64_t write_seq = impl->write_seq.load(std::memory_order_acquire);
+    size_t storage_bytes = static_cast<size_t>(stride * slots * elem_size);
+    size_t slot_seq_sz = static_cast<size_t>(slots) * sizeof(uint64_t);
+    size_t header_sz = sizeof(uint64_t) * 3 + sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t) + slot_seq_sz; // slots,stride,elem_size,type_id+pad,write_seq,slot_seq
+
+    // Build header+slot_seq in a temporary buffer and send as first writer call
+    std::vector<uint8_t> header;
+    try { header.resize(header_sz); } catch (...) { return 0; }
+    size_t hoff = 0;
+    std::memcpy(header.data() + hoff, &slots, sizeof(slots)); hoff += sizeof(slots);
+    std::memcpy(header.data() + hoff, &stride, sizeof(stride)); hoff += sizeof(stride);
+    std::memcpy(header.data() + hoff, &elem_size, sizeof(elem_size)); hoff += sizeof(elem_size);
+    std::memcpy(header.data() + hoff, &type_id, sizeof(type_id)); hoff += sizeof(type_id);
+    uint32_t pad = 0; std::memcpy(header.data() + hoff, &pad, sizeof(pad)); hoff += sizeof(pad);
+    std::memcpy(header.data() + hoff, &write_seq, sizeof(write_seq)); hoff += sizeof(write_seq);
+    // slot_seq under lock
+    {
+        std::unique_lock<std::mutex> lk(impl->cv_mu);
+        for (uint64_t i = 0; i < slots; ++i) {
+            uint64_t s = impl->slot_seq[i].load(std::memory_order_acquire);
+            std::memcpy(header.data() + hoff, &s, sizeof(s)); hoff += sizeof(s);
+        }
+    }
+
+    if (!writer(user, header.data(), header.size(), storage_bytes == 0 ? 1 : 0)) return 0;
+
+    // If no storage bytes, we're done
+    if (storage_bytes == 0) return 1;
+
+    // Stream storage bytes in chunks using backend copy/map
+    size_t remaining = storage_bytes;
+    size_t off = 0;
+    std::vector<uint8_t> tmp;
+    size_t max_chunk = std::min<size_t>(chunk_size, 4 * 1024 * 1024);
+    try { tmp.resize(max_chunk); } catch (...) { return 0; }
+
+    if (impl->storage_handle) {
+        const gp_mem_backend_vtable_t* svt = gp_mem_backend_get_vtable(impl->storage_handle);
+        while (remaining > 0) {
+            size_t cur = std::min<size_t>(remaining, tmp.size());
+            bool ok_read = false;
+            if (svt && svt->copy_from_backend) {
+                ok_read = svt->copy_from_backend(impl->storage_handle, off, tmp.data(), cur) != 0;
+            }
+            if (!ok_read) {
+                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+                if (!m) return 0;
+                std::memcpy(tmp.data(), reinterpret_cast<uint8_t*>(m) + off, cur);
+                gp_mem_backend_unmap(impl->storage_handle);
+                ok_read = true;
+            }
+            if (!ok_read) return 0;
+            remaining -= cur;
+            off += cur;
+            int is_final = remaining == 0 ? 1 : 0;
+            if (!writer(user, tmp.data(), cur, is_final)) return 0;
+        }
+    } else {
+        // no storage handle: send zeroed chunks
+        std::vector<uint8_t> zeros;
+        try { zeros.resize(tmp.size()); } catch (...) { return 0; }
+        while (remaining > 0) {
+            size_t cur = std::min<size_t>(remaining, zeros.size());
+            int is_final = (remaining - cur) == 0 ? 1 : 0;
+            if (!writer(user, zeros.data(), cur, is_final)) return 0;
+            remaining -= cur;
+        }
+    }
+
+    return 1;
+}
+
+// Deserialize a snapshot produced by gp_table_edge_serialize_snapshot and restore
+// it into the target edge FIFO. The FIFO will be reconfigured if necessary.
+extern "C" int32_t gp_table_edge_deserialize_snapshot(GP_TableContext* ctx, int32_t edge_idx, const void* buf, size_t buf_len) {
+    if (!ctx || !buf) return 0;
+    if (edge_idx < 0 || edge_idx >= static_cast<int>(ctx->edge_fifos.size())) return 0;
+    auto &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!fifo.impl) return 0;
+    auto impl = fifo.impl.get();
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(buf);
+    size_t off = 0;
+    if (buf_len < sizeof(uint64_t)*3 + sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t)) return 0;
+    uint64_t slots = 0; std::memcpy(&slots, src + off, sizeof(slots)); off += sizeof(slots);
+    uint64_t stride = 0; std::memcpy(&stride, src + off, sizeof(stride)); off += sizeof(stride);
+    uint64_t elem_size = 0; std::memcpy(&elem_size, src + off, sizeof(elem_size)); off += sizeof(elem_size);
+    int32_t type_id = 0; std::memcpy(&type_id, src + off, sizeof(type_id)); off += sizeof(type_id);
+    off += sizeof(uint32_t); // pad
+    uint64_t write_seq = 0; std::memcpy(&write_seq, src + off, sizeof(write_seq)); off += sizeof(write_seq);
+    size_t slot_seq_sz = static_cast<size_t>(slots) * sizeof(uint64_t);
+    size_t storage_bytes = static_cast<size_t>(stride * slots * elem_size);
+    size_t need = sizeof(uint64_t)*3 + sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t) + slot_seq_sz + storage_bytes;
+    if (buf_len < need) return 0;
+
+    // If config differs, reconfigure the fifo to match snapshot
+    {
+        std::unique_lock<std::mutex> lk(impl->cv_mu);
+        bool reconfig = false;
+        if (impl->slots != static_cast<size_t>(slots) || impl->stride != static_cast<size_t>(stride) || impl->elem_size != static_cast<size_t>(elem_size) || impl->type_id != type_id) {
+            fifo.configure(fifo.shape, static_cast<size_t>(slots), static_cast<size_t>(impl->top_k), static_cast<size_t>(elem_size), type_id);
+            impl = fifo.impl.get(); // refresh pointer
+        }
+
+        // copy slot_seq
+        for (uint64_t i = 0; i < slots; ++i) {
+            uint64_t s = 0; std::memcpy(&s, src + off, sizeof(s)); off += sizeof(s);
+            if (i < impl->slots) impl->slot_seq[i].store(s, std::memory_order_release);
+        }
+
+        // write storage bytes into impl->storage_handle
+        if (impl->storage_handle) {
+            const gp_mem_backend_vtable_t* svt = gp_mem_backend_get_vtable(impl->storage_handle);
+            bool ok = false;
+            if (svt && svt->copy_to_backend) {
+                if (svt->copy_to_backend(impl->storage_handle, 0, src + off, storage_bytes)) ok = true;
+            }
+            if (!ok) {
+                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+                if (!m) return 0;
+                std::memcpy(m, src + off, storage_bytes);
+                gp_mem_backend_unmap(impl->storage_handle);
+            }
+            off += storage_bytes;
+        } else {
+            off += storage_bytes; // skip
+        }
+
+        // restore write_seq
+        impl->write_seq.store(write_seq, std::memory_order_release);
+        impl->last_write_seq.store(write_seq, std::memory_order_release);
+        impl->cv.notify_all();
+    }
+
+    return 1;
+}
 int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b) {
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);
@@ -283,7 +508,7 @@ extern "C" int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entr
     uint64_t rid = re.uid;
     uint32_t flags = re.subgroup_flags;
     bool ok = false;
-    if (flags_imply_byref(flags)) {
+    if (fifo_effective_byref(re.fifo, flags)) {
         size_t sb = static_cast<size_t>(sample_len_bytes);
         size_t alloc_sz = sizeof(BoxedSample) + sb;
         uint8_t* buf = static_cast<uint8_t*>(std::malloc(alloc_sz));
@@ -449,7 +674,8 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     uint32_t flags = 0;
     if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
     bool ok = false;
-    if (flags_imply_byref(flags)) {
+    bool effective_byref = fifo_effective_byref(fifo, flags);
+    if (effective_byref) {
         // BYREF: box the raw sample bytes and publish its pointer instead so
         // consumers receive by-reference payloads. Box format: [BoxedSample][raw bytes]
         size_t sb = static_cast<size_t>(sample_len_bytes);
@@ -519,6 +745,21 @@ int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, u
         }
     }
     return 1;
+}
+
+// Publish a typed element by popping it from a RawStackFrame. This wrapper
+// forwards to the FIFO implementation which attempts optimized backend
+// transfers when possible.
+int32_t gp_table_edge_publish_from_frame(GP_TableContext* ctx, int32_t edge_idx, unsigned long long writer_key, struct RawStackFrame* src_frame, int32_t type_id, int32_t* out_dropped) {
+    if (out_dropped) *out_dropped = 0;
+    if (!ctx || !src_frame) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    bool dropped = false;
+    bool ok = fifo.push_from_frame(ctx->edge_ids[static_cast<size_t>(edge_idx)], writer_key, src_frame, type_id, &dropped);
+    if (out_dropped && dropped) *out_dropped = 1;
+    return ok ? 1 : 0;
 }
 
 // Pointer-oriented publish: publish an opaque pointer into the edge FIFO.
@@ -676,7 +917,14 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     uint32_t flags = 0;
     if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
     bool ok = false;
-    if (flags_imply_byref(flags)) {
+    bool effective_byref = flags_imply_byref(flags);
+    if (!effective_byref) {
+        // check attached backend capability
+        if (fifo.impl && fifo.impl->backend) {
+            if (gp_mem_backend_supports_byref(fifo.impl->backend)) effective_byref = true;
+        }
+    }
+    if (effective_byref) {
         // Peek first: if there's a pointer and it's a boxed sample, then
         // consume it; if it's a non-boxed pointer (e.g., EventPayload)
         // do not advance the reader here — let pointer-oriented APIs
@@ -741,7 +989,7 @@ int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long
     uint32_t flags = 0;
     if (static_cast<size_t>(edge_idx) < ctx->edge_subgroup_flags.size()) flags = ctx->edge_subgroup_flags[static_cast<size_t>(edge_idx)];
     bool ok = false;
-    if (flags_imply_byref(flags)) {
+    if (fifo_effective_byref(fifo, flags)) {
         void* p = nullptr;
         if (!fifo.peek_ptr(subscriber_key, &p)) return 0;
         if (!p) return 0;
@@ -835,6 +1083,121 @@ int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, u
         }
     }
     return 1;
+}
+
+// Attach or query a memory backend for an edge FIFO.
+int32_t gp_table_edge_set_backend(GP_TableContext* ctx, int32_t edge_idx, gp_mem_backend_handle_t h) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    fifo.set_backend(h);
+    return 1;
+}
+
+// Swap the backend attached to an edge FIFO at runtime. If `copy_over` is
+// non-zero, attempt to copy existing FIFO storage from the old backend (or
+// host storage) into the new backend. Returns 1 on success, 0 on failure.
+extern "C" int32_t gp_table_edge_swap_backend(GP_TableContext* ctx, int32_t edge_idx, gp_mem_backend_handle_t new_h, int32_t copy_over) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!fifo.impl) { fifo.set_backend(new_h); return 1; }
+    gp_mem_backend_handle_t old_h = fifo.get_backend();
+    if (old_h == new_h) return 1; // fast-path
+
+    if (!copy_over) {
+        fifo.set_backend(new_h);
+        return 1;
+    }
+
+    // Compute total storage size for the FIFO (host layout)
+    size_t total_bytes = fifo.impl->stride * fifo.impl->slots * fifo.impl->elem_size;
+    if (total_bytes == 0) { fifo.set_backend(new_h); return 1; }
+
+    std::vector<uint8_t> tmp;
+    try { tmp.resize(total_bytes); } catch (...) { return 0; }
+
+    // Read from old backend if possible
+    bool read_ok = false;
+    if (old_h) {
+        const gp_mem_backend_vtable_t* old_vt = gp_mem_backend_get_vtable(old_h);
+        if (old_vt && old_vt->copy_from_backend) {
+            if (old_vt->copy_from_backend(old_h, 0, tmp.data(), total_bytes)) read_ok = true;
+        }
+        if (!read_ok) {
+            void* m = gp_mem_backend_map_or_null(old_h);
+            if (m) {
+                std::memcpy(tmp.data(), m, total_bytes);
+                gp_mem_backend_unmap(old_h);
+                read_ok = true;
+            }
+        }
+    }
+    // Fallback to FIFO's internal storage handle
+    if (!read_ok && fifo.impl->storage_handle) {
+        const gp_mem_backend_vtable_t* sh_vt = gp_mem_backend_get_vtable(fifo.impl->storage_handle);
+        if (sh_vt && sh_vt->copy_from_backend) {
+            if (sh_vt->copy_from_backend(fifo.impl->storage_handle, 0, tmp.data(), total_bytes)) read_ok = true;
+        }
+        if (!read_ok) {
+            void* m = gp_mem_backend_map_or_null(fifo.impl->storage_handle);
+            if (m) {
+                std::memcpy(tmp.data(), m, total_bytes);
+                gp_mem_backend_unmap(fifo.impl->storage_handle);
+                read_ok = true;
+            }
+        }
+    }
+    if (!read_ok) return 0;
+
+    // Attach new backend and attempt to write into it
+    fifo.set_backend(new_h);
+    if (new_h) {
+        const gp_mem_backend_vtable_t* new_vt = gp_mem_backend_get_vtable(new_h);
+        bool write_ok = false;
+        if (new_vt && new_vt->copy_to_backend) {
+            if (new_vt->copy_to_backend(new_h, 0, tmp.data(), total_bytes)) write_ok = true;
+        }
+        if (!write_ok) {
+            // Try mapping
+            void* m = gp_mem_backend_map_or_null(new_h);
+            if (m) {
+                std::memcpy(m, tmp.data(), total_bytes);
+                gp_mem_backend_unmap(new_h);
+                write_ok = true;
+            }
+        }
+        if (!write_ok) {
+            // Could not transfer into new backend; revert backend pointer and fail.
+            fifo.set_backend(old_h);
+            return 0;
+        }
+    }
+
+    // Keep the FIFO internal storage in sync with the copied buffer.
+    if (fifo.impl->storage_handle) {
+        const gp_mem_backend_vtable_t* sh_vt = gp_mem_backend_get_vtable(fifo.impl->storage_handle);
+        if (sh_vt && sh_vt->copy_to_backend) {
+            sh_vt->copy_to_backend(fifo.impl->storage_handle, 0, tmp.data(), total_bytes);
+        } else {
+            void* m = gp_mem_backend_map_or_null(fifo.impl->storage_handle);
+            if (m) {
+                std::memcpy(m, tmp.data(), total_bytes);
+                gp_mem_backend_unmap(fifo.impl->storage_handle);
+            }
+        }
+    }
+    return 1;
+}
+
+gp_mem_backend_handle_t gp_table_edge_get_backend(GP_TableContext* ctx, int32_t edge_idx) {
+    if (!ctx) return nullptr;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return nullptr;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    return fifo.get_backend();
 }
 
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count) {

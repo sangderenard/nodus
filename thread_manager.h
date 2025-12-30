@@ -12,6 +12,7 @@
 #include <string>
 #include <array>
 #include "table_abi.h"
+#include "value_types.h"
 
 struct GP_TableContext;
 
@@ -171,6 +172,8 @@ public:
 
     void set_mode(Mode mode);
     Mode mode() const;
+    void set_module_tool_stack_default_type(ValueTypeId tid);
+    ValueTypeId module_tool_stack_default_type() const;
 
     // Submit a tick. If `wait` is true, the call blocks until that tick is completed
     // by the manager thread (safe for now: avoids concurrent mutation with render).
@@ -348,4 +351,11 @@ private:
     std::unordered_map<int, std::vector<float>> edge_assemble_buf_;
     // Cache of last-known stride per edge (0 = unknown)
     std::unordered_map<int, int> edge_stride_cache_;
+    // Typed stack storage per module (preallocated for hot execution).
+    std::vector<std::unique_ptr<RawStackFrame>> module_tool_stacks_;
+    size_t module_tool_stack_capacity_bytes_ = 4096;
+    std::atomic<ValueTypeId> module_tool_stack_default_type_{kInvalidValueTypeId};
+    std::mutex module_tool_stacks_mu_;
+    RawStackFrame* ensure_module_tool_stack(int module_idx);
+    void reset_module_tool_stack(RawStackFrame& frame);
 };

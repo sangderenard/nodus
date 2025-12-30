@@ -344,7 +344,14 @@ static void sync_edge_tensor_for_idx(GP_TableContext* ctx, size_t ei) {
     // destroyed and re-created; existing samples are preserved where possible.
     if (ei < ctx->edge_subgroup_flags.size()) {
         uint32_t f = ctx->edge_subgroup_flags[ei];
-        if (flags_imply_byref(f)) {
+        bool need_byref = flags_imply_byref(f);
+        if (!need_byref) {
+            // check attached backend
+            EdgeTensorFifo &ef = ctx->edge_fifos[ei];
+            gp_mem_backend_handle_t h = ef.get_backend();
+            if (h && gp_mem_backend_supports_byref(h)) need_byref = true;
+        }
+        if (need_byref) {
             // ensure stride can hold a pointer
             EdgeTensorFifo &ef = ctx->edge_fifos[ei];
             ef.ensure_stride_for_bytes(sizeof(void*));
