@@ -36,6 +36,49 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+
+#include "kernel_isa.h"
+#include <vector>
+
+// ...existing code from original_spirv_translation.cpp moved here...
+// spirv_translation.cpp
+// C++20 skeleton: IR -> (GLSL compute) -> SPIR-V via external compiler or shaderc.
+// Drop-in translation pipeline with caching and specialization support.
+//
+// Philosophy:
+// - Keep a tiny, explicit KernelIR that your SSA/graph can be adapted into.
+// - Emit portable GLSL compute (vulkan/spirv) first; compile to SPIR-V.
+// - Later: replace GLSL emission with a direct SPIR-V builder without changing the public API.
+//
+// Build:
+// - C++20 required.
+// - Optional: define NODUS_HAVE_SHADERC=1 and link shaderc if you embed compilation.
+// - Otherwise: provide path to glslangValidator or ensure it is on PATH.
+//
+// Security note:
+// - External compiler invocation uses args vector (no shell concatenation) on Windows;
+//   on POSIX it uses fork/exec. Adjust to your platform policy.
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cctype>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <optional>
+#include <sstream>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -43,110 +86,16 @@ namespace nodus::spirv {
 
 using u8  = std::uint8_t;
 using u32 = std::uint32_t;
+using i32 = std::int32_t;
 using u64 = std::uint64_t;
+using u16 = std::uint16_t;
 
 static inline std::string to_string(std::filesystem::path p) {
-  return p.u8string();
+  return p.string();
 }
 
 // ------------------------------
 // Minimal, portable KernelIR view
-// ------------------------------
-//
-// Adapt your SSA/function/region into this representation.
-// It is intentionally small: enough to emit a compute kernel.
-
-enum class ScalarType : u8 {
-  I32,
-  U32,
-  F32,
-  // TODO: F16, I16, U16, F64, etc.
-};
-
-struct TensorType {
-  ScalarType scalar{};
-  std::vector<u32> shape;         // Compile-time shape for v0; empty means "runtime" later.
-  bool is_buffer = true;          // For v0: all tensors live in SSBO-like buffers.
-  bool is_readonly = false;       // Inputs are typically readonly.
-};
-
-struct ValueRef {
-  u32 id = 0; // index into KernelIR::values
-};
-
-enum class OpCode : u16 {
-  // Core SSA-ish ops you likely already have.
-  Const,
-  Load,        // buffer + index -> scalar/vector
-  Store,       // buffer + index + value -> void
-
-  Add,
-  Sub,
-  Mul,
-  Div,
-  Neg,
-  Min,
-  Max,
-  Clamp,
-
-  // Comparisons/select
-  CmpLT,
-  CmpLE,
-  CmpGT,
-  CmpGE,
-  CmpEQ,
-  CmpNE,
-  Select,      // (cond, a, b)
-
-  // Elementary math (subset)
-  Exp,
-  Log,
-  Sqrt,
-  Rsqrt,
-
-  // TODO: reductions, matmul, gather/scatter, etc.
-};
-
-struct Operand {
-  // Either a ValueRef, or an immediate constant.
-  // Extend as needed (e.g., small vector constants, strings, ids).
-  std::variant<ValueRef, i32, u32, float> v;
-
-  static Operand ref(ValueRef r) { return Operand{r}; }
-  static Operand i(i32 x) { return Operand{x}; }
-  static Operand u(u32 x) { return Operand{x}; }
-  static Operand f(float x) { return Operand{x}; }
-};
-
-struct Instruction {
-  OpCode op{};
-  std::vector<Operand> inputs;
-  std::vector<ValueRef> outputs; // Often 0 or 1 output for v0; keep vector for future.
-};
-
-struct ValueDef {
-  TensorType type;                 // For scalar temps, shape.size()==0 and is_buffer=false.
-  std::string debug_name;
-};
-
-// One compute kernel region.
-struct KernelIR {
-  std::string name;
-
-  // Interface:
-  // - buffers: “tensors” passed by binding index
-  // - params: specialization/push-constant style inputs (for later)
-  std::vector<ValueDef> values;           // includes buffers and temporaries
-  std::vector<u32> buffer_value_ids;      // subset of values that are SSBOs
-  std::vector<Instruction> instrs;
-
-  // Work dispatch: global size known at runtime; local size (workgroup) chosen at compile.
-  std::array<u32, 3> suggested_local_size{16, 16, 1};
-
-  // For v0: 1D indexing (global invocation linear). Extend to 2D/3D.
-  u32 element_count = 0; // How many logical elements to process; used for bounds checks.
-};
-
 // ------------------------------
 // SPIR-V compilation outputs
 // ------------------------------
@@ -191,12 +140,12 @@ struct SpirvCompileResult {
 // Hash utilities (cache keys)
 // ------------------------------
 
-static inline u64 fnv1a64(std::span<const u8> data) {
+static inline u64 fnv1a64(const u8* data, size_t size) {
   constexpr u64 kOffset = 1469598103934665603ull;
   constexpr u64 kPrime  = 1099511628211ull;
   u64 h = kOffset;
-  for (u8 b : data) {
-    h ^= static_cast<u64>(b);
+  for (size_t i = 0; i < size; ++i) {
+    h ^= static_cast<u64>(data[i]);
     h *= kPrime;
   }
   return h;
@@ -208,7 +157,7 @@ static inline void hash_combine(u64& h, u64 v) {
 }
 
 static inline u64 hash_string(std::string_view s) {
-  return fnv1a64(std::span<const u8>(reinterpret_cast<const u8*>(s.data()), s.size()));
+  return fnv1a64(reinterpret_cast<const u8*>(s.data()), s.size());
 }
 
 // ------------------------------
@@ -765,6 +714,8 @@ public:
       std::filesystem::remove(glsl_file, ec);
     }
 
+
+#include "kernel_isa.h" // Integrate the new KernelISA definition
     SpirvCompileResult r;
     r.spirv = std::move(bin);
     r.glsl_source = opt_.keep_intermediates ? std::move(glsl) : std::string{};

@@ -9,6 +9,12 @@
 extern "C" {
 #endif
 
+// Expose SPIR-V translation integration for use by other components
+#ifdef __cplusplus
+#include "spirv_translation.h"
+void gp_mem_backend_translate_to_spirv(const nodus::spirv::KernelIR& ir);
+#endif
+
 // Forward declare table context so backends can expose table-edge attach helpers.
 typedef struct GP_TableContext GP_TableContext;
 
@@ -99,6 +105,14 @@ typedef struct {
     // Optionally return an opaque native stream/queue handle for the buffer
     // (e.g., CUDA stream pointer). Return 0 if unsupported.
     uintptr_t (*get_native_stream)(gp_mem_backend_handle_t h);
+
+    // Dispatch/execute a kernel described by a KernelIR (SPIR-V operator set)
+    // Returns 1 on success, 0 on failure. May be a stub for backends that do not support execution.
+#ifdef __cplusplus
+    int (*dispatch_kernel)(gp_mem_backend_handle_t backend_h, const nodus::spirv::KernelIR* kernel_ir);
+#else
+    void* dispatch_kernel; // for C compatibility
+#endif
 } gp_mem_backend_vtable_t;
 
 // Retrieve vtable for a backend handle (may return NULL if none).

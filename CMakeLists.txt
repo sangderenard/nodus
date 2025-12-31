@@ -1,174 +1,240 @@
+  # BitOps test
+  add_executable(test_bitops
+    tests/test_bitops.cpp
+  )
+  target_link_libraries(test_bitops PRIVATE canvas_tables)
+  add_test(NAME test_bitops COMMAND test_bitops)
+
+  # Translation matrix test
+  add_executable(test_translation_matrix
+    tests/test_translation_matrix.cpp
+  )
+  target_link_libraries(test_translation_matrix PRIVATE canvas_tables)
+  add_test(NAME test_translation_matrix COMMAND test_translation_matrix)
+  # Torch (standalone)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/dev_bundle/include/torch-src" AND EXISTS "${CMAKE_SOURCE_DIR}/dev_bundle/include/torch-src/CMakeLists.txt")
+    message(STATUS "Using local torch-src from dev_bundle/include; adding as subdirectory.")
+    add_subdirectory("${CMAKE_SOURCE_DIR}/dev_bundle/include/torch-src" "${CMAKE_BINARY_DIR}/torch-src-build")
+    include_directories("${CMAKE_SOURCE_DIR}/dev_bundle/include/torch-src")
+  endif()
+  # Ensure SDL_TTF::SDL_TTF alias exists for downstream compatibility
+  if(TARGET SDL3_ttf-shared)
+    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf-shared)
+  elseif(TARGET SDL3_ttf-static)
+    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf-static)
+  endif()
+# Set local source directories for all dependencies (including Torch)
+set(_SDL3_SRC      "${CMAKE_SOURCE_DIR}/dev_bundle/include/SDL3-src")
+set(_SDLTTF_SRC    "${CMAKE_SOURCE_DIR}/dev_bundle/include/SDL_ttf-src")
+set(_FREETYPE_SRC  "${CMAKE_SOURCE_DIR}/dev_bundle/include/freetype-src")
+set(_HARFBUZZ_SRC  "${CMAKE_SOURCE_DIR}/dev_bundle/include/harfbuzz-src")
+
+
 cmake_minimum_required(VERSION 3.15)
 project(canvas_tables LANGUAGES CXX)
-
-# ---------------------------------------------------------------------------
-# Policies (avoid noisy warnings on newer CMake)
-# ---------------------------------------------------------------------------
-if(POLICY CMP0135)
-  cmake_policy(SET CMP0135 NEW) # honor DOWNLOAD_EXTRACT_TIMESTAMP when provided
-endif()
-
-# Prefer SDL3_ttf canonical imported target name when available.
-# Alias a variety of possible target names (SDL3/legacy) to a single
-# canonical target `SDL_TTF::SDL_TTF` used by this project. This allows
-# downstream code to link to a single name regardless of the system's
-# packaging/FetchContent layout.
-if(NOT TARGET SDL_TTF::SDL_TTF)
-  if(TARGET SDL3_ttf::SDL3_ttf)
-    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf)
-  elseif(TARGET SDL3_ttf)
-    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf)
-  endif()
-endif()
-
-# FetchContent_Populate() deprecation warning control on newer CMake.
-# We intentionally use Populate for "download-only" archives (no CMakeLists).
-if(POLICY CMP0169)
-  cmake_policy(SET CMP0169 OLD)
-endif()
-
-# ---------------------------------------------------------------------------
-# FetchContent persistence (avoid re-downloading across fresh build dirs)
-#
-# Default: a stable per-user cache folder. Override via -DFETCHCONTENT_BASE_DIR=...
-# ---------------------------------------------------------------------------
-if(NOT DEFINED FETCHCONTENT_BASE_DIR)
-  if(WIN32)
-    set(_NODUS_FC_DEFAULT "$ENV{LOCALAPPDATA}/nodus_fetchcontent")
-  else()
-    set(_NODUS_FC_DEFAULT "$ENV{HOME}/.cache/nodus_fetchcontent")
-  endif()
-  set(FETCHCONTENT_BASE_DIR "${_NODUS_FC_DEFAULT}" CACHE PATH "Where FetchContent stores downloaded/extracted dependencies")
-endif()
-
 include(FetchContent)
+set(_all_sources_found TRUE)
+foreach(_dep_src IN ITEMS _SDL3_SRC _SDLTTF_SRC _FREETYPE_SRC _HARFBUZZ_SRC)
+  if(NOT EXISTS ${${_dep_src}})
+    set(_all_sources_found FALSE)
+  endif()
+endforeach()
 
-# Option to copy detected Torch headers into the repo root so ephemeral
-# CMake projects (which add the repo root to their include path) can find
-# headers like <torch/torch.h>. Useful for the test that builds plugin
-# DLLs in a temp project that only adds the repo root as an include dir.
-option(NODUS_PERSIST_TORCH_IN_REPO "Copy detected LibTorch headers into ${CMAKE_CURRENT_SOURCE_DIR}/torch for plugin builds" ON)
+  # SDL3
+  if(EXISTS "${_SDL3_SRC}")
+    message(STATUS "Using local SDL3-src from dev_bundle/include; adding as subdirectory.")
+    add_subdirectory("${_SDL3_SRC}" "${CMAKE_BINARY_DIR}/SDL3-src-build")
+    include_directories("${_SDL3_SRC}/include")
+  else()
+    find_package(SDL3 QUIET)
+    if(NOT SDL3_FOUND)
+      if(NODUS_ALLOW_NETWORK_FETCH)
+        message(STATUS "SDL3 not found; fetching SDL 3.x as a dependency.")
+        FetchContent_Declare(SDL3
+          GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+          GIT_TAG ${NODUS_SDL3_GIT_TAG}
+          GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(SDL3)
+      else()
+        message(FATAL_ERROR "SDL3 not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL3 or enable network fetch.")
+      endif()
+    endif()
+  endif()
 
-# Avoid FetchContent trying to update git deps every configure unless explicitly desired.
-set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Disable FetchContent updates after first download")
+  # SDL_ttf
+  if(EXISTS "${_SDLTTF_SRC}")
+    message(STATUS "Using local SDL_ttf-src from dev_bundle/include; adding as subdirectory.")
+    add_subdirectory("${_SDLTTF_SRC}" "${CMAKE_BINARY_DIR}/SDL_ttf-src-build")
+    include_directories("${_SDLTTF_SRC}/include")
+    # Ensure SDL_TTF::SDL_TTF alias exists for downstream compatibility
+    if(TARGET SDL3_ttf-shared)
+      add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf-shared)
+    elseif(TARGET SDL3_ttf-static)
+      add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf-static)
+    endif()
+  else()
+    find_package(SDL3_ttf QUIET)
+    if(NOT SDL3_ttf_FOUND)
+      if(NODUS_ALLOW_NETWORK_FETCH)
+        message(STATUS "SDL_ttf (SDL3-capable) not found; fetching SDL_ttf and HarfBuzz as dependencies.")
+        message(STATUS "Also fetching FreeType so SDL_ttf builds against a known FreeType.")
+        # FreeType (font rasterizer)
+        if(EXISTS "${_FREETYPE_SRC}")
+          add_subdirectory("${_FREETYPE_SRC}" "${CMAKE_BINARY_DIR}/freetype-src-build")
+          include_directories("${_FREETYPE_SRC}/include")
+        else()
+          FetchContent_Declare(freetype
+            GIT_REPOSITORY https://github.com/freetype/freetype.git
+            GIT_TAG ${NODUS_FREETYPE_GIT_TAG}
+            GIT_SHALLOW TRUE
+          )
+          FetchContent_MakeAvailable(freetype)
+          list(APPEND CMAKE_PREFIX_PATH "${freetype_SOURCE_DIR}")
+          if(DEFINED freetype_BINARY_DIR)
+            list(APPEND CMAKE_PREFIX_PATH "${freetype_BINARY_DIR}")
+          endif()
+        endif()
+        # HarfBuzz (used for shaping)
+        if(EXISTS "${_HARFBUZZ_SRC}")
+          add_subdirectory("${_HARFBUZZ_SRC}" "${CMAKE_BINARY_DIR}/harfbuzz-src-build")
+          include_directories("${_HARFBUZZ_SRC}/src")
+        else()
+          FetchContent_Declare(harfbuzz
+            GIT_REPOSITORY https://github.com/harfbuzz/harfbuzz.git
+            GIT_TAG 8.2.0
+            GIT_SHALLOW TRUE
+          )
+          FetchContent_MakeAvailable(harfbuzz)
+          list(APPEND CMAKE_PREFIX_PATH "${harfbuzz_SOURCE_DIR}")
+        endif()
+        # SDL_ttf (source repo supports building against SDL3 when configured)
+        FetchContent_Declare(SDL_ttf
+          GIT_REPOSITORY https://github.com/libsdl-org/SDL_ttf.git
+          GIT_TAG ${NODUS_SDLTTF_GIT_TAG}
+          GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(SDL_ttf)
+      else()
+        message(FATAL_ERROR "SDL_ttf (SDL3) not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL3_ttf or enable network fetch.")
+      endif()
+    endif()
+  endif()
 
-# ---------------------------------------------------------------------------
-# Options / overrides for fully-automatic dependency acquisition
-# ---------------------------------------------------------------------------
-option(NODUS_ALLOW_NETWORK_FETCH "Allow CMake to download dependencies (Torch/SDL3/NVTX) when not found locally" ON)
 
-# Allow override of SDL3/SDL_ttf git tags (use real SDL3/SDL3_ttf releases by default)
-set(NODUS_SDL3_GIT_TAG "release-3.2.28" CACHE STRING "SDL3 git tag to fetch when NODUS_ALLOW_NETWORK_FETCH=ON")
-set(NODUS_SDLTTF_GIT_TAG "release-3.2.2" CACHE STRING "SDL_ttf (SDL3-capable) git tag to fetch when NODUS_ALLOW_NETWORK_FETCH=ON")
 
-# Option: enable legacy canvas printf debug output (default OFF)
-option(GP_CANVAS_DEBUG_PRINTF "Enable legacy canvas printf debug output" OFF)
-if(GP_CANVAS_DEBUG_PRINTF)
-  add_compile_definitions(GP_CANVAS_DEBUG_PRINTF)
-endif()
+  # SDL3
+  if(EXISTS "${_SDL3_SRC}")
+    message(STATUS "Using local SDL3-src from dev_bundle/include; skipping FetchContent.")
+    list(APPEND CMAKE_PREFIX_PATH "${_SDL3_SRC}")
+    include_directories("${_SDL3_SRC}")
+  else()
+    find_package(SDL3 QUIET)
+    if(NOT SDL3_FOUND)
+      if(NODUS_ALLOW_NETWORK_FETCH)
+        message(STATUS "SDL3 not found; fetching SDL 3.x as a dependency.")
+        FetchContent_Declare(SDL3
+          GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+          GIT_TAG ${NODUS_SDL3_GIT_TAG}
+          GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(SDL3)
+      else()
+        message(FATAL_ERROR "SDL3 not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL3 or enable network fetch.")
+      endif()
+    endif()
+  endif()
 
-# If Torch must be downloaded, these can be set to force the exact libtorch ZIP.
-# Example:
-#   -DNODUS_TORCH_VERSION=2.7.1 -DNODUS_TORCH_CUDA_TAG=cu126
-set(NODUS_TORCH_VERSION "" CACHE STRING "PyTorch version to download for LibTorch (e.g. 2.7.1). If empty, tries to derive from Python torch.")
-set(NODUS_TORCH_CUDA_TAG "" CACHE STRING "LibTorch CUDA tag (e.g. cu126, cu124, cpu). If empty, tries to derive from Python torch.")
-set(NODUS_TORCH_URL "" CACHE STRING "Override LibTorch ZIP URL directly (takes precedence over version/tag).")
+  # FreeType
+  if(EXISTS "${_FREETYPE_SRC}")
+    message(STATUS "Using local freetype-src from dev_bundle/include; skipping FetchContent.")
+    list(APPEND CMAKE_PREFIX_PATH "${_FREETYPE_SRC}")
+    include_directories("${_FREETYPE_SRC}")
+  else()
+    set(_NEED_FETCH_FREETYPE TRUE)
+  endif()
 
-# NVTX (nvToolsExt) redist ZIP (Windows)
-option(NODUS_ENABLE_NVTX "Fetch Nsight NVTX redistributable (nvToolsExt) so Torch CUDA CMake can find nvToolsExt on CUDA 12.x+" ON)
-set(NODUS_NVTX_URL
-  "https://developer.download.nvidia.com/compute/cuda/redist/nsight_nvtx/windows-x86_64/nsight_nvtx-windows-x86_64-1.21018621-archive.zip"
-  CACHE STRING "Nsight NVTX (nvToolsExt) redist ZIP URL"
-)
+  # HarfBuzz
+  if(EXISTS "${_HARFBUZZ_SRC}")
+    message(STATUS "Using local harfbuzz-src from dev_bundle/include; skipping FetchContent.")
+    list(APPEND CMAKE_PREFIX_PATH "${_HARFBUZZ_SRC}")
+    include_directories("${_HARFBUZZ_SRC}")
+  else()
+    set(_NEED_FETCH_HARFBUZZ TRUE)
+  endif()
 
-# ---------------------------------------------------------------------------
-# Python interpreter (used for Torch autodetection and tests)
-# ---------------------------------------------------------------------------
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  # SDL_ttf
+  if(EXISTS "${_SDLTTF_SRC}")
+    message(STATUS "Using local SDL_ttf-src from dev_bundle/include; skipping FetchContent.")
+    list(APPEND CMAKE_PREFIX_PATH "${_SDLTTF_SRC}")
+    include_directories("${_SDLTTF_SRC}")
+  else()
+    find_package(SDL3_ttf QUIET)
+    if(NOT SDL3_ttf_FOUND)
+      if(NODUS_ALLOW_NETWORK_FETCH)
+        message(STATUS "SDL_ttf (SDL3-capable) not found; fetching SDL_ttf and HarfBuzz as dependencies.")
+        message(STATUS "Also fetching FreeType so SDL_ttf builds against a known FreeType.")
+        # FreeType (font rasterizer)
+        if(_NEED_FETCH_FREETYPE)
+          FetchContent_Declare(freetype
+            GIT_REPOSITORY https://github.com/freetype/freetype.git
+            GIT_TAG ${NODUS_FREETYPE_GIT_TAG}
+            GIT_SHALLOW TRUE
+          )
+          FetchContent_MakeAvailable(freetype)
+          list(APPEND CMAKE_PREFIX_PATH "${freetype_SOURCE_DIR}")
+          if(DEFINED freetype_BINARY_DIR)
+            list(APPEND CMAKE_PREFIX_PATH "${freetype_BINARY_DIR}")
+          endif()
+        endif()
+        # HarfBuzz (used for shaping)
+        if(_NEED_FETCH_HARFBUZZ)
+          FetchContent_Declare(harfbuzz
+            GIT_REPOSITORY https://github.com/harfbuzz/harfbuzz.git
+            GIT_TAG 8.2.0
+            GIT_SHALLOW TRUE
+          )
+          FetchContent_MakeAvailable(harfbuzz)
+          list(APPEND CMAKE_PREFIX_PATH "${harfbuzz_SOURCE_DIR}")
+        endif()
+        # SDL_ttf (source repo supports building against SDL3 when configured)
+        FetchContent_Declare(SDL_ttf
+          GIT_REPOSITORY https://github.com/libsdl-org/SDL_ttf.git
+          GIT_TAG ${NODUS_SDLTTF_GIT_TAG}
+          GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(SDL_ttf)
+      else()
+        message(FATAL_ERROR "SDL_ttf (SDL3) not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL3_ttf or enable network fetch.")
+      endif()
+    endif()
+  endif()
 
-message(STATUS "Python3 executable: ${Python3_EXECUTABLE}")
 
-# ---------------------------------------------------------------------------
-# Attempt to derive Torch info from Python (prefix path, version, CUDA tag)
-# ---------------------------------------------------------------------------
-set(PYTORCH_CMAKE_PREFIX "")
-set(PYTORCH_VERSION_FROM_PY "")
-set(PYTORCH_CUDA_TAG_FROM_PY "")
+# --- Restored original Python probe logic for torch (with print statements) ---
 
-set(_PYTORCH_PREFIX_SCRIPT "")
-string(APPEND _PYTORCH_PREFIX_SCRIPT
-  "import sys\n"
-  "try:\n"
-  "  import torch\n"
-  "  prefixes = torch.utils.cmake_prefix_path\n"
-  "  if isinstance(prefixes, (list, tuple)):\n"
-  "    print('\\n'.join(prefixes))\n"
-  "  else:\n"
-  "    print(prefixes or '')\n"
-  "except Exception:\n"
-  "  import traceback\n"
-  "  traceback.print_exc()\n"
-  "  sys.exit(1)\n"
-)
-
+# --- Strict Python torch probe: fail hard and print all output/errors ---
 execute_process(
-  COMMAND "${Python3_EXECUTABLE}" "-c" "${_PYTORCH_PREFIX_SCRIPT}"
+  COMMAND python -c "import torch; prefixes = getattr(torch.utils, 'cmake_prefix_path', '');\nif isinstance(prefixes, (list, tuple)): print('\\n'.join(prefixes))\nelse: print(prefixes or '')"
   RESULT_VARIABLE _PYTORCH_PREFIX_RC
   OUTPUT_VARIABLE PYTORCH_CMAKE_PREFIX
-  OUTPUT_STRIP_TRAILING_WHITESPACE
   ERROR_VARIABLE _PYTORCH_PREFIX_ERR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
   ERROR_STRIP_TRAILING_WHITESPACE
-  ERROR_QUIET
 )
 message(STATUS "Torch prefix probe stdout raw: '${PYTORCH_CMAKE_PREFIX}'")
+message(STATUS "Torch prefix probe stderr: '${_PYTORCH_PREFIX_ERR}'")
 string(LENGTH "${PYTORCH_CMAKE_PREFIX}" _PYTORCH_PREFIX_LEN)
 message(STATUS "Torch prefix probe stdout length: ${_PYTORCH_PREFIX_LEN}")
-
-set(_PYTORCH_VERSION_SCRIPT "")
-string(APPEND _PYTORCH_VERSION_SCRIPT
-  "import sys\n"
-  "try:\n"
-  "  import torch\n"
-  "  ver = str(torch.__version__).split('+')[0]\n"
-  "  cuda = torch.version.cuda\n"
-  "  tag = ('cu' + str(cuda).replace('.','')) if cuda else 'cpu'\n"
-  "  print(ver)\n"
-  "  print(tag)\n"
-  "except Exception:\n"
-  "  import traceback\n"
-  "  traceback.print_exc()\n"
-  "  sys.exit(1)\n"
-)
-
-execute_process(
-  COMMAND "${Python3_EXECUTABLE}" "-c" "${_PYTORCH_VERSION_SCRIPT}"
-  RESULT_VARIABLE _PYTORCH_VER_RC
-  OUTPUT_VARIABLE _PYTORCH_VER_OUT
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  ERROR_VARIABLE _PYTORCH_VER_ERR
-  ERROR_STRIP_TRAILING_WHITESPACE
-  ERROR_QUIET
-)
-message(STATUS "Torch version probe stdout raw: '${_PYTORCH_VER_OUT}'")
-string(LENGTH "${_PYTORCH_VER_OUT}" _PYTORCH_VER_OUT_LEN)
-message(STATUS "Torch version probe stdout length: ${_PYTORCH_VER_OUT_LEN}")
-
-if(_PYTORCH_PREFIX_RC EQUAL 0 AND PYTORCH_CMAKE_PREFIX)
-  string(REPLACE "\r\n" "\n" _PYTORCH_CMAKE_PREFIX_TEMP "${PYTORCH_CMAKE_PREFIX}")
-  string(REPLACE "\r" "\n" _PYTORCH_CMAKE_PREFIX_TEMP "${_PYTORCH_CMAKE_PREFIX_TEMP}")
-  string(REGEX REPLACE "\n+$" "" _PYTORCH_CMAKE_PREFIX_TEMP "${_PYTORCH_CMAKE_PREFIX_TEMP}")
-  string(REPLACE "\n" ";" _PYTORCH_CMAKE_PREFIX_LIST "${_PYTORCH_CMAKE_PREFIX_TEMP}")
-  message(STATUS "Detected Python Torch cmake prefix path(s): ${_PYTORCH_CMAKE_PREFIX_LIST}")
-  foreach(_prefix IN LISTS _PYTORCH_CMAKE_PREFIX_LIST)
-    list(APPEND CMAKE_PREFIX_PATH "${_prefix}")
-  endforeach()
-else()
-  message(STATUS "Python-based Torch cmake-prefix detection failed; will fall back to fetch-based resolution if needed.")
-  message(STATUS "Torch prefix probe exit code: ${_PYTORCH_PREFIX_RC}")
-  if(_PYTORCH_PREFIX_ERR)
-    message(STATUS "Torch prefix probe stderr: ${_PYTORCH_PREFIX_ERR}")
-  endif()
+if(NOT (_PYTORCH_PREFIX_RC EQUAL 0 AND PYTORCH_CMAKE_PREFIX))
+  message(FATAL_ERROR "Torch Python probe failed!\nReturn code: ${_PYTORCH_PREFIX_RC}\nStdout: ${PYTORCH_CMAKE_PREFIX}\nStderr: ${_PYTORCH_PREFIX_ERR}")
 endif()
+string(REPLACE "\r\n" "\n" _PYTORCH_CMAKE_PREFIX_TEMP "${PYTORCH_CMAKE_PREFIX}")
+string(REPLACE "\r" "\n" _PYTORCH_CMAKE_PREFIX_TEMP "${_PYTORCH_CMAKE_PREFIX_TEMP}")
+string(REPLACE "\n" ";" _PYTORCH_CMAKE_PREFIX_LIST "${_PYTORCH_CMAKE_PREFIX_TEMP}")
+foreach(_prefix IN LISTS _PYTORCH_CMAKE_PREFIX_LIST)
+  list(APPEND CMAKE_PREFIX_PATH "${_prefix}")
+endforeach()
 
 if(_PYTORCH_VER_RC EQUAL 0 AND _PYTORCH_VER_OUT)
   string(REPLACE "\r\n" "\n" _PYTORCH_VER_OUT "${_PYTORCH_VER_OUT}")
@@ -189,6 +255,7 @@ else()
   endif()
 endif()
 
+
 # Honor explicit overrides (cache vars), otherwise derive from Python torch.
 if(NOT NODUS_TORCH_VERSION AND PYTORCH_VERSION_FROM_PY)
   set(NODUS_TORCH_VERSION "${PYTORCH_VERSION_FROM_PY}")
@@ -197,95 +264,41 @@ if(NOT NODUS_TORCH_CUDA_TAG AND PYTORCH_CUDA_TAG_FROM_PY)
   set(NODUS_TORCH_CUDA_TAG "${PYTORCH_CUDA_TAG_FROM_PY}")
 endif()
 
+# If Torch_INCLUDE_DIRS is not set, use the first Python probe result, but always build from dev_bundle/include/torch-src
+if(NOT DEFINED Torch_INCLUDE_DIRS AND DEFINED _PYTORCH_CMAKE_PREFIX_LIST)
+  list(LENGTH _PYTORCH_CMAKE_PREFIX_LIST _torch_prefix_count)
+  if(_torch_prefix_count GREATER 0)
+    list(GET _PYTORCH_CMAKE_PREFIX_LIST 0 _first_torch_prefix)
+    set(_TORCHSRC_DEST "${CMAKE_SOURCE_DIR}/dev_bundle/include/torch-src")
+    file(MAKE_DIRECTORY "${_TORCHSRC_DEST}")
+    if(EXISTS "${_first_torch_prefix}")
+      file(COPY "${_first_torch_prefix}/" DESTINATION "${_TORCHSRC_DEST}")
+    endif()
+    set(Torch_INCLUDE_DIRS "${_TORCHSRC_DEST}")
+  endif()
+endif()
+
+
 # ---------------------------------------------------------------------------
-# Ensure nvToolsExt is available (CUDA 12.x+ often lacks the legacy stub lib)
-# This must be done BEFORE find_package(Torch).
+# Use persistent dev_bundle/nvtoolsext for nvToolsExt headers and libraries
 # ---------------------------------------------------------------------------
-if(WIN32 AND NODUS_ENABLE_NVTX AND NODUS_ALLOW_NETWORK_FETCH)
-  FetchContent_Declare(nsight_nvtx_redist
-    URL "${NODUS_NVTX_URL}"
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+set(_NVTX_PERSISTENT_ROOT "${CMAKE_SOURCE_DIR}/dev_bundle/nvtoolsext")
+set(_NVTX_PERSISTENT_INCLUDE "${_NVTX_PERSISTENT_ROOT}/include")
+set(_NVTX_PERSISTENT_LIB_X64 "${_NVTX_PERSISTENT_ROOT}/lib/x64")
+
+set(NVTOOLSEXT_INCLUDE_DIR "${_NVTX_PERSISTENT_INCLUDE}" CACHE PATH "NVTX include dir" FORCE)
+set(NVTOOLSEXT_LIBRARY     "${_NVTX_PERSISTENT_LIB_X64}/nvToolsExt64_1.lib" CACHE FILEPATH "NVTX import library" FORCE)
+set(NVTOOLSEXT_PATH        "${_NVTX_PERSISTENT_ROOT}" CACHE PATH "NVTX prefix (has include/)" FORCE)
+set(ENV{NVTOOLSEXT_PATH} "${_NVTX_PERSISTENT_ROOT}")
+
+if(NOT TARGET CUDA::nvToolsExt)
+  add_library(CUDA::nvToolsExt UNKNOWN IMPORTED)
+  set_target_properties(CUDA::nvToolsExt PROPERTIES
+    IMPORTED_LOCATION "${NVTOOLSEXT_LIBRARY}"
+    IMPORTED_LOCATION_RELEASE "${NVTOOLSEXT_LIBRARY}"
+    IMPORTED_LOCATION_DEBUG "${NVTOOLSEXT_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${NVTOOLSEXT_INCLUDE_DIR}"
   )
-  FetchContent_GetProperties(nsight_nvtx_redist)
-  if(NOT nsight_nvtx_redist_POPULATED)
-    message(STATUS "Fetching Nsight NVTX (nvToolsExt) redistributable to satisfy Torch CUDA CMake checks.")
-    FetchContent_Populate(nsight_nvtx_redist)
-  endif()
-
-  set(_NVTX_ROOT "${nsight_nvtx_redist_SOURCE_DIR}")
-
-  # Robust search compatible with CMake 3.15 (avoid '**' patterns).
-  set(_NVTX_HDR "")
-  set(_NVTX_LIB64 "")
-  file(GLOB_RECURSE _NVTX_ALL_FILES LIST_DIRECTORIES false "${_NVTX_ROOT}/*")
-  foreach(_f IN LISTS _NVTX_ALL_FILES)
-    if(NOT _NVTX_HDR AND _f MATCHES "nvToolsExt\\.h$")
-      set(_NVTX_HDR "${_f}")
-    endif()
-    if(NOT _NVTX_LIB64 AND _f MATCHES "nvToolsExt64_1\\.lib$")
-      set(_NVTX_LIB64 "${_f}")
-    endif()
-  endforeach()
-
-  if(NOT _NVTX_HDR OR NOT _NVTX_LIB64)
-    message(FATAL_ERROR
-      "Nsight NVTX redist fetched but nvToolsExt.h or nvToolsExt64_1.lib was not found under: ${_NVTX_ROOT}"
-    )
-  endif()
-
-  get_filename_component(_NVTX_INCLUDE_DIR "${_NVTX_HDR}" DIRECTORY)
-  get_filename_component(_NVTX_LIB_DIR "${_NVTX_LIB64}" DIRECTORY)
-
-  # Torch's cuda.cmake searches for a library named 'nvToolsExt' (often expecting nvToolsExt.lib),
-  # while the redistributable is typically named nvToolsExt64_1.lib. Provide an alias file name.
-  set(_NVTX_ALIAS_LIB "${_NVTX_LIB_DIR}/nvToolsExt.lib")
-  if(NOT EXISTS "${_NVTX_ALIAS_LIB}")
-    configure_file("${_NVTX_LIB64}" "${_NVTX_ALIAS_LIB}" COPYONLY)
-  endif()
-
-  # Normalize include root (NVTX 3 puts headers in include/nvtx3/ sometimes)
-  set(_NVTX_INCLUDE_ROOT "${_NVTX_INCLUDE_DIR}")
-  if(_NVTX_INCLUDE_ROOT MATCHES "[/\\\\]include[/\\\\]nvtx3$")
-    get_filename_component(_NVTX_INCLUDE_ROOT "${_NVTX_INCLUDE_ROOT}" DIRECTORY) # .../include
-  endif()
-
-  # Torch tends to form include path as ${NVTOOLSEXT_PATH}/include, so set PATH to the
-  # directory whose child is "include".
-  get_filename_component(_NVTX_PREFIX "${_NVTX_INCLUDE_ROOT}" DIRECTORY)
-
-  # Safety: if layout is odd, fall back to _NVTX_ROOT but ensure an include/ exists.
-  if(NOT EXISTS "${_NVTX_PREFIX}/include")
-    set(_NVTX_PREFIX "${_NVTX_ROOT}")
-    file(MAKE_DIRECTORY "${_NVTX_PREFIX}/include")
-  endif()
-
-  # Create Torch-expected lib/x64 layout so ${NVTOOLSEXT_PATH}/lib/x64/nvToolsExt64_1.lib exists.
-  set(_NVTX_LIB_X64_DIR "${_NVTX_PREFIX}/lib/x64")
-  file(MAKE_DIRECTORY "${_NVTX_LIB_X64_DIR}")
-  if(NOT EXISTS "${_NVTX_LIB_X64_DIR}/nvToolsExt64_1.lib")
-    configure_file("${_NVTX_LIB64}" "${_NVTX_LIB_X64_DIR}/nvToolsExt64_1.lib" COPYONLY)
-  endif()
-  if(EXISTS "${_NVTX_LIB_DIR}/nvToolsExt64_1.dll" AND NOT EXISTS "${_NVTX_LIB_X64_DIR}/nvToolsExt64_1.dll")
-    configure_file("${_NVTX_LIB_DIR}/nvToolsExt64_1.dll" "${_NVTX_LIB_X64_DIR}/nvToolsExt64_1.dll" COPYONLY)
-  endif()
-
-  # These cache vars are what Torch's CMake expects to be set / discovered.
-  set(NVTOOLSEXT_INCLUDE_DIR "${_NVTX_INCLUDE_ROOT}" CACHE PATH "NVTX include dir" FORCE)
-  set(NVTOOLSEXT_LIBRARY     "${_NVTX_ALIAS_LIB}"   CACHE FILEPATH "NVTX import library" FORCE)
-  set(NVTOOLSEXT_PATH        "${_NVTX_PREFIX}"      CACHE PATH "NVTX prefix (has include/)" FORCE)
-
-  # Also helpful for any scripts/tooling that consult the environment.
-  set(ENV{NVTOOLSEXT_PATH} "${_NVTX_PREFIX}")
-
-  if(NOT TARGET CUDA::nvToolsExt)
-    add_library(CUDA::nvToolsExt UNKNOWN IMPORTED)
-    set_target_properties(CUDA::nvToolsExt PROPERTIES
-      IMPORTED_LOCATION "${_NVTX_ALIAS_LIB}"
-      IMPORTED_LOCATION_RELEASE "${_NVTX_ALIAS_LIB}"
-      IMPORTED_LOCATION_DEBUG "${_NVTX_ALIAS_LIB}"
-      INTERFACE_INCLUDE_DIRECTORIES "${_NVTX_INCLUDE_ROOT}"
-    )
-  endif()
 endif()
 
 
@@ -319,6 +332,23 @@ if(NOT TARGET SDL_TTF::SDL_TTF)
   if(NOT SDL3_ttf_FOUND)
     if(NODUS_ALLOW_NETWORK_FETCH)
       message(STATUS "SDL_ttf (SDL3-capable) not found; fetching SDL_ttf and HarfBuzz as dependencies.")
+      message(STATUS "Also fetching FreeType so SDL_ttf builds against a known FreeType.")
+      # FreeType (font rasterizer)
+      FetchContent_Declare(freetype
+        GIT_REPOSITORY https://github.com/freetype/freetype.git
+        GIT_TAG ${NODUS_FREETYPE_GIT_TAG}
+        GIT_SHALLOW TRUE
+      )
+      
+      FetchContent_GetProperties(freetype)
+      if(NOT freetype_POPULATED)
+        FetchContent_Populate(freetype)
+      endif()
+      # Expose freetype to the CMake prefix so SDL_ttf can find it
+      list(APPEND CMAKE_PREFIX_PATH "${freetype_SOURCE_DIR}")
+      if(DEFINED freetype_BINARY_DIR)
+        list(APPEND CMAKE_PREFIX_PATH "${freetype_BINARY_DIR}")
+      endif()
       # HarfBuzz (used for shaping)
       FetchContent_Declare(harfbuzz
         GIT_REPOSITORY https://github.com/harfbuzz/harfbuzz.git
@@ -343,7 +373,9 @@ if(NOT TARGET SDL_TTF::SDL_TTF)
         FetchContent_Populate(SDL_ttf)
       endif()
       # Make available (will configure and build if necessary)
-      FetchContent_MakeAvailable(harfbuzz SDL_ttf)
+      # Ensure freetype/harfbuzz are available before SDL_ttf so the SDL_ttf
+      # build picks them up when configuring.
+      FetchContent_MakeAvailable(freetype harfbuzz SDL_ttf)
     else()
       message(FATAL_ERROR "SDL_ttf (SDL3) not found and NODUS_ALLOW_NETWORK_FETCH=OFF. Please install SDL3_ttf or enable network fetch.")
     endif()
@@ -398,6 +430,89 @@ if(NOT Torch_FOUND)
   endif()
 endif()
 
+# ---------------------------------------------------------------------------
+# Developer bundle target: gather built DLLs and third-party headers
+# into ${CMAKE_SOURCE_DIR}/dev_bundle for local developer builds.
+# This target is intentionally opt-in: run `cmake --build . --target prepare_dev_bundle`.
+# ---------------------------------------------------------------------------
+set(DEV_BUNDLE_DIR "${CMAKE_SOURCE_DIR}/dev_bundle")
+set(DEV_BUNDLE_BIN "${DEV_BUNDLE_DIR}/bin")
+set(DEV_BUNDLE_INCLUDE "${DEV_BUNDLE_DIR}/include")
+
+add_custom_target(prepare_dev_bundle
+  COMMENT "Prepare developer bundle (copies built DLLs and headers into ${DEV_BUNDLE_DIR})"
+)
+
+# Ensure directories exist at build-time
+add_custom_command(TARGET prepare_dev_bundle PRE_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${DEV_BUNDLE_BIN}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${DEV_BUNDLE_INCLUDE}"
+)
+
+# Copy all DLLs from the canvas_tables target output directory into dev_bundle/bin
+if(TARGET canvas_tables)
+  add_custom_command(TARGET prepare_dev_bundle POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Copying runtime DLLs from $<TARGET_FILE_DIR:canvas_tables> to ${DEV_BUNDLE_BIN}"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "$<TARGET_FILE_DIR:canvas_tables>" "${DEV_BUNDLE_BIN}"
+  )
+else()
+  # Fallback: copy any DLLs from the build tree config dir
+  add_custom_command(TARGET prepare_dev_bundle POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Copying runtime DLLs from ${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR} to ${DEV_BUNDLE_BIN}"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}" "${DEV_BUNDLE_BIN}"
+  )
+endif()
+
+
+
+# Copy all major FetchContent source/include trees for dev completeness
+set(_NODUS_FETCHCONTENT_DIR "$ENV{LOCALAPPDATA}/nodus_fetchcontent")
+set(_NODUS_FETCHCONTENT_SUBDIRS
+  "SDL_ttf-src"
+  "SDL3-src"
+  "freetype-src"
+  "harfbuzz-src"
+  "torch-src"
+)
+foreach(_subdir IN LISTS _NODUS_FETCHCONTENT_SUBDIRS)
+  set(_srcdir "${_NODUS_FETCHCONTENT_DIR}/${_subdir}")
+  if(EXISTS "${_srcdir}")
+    add_custom_command(TARGET prepare_dev_bundle POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E echo "Copying ${_subdir} -> ${DEV_BUNDLE_INCLUDE}/${_subdir}"
+      COMMAND ${CMAKE_COMMAND} -E copy_directory "${_srcdir}" "${DEV_BUNDLE_INCLUDE}/${_subdir}"
+    )
+  endif()
+endforeach()
+
+
+# Copy Torch headers into dev_bundle/include/torch-src for unified dev pack
+if(DEFINED Torch_INCLUDE_DIRS)
+  set(_TORCHSRC_DEST "${DEV_BUNDLE_INCLUDE}/torch-src")
+  file(MAKE_DIRECTORY "${_TORCHSRC_DEST}")
+  foreach(_inc IN LISTS Torch_INCLUDE_DIRS)
+    if(EXISTS "${_inc}")
+      add_custom_command(TARGET prepare_dev_bundle POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E echo "Copying Torch headers from ${_inc} -> ${_TORCHSRC_DEST}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${_inc}" "${_TORCHSRC_DEST}"
+      )
+    endif()
+  endforeach()
+endif()
+
+# Also allow copying explicit include vars if set (Torch_INCLUDE_DIRS etc.)
+if(DEFINED Torch_INCLUDE_DIRS)
+  foreach(_inc IN LISTS Torch_INCLUDE_DIRS)
+    add_custom_command(TARGET prepare_dev_bundle POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E echo "Copying headers from ${_inc} to ${DEV_BUNDLE_INCLUDE}"
+      COMMAND ${CMAKE_COMMAND} -E copy_directory "${_inc}" "${DEV_BUNDLE_INCLUDE}/torch_inc"
+    )
+  endforeach()
+endif()
+
+# Make prepare_dev_bundle depend on the main library so DLLs exist
+add_dependencies(prepare_dev_bundle canvas_tables)
+
+
 if(DEFINED TORCH_INCLUDE_DIRS)
   set(_TORCH_INCLUDE_DIRS_CLEAN "")
   foreach(_inc IN LISTS TORCH_INCLUDE_DIRS)
@@ -448,23 +563,18 @@ if(DEFINED TORCH_INCLUDE_DIRS)
     endif()
 endif()
 
-# Optionally copy Torch headers into the repository root (./torch/)
-if(DEFINED TORCH_INCLUDE_DIRS AND NODUS_PERSIST_TORCH_IN_REPO)
-  set(_NODUS_REPO_TORCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/torch")
-  if(NOT EXISTS "${_NODUS_REPO_TORCH_DIR}")
-    file(MAKE_DIRECTORY "${_NODUS_REPO_TORCH_DIR}")
-    foreach(_inc IN LISTS TORCH_INCLUDE_DIRS)
-      if(EXISTS "${_inc}")
-        message(STATUS "Copying Torch headers into repo: ${_inc} -> ${_NODUS_REPO_TORCH_DIR}")
-        file(COPY "${_inc}/" DESTINATION "${_NODUS_REPO_TORCH_DIR}")
-      endif()
-    endforeach()
-  else()
-    message(STATUS "Torch headers already present in ${_NODUS_REPO_TORCH_DIR}; skipping copy")
-  endif()
-endif()
+
 
 # ---------------------------------------------------------------------------
+# Prefer dev_bundle/include/*-src for dependency headers if present
+set(_NODUS_DEV_BUNDLE_INCLUDE "${CMAKE_SOURCE_DIR}/dev_bundle/include")
+foreach(_dep IN LISTS _NODUS_FETCHCONTENT_SUBDIRS)
+  set(_depinc "${_NODUS_DEV_BUNDLE_INCLUDE}/${_dep}")
+  if(EXISTS "${_depinc}")
+    list(APPEND CMAKE_PREFIX_PATH "${_depinc}")
+    include_directories("${_depinc}")
+  endif()
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Windows DLL exports convenience
@@ -477,29 +587,8 @@ endif()
 # Targets
 # ---------------------------------------------------------------------------
 add_library(canvas_tables SHARED
-  canvas_abi.cpp
-  module_preview.cpp
-  module_library.cpp
-  module_library_actualizer.cpp
-  plugin_loader.cpp
-  plugin_manager.cpp
-  table_abi.cpp
-  table_node_groups.cpp
-  menu_waveform.cpp
-  menu_waveform_abi.cpp
-  rope_sim.cpp
-  raytrace_2d.cpp
-  raytrace_3d.cpp
-  stage_abi.cpp
-  subject_capture.cpp
-  text_render_helper.cpp
-  tool_registry.cpp
-  src/tool_ir.cpp
-  thread_manager.cpp
-  console_logger.cpp
-  mem_backend_host.cpp
-  tools/sdlttf_to_torch.cpp
-  meta_edge_snapshot_wrapper.cpp
+  # sources are now gathered from src/ via cmake/auto_sources.cmake
+  # placeholder to keep CMake syntax valid; real sources appended by include(cmake/auto_sources.cmake)
 )
 
 # Small helper executable to run the module actualizer from the built project
@@ -595,7 +684,7 @@ endif()
 if(TARGET SDL_TTF::SDL_TTF)
   target_include_directories(canvas_tables PUBLIC $<TARGET_PROPERTY:SDL_TTF::SDL_TTF,INTERFACE_INCLUDE_DIRECTORIES>)
 endif()
-target_compile_features(canvas_tables PUBLIC cxx_std_17)
+target_compile_features(canvas_tables PUBLIC cxx_std_20)
 
 enable_testing()
 
@@ -638,3 +727,6 @@ option(ENABLE_EIGEN_SIM "Enable Eigen-accelerated rope simulation" OFF)
 if(ENABLE_EIGEN_SIM)
   target_compile_definitions(canvas_tables PUBLIC EIGEN_SIM)
 endif()
+# include auto-discovered sources
+include(cmake/auto_sources.cmake)
+

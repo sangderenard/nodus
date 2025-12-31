@@ -123,12 +123,12 @@ GP_MetaGroup* MetaCloud::apply_to_table(GP_TableContext* ctx) const {
     // 1) Create rings (by persisted rope UID) and register ring edges if a key is present
     for (const auto &r : rings_) {
         if (r.uid == 0ull) continue;
-        int ring_id = gp_table_create_ring_by_uid(ctx, r.uid, r.u);
+        int ring_id = gp_table_create_ring_by_id(ctx, r.uid, r.u);
         if (ring_id < 0) {
             // UID->index resolution failure or create failure: abort
             for (int rid : created_ring_ids) gp_table_destroy_ring(ctx, rid);
             gp_table_meta_destroy(ctx, mg);
-            return 3;
+            return nullptr;
         }
         created_ring_ids.push_back(ring_id);
         if (r.key != 0ull) {
@@ -138,7 +138,7 @@ GP_MetaGroup* MetaCloud::apply_to_table(GP_TableContext* ctx) const {
                 for (int eid : created_ring_entries) gp_table_unregister_ring_edge(ctx, eid);
                 for (int rid : created_ring_ids) gp_table_destroy_ring(ctx, rid);
                 gp_table_meta_destroy(ctx, mg);
-                return 3;
+                return nullptr;
             }
             created_ring_entries.push_back(entry);
         }
@@ -153,30 +153,27 @@ GP_MetaGroup* MetaCloud::apply_to_table(GP_TableContext* ctx) const {
                 for (int eid : created_ring_entries) gp_table_unregister_ring_edge(ctx, eid);
                 for (int rid : created_ring_ids) gp_table_destroy_ring(ctx, rid);
                 gp_table_meta_destroy(ctx, mg);
-                return 5;
+                return nullptr;
             }
             continue;
         }
         int ok = 0;
-        if (cvs) ok = gp_canvas_table_meta_add_vertex_by_uid(cvs, ctx, reinterpret_cast<void*>(mg), v.rope_uid, v.vertex_idx);
+        if (cvs) ok = gp_canvas_table_meta_add_vertex_by_id(cvs, ctx, reinterpret_cast<void*>(mg), v.rope_uid, v.vertex_idx);
         if (!ok) {
             // fallback: find table-local rope index
-            int rope_idx = -1;
-            for (size_t ri = 0; ri < ctx->rope_uids.size(); ++ri) {
-                if (ctx->rope_uids[ri] == v.rope_uid) { rope_idx = static_cast<int>(ri); break; }
-            }
+            int rope_idx = gp_table_resolve_rope_id_to_sim_index(ctx, v.rope_uid);
             if (rope_idx < 0) {
                 for (int eid : created_ring_entries) gp_table_unregister_ring_edge(ctx, eid);
                 for (int rid : created_ring_ids) gp_table_destroy_ring(ctx, rid);
                 gp_table_meta_destroy(ctx, mg);
-                return 5;
+                return nullptr;
             }
             int ok2 = gp_table_meta_add_vertex(ctx, mg, rope_idx, v.vertex_idx);
             if (!ok2) {
                 for (int eid : created_ring_entries) gp_table_unregister_ring_edge(ctx, eid);
                 for (int rid : created_ring_ids) gp_table_destroy_ring(ctx, rid);
                 gp_table_meta_destroy(ctx, mg);
-                return 4;
+                return nullptr;
             }
         }
     }
@@ -189,7 +186,7 @@ GP_MetaGroup* MetaCloud::apply_to_table(GP_TableContext* ctx) const {
             for (int eid : created_ring_entries) gp_table_unregister_ring_edge(ctx, eid);
             for (int rid : created_ring_ids) gp_table_destroy_ring(ctx, rid);
             gp_table_meta_destroy(ctx, mg);
-            return 6;
+            return nullptr;
         }
     } else if ((overlay_.key_a != 0ull || overlay_.key_b != 0ull)) {
         // No canvas available; at minimum persist keys onto the meta-group for later binding

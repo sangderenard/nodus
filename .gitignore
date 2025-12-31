@@ -33,7 +33,7 @@
 
 # Generated project dirs
 build-*/
-
+dev_bundle/
 # Local build presets
 /build_test/
 /build_real/

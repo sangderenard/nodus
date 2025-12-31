@@ -62,4 +62,7 @@ private:
 // Helper utilities (implementation in tool_ir.cpp)
 namespace tool_ir {
     // make_registry_entry is declared in tool_registry.h where ToolRegistry is visible.
+
+    // Expose ToolIR-to-SPIR-V translation integration
+    void tool_ir_translate_kernel_to_spirv(const nodus::spirv::KernelIR& ir);
 }

@@ -1,8 +1,25 @@
+// Dispatch/execute a kernel described by a KernelIR (SPIR-V operator set)
+static int cpu_dispatch_kernel(gp_mem_backend_handle_t backend_h, const nodus::spirv::KernelIR* kernel_ir) {
+    if (!backend_h || !kernel_ir) return 0;
+    // Translate the kernel IR to SPIR-V (and optionally execute or simulate)
+    using namespace nodus::spirv;
+    SpirvCompileOptions opts;
+    SpirvTranslator translator(opts);
+    auto result = translator.translate_kernel_to_spirv(*kernel_ir);
+    // For now, just log the translation and return success (stub)
+    std::fprintf(stderr, "[mem_backend] cpu_dispatch_kernel: translated kernel '%s' to SPIR-V (%zu words)\n", kernel_ir->name.c_str(), result.spirv.words.size());
+    // TODO: Actually execute or simulate the kernel on the CPU backend
+    return 1;
+}
 // mem_backend_host.cpp -- host/CPU MemoryBackend adapted to new vtable
 #include "mem_backend.h"
 #include <cstdlib>
 #include <cstring>
+#include "spirv_translation.h"
 #include <mutex>
+#include "kernel_isa.h" // Integrate KernelISA for KernelIR usage
+
+
 #include <atomic>
 #include <thread>
 #include <algorithm>
@@ -39,6 +56,16 @@ struct CpuBackend {
         if (n > 0) {
             ptr = std::malloc(n);
             if (ptr) std::memset(ptr, 0, n);
+
+// Example stub: Integrate SPIR-V translation into the memory backend
+// (Replace or extend this with actual logic as needed)
+void gp_mem_backend_translate_to_spirv(const nodus::spirv::KernelIR& ir) {
+    using namespace nodus::spirv;
+    SpirvCompileOptions opts;
+    SpirvTranslator translator(opts);
+    auto result = translator.translate_kernel_to_spirv(ir);
+    // TODO: Store/use result.spirv as needed
+}
             size = ptr ? n : 0;
         }
         unsigned hc = std::thread::hardware_concurrency();
@@ -179,7 +206,8 @@ static const gp_mem_backend_vtable_t g_cpu_vtable = {
     &cpu_get_native_handle,
     &cpu_record_event,
     &cpu_wait_event,
-    &cpu_get_native_stream
+    &cpu_get_native_stream,
+    &cpu_dispatch_kernel
 };
 
 // Forward declarations for filesystem backend functions (defined later)
