@@ -43,6 +43,12 @@ endif()
 
 include(FetchContent)
 
+# Option to copy detected Torch headers into the repo root so ephemeral
+# CMake projects (which add the repo root to their include path) can find
+# headers like <torch/torch.h>. Useful for the test that builds plugin
+# DLLs in a temp project that only adds the repo root as an include dir.
+option(NODUS_PERSIST_TORCH_IN_REPO "Copy detected LibTorch headers into ${CMAKE_CURRENT_SOURCE_DIR}/torch for plugin builds" ON)
+
 # Avoid FetchContent trying to update git deps every configure unless explicitly desired.
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Disable FetchContent updates after first download")
 
@@ -416,6 +422,48 @@ if(NOT TARGET Torch::Torch)
   endif()
 endif()
 
+# Persist Torch headers so they survive build-dir cleanup and are available
+# for plugin/module development. Copy headers into the FetchContent base dir
+# (configurable via FETCHCONTENT_BASE_DIR) and expose them via an INTERFACE
+# target `nodus_persisted_torch_includes` so other targets can consume them.
+if(DEFINED TORCH_INCLUDE_DIRS)
+  set(_NODUS_PERSISTENT_TORCH_INCLUDE "${FETCHCONTENT_BASE_DIR}/libtorch_include")
+  if(NOT EXISTS "${_NODUS_PERSISTENT_TORCH_INCLUDE}")
+    file(MAKE_DIRECTORY "${_NODUS_PERSISTENT_TORCH_INCLUDE}")
+    foreach(_inc IN LISTS TORCH_INCLUDE_DIRS)
+      if(EXISTS "${_inc}")
+        message(STATUS "Persisting Torch headers from ${_inc} -> ${_NODUS_PERSISTENT_TORCH_INCLUDE}")
+        file(COPY "${_inc}/" DESTINATION "${_NODUS_PERSISTENT_TORCH_INCLUDE}")
+      endif()
+    endforeach()
+  endif()
+
+    if(NOT NODUS_PERSIST_TORCH_IN_REPO)
+      if(NOT TARGET nodus_persisted_torch_includes)
+        add_library(nodus_persisted_torch_includes INTERFACE)
+        target_include_directories(nodus_persisted_torch_includes INTERFACE "${_NODUS_PERSISTENT_TORCH_INCLUDE}")
+      endif()
+    else()
+      message(STATUS "NODUS_PERSIST_TORCH_IN_REPO=ON; not creating nodus_persisted_torch_includes to avoid duplicate includes")
+    endif()
+endif()
+
+# Optionally copy Torch headers into the repository root (./torch/)
+if(DEFINED TORCH_INCLUDE_DIRS AND NODUS_PERSIST_TORCH_IN_REPO)
+  set(_NODUS_REPO_TORCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/torch")
+  if(NOT EXISTS "${_NODUS_REPO_TORCH_DIR}")
+    file(MAKE_DIRECTORY "${_NODUS_REPO_TORCH_DIR}")
+    foreach(_inc IN LISTS TORCH_INCLUDE_DIRS)
+      if(EXISTS "${_inc}")
+        message(STATUS "Copying Torch headers into repo: ${_inc} -> ${_NODUS_REPO_TORCH_DIR}")
+        file(COPY "${_inc}/" DESTINATION "${_NODUS_REPO_TORCH_DIR}")
+      endif()
+    endforeach()
+  else()
+    message(STATUS "Torch headers already present in ${_NODUS_REPO_TORCH_DIR}; skipping copy")
+  endif()
+endif()
+
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -446,6 +494,7 @@ add_library(canvas_tables SHARED
   subject_capture.cpp
   text_render_helper.cpp
   tool_registry.cpp
+  src/tool_ir.cpp
   thread_manager.cpp
   console_logger.cpp
   mem_backend_host.cpp
@@ -525,9 +574,13 @@ endif()
 find_package(Eigen3 REQUIRED)
 
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen)
 if(TARGET Torch::Torch)
   target_link_libraries(canvas_tables PUBLIC Torch::Torch)
+endif()
+if(TARGET nodus_persisted_torch_includes)
+  target_link_libraries(canvas_tables PUBLIC nodus_persisted_torch_includes)
 endif()
 if(TARGET SDL_TTF::SDL_TTF)
   target_link_libraries(canvas_tables PRIVATE SDL_TTF::SDL_TTF)

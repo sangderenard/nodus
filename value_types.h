@@ -9,7 +9,18 @@
 #include <mutex>
 #include <cstring>
 #include <new>
-#include <torch/torch.h>
+#if defined(__has_include)
+# if __has_include(<torch/torch.h>)
+#  include <torch/torch.h>
+#  define NODUS_HAVE_LIBTORCH 1
+# else
+#  define NODUS_HAVE_LIBTORCH 0
+namespace torch { class Tensor; }
+# endif
+#else
+# include <torch/torch.h>
+# define NODUS_HAVE_LIBTORCH 1
+#endif
 
 // Simple runtime type description used to register primitive and struct
 // shapes that can be carried on table edges and stacks. The registry is

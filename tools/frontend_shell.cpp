@@ -21,7 +21,18 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
-#include <torch/torch.h>
+#if defined(__has_include)
+# if __has_include(<torch/torch.h>)
+#  include <torch/torch.h>
+#  define NODUS_HAVE_LIBTORCH 1
+# else
+#  define NODUS_HAVE_LIBTORCH 0
+namespace torch { class Tensor; class Device; }
+# endif
+#else
+# include <torch/torch.h>
+# define NODUS_HAVE_LIBTORCH 1
+#endif
 #include <filesystem>
 #include <system_error>
 #ifdef _WIN32

@@ -509,6 +509,15 @@ extern "C" void gp_mem_backend_release(gp_mem_backend_handle_t h) {
     auto it_type = g_handle_types.find(h);
     int t = (it_type != g_handle_types.end()) ? it_type->second : -1;
     if (it_type != g_handle_types.end()) g_handle_types.erase(it_type);
+    // If this handle is a registered backend context, treat it accordingly
+    if (g_backend_contexts.find(h) != g_backend_contexts.end()) {
+        // filesystem backend context
+        FsBackendCtx* ctx = reinterpret_cast<FsBackendCtx*>(h);
+        std::fprintf(stderr, "[mem_backend] gp_mem_backend_release: deleting backend ctx=%p base_dir=%s\n", (void*)ctx, ctx->base_dir.c_str());
+        g_backend_contexts.erase(h);
+        delete ctx;
+        return;
+    }
     std::fprintf(stderr, "[mem_backend] gp_mem_backend_release: handle=%p type=%d\n", (void*)h, t);
     if (t == (int)GP_MEM_BACKEND_CPU) {
         CpuBackend* b = reinterpret_cast<CpuBackend*>(h);
@@ -524,11 +533,7 @@ extern "C" void gp_mem_backend_release(gp_mem_backend_handle_t h) {
         try { prev = fb->refs.fetch_sub(1); } catch (...) { return; }
         std::fprintf(stderr, "[mem_backend] gp_mem_backend_release: FILE handle=%p prev_refs=%d path=%s\n", (void*)fb, prev, fb->path.c_str());
         if (prev <= 1) {
-            // Null out pointers before deletion to avoid destructor double-close during debugging
-            if (fb->f) { std::fclose(fb->f); fb->f = nullptr; }
-            if (fb->native_path_cstr) { std::free(fb->native_path_cstr); fb->native_path_cstr = nullptr; }
-            if (fb->params_blob) { std::free(fb->params_blob); fb->params_blob = nullptr; }
-            std::fprintf(stderr, "[mem_backend] gp_mem_backend_release: deleting FILE handle=%p (cleaned)\n", (void*)fb);
+            std::fprintf(stderr, "[mem_backend] gp_mem_backend_release: deleting FILE handle=%p\n", (void*)fb);
             delete fb;
         }
         return;

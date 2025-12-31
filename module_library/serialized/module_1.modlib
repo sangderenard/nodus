@@ -1,3 +1,0 @@
-MODULELIB V1
-ROOT "module_library"
-MODULE module_1 1 "Table" "serialized\\module_1.gpmod" "source/modules\\module_1.cpp" 0 "" 0 2 0

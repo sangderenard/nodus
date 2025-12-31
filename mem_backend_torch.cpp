@@ -1,6 +1,17 @@
 // mem_backend_torch.cpp -- Minimal Torch-backed memory vtable (CPU-only)
 #include "mem_backend.h"
-#include <torch/torch.h>
+#if defined(__has_include)
+# if __has_include(<torch/torch.h>)
+#  include <torch/torch.h>
+#  define NODUS_HAVE_LIBTORCH 1
+# else
+#  define NODUS_HAVE_LIBTORCH 0
+namespace torch { class Tensor; namespace detail { } }
+# endif
+#else
+# include <torch/torch.h>
+# define NODUS_HAVE_LIBTORCH 1
+#endif
 #include <cstdint>
 #include <cstring>
 

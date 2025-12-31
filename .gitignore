@@ -8,6 +8,9 @@
 /Makefile
 /install_manifest.txt
 /compile_commands.json
+/torch
+/module_library
+
 
 # Visual Studio
 *.sln

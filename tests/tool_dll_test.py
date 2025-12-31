@@ -156,13 +156,20 @@ class ToolDllTest(unittest.TestCase):
             proj_dir = os.path.join(temp_root, "loader_cmake")
             build_dir = os.path.join(proj_dir, "build")
             os.makedirs(proj_dir, exist_ok=True)
+            # Inherit include/link settings from the main build so temp projects
+            # can resolve project symbols and find import libraries.
+            repo_build_dir = os.path.join(self.repo_root, "build")
+            repo_build_release = os.path.join(repo_build_dir, "Release").replace("\\", "/")
+            canvas_lib_full = os.path.join(repo_build_release, "canvas_tables.lib").replace("\\", "/")
             cmakelists = """
 cmake_minimum_required(VERSION 3.15)
 project(tool_loader LANGUAGES CXX)
 add_executable(tool_loader "%s")
 target_include_directories(tool_loader PRIVATE "%s")
+# Link directly to the main project's import library to avoid search/path issues.
+target_link_libraries(tool_loader PRIVATE "%s")
 set_target_properties(tool_loader PROPERTIES CXX_STANDARD 17)
-""" % (loader_cpp.replace("\\", "/"), self.repo_root.replace("\\", "/"))
+""" % (loader_cpp.replace("\\", "/"), self.repo_root.replace("\\", "/"), canvas_lib_full)
             if not sys.platform.startswith("win"):
                 cmakelists += "\nfind_package(Threads REQUIRED)\nset(CMAKE_THREAD_LIBS_INIT ${CMAKE_THREAD_LIBS_INIT})\nadd_definitions(-D_POSIX_C_SOURCE=200112L)\n" \
                            + "target_link_libraries(tool_loader PRIVATE dl)\n"
@@ -190,13 +197,19 @@ set_target_properties(tool_loader PROPERTIES CXX_STANDARD 17)
                 build_dir = os.path.join(proj_dir, "build")
                 os.makedirs(proj_dir, exist_ok=True)
 
+                # Make the tool project inherit include dirs and link against
+                # the main project so temporary builds can locate symbols.
+                repo_build_dir = os.path.join(self.repo_root, "build")
+                repo_build_release = os.path.join(repo_build_dir, "Release").replace("\\", "/")
+                canvas_lib_full = os.path.join(repo_build_release, "canvas_tables.lib").replace("\\", "/")
                 cmakelists = """
 cmake_minimum_required(VERSION 3.15)
 project(%s LANGUAGES CXX)
 add_library(%s SHARED "%s")
 target_include_directories(%s PRIVATE "%s")
+target_link_libraries(%s PRIVATE "%s")
 set_target_properties(%s PROPERTIES CXX_STANDARD 17)
-""" % (tool_name, tool_name, tool_source.replace('\\', '/'), tool_name, self.repo_root.replace('\\', '/'), tool_name)
+""" % (tool_name, tool_name, tool_source.replace('\\', '/'), tool_name, self.repo_root.replace('\\', '/'), tool_name, canvas_lib_full, tool_name)
 
                 cmake_file = os.path.join(proj_dir, "CMakeLists.txt")
                 with open(cmake_file, "w", encoding="utf-8") as f:
@@ -247,7 +260,13 @@ set_target_properties(%s PROPERTIES CXX_STANDARD 17)
                     (p for p in self.serialized if os.path.splitext(os.path.basename(p))[0] == module_id),
                     None,
                 )
-                subprocess.run([loader_exec, tool_lib, serialized or ""], check=True)
+                # Ensure runtime loader can find dependent DLLs by adding
+                # the main build Release dir and the tool's dir to PATH.
+                env = os.environ.copy()
+                repo_release = os.path.join(self.repo_root, "build", "Release")
+                tool_dir = os.path.dirname(tool_lib)
+                env["PATH"] = os.pathsep.join([repo_release, tool_dir, env.get("PATH", "")])
+                subprocess.run([loader_exec, tool_lib, serialized or ""], check=True, env=env)
 
 
 if __name__ == "__main__":

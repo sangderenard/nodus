@@ -2,7 +2,18 @@
 
 #include <string>
 #include <stdexcept>
-#include <torch/torch.h>
+#if defined(__has_include)
+# if __has_include(<torch/torch.h>)
+#  include <torch/torch.h>
+#  define NODUS_HAVE_LIBTORCH 1
+# else
+#  define NODUS_HAVE_LIBTORCH 0
+namespace torch { class Tensor; }
+# endif
+#else
+# include <torch/torch.h>
+# define NODUS_HAVE_LIBTORCH 1
+#endif
 
 // Don't force SDL headers into every TU that includes this header.
 // Instead, forward-declare the TTF_Font type and provide a small, portable

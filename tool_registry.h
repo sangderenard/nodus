@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "tool_api.h"
+#include "tool_ir.h"
 
 class ToolRegistry {
 public:
@@ -35,6 +36,14 @@ private:
 };
 
 ToolRegistry& tool_registry_global();
+
+namespace tool_ir { ToolRegistry::Entry make_registry_entry(std::shared_ptr<ToolIR> ir); }
+
+// Helper to register a ToolIR directly.
+inline bool register_tool_ir(std::shared_ptr<ToolIR> ir) {
+    if (!ir) return false;
+    return tool_registry_global().register_tool(tool_ir::make_registry_entry(ir));
+}
 
 class ToolRegistrar {
 public:
