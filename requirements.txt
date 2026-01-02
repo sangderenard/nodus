@@ -1,0 +1,4 @@
+# Repository Python requirements (leave empty or add needed deps)
+# Example:
+# numpy
+# protobuf

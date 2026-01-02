@@ -11,8 +11,9 @@
 namespace nodus {
 namespace bitops {
 
-// Enum for bit-struct types
-enum class BitStructType {
+
+// Math/semantic object kinds (nouns)
+enum class BitObjectKind {
     INTEGER,
     RATIONAL,
     FLOAT,
@@ -34,8 +35,61 @@ enum class BitStructType {
     MANIFOLD,
     SYMBOLIC,
     EXPRESSION,
-    SERIALIZATION,
+    SERIALIZATION
+};
+
+// Control/statement forms (syntax)
+enum class BitStmtKind {
     IF,
+    ELSE_,
+    MATCH,
+    FOR_,
+    WHILE_,
+    SWITCH_,
+    GOTO_,
+    BREAK_,
+    CONTINUE_,
+    RETURN_,
+    ASSIGN
+};
+
+// Storage/layout/allocator/backend artifacts
+enum class BitStorageKind {
+    BITLAYOUT,
+    TYPE,
+    SCHEMA,
+    BITTENSOR,
+    BITTENSORMEMORY,
+    BITTENSORMEMORYGRAPH
+};
+
+// Bit-level operation kinds (verbs)
+enum class BitOpKind {
+    INT_TO_GRAY_U32,
+    GRAY_TO_INT_U32,
+    GETBIT_U32,
+    SETBIT_U32,
+    ADD_U32,
+    SUB_U32,
+    AND_U32,
+    OR_U32,
+    XOR_U32,
+    MUL_U32,
+    DIV_U32,
+    MOD_U32,
+    NOT_U32,
+    SHL_U32,
+    SHR_U32
+    // ...extend as needed
+};
+
+// BitStruct covers logical ops, control forms, and storage/layout tags
+enum class BitStructType {
+    AND,
+    OR,
+    XOR,
+    NOT,
+    INTEGER,
     ELSE_,
     MATCH,
     FOR_,
@@ -63,6 +117,8 @@ struct BitOps {
         for (uint32_t shift = 1; shift < 32; shift <<= 1) n ^= (g >> shift);
         return n;
     }
+    static uint32_t getbit_u32(uint32_t x, uint32_t bit) { return (x >> bit) & 1u; }
+    static uint32_t setbit_u32(uint32_t x, uint32_t bit, uint32_t v) { return (x & ~(1u << bit)) | ((v & 1u) << bit); }
     static uint32_t bit_add(uint32_t x, uint32_t y) { return x + y; }
     static uint32_t bit_sub(uint32_t x, uint32_t y) { return x - y; }
     static uint32_t bit_and(uint32_t x, uint32_t y) { return x & y; }
@@ -79,8 +135,11 @@ struct BitOps {
 // BitStruct: base for bit-level types
 struct BitStruct {
     BitStructType type;
+    BitObjectKind object_kind;
+    std::vector<uint32_t> inputs;
     std::vector<uint32_t> bits;
-    BitStruct(BitStructType t, std::vector<uint32_t> b) : type(t), bits(std::move(b)) {}
+    BitStruct(BitStructType s, BitObjectKind t, std::vector<uint32_t> in, std::vector<uint32_t> b = {})
+        : type(s), object_kind(t), inputs(std::move(in)), bits(std::move(b)) {}
 };
 
 // Integer, Rational, Float, Complex, etc. can be added as needed

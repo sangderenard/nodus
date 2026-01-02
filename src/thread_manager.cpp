@@ -5,7 +5,15 @@
 #include "canvas_abi.h"
 #include "tool_api.h"
 #include "value_types.h"
+
+#ifndef NODUS_ENABLE_TORCH
+#define NODUS_ENABLE_TORCH 0
+#endif
+
+#if NODUS_ENABLE_TORCH
 #include "tools/sdlttf_to_torch.h"
+#endif
+
 #include <chrono>
 #include "stage_abi.h"
 
@@ -1118,6 +1126,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         break;
                     }
                     case ModuleToolKind::TensorAllocator: {
+#if NODUS_ENABLE_TORCH
                         // Built-in tensor allocator: operate on a RawStackFrame
                         // stored in the module frame pointer for this contact.
                         GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
@@ -1193,9 +1202,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 }
                             }
                         }
+#endif
                         break;
                     }
                     case ModuleToolKind::FontRenderer: {
+#if NODUS_ENABLE_TORCH
                         // Row tool: consume integer codepoints until a torch tensor pointer
                         // is encountered; then render the collected codepoints into the
                         // provided tensor using SDL_ttf helper and push the tensor back.
@@ -1341,6 +1352,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 }
                             }
                         }
+#endif
                         break;
                     }
                     case ModuleToolKind::RectRgba: {

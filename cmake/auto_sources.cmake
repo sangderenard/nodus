@@ -12,5 +12,11 @@ if (TARGET canvas_tables)
     )
     # Exclude legacy or intentionally-ignored compilation units
     list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/mem_backend_cpu\\.cpp$")
+    if(NOT NODUS_ENABLE_TORCH)
+        # Drop Torch-dependent translation units when Torch is disabled
+        list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/mem_backend_torch\\.cpp$")
+        list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/kernel_torch\\.cpp$")
+        list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/sdlttf_shim\\.cpp$")
+    endif()
     target_sources(canvas_tables PRIVATE ${NODUS_PROJECT_SRC})
 endif()

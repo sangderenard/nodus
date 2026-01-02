@@ -1,9 +1,11 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
-#include <filesystem>
+#include <cstdint>
 
 namespace nodus::spirv {
 
@@ -15,7 +17,11 @@ using u16 = std::uint16_t;
 
 // Forward declarations for key IR and translation types
 struct KernelIR;
-struct SpirvBinary;
+
+// Definition for SpirvBinary (was only forward declared)
+struct SpirvBinary {
+    std::vector<u32> words; // SPIR-V is u32 word stream
+};
 
 enum class TargetEnv : uint8_t {
     Vulkan_1_1,
@@ -32,6 +38,9 @@ struct SpirvCompileOptions {
     bool keep_intermediates = false;
     bool verbose = false;
     uint32_t glsl_version = 460;
+    std::vector<std::pair<std::string, std::string>> defines;
+    bool enable_scalar_block_layout = true;
+    bool emit_debug_comments = false;
 };
 
 struct SpirvCompileResult {
@@ -53,6 +62,10 @@ class SpirvTranslator {
 public:
     explicit SpirvTranslator(SpirvCompileOptions opt = {}, std::unique_ptr<class ISpirvCompiler> compiler = {});
     SpirvCompileResult translate_kernel_to_spirv(const KernelIR& k);
+
+private:
+    SpirvCompileOptions opt_;
+    std::unique_ptr<ISpirvCompiler> compiler_;
 };
 
 // Optionally expose helpers for constructing IR, options, etc.

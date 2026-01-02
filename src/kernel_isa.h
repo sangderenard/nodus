@@ -8,6 +8,12 @@
 #include <string>
 #include <vector>
 #include <variant>
+#include <array>
+
+// Windows headers define CONST as a macro; undef to keep enum names intact.
+#ifdef CONST
+#undef CONST
+#endif
 
 namespace nodus {
 namespace spirv {
@@ -67,7 +73,13 @@ enum class OpCode : uint16_t {
     SHUFFLE,           // vecA, vecB, mask
     IF,                // cond, then_block, else_block
     BARRIER,           // kind, scope, semantics
-    ATOMIC             // kind, scope, semantics, addr, args...
+    ATOMIC,            // kind, scope, semantics, addr, args...
+
+    // Logical ops
+    AND,               // a, b
+    OR,                // a, b
+    NOT,               // x
+    XOR                // a, b
 };
 
 // IR instruction
