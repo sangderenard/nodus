@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mem_backend.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -46,6 +47,7 @@ enum ValueTypeBuiltin : int {
     VT_EIGEN_TENSOR,
     VT_TORCH_TENSOR,
     VT_UTF16_VIEW,
+    VT_ABSTRACT_TENSOR,
     VT_BUILTIN_COUNT
 };
 static constexpr int kValueTypePlaceholderCount = 16; // reserved slots for dynamic type building
@@ -152,6 +154,7 @@ private:
         builtin_ids_[VT_EIGEN_TENSOR] = register_primitive("eigen_tensor_view", static_cast<uint32_t>(sizeof(void*)));
         builtin_ids_[VT_TORCH_TENSOR] = register_primitive("torch_tensor_ptr", static_cast<uint32_t>(sizeof(void*)));
         builtin_ids_[VT_UTF16_VIEW] = register_primitive("utf16_view", static_cast<uint32_t>(sizeof(void*)));
+        builtin_ids_[VT_ABSTRACT_TENSOR] = register_primitive("abstract_tensor_handle", static_cast<uint32_t>(sizeof(nodus::tensors::AbstractTensorHandle)));
         // Reserve some placeholder entries for dynamic types (names are not meaningful for lookup)
         for (int i = 0; i < kValueTypePlaceholderCount; ++i) {
             char tmp[32];
@@ -443,6 +446,18 @@ inline int raw_stack_push_torch(RawStackFrame& frame, torch::Tensor* tensor_ptr)
 // Returns 1 on success and writes the pointer into `out`.
 inline int raw_stack_pop_torch(RawStackFrame& frame, torch::Tensor*& out) {
     const ValueTypeId tid = ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR);
+    return raw_stack_pop_typed(frame, &out, tid);
+}
+
+// Push a single AbstractTensorHandle onto the raw stack.
+inline int raw_stack_push_abstract_tensor(RawStackFrame& frame, nodus::tensors::AbstractTensorHandle handle) {
+    const ValueTypeId tid = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+    return raw_stack_push_typed(frame, &handle, tid);
+}
+
+// Pop a single AbstractTensorHandle from the raw stack.
+inline int raw_stack_pop_abstract_tensor(RawStackFrame& frame, nodus::tensors::AbstractTensorHandle& out) {
+    const ValueTypeId tid = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
     return raw_stack_pop_typed(frame, &out, tid);
 }
 

@@ -4,6 +4,7 @@
 #include "stage_abi.h"
 #include "canvas_abi.h"
 #include "tool_api.h"
+#include "table_tensor_tool.h"
 #include "value_types.h"
 
 #ifndef NODUS_ENABLE_TORCH
@@ -38,6 +39,13 @@ extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_
 extern void canvas_clear_module_input_pulses(int module_idx);
 extern void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count);
 extern void canvas_set_module_stack_snapshot_meta(int module_idx, int row_idx, const int* types, const int* counts, int count);
+
+namespace {
+GP_TableTensorToolState* get_tensor_tool_state() {
+    static GP_TableTensorToolState* state = gp_table_tensor_tool_create(nullptr);
+    return state;
+}
+} // namespace
 extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
 extern ITool* canvas_get_plugin_instance(int module_idx, int row_idx);
 
@@ -1203,6 +1211,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             }
                         }
 #endif
+                        break;
+                    }
+                    case ModuleToolKind::TensorTool: {
+                        GP_TableContext* table = req.root_table ? req.root_table : mod.table;
+                        gp_table_tensor_tool_tick(get_tensor_tool_state(), table, mod_idx, row);
                         break;
                     }
                     case ModuleToolKind::FontRenderer: {

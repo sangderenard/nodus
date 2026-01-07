@@ -37,6 +37,7 @@ enum class ModuleToolKind : int8_t {
     Clone = 11,
     TensorAllocator = 12,
     FontRenderer = 13,
+    TensorTool = 14,
 };
 
 enum class ModuleToolOrigin : int8_t {
@@ -96,6 +97,8 @@ inline ToolStackSpec module_tool_stack_spec(ModuleToolKind tool) {
         case ModuleToolKind::Clone:
             return {2, 0};
         case ModuleToolKind::TensorAllocator:
+            return {0, 0};
+        case ModuleToolKind::TensorTool:
             return {0, 0};
         case ModuleToolKind::None:
         default:

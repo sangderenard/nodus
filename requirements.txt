@@ -2,3 +2,6 @@
 # Example:
 # numpy
 # protobuf
+torch
+pygame
+numpy

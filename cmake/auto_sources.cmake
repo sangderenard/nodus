@@ -1,22 +1,13 @@
-# Auto-generated source gatherer for nodus
-# Gathers top-level .cpp from src/ to avoid having sources at repo root.
-file(GLOB_RECURSE NODUS_PROJECT_SRC CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/**/*.cpp"
+if(NOT TARGET canvas_tables)
+  message(FATAL_ERROR "auto_sources.cmake expected canvas_tables target to exist.")
+endif()
+
+file(GLOB_RECURSE NODUS_CANVAS_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
 )
-# Ensure include dir is added
-if (TARGET canvas_tables)
-    target_include_directories(canvas_tables PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/include/inl
-    )
-    # Exclude legacy or intentionally-ignored compilation units
-    list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/mem_backend_cpu\\.cpp$")
-    if(NOT NODUS_ENABLE_TORCH)
-        # Drop Torch-dependent translation units when Torch is disabled
-        list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/mem_backend_torch\\.cpp$")
-        list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/kernel_torch\\.cpp$")
-        list(FILTER NODUS_PROJECT_SRC EXCLUDE REGEX ".*/sdlttf_shim\\.cpp$")
-    endif()
-    target_sources(canvas_tables PRIVATE ${NODUS_PROJECT_SRC})
+
+if(NODUS_CANVAS_SOURCES)
+  target_sources(canvas_tables PRIVATE ${NODUS_CANVAS_SOURCES})
 endif()

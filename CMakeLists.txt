@@ -26,9 +26,19 @@ set(NODUS_SDL3_GIT_TAG "release-3.2.4" CACHE STRING "SDL3 git tag")
 set(NODUS_SDLTTF_GIT_TAG "release-3.2.2" CACHE STRING "SDL_ttf git tag")
 set(NODUS_FREETYPE_GIT_TAG "VER-2-13-2" CACHE STRING "FreeType git tag")
 
-# Python/torch probe removed — prefer explicit repo venv or user-specified python.
-set(NODUS_PYTHON_EXECUTABLE "" CACHE FILEPATH "Explicit python executable to use for repo tasks (optional)")
-set(NODUS_TORCH_VERSION "main" CACHE STRING "Torch version to fetch (tag or branch, e.g. v2.4.1 or main)")
+# Python/torch probe removed - prefer explicit repo venv or user-specified python.
+set(NODUS_PYTHON_EXECUTABLE "C:/Users/alber/AppData/Local/Programs/Python/Python311/python.exe" CACHE FILEPATH "Explicit python executable to use for repo tasks (optional)")
+set(NODUS_TORCH_ROOT "C:/Users/alber/AppData/Local/Programs/Python/Python311/Lib/site-packages/torch" CACHE PATH "Root of a Torch install (e.g. Python site-packages/torch or a libtorch unpack)")
+set(NODUS_TORCH_PYTHON_INCLUDE_DIRS
+  ""
+  CACHE STRING
+  "Torch include dirs from python site-packages (semicolon-separated); leave empty to auto-derive from NODUS_TORCH_ROOT if possible"
+)
+set(NODUS_TORCH_VERSION "v2.9.1" CACHE STRING "Torch version to fetch (tag or branch, e.g. v2.4.1 or main)")
+set(NODUS_CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)")
+set(NODUS_CUDA_BIN_DIR "" CACHE PATH "CUDA bin dir override (optional; defaults to <root>/bin)")
+set(NODUS_CUDA_LIB_DIR "" CACHE PATH "CUDA lib dir override (optional; defaults to <root>/lib/x64 on Windows)")
+set(NODUS_CUDA_INCLUDE_DIR "" CACHE PATH "CUDA include dir override (optional; defaults to <root>/include)")
 
 # ---------------------------------------------------------------------------
 # Developer bundle paths
@@ -37,19 +47,10 @@ set(DEV_BUNDLE_DIR "${CMAKE_SOURCE_DIR}/dev_bundle")
 set(DEV_BUNDLE_BIN "${DEV_BUNDLE_DIR}/bin")
 set(DEV_BUNDLE_INCLUDE "${DEV_BUNDLE_DIR}/include")
 set(DEV_BUNDLE_LIB "${DEV_BUNDLE_DIR}/lib")
-set(DEV_BUNDLE_LIBTORCH "${DEV_BUNDLE_DIR}/libtorch")
-set(DEV_BUNDLE_LIBTORCH_BIN "${DEV_BUNDLE_LIBTORCH}/bin")
-set(DEV_BUNDLE_LIBTORCH_LIB "${DEV_BUNDLE_LIBTORCH}/lib")
-set(DEV_BUNDLE_LIBTORCH_SHARE "${DEV_BUNDLE_LIBTORCH}/share/cmake/Torch")
-set(DEV_BUNDLE_LIBTORCH_INCLUDE "${DEV_BUNDLE_LIBTORCH}/include")
 
 # ---------------------------------------------------------------------------
-# Dependency consumption (NO building/fetching here)
-#
-# Build/install deps in isolation using:
-#   dev_bundle/deps/README.md
+# Dependency consumption
 # ---------------------------------------------------------------------------
-list(PREPEND CMAKE_PREFIX_PATH "${DEV_BUNDLE_DIR}")
 
 # NVTX / nvToolsExt (prebuilt in dev_bundle/nvtoolsext)
 if(WIN32)
@@ -73,32 +74,20 @@ if(WIN32)
   endif()
 endif()
 
-# SDL3
-find_package(SDL3 CONFIG QUIET)
-if(NOT SDL3_FOUND)
-  message(FATAL_ERROR
-    "SDL3 not found. Build/install it into dev_bundle first using dev_bundle/deps/README.md (SDL3 section).\n"
-    "Expected CMake package under: ${DEV_BUNDLE_DIR}"
-  )
-endif()
+# SDL3 (vcpkg)
+find_package(SDL3 CONFIG REQUIRED)
 
-# SDL3_ttf (exports SDL3_ttf and/or SDL_TTF::SDL_TTF depending on build)
-find_package(SDL3_ttf CONFIG QUIET)
-if(NOT SDL3_ttf_FOUND)
-  message(FATAL_ERROR
-    "SDL3_ttf not found. Build/install it into dev_bundle first using dev_bundle/deps/README.md (SDL3_ttf section).\n"
-    "Expected CMake package under: ${DEV_BUNDLE_DIR}"
-  )
-endif()
+# SDL3_ttf (vcpkg exports SDL3_ttf::SDL3_ttf)
+find_package(SDL3_ttf CONFIG REQUIRED)
 
 # Ensure SDL_TTF::SDL_TTF alias exists for downstream compatibility
 if(NOT TARGET SDL_TTF::SDL_TTF)
-  if(TARGET SDL3_ttf::SDL3_ttf)
+  if(TARGET SDL3_ttf::SDL3_ttf-shared)
+    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf-shared)
+  elseif(TARGET SDL3_ttf::SDL3_ttf-static)
+    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf-static)
+  elseif(TARGET SDL3_ttf::SDL3_ttf)
     add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf)
-  elseif(TARGET SDL3_ttf-shared)
-    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf-shared)
-  elseif(TARGET SDL3_ttf-static)
-    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf-static)
   endif()
 endif()
 
@@ -110,16 +99,165 @@ find_package(OpenMP QUIET)
 
 # Torch
 if(NODUS_ENABLE_TORCH)
-  set(_NODUS_TORCH_PACKAGE_DIR "${DEV_BUNDLE_LIBTORCH}/share/cmake/Torch")
-  if(EXISTS "${_NODUS_TORCH_PACKAGE_DIR}/TorchConfig.cmake")
-    find_package(Torch REQUIRED PATHS "${_NODUS_TORCH_PACKAGE_DIR}" NO_DEFAULT_PATH)
+  # If the cache was left empty, reset CUDA root to the default path (quoted) so CMake sees it.
+  if(NODUS_CUDA_TOOLKIT_ROOT STREQUAL "")
+    set(NODUS_CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)" FORCE)
+  endif()
+
+  # Surface CUDA toolkit root for CUDA-enabled Torch wheels (fixed default path unless user overrides).
+  if(EXISTS "${NODUS_CUDA_TOOLKIT_ROOT}")
+    # Modern CMake prefers CUDAToolkit_ROOT; older configs look at CUDA_TOOLKIT_ROOT_DIR / CUDA_PATH / CUDA_NVCC_EXECUTABLE.
+    set(CUDAToolkit_ROOT "${NODUS_CUDA_TOOLKIT_ROOT}" CACHE PATH "" FORCE)
+    set(CUDA_TOOLKIT_ROOT_DIR "${NODUS_CUDA_TOOLKIT_ROOT}" CACHE PATH "" FORCE)
+    set(ENV{CUDA_PATH} "${NODUS_CUDA_TOOLKIT_ROOT}")
+    if(EXISTS "${NODUS_CUDA_TOOLKIT_ROOT}/bin/nvcc.exe")
+      set(CMAKE_CUDA_COMPILER "${NODUS_CUDA_TOOLKIT_ROOT}/bin/nvcc.exe" CACHE FILEPATH "" FORCE)
+      set(CUDA_NVCC_EXECUTABLE "${NODUS_CUDA_TOOLKIT_ROOT}/bin/nvcc.exe" CACHE FILEPATH "" FORCE)
+    endif()
+    message(STATUS "CUDA toolkit root: ${NODUS_CUDA_TOOLKIT_ROOT}")
   else()
-    message(FATAL_ERROR
-      "Torch requested (NODUS_ENABLE_TORCH=ON) but no Torch package was found in dev_bundle.\n"
-      "Build/stage it first using dev_bundle/deps/README.md (Torch section).\n"
-      "Expected: ${_NODUS_TORCH_PACKAGE_DIR}/TorchConfig.cmake"
+    message(STATUS "CUDA toolkit not found at ${NODUS_CUDA_TOOLKIT_ROOT}; if your Torch wheel is CUDA-enabled, install CUDA there or override NODUS_CUDA_TOOLKIT_ROOT.")
+  endif()
+
+  # Prefer a user-specified Torch root (Python wheel or libtorch); fall back to dev_bundle.
+  set(_NODUS_TORCH_SEARCH_DIRS "")
+  if(NOT NODUS_TORCH_ROOT STREQUAL "")
+    list(APPEND _NODUS_TORCH_SEARCH_DIRS
+      "${NODUS_TORCH_ROOT}/share/cmake/Torch"
+      "${NODUS_TORCH_ROOT}/cmake"
     )
   endif()
+
+  set(_NODUS_TORCH_CONFIG "")
+  foreach(_NODUS_TORCH_PACKAGE_DIR IN LISTS _NODUS_TORCH_SEARCH_DIRS)
+    if(EXISTS "${_NODUS_TORCH_PACKAGE_DIR}/TorchConfig.cmake")
+      set(_NODUS_TORCH_CONFIG "${_NODUS_TORCH_PACKAGE_DIR}/TorchConfig.cmake")
+      break()
+    endif()
+  endforeach()
+
+  set(_NODUS_TORCH_FOUND FALSE)
+  if(_NODUS_TORCH_CONFIG)
+    get_filename_component(_NODUS_TORCH_PACKAGE_DIR "${_NODUS_TORCH_CONFIG}" DIRECTORY)
+    find_package(Torch REQUIRED PATHS "${_NODUS_TORCH_PACKAGE_DIR}" NO_DEFAULT_PATH)
+    set(_NODUS_TORCH_FOUND TRUE)
+  else()
+    find_package(Torch QUIET)
+    if(Torch_FOUND)
+      set(_NODUS_TORCH_FOUND TRUE)
+    endif()
+  endif()
+
+  if(NOT _NODUS_TORCH_FOUND)
+    message(FATAL_ERROR
+      "Torch requested (NODUS_ENABLE_TORCH=ON) but TorchConfig.cmake was not found.\n"
+      "Hint: set -DNODUS_TORCH_ROOT=<python site-packages>/torch or point at a libtorch unpack.\n"
+      "Searched: ${_NODUS_TORCH_SEARCH_DIRS} and CMake defaults (Torch_DIR/CMAKE_PREFIX_PATH)."
+    )
+  endif()
+
+  if(Torch_FOUND AND NOT TARGET Torch::Torch)
+    if(TARGET torch)
+      add_library(Torch::Torch ALIAS torch)
+    elseif(DEFINED TORCH_LIBRARIES)
+      add_library(Torch::Torch INTERFACE IMPORTED)
+      set_target_properties(Torch::Torch PROPERTIES INTERFACE_LINK_LIBRARIES "${TORCH_LIBRARIES}")
+      if(DEFINED TORCH_INCLUDE_DIRS)
+        set_target_properties(Torch::Torch PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${TORCH_INCLUDE_DIRS}")
+      endif()
+    endif()
+  endif()
+endif()
+
+# Optional torch headers from python site-packages (no linking).
+if(NODUS_TORCH_PYTHON_INCLUDE_DIRS STREQUAL "" AND NOT NODUS_TORCH_ROOT STREQUAL "")
+  set(_NODUS_TORCH_PYTHON_INCLUDE_DIRS_GUESS
+    "${NODUS_TORCH_ROOT}/include;${NODUS_TORCH_ROOT}/include/torch/csrc/api/include;${NODUS_TORCH_ROOT}/include/TH;${NODUS_TORCH_ROOT}/include/THC"
+  )
+  set(NODUS_TORCH_PYTHON_INCLUDE_DIRS "${_NODUS_TORCH_PYTHON_INCLUDE_DIRS_GUESS}" CACHE STRING
+    "Torch include dirs from python site-packages (semicolon-separated); auto-derived from NODUS_TORCH_ROOT when unset"
+    FORCE)
+endif()
+
+set(_NODUS_TORCH_INCLUDE_DIRS "")
+foreach(_NODUS_TORCH_INC_DIR IN LISTS NODUS_TORCH_PYTHON_INCLUDE_DIRS)
+  if(EXISTS "${_NODUS_TORCH_INC_DIR}")
+    list(APPEND _NODUS_TORCH_INCLUDE_DIRS "${_NODUS_TORCH_INC_DIR}")
+  endif()
+endforeach()
+if(_NODUS_TORCH_INCLUDE_DIRS)
+  add_library(nodus_torch_includes INTERFACE)
+  target_include_directories(nodus_torch_includes INTERFACE ${_NODUS_TORCH_INCLUDE_DIRS})
+endif()
+
+# Optional CUDA toolkit verification (for CUDA-enabled Torch). Only runs when a CUDA path is supplied.
+set(_NODUS_CUDA_WANTS_CHECK FALSE)
+if(NOT NODUS_CUDA_TOOLKIT_ROOT STREQUAL "")
+  set(_NODUS_CUDA_WANTS_CHECK TRUE)
+endif()
+if(NOT NODUS_CUDA_BIN_DIR STREQUAL "")
+  set(_NODUS_CUDA_WANTS_CHECK TRUE)
+endif()
+if(NOT NODUS_CUDA_LIB_DIR STREQUAL "")
+  set(_NODUS_CUDA_WANTS_CHECK TRUE)
+endif()
+if(NOT NODUS_CUDA_INCLUDE_DIR STREQUAL "")
+  set(_NODUS_CUDA_WANTS_CHECK TRUE)
+endif()
+
+if(_NODUS_CUDA_WANTS_CHECK)
+  set(_NODUS_CUDA_ROOT "${NODUS_CUDA_TOOLKIT_ROOT}")
+  if(_NODUS_CUDA_ROOT STREQUAL "" AND NOT NODUS_CUDA_BIN_DIR STREQUAL "")
+    get_filename_component(_NODUS_CUDA_ROOT "${NODUS_CUDA_BIN_DIR}/.." ABSOLUTE)
+  endif()
+  if(_NODUS_CUDA_ROOT STREQUAL "" AND NOT NODUS_CUDA_LIB_DIR STREQUAL "")
+    get_filename_component(_NODUS_CUDA_ROOT "${NODUS_CUDA_LIB_DIR}/.." ABSOLUTE)
+  endif()
+  if(_NODUS_CUDA_ROOT STREQUAL "" AND NOT NODUS_CUDA_INCLUDE_DIR STREQUAL "")
+    get_filename_component(_NODUS_CUDA_ROOT "${NODUS_CUDA_INCLUDE_DIR}/.." ABSOLUTE)
+  endif()
+
+  if(_NODUS_CUDA_ROOT STREQUAL "")
+    message(FATAL_ERROR "CUDA check requested but no CUDA root could be inferred. Set -DNODUS_CUDA_TOOLKIT_ROOT=<path>.")
+  endif()
+
+  set(_NODUS_CUDA_BIN "${NODUS_CUDA_BIN_DIR}")
+  if(_NODUS_CUDA_BIN STREQUAL "")
+    set(_NODUS_CUDA_BIN "${_NODUS_CUDA_ROOT}/bin")
+  endif()
+
+  set(_NODUS_CUDA_LIB "${NODUS_CUDA_LIB_DIR}")
+  if(_NODUS_CUDA_LIB STREQUAL "")
+    if(WIN32)
+      set(_NODUS_CUDA_LIB "${_NODUS_CUDA_ROOT}/lib/x64")
+    else()
+      set(_NODUS_CUDA_LIB "${_NODUS_CUDA_ROOT}/lib64")
+    endif()
+  endif()
+
+  set(_NODUS_CUDA_INCLUDE "${NODUS_CUDA_INCLUDE_DIR}")
+  if(_NODUS_CUDA_INCLUDE STREQUAL "")
+    set(_NODUS_CUDA_INCLUDE "${_NODUS_CUDA_ROOT}/include")
+  endif()
+
+  if(NOT EXISTS "${_NODUS_CUDA_INCLUDE}/cuda.h")
+    message(FATAL_ERROR "cuda.h not found at ${_NODUS_CUDA_INCLUDE}/cuda.h. Check NODUS_CUDA_TOOLKIT_ROOT or NODUS_CUDA_INCLUDE_DIR.")
+  endif()
+
+  find_library(_NODUS_CUDA_CUDART_LIBRARY
+    NAMES cudart cudart_static cudart64_12 cudart64_11 cudart64_10
+    PATHS "${_NODUS_CUDA_LIB}"
+    NO_DEFAULT_PATH
+  )
+  if(NOT _NODUS_CUDA_CUDART_LIBRARY)
+    message(FATAL_ERROR "cudart library not found in ${_NODUS_CUDA_LIB}. Set NODUS_CUDA_LIB_DIR or NODUS_CUDA_TOOLKIT_ROOT.")
+  endif()
+
+  if(NOT EXISTS "${_NODUS_CUDA_BIN}")
+    message(FATAL_ERROR "CUDA bin dir not found: ${_NODUS_CUDA_BIN}.")
+  endif()
+
+  message(STATUS "CUDA toolkit check: root=${_NODUS_CUDA_ROOT} bin=${_NODUS_CUDA_BIN} lib=${_NODUS_CUDA_LIB} include=${_NODUS_CUDA_INCLUDE} cudart=${_NODUS_CUDA_CUDART_LIBRARY}")
 endif()
 
 add_custom_target(prepare_dev_bundle
@@ -261,6 +399,12 @@ else()
 endif()
 
 enable_testing()
+
+# Python interpreter for tests/tools.
+if(NODUS_PYTHON_EXECUTABLE)
+  set(Python3_EXECUTABLE "${NODUS_PYTHON_EXECUTABLE}" CACHE FILEPATH "Python3 interpreter" FORCE)
+endif()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # Unit tests
 add_executable(test_thread_manager

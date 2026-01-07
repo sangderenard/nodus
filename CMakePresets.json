@@ -6,7 +6,11 @@
       "displayName": "Regular build",
       "description": "Configure regular project build",
       "binaryDir": "${sourceDir}/build",
+      "environment": {
+        "VCPKG_FEATURE_FLAGS": "manifests"
+      },
       "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
         "MODULE_LIBRARY_MODE": "regular"
       }
@@ -16,7 +20,11 @@
       "displayName": "Module library - test",
       "description": "Configure build to generate test module library sources",
       "binaryDir": "${sourceDir}/build_test",
+      "environment": {
+        "VCPKG_FEATURE_FLAGS": "manifests"
+      },
       "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
         "MODULE_LIBRARY_MODE": "test",
         "GENERATE_TEST_MODULE_LIBRARY": "ON"
@@ -27,7 +35,11 @@
       "displayName": "Module library - real",
       "description": "Configure build to generate real module library sources",
       "binaryDir": "${sourceDir}/build_real",
+      "environment": {
+        "VCPKG_FEATURE_FLAGS": "manifests"
+      },
       "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
         "MODULE_LIBRARY_MODE": "real",
         "GENERATE_REAL_MODULE_LIBRARY": "ON"

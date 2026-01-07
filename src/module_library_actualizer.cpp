@@ -189,6 +189,11 @@ void emit_stack_step(std::ostringstream& ss, ModuleToolKind kind, int attachment
             ss << "            // StackDisplay: snapshot handled externally; no stack mutation here.\n";
             ss << "        }\n";
             break;
+        case ModuleToolKind::TensorTool:
+            ss << "        {\n";
+            ss << "            // TensorTool: runtime-driven, no stack mutation here yet.\n";
+            ss << "        }\n";
+            break;
         case ModuleToolKind::TableNumber:
             ss << "        {\n";
             ss << "            int val = std::max(0, " << attachment_count << ");\n";

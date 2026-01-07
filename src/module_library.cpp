@@ -57,6 +57,7 @@ const char* gp_module_tool_kind_name(ModuleToolKind kind) {
         case ModuleToolKind::RectRgba: return "RectRgba";
         case ModuleToolKind::TableNumber: return "TableNumber";
         case ModuleToolKind::Clone: return "Clone";
+        case ModuleToolKind::TensorTool: return "TensorTool";
         case ModuleToolKind::None:
         default:
             return "None";

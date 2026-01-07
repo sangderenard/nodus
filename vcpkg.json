@@ -1,0 +1,8 @@
+{
+  "name": "nodus",
+  "version-string": "0.0.0",
+  "dependencies": [
+    "sdl3",
+    "sdl3-ttf"
+  ]
+}
