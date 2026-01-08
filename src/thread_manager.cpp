@@ -30,6 +30,14 @@
 #ifndef fprintf
 #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
+#ifndef NODUS_DEBUG_MOUSE_LISTENER
+#define NODUS_DEBUG_MOUSE_LISTENER 0
+#endif
+#if NODUS_DEBUG_MOUSE_LISTENER
+#define ML_DEBUGF(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define ML_DEBUGF(...) do {} while (0)
+#endif
 
 // EventPayload is declared in canvas_abi.h and used for pointer-mode FIFO
 // events published by the canvas.
@@ -949,7 +957,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         break;
                     }
                     case ModuleToolKind::MouseListener: {
-                        fprintf(stderr, "[DBG] MouseListener: executing for mod=%d contact=%d\n", mod_idx, meta.contact_idx);
+                        ML_DEBUGF("[DBG] MouseListener: executing for mod=%d contact=%d\n", mod_idx, meta.contact_idx);
                         float mx = 0.0f;
                         float my = 0.0f;
                         float mdx = 0.0f;
@@ -974,7 +982,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 // Check whether this contact has a bound pending action
                                 void* bound_ptr = canvas_single ? gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, contact_idx) : nullptr;
                                 if (!bound_ptr) {
-                                    fprintf(stderr, "[DBG] MouseListener: no bound_ptr for mod=%d contact=%d\n", mod_idx, contact_idx);
+                                    ML_DEBUGF("[DBG] MouseListener: no bound_ptr for mod=%d contact=%d\n", mod_idx, contact_idx);
                                     continue;
                                 }
                                 struct MinimalPending { int32_t action_id; };
@@ -987,11 +995,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 if (reader_key == 0) reader_key = 0x8000000000000000ull;
                                 // Debug: report computed reader_key and target edge so we can
                                 // compare it with the writer_key printed at publish time.
-                                fprintf(stderr, "[DBG] sub edge=%d -> mod=%d contact=%d reader_key=%llu (0x%llx)\n", edge_idx, mod_idx, contact_idx, (unsigned long long)reader_key, (unsigned long long)reader_key);
+                                ML_DEBUGF("[DBG] sub edge=%d -> mod=%d contact=%d reader_key=%llu (0x%llx)\n", edge_idx, mod_idx, contact_idx, (unsigned long long)reader_key, (unsigned long long)reader_key);
                                 int32_t unread = 0;
                                 gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
                                 gp_table_edge_unread(fifo_table, edge_idx, reader_key, &unread);
-                                fprintf(stderr, "[DBG] unread edge=%d reader_key=%llu -> %d\n", edge_idx, (unsigned long long)reader_key, unread);
+                                ML_DEBUGF("[DBG] unread edge=%d reader_key=%llu -> %d\n", edge_idx, (unsigned long long)reader_key, unread);
                                 if (unread <= 0) continue;
                                 if (!edge_stride_allows_pointer(fifo_table, edge_idx)) continue;
 
@@ -1014,7 +1022,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                     // Only deliver payloads that match the contact's bound action
                                     if (pa->action_id != bound_action) {
                                         // Not our action: log and stash it back as managed payload
-                                        fprintf(stderr, "[DBG] stash not-matching action=%d bound=%d mod=%d contact=%d edge=%d src_mod=%d frame=%d\n", pa->action_id, bound_action, mod_idx, contact_idx, edge_idx, ep->src_module, ep->frame_idx);
+                                        ML_DEBUGF("[DBG] stash not-matching action=%d bound=%d mod=%d contact=%d edge=%d src_mod=%d frame=%d\n", pa->action_id, bound_action, mod_idx, contact_idx, edge_idx, ep->src_module, ep->frame_idx);
                                         GP_CanvasContext* c_single = gp_canvas_get_singleton();
                                         if (c_single) {
                                             gp_canvas_set_module_frame_ptr(c_single, ep->src_module, 0, ep->frame_idx, pa_void);
@@ -1037,7 +1045,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                     device_id = pa->device_id;
 
                                     // deliver this payload to the module's MouseListener stack
-                                    fprintf(stderr, "[DBG] deliver action=%d -> mod=%d contact=%d edge=%d src_mod=%d frame=%d mx=%f my=%f mdx=%f mdy=%f scroll=%f dev=%d down=0x%X up=0x%X\n", pa->action_id, mod_idx, contact_idx, edge_idx, ep->src_module, ep->frame_idx, mx, my, mdx, mdy, scroll, device_id, button_mask_down, button_mask_up);
+                                    ML_DEBUGF("[DBG] deliver action=%d -> mod=%d contact=%d edge=%d src_mod=%d frame=%d mx=%f my=%f mdx=%f mdy=%f scroll=%f dev=%d down=0x%X up=0x%X\n", pa->action_id, mod_idx, contact_idx, edge_idx, ep->src_module, ep->frame_idx, mx, my, mdx, mdy, scroll, device_id, button_mask_down, button_mask_up);
 
                                     // Push typed values into the module's raw byte stack
                                     // (the single canonical stack). We require a RawStackFrame
@@ -1050,7 +1058,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                         rs_for_push = reinterpret_cast<RawStackFrame*>(maybe_raw);
                                     }
                                     if (!rs_for_push) {
-                                        fprintf(stderr, "[DBG] no raw stack frame for mod=%d contact=%d -> dropping event\n", mod_idx, contact_idx);
+                                        ML_DEBUGF("[DBG] no raw stack frame for mod=%d contact=%d -> dropping event\n", mod_idx, contact_idx);
                                     } else {
                                         ValueTypeId vt_float = ValueTypeRegistry::global().builtin(VT_FLOAT32);
                                         ValueTypeId vt_uint32 = ValueTypeRegistry::global().builtin(VT_UINT32);
@@ -1069,7 +1077,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                                && raw_stack_push_typed(*rs_for_push, &mdx, vt_float)
                                                && raw_stack_push_typed(*rs_for_push, &mdy, vt_float);
                                         if (!ok) {
-                                            fprintf(stderr, "[DBG] raw_stack_push_typed failed for mod=%d contact=%d\n", mod_idx, contact_idx);
+                                            ML_DEBUGF("[DBG] raw_stack_push_typed failed for mod=%d contact=%d\n", mod_idx, contact_idx);
                                         }
                                     }
 

@@ -5,14 +5,13 @@
 #include <cstdint>
 #include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Expose SPIR-V translation integration for use by other components
+// Expose SPIR-V translation integration for use by other components.
+// Keep C++-only declarations outside the C ABI block to avoid C linkage
+// applying to C++ headers and templates.
 #ifdef __cplusplus
 #include "spirv_translation.h"
 void gp_mem_backend_translate_to_spirv(const nodus::spirv::KernelIR& ir);
+extern "C" {
 #endif
 
 // Forward declare table context so backends can expose table-edge attach helpers.

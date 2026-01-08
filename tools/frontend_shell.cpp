@@ -38,6 +38,14 @@ namespace torch { class Tensor; class Device; }
 #ifdef _WIN32
 #  include <windows.h>
 #endif
+#ifndef NODUS_DEBUG_MOUSE_LISTENER
+#define NODUS_DEBUG_MOUSE_LISTENER 0
+#endif
+#if NODUS_DEBUG_MOUSE_LISTENER
+#define MOUSE_MOVE_DEBUGF(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define MOUSE_MOVE_DEBUGF(...) do {} while (0)
+#endif
 
 #include "canvas_abi.h"
 
@@ -739,7 +747,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
             // translate to canvas-local float coords and forward deltas
             float lx = mx - static_cast<float>(resources_.layout.canvas_x);
             float ly = my - static_cast<float>(resources_.layout.canvas_y);
-            fprintf(stderr, "[DBG] frontend on_mouse_move ctx=%p lx=%f,ly=%f mdx=%f,mdy=%f\n", (void*)ctx, lx, ly, mdx, mdy);
+            MOUSE_MOVE_DEBUGF("[DBG] frontend on_mouse_move ctx=%p lx=%f,ly=%f mdx=%f,mdy=%f\n", (void*)ctx, lx, ly, mdx, mdy);
             gp_canvas_on_mouse_move(ctx, lx, ly, mdx, mdy);
             break;
         }

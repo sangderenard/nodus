@@ -6,6 +6,14 @@
 #ifndef fprintf
 #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
+#ifndef NODUS_DEBUG_PLUGIN_DEPLOY
+#define NODUS_DEBUG_PLUGIN_DEPLOY 0
+#endif
+#if NODUS_DEBUG_PLUGIN_DEPLOY
+#define PLUGIN_DEPLOYF(...) printf(__VA_ARGS__)
+#else
+#define PLUGIN_DEPLOYF(...) do {} while (0)
+#endif
 struct GP_MetaGroup;
 // Local copy of LassoConfig layout (header only forward-declares it).
 typedef struct LassoConfig {
@@ -762,6 +770,8 @@ static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, cons
     for (size_t ri = 0; ri < ctx->module_io_rows[module_idx].size(); ++ri) {
         const auto &r = ctx->module_io_rows[module_idx][ri];
         if (r.kind == ModuleRowKind::Tool && r.tool_origin == ModuleToolOrigin::Plugin && !r.plugin_id.empty()) {
+            PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] apply_io_rows: module=%d row=%zu plugin_id=%s\n",
+                module_idx, ri, r.plugin_id.c_str());
             try {
                 auto inst = tool_registry_global().create(r.plugin_id);
                 if (inst) {
@@ -769,6 +779,11 @@ static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, cons
                     tctx.user = reinterpret_cast<void*>(static_cast<intptr_t>(module_idx));
                     try { inst->initialize(tctx); } catch (...) {}
                     ctx->module_plugin_instances[module_idx][ri] = std::move(inst);
+                    PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] apply_io_rows: module=%d row=%zu plugin_id=%s instance=ok\n",
+                        module_idx, ri, r.plugin_id.c_str());
+                } else {
+                    PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] apply_io_rows: module=%d row=%zu plugin_id=%s instance=null\n",
+                        module_idx, ri, r.plugin_id.c_str());
                 }
             } catch (...) {}
         }
@@ -3280,16 +3295,26 @@ static bool canvas_build_module_library_for_module(GP_CanvasContextImpl* ctx,
     module.source_path = gp_module_library_module_source_path(std::string(), module.id);
     module.convert_to_tool = convert_to_tool;
     module.tool_caps = 0;
-    module.input_count = 0;
-    module.output_count = 0;
+    module.input_count = -1;
+    module.output_count = -1;
+    bool saw_input = false;
+    bool saw_output = false;
 
     for (size_t row_idx = 0; row_idx < rows.size(); ++row_idx) {
         const auto &row = rows[row_idx];
         if (row.kind == ModuleRowKind::Input) {
+            if (!saw_input) {
+                module.input_count = 0;
+                saw_input = true;
+            }
             module.input_count += std::clamp(row.attachment_count, 1, 32);
             continue;
         }
         if (row.kind == ModuleRowKind::Output) {
+            if (!saw_output) {
+                module.output_count = 0;
+                saw_output = true;
+            }
             module.output_count += std::clamp(row.attachment_count, 1, 32);
             continue;
         }
@@ -3731,6 +3756,11 @@ static void canvas_refresh_plugin_tools(GP_CanvasContextImpl* ctx) {
     ctx->plugin_tool_ids.swap(ids_unique);
     ctx->plugin_tool_labels.swap(labels_unique);
     ctx->plugin_tool_kinds.swap(kinds_unique);
+    PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] refresh_plugin_tools: compiled_tools=%zu\n", ctx->plugin_tool_ids.size());
+    for (size_t i = 0; i < ctx->plugin_tool_ids.size(); ++i) {
+        PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] refresh_plugin_tools: tool_id=%s kind=%d\n",
+            ctx->plugin_tool_ids[i].c_str(), static_cast<int>(ctx->plugin_tool_kinds[i]));
+    }
 }
 
 static bool canvas_apply_module_library_entry(GP_CanvasContextImpl* ctx,
@@ -5480,6 +5510,8 @@ static void canvas_push_plugin_tool_to_focused(GP_CanvasContextImpl* ctx, const 
     row.tool_origin = ModuleToolOrigin::Plugin;
     row.plugin_id = plugin_id;
     rows.push_back(row);
+    PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] push_plugin_tool: module=%d plugin_id=%s row=%zu\n",
+        focused, plugin_id.c_str(), rows.size() - 1);
     // ensure plugin instances vector aligns with rows
     if (focused >= static_cast<int>(ctx->module_plugin_instances.size())) ctx->module_plugin_instances.resize(focused + 1);
     if (ctx->module_plugin_instances[focused].size() < rows.size()) ctx->module_plugin_instances[focused].resize(rows.size());
@@ -5493,9 +5525,16 @@ static void canvas_push_plugin_tool_to_focused(GP_CanvasContextImpl* ctx, const 
             tctx.user = reinterpret_cast<void*>(static_cast<intptr_t>(focused));
             try { inst->initialize(tctx); } catch (...) {}
             ctx->module_plugin_instances[focused][rows.size() - 1] = std::move(inst);
+            PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] push_plugin_tool: module=%d plugin_id=%s instance=ok\n",
+                focused, plugin_id.c_str());
+        } else {
+            PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] push_plugin_tool: module=%d plugin_id=%s instance=null\n",
+                focused, plugin_id.c_str());
         }
     } catch (...) {
         // creation failed; leave null instance
+        PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] push_plugin_tool: module=%d plugin_id=%s instance=exception\n",
+            focused, plugin_id.c_str());
     }
     // Apply host-driven autobind hints advertised by the plugin.
     if (const auto* entry = tool_registry_global().find(plugin_id)) {

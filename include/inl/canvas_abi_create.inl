@@ -6,6 +6,14 @@
 #ifndef fprintf
 #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
+#ifndef NODUS_DEBUG_MOUSE_LISTENER
+#define NODUS_DEBUG_MOUSE_LISTENER 0
+#endif
+#if NODUS_DEBUG_MOUSE_LISTENER
+#define MOUSE_MOVE_DEBUGF(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define MOUSE_MOVE_DEBUGF(...) do {} while (0)
+#endif
 
 extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     GP_CanvasContextImpl* c = new GP_CanvasContextImpl(width, height);
@@ -1089,7 +1097,7 @@ extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, float x, float y,
         return 1;
     }
     // Dispatch mouse-move event to any bound ports for CANVAS_ACT_MOUSE_MOVE
-    fprintf(stderr, "[DBG] on_mouse_move action=%d world=%d,%d dx=%f dy=%f\n", CANVAS_ACT_MOUSE_MOVE, world_x, world_y, dx, dy);
+    MOUSE_MOVE_DEBUGF("[DBG] on_mouse_move action=%d world=%d,%d dx=%f dy=%f\n", CANVAS_ACT_MOUSE_MOVE, world_x, world_y, dx, dy);
     canvas_dispatch_event_to_bound_ports(c, CANVAS_ACT_MOUSE_MOVE, world_x, world_y, false, false, dx, dy, 0, 0.0f);
     return 0;
 }

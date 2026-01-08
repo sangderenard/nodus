@@ -10,6 +10,9 @@ project(canvas_tables LANGUAGES CXX)
 option(NODUS_ENABLE_TORCH "Enable Torch/LibTorch build and Torch-dependent targets" ON)
 option(NODUS_DEPS_ONLY "Fetch/populate dependencies/dev_bundle and skip nodus targets" OFF)
 option(NODUS_NO_DEPS "Do not fetch external dependencies; require preinstalled packages" OFF)
+option(NODUS_DEBUG_PLUGIN_DEPLOY "Enable verbose plugin deployment logging" OFF)
+option(NODUS_DEBUG_MOUSE_LISTENER "Enable verbose mouse listener logging" OFF)
+option(NODUS_DEBUG_SERIALIZE "Enable verbose serialize/deserialize logging" OFF)
 
 if(NODUS_NO_DEPS)
   message(STATUS "NODUS_NO_DEPS=ON: main project will not fetch/build any dependencies.")
@@ -287,6 +290,8 @@ add_library(canvas_tables SHARED
   # placeholder to keep CMake syntax valid; real sources appended by include(cmake/auto_sources.cmake)
 )
 
+add_library(canvas_tables_static STATIC)
+
 # Small helper executable to run the module actualizer from the built project
 add_executable(modlib_actualize tools/modlib_actualize_main.cpp)
 target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -389,7 +394,45 @@ endif()
 target_compile_features(canvas_tables PUBLIC cxx_std_20)
 target_compile_definitions(canvas_tables PUBLIC
   NODUS_ENABLE_TORCH=$<IF:$<BOOL:${NODUS_ENABLE_TORCH}>,1,0>
+  NODUS_DEBUG_PLUGIN_DEPLOY=$<IF:$<BOOL:${NODUS_DEBUG_PLUGIN_DEPLOY}>,1,0>
+  NODUS_DEBUG_MOUSE_LISTENER=$<IF:$<BOOL:${NODUS_DEBUG_MOUSE_LISTENER}>,1,0>
+  NODUS_DEBUG_SERIALIZE=$<IF:$<BOOL:${NODUS_DEBUG_SERIALIZE}>,1,0>
 )
+
+target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen)
+if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
+  target_link_libraries(canvas_tables_static PUBLIC Torch::Torch)
+endif()
+if(NODUS_ENABLE_TORCH AND TARGET nodus_persisted_torch_includes)
+  target_link_libraries(canvas_tables_static PUBLIC nodus_persisted_torch_includes)
+endif()
+if(NODUS_ENABLE_TORCH AND TARGET nodus_torch_includes)
+  target_link_libraries(canvas_tables_static PUBLIC nodus_torch_includes)
+endif()
+if(TARGET SDL_TTF::SDL_TTF)
+  target_link_libraries(canvas_tables_static PRIVATE SDL_TTF::SDL_TTF)
+endif()
+if(TARGET SDL3::SDL3)
+  target_include_directories(canvas_tables_static PUBLIC $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+if(TARGET SDL_TTF::SDL_TTF)
+  target_include_directories(canvas_tables_static PUBLIC $<TARGET_PROPERTY:SDL_TTF::SDL_TTF,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+target_compile_features(canvas_tables_static PUBLIC cxx_std_20)
+target_compile_definitions(canvas_tables_static PUBLIC
+  NODUS_ENABLE_TORCH=$<IF:$<BOOL:${NODUS_ENABLE_TORCH}>,1,0>
+  NODUS_DEBUG_PLUGIN_DEPLOY=$<IF:$<BOOL:${NODUS_DEBUG_PLUGIN_DEPLOY}>,1,0>
+  NODUS_DEBUG_MOUSE_LISTENER=$<IF:$<BOOL:${NODUS_DEBUG_MOUSE_LISTENER}>,1,0>
+  NODUS_DEBUG_SERIALIZE=$<IF:$<BOOL:${NODUS_DEBUG_SERIALIZE}>,1,0>
+)
+
+if(WIN32)
+  set_target_properties(canvas_tables PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+  target_link_options(canvas_tables PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/cmake/canvas_tables.def")
+endif()
 
 # Make prepare_dev_bundle depend on the main library so DLLs exist.
 if(NOT NODUS_DEPS_ONLY)
@@ -410,36 +453,62 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_executable(test_thread_manager
   tests/thread_manager_test.cpp
 )
-target_link_libraries(test_thread_manager PRIVATE canvas_tables)
+target_link_libraries(test_thread_manager PRIVATE canvas_tables_static)
 add_test(NAME thread_manager_test COMMAND test_thread_manager)
 
 add_executable(test_frame_serialization
   tests/frame_serialization_test.cpp
 )
-target_link_libraries(test_frame_serialization PRIVATE canvas_tables)
+target_link_libraries(test_frame_serialization PRIVATE canvas_tables_static)
 add_test(NAME frame_serialization_test COMMAND test_frame_serialization)
 
 add_executable(test_edge_backend_coordination
   tests/edge_backend_coordination_test.cpp
 )
-target_link_libraries(test_edge_backend_coordination PRIVATE canvas_tables)
+target_link_libraries(test_edge_backend_coordination PRIVATE canvas_tables_static)
 add_test(NAME edge_backend_coordination_test COMMAND test_edge_backend_coordination)
 
 add_executable(test_meta_edge_snapshot_wrapper
   tests/meta_edge_snapshot_wrapper_test.cpp
 )
-target_link_libraries(test_meta_edge_snapshot_wrapper PRIVATE canvas_tables)
+target_link_libraries(test_meta_edge_snapshot_wrapper PRIVATE canvas_tables_static)
 add_test(NAME meta_edge_snapshot_wrapper_test COMMAND test_meta_edge_snapshot_wrapper)
 
 add_executable(test_mem_backend_manifest
   tests/mem_backend_manifest_test.cpp
 )
-target_link_libraries(test_mem_backend_manifest PRIVATE canvas_tables)
+target_link_libraries(test_mem_backend_manifest PRIVATE canvas_tables_static)
 add_test(NAME mem_backend_manifest_test COMMAND test_mem_backend_manifest)
 
-add_test(NAME tool_dll_test
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_dll_test.py
+add_executable(test_tensor_backend_smoke
+  tests/tensor_backend_smoke_test.cpp
 )
+target_link_libraries(test_tensor_backend_smoke PRIVATE canvas_tables_static)
+add_test(NAME tensor_backend_smoke_test COMMAND test_tensor_backend_smoke)
+
+add_executable(test_tensor_registry
+  tests/tensor_registry_test.cpp
+)
+target_link_libraries(test_tensor_registry PRIVATE canvas_tables_static)
+add_test(NAME tensor_registry_test COMMAND test_tensor_registry)
+
+add_executable(test_tensor_ops_lowering
+  tests/tensor_ops_lowering_test.cpp
+)
+target_link_libraries(test_tensor_ops_lowering PRIVATE canvas_tables_static)
+add_test(NAME tensor_ops_lowering_test COMMAND test_tensor_ops_lowering)
+
+add_executable(test_tool_dll
+  tests/tool_dll_test.cpp
+)
+target_link_libraries(test_tool_dll PRIVATE canvas_tables_static)
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" NODUS_REPO_ROOT_PATH)
+file(TO_CMAKE_PATH "${CMAKE_BINARY_DIR}" NODUS_BUILD_DIR_PATH)
+target_compile_definitions(test_tool_dll PRIVATE
+  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
+  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+)
+add_test(NAME tool_dll_test COMMAND test_tool_dll)
 
 option(ENABLE_EIGEN_SIM "Enable Eigen-accelerated rope simulation" OFF)
 if(ENABLE_EIGEN_SIM)

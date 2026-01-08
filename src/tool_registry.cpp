@@ -8,9 +8,10 @@ ToolRegistry& tool_registry_global() {
 
 bool ToolRegistry::register_tool(Entry entry) {
     if (entry.id.empty() || !entry.factory) return false;
-    bool inserted = entries_.emplace(entry.id, std::move(entry)).second;
+    auto result = entries_.emplace(entry.id, std::move(entry));
+    bool inserted = result.second;
     if (inserted) {
-        const auto& e = entries_.find(entry.id)->second;
+        const auto& e = result.first->second;
         std::cerr << "DEBUG: ToolRegistry registered tool id='" << e.id << "'" << " name='" << e.name << "'"
                   << " auto_mouse_ports=" << e.auto_mouse_ports << " auto_keyboard_ports=" << e.auto_keyboard_ports << "\n";
     } else {

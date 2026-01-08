@@ -42,12 +42,12 @@ typedef struct LassoConfig {
 
 
 // Segmented implementation pieces (see .inl files for details).
-#include "table_abi_primitives.inl"
-#include "table_abi_core.inl"
-#include "table_abi_context_meta.inl"
-#include "table_abi_pending_ops.inl"
-#include "table_abi_rope_draw.inl"
-#include "table_abi_edge_io.inl"
-#include "table_abi_serialization.inl"
-#include "table_abi_relax_prospective.inl"
-#include "table_abi_cpp_helpers.inl"
+#include "inl/table_abi_primitives.inl"
+#include "inl/table_abi_core.inl"
+#include "inl/table_abi_context_meta.inl"
+#include "inl/table_abi_pending_ops.inl"
+#include "inl/table_abi_rope_draw.inl"
+#include "inl/table_abi_edge_io.inl"
+#include "inl/table_abi_serialization.inl"
+#include "inl/table_abi_relax_prospective.inl"
+#include "inl/table_abi_cpp_helpers.inl"

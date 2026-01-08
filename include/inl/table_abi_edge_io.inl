@@ -1368,6 +1368,21 @@ int32_t gp_table_edge_set_order_mode(GP_TableContext* ctx, int32_t edge_idx, int
     return 1;
 }
 
+int32_t gp_table_edge_set_dirty_grid(GP_TableContext* ctx, int32_t edge_idx, int32_t grid_x, int32_t grid_y, float threshold) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].set_dirty_grid(grid_x, grid_y, threshold);
+    return 1;
+}
+
+int32_t gp_table_edge_get_dirty_mask(GP_TableContext* ctx, int32_t edge_idx, uint8_t* out_mask, int32_t out_len, int32_t* out_grid_x, int32_t* out_grid_y, uint64_t* out_seq) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    return ctx->edge_fifos[static_cast<size_t>(edge_idx)].dirty_mask_copy(out_mask, out_len, out_grid_x, out_grid_y, out_seq);
+}
+
 int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx) {
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);

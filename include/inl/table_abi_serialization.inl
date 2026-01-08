@@ -6,6 +6,14 @@
 #ifndef fprintf
 #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
+#ifndef NODUS_DEBUG_SERIALIZE
+#define NODUS_DEBUG_SERIALIZE 0
+#endif
+#if NODUS_DEBUG_SERIALIZE
+#define SERIALIZE_DEBUGF(...) printf(__VA_ARGS__)
+#else
+#define SERIALIZE_DEBUGF(...) do {} while (0)
+#endif
 // [8 bytes magic 'GPTBL001'][uint32_t version]
 // version 1: GP_TableStyle, cols, rows, edges, selected keys
 // version 2: same as v1, then int32 meta_group_count, followed by per-meta-group blob
@@ -105,13 +113,13 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
 
     // Log meta-group count and total size needed when serializing (helps
     // troubleshooting when saved modules appear to lack meta-groups).
-    printf("gp_table_serialize: ctx=%p mg_count=%d need=%d\n", (void*)ctx, mg_count, need);
+    SERIALIZE_DEBUGF("gp_table_serialize: ctx=%p mg_count=%d need=%d\n", (void*)ctx, mg_count, need);
     if (!ctx->rope_ids.empty()) {
-        printf("gp_table_serialize: rope_ids:");
-        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) printf(" %llu", (unsigned long long)ctx->rope_ids[ri]);
-        printf("\n");
+        SERIALIZE_DEBUGF("gp_table_serialize: rope_ids:");
+        for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) SERIALIZE_DEBUGF(" %llu", (unsigned long long)ctx->rope_ids[ri]);
+        SERIALIZE_DEBUGF("\n");
     } else {
-        printf("gp_table_serialize: rope_ids: <empty>\n");
+        SERIALIZE_DEBUGF("gp_table_serialize: rope_ids: <empty>\n");
     }
 
     if (!out_buf) return need;
@@ -194,12 +202,12 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
         GP_MetaGroup* mg = ctx->meta_groups[static_cast<size_t>(i)].get();
         if (mg) {
             LassoConfig lc = mg->lasso_config;
-            printf("gp_table_serialize: mg id=%llu vcount=%d sim_idx=%d lasso.spring_min_rest=%.2f spring_reduce_rate=%.2f spring_mode=%u\n",
-                   (unsigned long long)mg->id, (int)mg->vertices.size(), mg->sim_group_idx, lc.spring_min_rest, lc.spring_reduce_rate, (unsigned)lc.spring_mode);
+            SERIALIZE_DEBUGF("gp_table_serialize: mg id=%llu vcount=%d sim_idx=%d lasso.spring_min_rest=%.2f spring_reduce_rate=%.2f spring_mode=%u\n",
+                             (unsigned long long)mg->id, (int)mg->vertices.size(), mg->sim_group_idx, lc.spring_min_rest, lc.spring_reduce_rate, (unsigned)lc.spring_mode);
             // Dump full meta-group for diagnostics
-            gp_table_debug_dump_meta_group(ctx, mg, "serialize");
+            if (NODUS_DEBUG_SERIALIZE) gp_table_debug_dump_meta_group(ctx, mg, "serialize");
         } else {
-            printf("gp_table_serialize: mg <null>\n");
+            SERIALIZE_DEBUGF("gp_table_serialize: mg <null>\n");
         }
         int32_t vcount = static_cast<int32_t>(mg ? mg->vertices.size() : 0);
         memcpy(p, &vcount, 4); p += 4;
@@ -291,11 +299,11 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         uint64_t u = 0ull; memcpy(&u, p, 8); p += 8;
         atlas.push_back(u);
     }
-    printf("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
-    printf("gp_table_deserialize: canvas singleton=%p\n", (void*)gp_canvas_get_singleton());
-    printf("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
+    SERIALIZE_DEBUGF("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
+    SERIALIZE_DEBUGF("gp_table_deserialize: canvas singleton=%p\n", (void*)gp_canvas_get_singleton());
+    SERIALIZE_DEBUGF("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
     // trace: report deserialize invocation
-    printf("gp_table_deserialize: ctx=%p len=%d version=%u\n", (void*)ctx, in_len, (unsigned)version);
+    SERIALIZE_DEBUGF("gp_table_deserialize: ctx=%p len=%d version=%u\n", (void*)ctx, in_len, (unsigned)version);
     // Canvas singleton (may be null). Declare early so deserialization can
     // register persisted rope/module UUIDs with the canvas if available.
     GP_CanvasContext* cvs = gp_canvas_get_singleton();
@@ -303,7 +311,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     if (version != expected_version) {
         // No backward-compatibility: if save version mismatches current
         // format, abandon any attempt to negotiate and wipe the context.
-        printf("gp_table_deserialize: version mismatch (have=%u want=%u) - wiping ctx=%p\n", (unsigned)version, (unsigned)expected_version, (void*)ctx);
+        SERIALIZE_DEBUGF("gp_table_deserialize: version mismatch (have=%u want=%u) - wiping ctx=%p\n", (unsigned)version, (unsigned)expected_version, (void*)ctx);
         if (ctx) {
             // Clear visible data and reset state to a clean default.
             ctx->rows.clear();
@@ -383,11 +391,11 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         memcpy(&ru, p, sizeof(uint64_t)); p += sizeof(uint64_t);
         rope_ids_temp.push_back(ru);
     }
-    printf("gp_table_deserialize: rope_uid_count=%d\n", rope_uid_count);
+    SERIALIZE_DEBUGF("gp_table_deserialize: rope_uid_count=%d\n", rope_uid_count);
     if (!rope_ids_temp.empty()) {
-        printf("gp_table_deserialize: rope_ids:");
-        for (size_t ri = 0; ri < rope_ids_temp.size(); ++ri) printf(" %llu", (unsigned long long)rope_ids_temp[ri]);
-        printf("\n");
+        SERIALIZE_DEBUGF("gp_table_deserialize: rope_ids:");
+        for (size_t ri = 0; ri < rope_ids_temp.size(); ++ri) SERIALIZE_DEBUGF(" %llu", (unsigned long long)rope_ids_temp[ri]);
+        SERIALIZE_DEBUGF("\n");
     }
     // selected keys
     int32_t sel_count = 0;
@@ -442,7 +450,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         if (rope_blob_len > 0) {
             restored_sim = rope_sim_deserialize(p, rope_blob_len);
             if (!restored_sim) {
-                printf("gp_table_deserialize: failed to deserialize RopeSim blob\n");
+                SERIALIZE_DEBUGF("gp_table_deserialize: failed to deserialize RopeSim blob\n");
             }
             p += rope_blob_len;
         }
@@ -510,7 +518,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     if (p + 4 > in_buf + in_len) return 1; // nothing more
     int32_t mg_count = 0;
     memcpy(&mg_count, p, 4); p += 4;
-    printf("gp_table_deserialize: meta-group count=%d\n", mg_count);
+    SERIALIZE_DEBUGF("gp_table_deserialize: meta-group count=%d\n", mg_count);
     if (mg_count < 0) return 1;
     struct MGData { std::vector<std::pair<uint64_t,int>> verts; float confinement; int32_t sim_idx; uint64_t id; LassoConfig lc; uint64_t anchor_uid; int32_t anchor_v; uint32_t subgroup_flags; int32_t channel_group; int32_t dang_rope; int32_t dang_vid; float dang_len; int32_t ring_mode; float ring_u; uint64_t oka; uint64_t okb; uint64_t port_a; uint64_t port_b; };
     std::vector<MGData> mgds;
@@ -554,7 +562,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     for (auto &d : mgds) {
         GP_MetaGroup* mg = gp_table_meta_create(ctx);
         if (!mg) continue;
-        printf("gp_table_deserialize: creating meta-group ctx=%p mg=%p id=%llu oka=%llu okb=%llu verts=%zu sim_idx=%d\n",
+        SERIALIZE_DEBUGF("gp_table_deserialize: creating meta-group ctx=%p mg=%p id=%llu oka=%llu okb=%llu verts=%zu sim_idx=%d\n",
                (void*)ctx, (void*)mg, static_cast<unsigned long long>(d.id), static_cast<unsigned long long>(d.oka), static_cast<unsigned long long>(d.okb), d.verts.size(), d.sim_idx);
         // restore simple fields
         mg->confinement = d.confinement;
@@ -577,7 +585,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
             if (resolved >= 0) {
                 mg->anchor_rope = resolved;
             } else {
-                printf("gp_table_deserialize: ERROR - could not resolve anchor rope id=%llu\n", (unsigned long long)d.anchor_uid);
+                SERIALIZE_DEBUGF("gp_table_deserialize: ERROR - could not resolve anchor rope id=%llu\n", (unsigned long long)d.anchor_uid);
                 return 2; // hard-fail: unresolved persisted anchor UID
             }
         }
@@ -630,11 +638,11 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
                 if (ring_id < 0) {
                     ring_id = gp_table_create_ring_by_id(ctx, target_uid, ru);
                     if (ring_id == -2) {
-                        printf("gp_table_deserialize: ERROR - could not resolve rope id=%llu for ring creation\n", (unsigned long long)target_uid);
+                        SERIALIZE_DEBUGF("gp_table_deserialize: ERROR - could not resolve rope id=%llu for ring creation\n", (unsigned long long)target_uid);
                         return 3; // hard-fail: unresolved rope id for ring
                     }
                     if (ring_id >= 0) {
-                        printf("gp_table_deserialize: recreated ring id=%d u=%.3f for mg=%p id=%llu\n", ring_id, ru, (void*)mg, (unsigned long long)mg->id);
+                        SERIALIZE_DEBUGF("gp_table_deserialize: recreated ring id=%d u=%.3f for mg=%p id=%llu\n", ring_id, ru, (void*)mg, (unsigned long long)mg->id);
                     }
                 }
                 if (ring_id >= 0) {
@@ -653,34 +661,34 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
             if (root_sim_void) {
                 RopeSim* rootsim = reinterpret_cast<RopeSim*>(root_sim_void);
                 gp_table_attach_rope_sim(ctx, rootsim, 0);
-                printf("gp_table_deserialize: attached canvas root RopeSim %p to table %p\n", (void*)rootsim, (void*)ctx);
+                SERIALIZE_DEBUGF("gp_table_deserialize: attached canvas root RopeSim %p to table %p\n", (void*)rootsim, (void*)ctx);
             } else {
-                printf("gp_table_deserialize: canvas has no root RopeSim available; deferring sim attachment for table %p\n", (void*)ctx);
+                SERIALIZE_DEBUGF("gp_table_deserialize: canvas has no root RopeSim available; deferring sim attachment for table %p\n", (void*)ctx);
             }
         }
 
         // add vertices (resolve via canvas mapping by persistent rope UID)
-        printf("gp_table_deserialize: mg id=%llu sim_idx=%d overlay_oka=%llu okb=%llu lasso_flags=%u widget=%u spring_min_rest=%.2f spring_reduce_rate=%.2f spring_mode=%u verts=%zu\n",
+        SERIALIZE_DEBUGF("gp_table_deserialize: mg id=%llu sim_idx=%d overlay_oka=%llu okb=%llu lasso_flags=%u widget=%u spring_min_rest=%.2f spring_reduce_rate=%.2f spring_mode=%u verts=%zu\n",
                (unsigned long long)mg->id, d.sim_idx, (unsigned long long)d.oka, (unsigned long long)d.okb,
                d.lc.flags, static_cast<unsigned int>(d.lc.widget_type), d.lc.spring_min_rest, d.lc.spring_reduce_rate, static_cast<unsigned int>(d.lc.spring_mode), d.verts.size());
 
         for (auto &vp : d.verts) {
             uint64_t want_uid = vp.first;
             if (want_uid == 0ull) {
-                printf("gp_table_deserialize: warning, vertex has zero rope_uid, skipping\n");
+                SERIALIZE_DEBUGF("gp_table_deserialize: warning, vertex has zero rope_uid, skipping\n");
                 continue;
             }
             if (!ctx->rope_sim) {
-                printf("gp_table_deserialize: deferring meta vertex rope_id=%llu (no RopeSim attached yet)\n", (unsigned long long)want_uid);
+                SERIALIZE_DEBUGF("gp_table_deserialize: deferring meta vertex rope_id=%llu (no RopeSim attached yet)\n", (unsigned long long)want_uid);
                 gp_table_queue_pending_meta_vertex(ctx, mg, want_uid, vp.second);
                 continue;
             }
             int resolved = -1;
             if (cvs) resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, want_uid);
             if (resolved < 0) resolved = gp_table_resolve_rope_id_to_sim_index(ctx, want_uid);
-            printf("gp_table_deserialize: mapping rope_id=%llu -> resolved_idx=%d vert=%d\n", (unsigned long long)want_uid, resolved, vp.second);
+            SERIALIZE_DEBUGF("gp_table_deserialize: mapping rope_id=%llu -> resolved_idx=%d vert=%d\n", (unsigned long long)want_uid, resolved, vp.second);
             if (resolved < 0) {
-                printf("gp_table_deserialize: deferring unresolved rope id=%llu for meta-group vertex\n", (unsigned long long)want_uid);
+                SERIALIZE_DEBUGF("gp_table_deserialize: deferring unresolved rope id=%llu for meta-group vertex\n", (unsigned long long)want_uid);
                 gp_table_queue_pending_meta_vertex(ctx, mg, want_uid, vp.second);
                 continue;
             }
@@ -735,9 +743,8 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         {
             RopeSim* sim = ctx->rope_sim;
             if (sim && mg->sim_group_idx >= 0) {
-                printf("gp_table_deserialize: installed mg=%p id=%llu sim=%p sim_group_idx=%d vertices=%zu\n",
-                       (void*)mg, (unsigned long long)mg->id, (void*)sim, mg->sim_group_idx, mg->vertices.size());
-                fflush(stdout);
+                SERIALIZE_DEBUGF("gp_table_deserialize: installed mg=%p id=%llu sim=%p sim_group_idx=%d vertices=%zu\n",
+                                 (void*)mg, (unsigned long long)mg->id, (void*)sim, mg->sim_group_idx, mg->vertices.size());
             }
         }
         // set lasso config via API
@@ -749,7 +756,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         // set channel/group
         gp_table_meta_set_channel_group(ctx, mg, d.channel_group);
         // Dump meta-group state after vertices and attachments for diagnostics
-        gp_table_debug_dump_meta_group(ctx, mg, "deserialize_post_add");
+        if (NODUS_DEBUG_SERIALIZE) gp_table_debug_dump_meta_group(ctx, mg, "deserialize_post_add");
         
     }
 

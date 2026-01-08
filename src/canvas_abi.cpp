@@ -40,11 +40,11 @@
 
 
 // Segmented implementation pieces (see .inl files for details).
-#include "canvas_abi_primitives.inl"
-#include "canvas_abi_context.inl"
-#include "canvas_abi_rope_map.inl"
-#include "canvas_abi_create.inl"
-#include "canvas_abi_table_step.inl"
-#include "canvas_abi_actions_edges.inl"
-#include "canvas_abi_save_load.inl"
-#include "canvas_abi_overlay_raster.inl"
+#include "inl/canvas_abi_primitives.inl"
+#include "inl/canvas_abi_context.inl"
+#include "inl/canvas_abi_rope_map.inl"
+#include "inl/canvas_abi_create.inl"
+#include "inl/canvas_abi_table_step.inl"
+#include "inl/canvas_abi_actions_edges.inl"
+#include "inl/canvas_abi_save_load.inl"
+#include "inl/canvas_abi_overlay_raster.inl"

@@ -161,6 +161,24 @@ int gp_plugin_build_module_and_load(const char* module_src,
                                     int out_id_capacity) {
     if (!module_src || !out_id || out_id_capacity <= 0) return 0;
     namespace fs = std::filesystem;
+    auto resolve_repo_root = [&](const fs::path& abs_src) -> fs::path {
+        // Prefer an explicit repo_root when it contains include/tool_api.h.
+        if (repo_root && repo_root[0] != '\0') {
+            fs::path rr(repo_root);
+            rr = fs::absolute(rr);
+            if (fs::exists(rr / "include" / "tool_api.h")) return rr;
+        }
+        // Otherwise, walk up from module source to find include/tool_api.h.
+        fs::path cur = abs_src.parent_path();
+        while (!cur.empty()) {
+            if (fs::exists(cur / "include" / "tool_api.h")) return cur;
+            fs::path parent = cur.parent_path();
+            if (parent == cur) break;
+            cur = parent;
+        }
+        // Fallback to current working directory.
+        return fs::current_path();
+    };
     try {
         fs::path src = fs::path(module_src);
         if (!fs::exists(src)) return 0;
@@ -179,10 +197,10 @@ int gp_plugin_build_module_and_load(const char* module_src,
         std::filesystem::path abs_src = std::filesystem::absolute(src);
         std::string abs_src_str = abs_src.generic_string();
         cm << "add_library(" << module_name << " SHARED \"" << abs_src_str << "\")\n";
-        if (repo_root && repo_root[0] != '\0') {
-            std::filesystem::path rr(repo_root);
-            std::filesystem::path abs_rr = std::filesystem::absolute(rr);
-            cm << "target_include_directories(" << module_name << " PRIVATE \"" << abs_rr.generic_string() << "\")\n";
+        {
+            std::filesystem::path abs_rr = resolve_repo_root(abs_src);
+            std::filesystem::path abs_inc = abs_rr / "include";
+            cm << "target_include_directories(" << module_name << " PRIVATE \"" << abs_rr.generic_string() << "\" \"" << abs_inc.generic_string() << "\")\n";
             std::filesystem::path release_dir = abs_rr / "build" / "Release";
             const std::vector<std::string> candidate_libs = {
                 (release_dir / "canvas_tables.lib").generic_string(),

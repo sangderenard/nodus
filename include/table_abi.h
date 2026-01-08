@@ -506,6 +506,12 @@ int32_t gp_table_edge_index_for_key(GP_TableContext* ctx, unsigned long long led
 int32_t gp_table_edge_index_for_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b, int32_t* out_edge_idx);
 int32_t gp_table_edge_set_delta_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t delta_mode);
 int32_t gp_table_edge_set_order_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t order_mode);
+// Configure per-edge dirty grid segmentation used for delta-aware buffers.
+// grid_x/grid_y define the number of tiles across the logical tensor surface.
+// threshold applies to float buffers; non-float buffers treat any byte diff as dirty.
+int32_t gp_table_edge_set_dirty_grid(GP_TableContext* ctx, int32_t edge_idx, int32_t grid_x, int32_t grid_y, float threshold);
+// Copy the latest dirty mask (one byte per tile, 0/1). Returns bytes written.
+int32_t gp_table_edge_get_dirty_mask(GP_TableContext* ctx, int32_t edge_idx, uint8_t* out_mask, int32_t out_len, int32_t* out_grid_x, int32_t* out_grid_y, uint64_t* out_seq);
 int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx);
 int32_t gp_table_remove_edge_pair(GP_TableContext* ctx, unsigned long long a, unsigned long long b);
 

@@ -564,7 +564,9 @@ struct EdgeTensorFifo {
     std::vector<int32_t> shape;
     std::unique_ptr<Impl> impl;
     std::vector<float> last_sample;
+    std::vector<uint8_t> last_sample_bytes;
     bool last_sample_valid = false;
+    bool last_sample_bytes_valid = false;
     bool delta_mode = false;
     std::vector<float> order_history;
     std::vector<float> order_integrator;
@@ -572,6 +574,15 @@ struct EdgeTensorFifo {
     int32_t order_mode = 0;
     int32_t order_history_count = 0;
     int32_t order_history_cursor = 0;
+    // Dirty-grid state for delta-aware buffers (tile mask for recent write).
+    int32_t dirty_grid_x_req = 0;
+    int32_t dirty_grid_y_req = 0;
+    int32_t dirty_grid_x = 0;
+    int32_t dirty_grid_y = 0;
+    float dirty_threshold = 0.0f;
+    std::vector<uint8_t> dirty_mask;
+    std::atomic<uint64_t> dirty_seq{0};
+    std::mutex dirty_mu;
 
     EdgeTensorFifo() : impl(new Impl()) {}
     EdgeTensorFifo(EdgeTensorFifo&&) noexcept = default;
@@ -597,12 +608,15 @@ struct EdgeTensorFifo {
 
         last_sample.assign(impl->stride, 0.0f);
         last_sample_valid = false;
+        last_sample_bytes.assign(impl->stride * impl->elem_size, 0u);
+        last_sample_bytes_valid = false;
         order_history.assign(static_cast<size_t>(kMaxOrder) * impl->stride, 0.0f);
         order_integrator.assign(static_cast<size_t>(kMaxOrder) * impl->stride, 0.0f);
         scratch.assign(impl->stride, 0.0f);
         order_mode = 0;
         order_history_count = 0;
         order_history_cursor = 0;
+        refresh_dirty_grid();
 
         size_t total_bytes = impl->stride * impl->slots * impl->elem_size;
         // Allocate a host-backed storage buffer by default. If a backend was
@@ -676,6 +690,144 @@ struct EdgeTensorFifo {
         std::fill(order_integrator.begin(), order_integrator.end(), 0.0f);
         last_sample_valid = false;
     }
+    void set_dirty_grid(int32_t grid_x, int32_t grid_y, float threshold) {
+        dirty_grid_x_req = grid_x;
+        dirty_grid_y_req = grid_y;
+        dirty_threshold = std::max(0.0f, threshold);
+        refresh_dirty_grid();
+    }
+    int32_t dirty_mask_copy(uint8_t* out_mask, int32_t out_len, int32_t* out_grid_x, int32_t* out_grid_y, uint64_t* out_seq) {
+        if (out_grid_x) *out_grid_x = dirty_grid_x;
+        if (out_grid_y) *out_grid_y = dirty_grid_y;
+        if (out_seq) *out_seq = dirty_seq.load(std::memory_order_relaxed);
+        if (!out_mask || out_len <= 0) return 0;
+        std::lock_guard<std::mutex> lock(dirty_mu);
+        int32_t need = static_cast<int32_t>(dirty_mask.size());
+        int32_t copy_len = std::min(out_len, need);
+        if (copy_len > 0) {
+            std::memcpy(out_mask, dirty_mask.data(), static_cast<size_t>(copy_len));
+        }
+        return copy_len;
+    }
+
+private:
+    void refresh_dirty_grid() {
+        int32_t gx = dirty_grid_x_req;
+        int32_t gy = dirty_grid_y_req;
+        if (gx <= 0 || gy <= 0 || !impl) {
+            std::lock_guard<std::mutex> lock(dirty_mu);
+            dirty_grid_x = 0;
+            dirty_grid_y = 0;
+            dirty_mask.clear();
+            dirty_seq.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        size_t width = 0;
+        if (!shape.empty()) width = static_cast<size_t>(std::max<int32_t>(1, shape.back()));
+        if (width == 0) width = impl->stride;
+        size_t height = (width > 0) ? ((impl->stride + width - 1) / width) : 0;
+        int32_t max_x = static_cast<int32_t>(std::max<size_t>(1, width));
+        int32_t max_y = static_cast<int32_t>(std::max<size_t>(1, height));
+        int32_t min_x = (max_x >= 2) ? 2 : 1;
+        int32_t min_y = (max_y >= 2) ? 2 : 1;
+        gx = std::clamp(gx, min_x, max_x);
+        gy = std::clamp(gy, min_y, max_y);
+        std::lock_guard<std::mutex> lock(dirty_mu);
+        dirty_grid_x = gx;
+        dirty_grid_y = gy;
+        dirty_mask.assign(static_cast<size_t>(gx) * static_cast<size_t>(gy), 0u);
+        dirty_seq.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void update_dirty_mask(const void* current_sample, size_t bytes) {
+        if (!impl) return;
+        if (dirty_grid_x <= 0 || dirty_grid_y <= 0 || !current_sample) return;
+        size_t width = 0;
+        if (!shape.empty()) width = static_cast<size_t>(std::max<int32_t>(1, shape.back()));
+        if (width == 0) width = impl->stride;
+        size_t height = (width > 0) ? ((impl->stride + width - 1) / width) : 0;
+        if (width == 0 || height == 0) return;
+        int32_t gx = dirty_grid_x;
+        int32_t gy = dirty_grid_y;
+        std::lock_guard<std::mutex> lock(dirty_mu);
+        if (dirty_mask.size() != static_cast<size_t>(gx) * static_cast<size_t>(gy)) {
+            dirty_mask.assign(static_cast<size_t>(gx) * static_cast<size_t>(gy), 0u);
+        }
+        if (!last_sample_bytes_valid || last_sample_bytes.size() != bytes) {
+            std::fill(dirty_mask.begin(), dirty_mask.end(), static_cast<uint8_t>(1));
+            dirty_seq.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const size_t elem_size = impl->elem_size;
+        const bool use_float = (elem_size == sizeof(float));
+        const float* cur_f = reinterpret_cast<const float*>(current_sample);
+        const float* prev_f = nullptr;
+        const uint8_t* cur_b = reinterpret_cast<const uint8_t*>(current_sample);
+        const uint8_t* prev_b = reinterpret_cast<const uint8_t*>(last_sample_bytes.data());
+        if (use_float) {
+            if (!last_sample_valid || last_sample.size() != impl->stride) {
+                std::fill(dirty_mask.begin(), dirty_mask.end(), static_cast<uint8_t>(1));
+                dirty_seq.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            prev_f = last_sample.data();
+        }
+        auto seg_bounds = [](int32_t idx, int32_t count, size_t size, size_t* out_start, size_t* out_end) {
+            if (!out_start || !out_end) return;
+            if (count <= 0 || size == 0) {
+                *out_start = 0;
+                *out_end = 0;
+                return;
+            }
+            size_t base = size / static_cast<size_t>(count);
+            size_t rem = size % static_cast<size_t>(count);
+            size_t start = static_cast<size_t>(idx) * base + static_cast<size_t>(std::min<int32_t>(idx, static_cast<int32_t>(rem)));
+            size_t len = base + ((static_cast<size_t>(idx) < rem) ? 1u : 0u);
+            *out_start = start;
+            *out_end = start + len;
+        };
+        float threshold = std::max(0.0f, dirty_threshold);
+        size_t stride_elems = impl->stride;
+        for (int32_t sy = 0; sy < gy; ++sy) {
+            size_t y0 = 0, y1 = 0;
+            seg_bounds(sy, gy, height, &y0, &y1);
+            for (int32_t sx = 0; sx < gx; ++sx) {
+                size_t x0 = 0, x1 = 0;
+                seg_bounds(sx, gx, width, &x0, &x1);
+                bool dirty = false;
+                for (size_t y = y0; y < y1 && !dirty; ++y) {
+                    size_t row = y * width;
+                    for (size_t x = x0; x < x1; ++x) {
+                        size_t idx = row + x;
+                        if (idx >= stride_elems) { dirty = false; break; }
+                        if (use_float) {
+                            float dv = std::fabs(cur_f[idx] - prev_f[idx]);
+                            if (dv > threshold) { dirty = true; break; }
+                        } else {
+                            size_t off = idx * elem_size;
+                            bool diff = false;
+                            for (size_t b = 0; b < elem_size; ++b) {
+                                if (cur_b[off + b] != prev_b[off + b]) { diff = true; break; }
+                            }
+                            if (diff) { dirty = true; break; }
+                        }
+                    }
+                }
+                dirty_mask[static_cast<size_t>(sy) * static_cast<size_t>(gx) + static_cast<size_t>(sx)] = dirty ? 1u : 0u;
+            }
+        }
+        dirty_seq.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void mark_dirty_all() {
+        if (dirty_grid_x <= 0 || dirty_grid_y <= 0) return;
+        std::lock_guard<std::mutex> lock(dirty_mu);
+        if (!dirty_mask.empty()) {
+            std::fill(dirty_mask.begin(), dirty_mask.end(), static_cast<uint8_t>(1));
+            dirty_seq.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+public:
 
     void maybe_claim_writer(uint64_t key) {
         if (!impl) return;
@@ -954,6 +1106,7 @@ struct EdgeTensorFifo {
         size_t slot = static_cast<size_t>(seq % static_cast<uint64_t>(impl->slots));
         size_t bytes = impl->stride * impl->elem_size;
         const void* effective_sample_ptr = (effective_sample_f ? reinterpret_cast<const void*>(effective_sample_f) : reinterpret_cast<const void*>(sample_bytes_u));
+        update_dirty_mask(effective_sample_ptr, bytes);
         // Write into the FIFO's backend-owned storage buffer.
         gp_mem_backend_handle_t sh = impl->storage_handle;
         if (!sh) {
@@ -993,6 +1146,12 @@ struct EdgeTensorFifo {
                 // For non-float element sizes we keep last_sample invalid (or zeroed)
                 last_sample_valid = false;
             }
+        }
+        if (last_sample_bytes.size() == impl->stride * impl->elem_size) {
+            std::memcpy(last_sample_bytes.data(), effective_sample_ptr, impl->stride * impl->elem_size);
+            last_sample_bytes_valid = true;
+        } else {
+            last_sample_bytes_valid = false;
         }
         impl->cv.notify_all();
         if (out_dropped) *out_dropped = dropped ? 1 : 0;
@@ -1078,6 +1237,9 @@ struct EdgeTensorFifo {
                 impl->write_seq.store(seq + 1, std::memory_order_release);
                 note_activity(seq + 1, impl->last_write_seq, impl->last_write_region, impl->write_friction, impl->write_phase);
                 impl->cv.notify_all();
+                mark_dirty_all();
+                last_sample_valid = false;
+                last_sample_bytes_valid = false;
                 if (out_dropped) *out_dropped = dropped ? 1 : 0;
                 return true;
             }

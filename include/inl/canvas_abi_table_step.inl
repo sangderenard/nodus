@@ -6,6 +6,14 @@ extern "C" int gp_canvas_create_table(GP_CanvasContext* ctx_, int module_idx) {
 #ifndef fprintf
 #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
+#ifndef NODUS_DEBUG_SERIALIZE
+#define NODUS_DEBUG_SERIALIZE 0
+#endif
+#if NODUS_DEBUG_SERIALIZE
+#define SERIALIZE_DEBUGF(...) printf(__VA_ARGS__)
+#else
+#define SERIALIZE_DEBUGF(...) do {} while (0)
+#endif
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return 0;
@@ -911,7 +919,7 @@ extern "C" int gp_canvas_attach_table(GP_CanvasContext* ctx_, int module_idx, GP
                         std::vector<char> buf((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
                         ifs.close();
                         if (!buf.empty()) {
-                            printf("gp_canvas_attach_table: loading serialized module %s from %s (size=%zu)\n", mid.c_str(), full.string().c_str(), buf.size());
+                            SERIALIZE_DEBUGF("gp_canvas_attach_table: loading serialized module %s from %s (size=%zu)\n", mid.c_str(), full.string().c_str(), buf.size());
                             gp_table_deserialize(table, buf.data(), static_cast<int32_t>(buf.size()));
                         }
                     }

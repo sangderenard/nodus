@@ -4,7 +4,8 @@
 #include <filesystem>
 #include <chrono>
 
-#include "../plugin_loader.h"
+#include "..\src\plugin_loader.cpp"
+#include "..\src\tool_registry.cpp"
 
 namespace fs = std::filesystem;
 
@@ -66,7 +67,7 @@ int main(int argc, char** argv) {
         std::string builddir = argv[2];
         std::string target = argv[3];
         std::string built_rel = argv[4];
-        std::string dest_dir = (argc >= 6) ? argv[5] : ".";
+        std::string dest_dir = (argc >= 6) ? argv[5] : (fs::path("module_library") / "build" / "out").string();
 
         // run cmake --build
         std::string cmdline = "cmake --build \"" + builddir + "\" --config Release --target \"" + target + "\"";
