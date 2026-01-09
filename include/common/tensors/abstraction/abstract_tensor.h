@@ -38,6 +38,7 @@ public:
     TensorBackend* backend() const { return backend_; }
     AbstractTensorHandle handle() const { return handle_; }
 
+    void set_dtype(TensorDType dtype);
     void reset();
     void release();
     bool refresh_desc();

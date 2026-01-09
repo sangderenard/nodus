@@ -36,8 +36,7 @@ enum class ModuleToolKind : int8_t {
     TableNumber = 10,
     Clone = 11,
     TensorAllocator = 12,
-    FontRenderer = 13,
-    TensorTool = 14,
+    TensorTool = 13,
 };
 
 enum class ModuleToolOrigin : int8_t {

@@ -15,6 +15,7 @@ enum class TensorDType : uint8_t {
     U32,
     U64,
     Bool,
+    Ptr,
 };
 
 // Layout semantics for the tensor descriptor; backends may ignore Opaque.
@@ -38,6 +39,7 @@ inline constexpr uint32_t tensor_dtype_size_bytes(TensorDType dtype) {
         case TensorDType::U32: return 4;
         case TensorDType::U64: return 8;
         case TensorDType::Bool: return 1;
+        case TensorDType::Ptr: return static_cast<uint32_t>(sizeof(void*));
         case TensorDType::Unknown:
         default:
             return 0;

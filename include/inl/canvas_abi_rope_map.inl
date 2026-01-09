@@ -3175,7 +3175,7 @@ static bool parse_tool_kind_from_id(const std::string& tool_id, ModuleToolKind& 
         if (ch < '0' || ch > '9') return false;
         value = value * 10 + (ch - '0');
     }
-    const int max_kind = static_cast<int>(ModuleToolKind::FontRenderer);
+    const int max_kind = static_cast<int>(ModuleToolKind::TensorTool);
     if (value <= 0 || value > max_kind) return false;
     out_kind = static_cast<ModuleToolKind>(value);
     return true;

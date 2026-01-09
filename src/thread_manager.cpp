@@ -6,13 +6,13 @@
 #include "tool_api.h"
 #include "table_tensor_tool.h"
 #include "value_types.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
+#include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/tensor_registry.h"
+#include "common/tensors/abstraction/tensor_types.h"
 
 #ifndef NODUS_ENABLE_TORCH
 #define NODUS_ENABLE_TORCH 0
-#endif
-
-#if NODUS_ENABLE_TORCH
-#include "tools/sdlttf_to_torch.h"
 #endif
 
 #include <chrono>
@@ -1142,7 +1142,6 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         break;
                     }
                     case ModuleToolKind::TensorAllocator: {
-#if NODUS_ENABLE_TORCH
                         // Built-in tensor allocator: operate on a RawStackFrame
                         // stored in the module frame pointer for this contact.
                         GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
@@ -1152,58 +1151,89 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         RawStackFrame* rs = reinterpret_cast<RawStackFrame*>(maybe_raw);
                         if (!rs) break;
 
-                        // Collect old pointers and shapes
-                        std::vector<torch::Tensor*> old_ptrs;
-                        std::vector<std::vector<int64_t>> shapes;
+                        nodus::tensors::TensorBackend* backend = nodus::tensors::default_backend();
+                        if (!backend) break;
+
+                        // Collect old handles and shapes
+                        std::vector<nodus::tensors::AbstractTensorHandle> old_handles;
+                        std::vector<std::vector<uint32_t>> shapes;
 
                         ValueTypeId top_tid = kInvalidValueTypeId;
                         while (true) {
                             if (!raw_stack_peek_type(*rs, top_tid)) break;
-                            if (top_tid != ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR)) break;
+                            if (top_tid != ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR)) break;
 
-                            // Pop the tensor pointer
-                            torch::Tensor* tptr = nullptr;
-                            if (!raw_stack_pop_torch(*rs, tptr)) break;
-                            old_ptrs.push_back(tptr);
+                            // Pop the tensor handle
+                            nodus::tensors::AbstractTensorHandle h{};
+                            if (!raw_stack_pop_abstract_tensor(*rs, h)) break;
+                            old_handles.push_back(h);
 
-                            // Pop consecutive int64 dims below the pointer (top-first order)
-                            std::vector<int64_t> dims;
-                            raw_stack_pop_int64s_while(*rs, dims);
-                            std::reverse(dims.begin(), dims.end()); // restore original push order
+                            // Pop consecutive int64 dims below the handle (top-first order)
+                            std::vector<int64_t> dims_raw;
+                            raw_stack_pop_int64s_while(*rs, dims_raw);
+                            std::reverse(dims_raw.begin(), dims_raw.end()); // restore original push order
+                            std::vector<uint32_t> dims;
+                            dims.reserve(dims_raw.size());
+                            for (int64_t v : dims_raw) {
+                                int64_t clamped = std::max<int64_t>(1, v);
+                                dims.push_back(static_cast<uint32_t>(clamped));
+                            }
                             shapes.push_back(std::move(dims));
                         }
 
-                        if (old_ptrs.empty()) break;
+                        if (old_handles.empty()) break;
 
                         // Destroy old tensors
-                        for (auto p : old_ptrs) if (p) delete p;
+                        for (const auto& h : old_handles) {
+                            if (nodus::tensors::abstract_tensor_handle_is_valid(h)) {
+                                backend->destroy(h);
+                            }
+                        }
 
                         // Allocate new tensors for each recorded shape (same logical order)
-                        std::vector<torch::Tensor*> new_ptrs;
-                        new_ptrs.reserve(shapes.size());
+                        std::vector<nodus::tensors::AbstractTensorHandle> new_handles;
+                        new_handles.reserve(shapes.size());
                         bool alloc_ok = true;
-                        try {
-                            for (const auto& s : shapes) {
-                                torch::Tensor* nptr = new torch::Tensor(torch::empty(s, torch::kFloat32));
-                                new_ptrs.push_back(nptr);
+                        for (const auto& dims : shapes) {
+                            nodus::tensors::TensorDesc desc{};
+                            desc.dtype = nodus::tensors::TensorDType::F32;
+                            desc.layout = nodus::tensors::TensorLayout::Dense;
+                            if (dims.empty()) {
+                                desc.shape.dims = {1};
+                            } else {
+                                desc.shape.dims = dims;
                             }
-                        } catch (...) {
-                            alloc_ok = false;
+                            nodus::tensors::AbstractTensorHandle h = backend->create(desc);
+                            if (!nodus::tensors::abstract_tensor_handle_is_valid(h)) {
+                                alloc_ok = false;
+                                break;
+                            }
+                            new_handles.push_back(h);
                         }
                         if (!alloc_ok) {
-                            for (auto p : new_ptrs) delete p;
+                            for (const auto& h : new_handles) {
+                                if (nodus::tensors::abstract_tensor_handle_is_valid(h)) {
+                                    backend->destroy(h);
+                                }
+                            }
                             break;
                         }
 
-                        // Push new pointers back onto the raw stack in reverse so top ordering preserved
-                        for (auto it = new_ptrs.rbegin(); it != new_ptrs.rend(); ++it) {
-                            if (!raw_stack_push_torch(*rs, *it)) {
+                        // Push new handles back onto the raw stack in reverse so top ordering preserved
+                        for (auto it = new_handles.rbegin(); it != new_handles.rend(); ++it) {
+                            if (!raw_stack_push_abstract_tensor(*rs, *it)) {
                                 // push failed: cleanup and abort
-                                for (auto p : new_ptrs) delete p;
+                                for (const auto& h : new_handles) {
+                                    if (nodus::tensors::abstract_tensor_handle_is_valid(h)) {
+                                        backend->destroy(h);
+                                    }
+                                }
                                 alloc_ok = false;
                                 break;
                             }
                         }
+                        if (!alloc_ok) break;
+
                         // Clear and free any managed event payload that delivered this frame
                         {
                             int led_idx = (meta.contact_idx - kModuleFrameContactBase) % kModuleExtraLedCount;
@@ -1218,162 +1248,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                                 }
                             }
                         }
-#endif
                         break;
                     }
                     case ModuleToolKind::TensorTool: {
                         GP_TableContext* table = req.root_table ? req.root_table : mod.table;
                         gp_table_tensor_tool_tick(get_tensor_tool_state(), table, mod_idx, row);
-                        break;
-                    }
-                    case ModuleToolKind::FontRenderer: {
-#if NODUS_ENABLE_TORCH
-                        // Row tool: consume integer codepoints until a torch tensor pointer
-                        // is encountered; then render the collected codepoints into the
-                        // provided tensor using SDL_ttf helper and push the tensor back.
-                        GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-                        if (!canvas_single) break;
-                        void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, meta.contact_idx);
-                        if (!maybe_raw) break;
-                        RawStackFrame* rs = reinterpret_cast<RawStackFrame*>(maybe_raw);
-                        if (!rs) break;
-
-                        // Collect consecutive integer codepoints (preserve original types)
-                        struct IntItem { ValueTypeId tid; int64_t v; };
-                        std::vector<IntItem> popped_ints;
-                        ValueTypeId top_tid = kInvalidValueTypeId;
-                        while (rs->byte_count > 0) {
-                            if (!raw_stack_peek_type(*rs, top_tid)) break;
-                            // If we hit a tensor pointer, stop collecting
-                            if (top_tid == ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR)) break;
-                            // If integer types, pop preserving size
-                            if (top_tid == ValueTypeRegistry::global().builtin(VT_INT64) || top_tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
-                                int64_t v = 0;
-                                if (!raw_stack_pop_typed(*rs, &v, top_tid)) break;
-                                popped_ints.push_back({top_tid, v});
-                                continue;
-                            } else if (top_tid == ValueTypeRegistry::global().builtin(VT_INT32) || top_tid == ValueTypeRegistry::global().builtin(VT_UINT32)) {
-                                int32_t v32 = 0;
-                                if (!raw_stack_pop_typed(*rs, &v32, top_tid)) break;
-                                popped_ints.push_back({top_tid, static_cast<int64_t>(v32)});
-                                continue;
-                            }
-                            // Non-integer and non-tensor encountered: stop scanning
-                            break;
-                        }
-
-                        // Next element must be a tensor pointer for a render target
-                        if (popped_ints.empty()) break; // nothing to render
-                        if (!raw_stack_peek_type(*rs, top_tid)) {
-                            // restore popped ints
-                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
-                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
-                                    int64_t v = it->v;
-                                    raw_stack_push_typed(*rs, &v, it->tid);
-                                } else {
-                                    int32_t v32 = static_cast<int32_t>(it->v);
-                                    raw_stack_push_typed(*rs, &v32, it->tid);
-                                }
-                            }
-                            break;
-                        }
-                        if (top_tid != ValueTypeRegistry::global().builtin(VT_TORCH_TENSOR)) {
-                            // restore popped ints
-                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
-                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
-                                    int64_t v = it->v;
-                                    raw_stack_push_typed(*rs, &v, it->tid);
-                                } else {
-                                    int32_t v32 = static_cast<int32_t>(it->v);
-                                    raw_stack_push_typed(*rs, &v32, it->tid);
-                                }
-                            }
-                            break;
-                        }
-
-                        // Pop the tensor pointer
-                        torch::Tensor* target_ptr = nullptr;
-                        if (!raw_stack_pop_torch(*rs, target_ptr) || !target_ptr) {
-                            // restore popped ints
-                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
-                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
-                                    int64_t v = it->v;
-                                    raw_stack_push_typed(*rs, &v, it->tid);
-                                } else {
-                                    int32_t v32 = static_cast<int32_t>(it->v);
-                                    raw_stack_push_typed(*rs, &v32, it->tid);
-                                }
-                            }
-                            break;
-                        }
-
-                        // Reconstruct codepoint sequence in original push order
-                        std::vector<uint32_t> codepoints;
-                        codepoints.reserve(popped_ints.size());
-                        for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
-                            codepoints.push_back(static_cast<uint32_t>(it->v));
-                        }
-
-                        // Convert to UTF-16 string
-                        std::u16string utf16;
-                        utf16.reserve(codepoints.size());
-                        for (uint32_t cp : codepoints) {
-                            if (cp <= 0xFFFFu) {
-                                utf16.push_back(static_cast<char16_t>(cp));
-                            } else if (cp <= 0x10FFFFu) {
-                                uint32_t v = cp - 0x10000u;
-                                char16_t hi = static_cast<char16_t>((v >> 10) + 0xD800u);
-                                char16_t lo = static_cast<char16_t>((v & 0x3FFu) + 0xDC00u);
-                                utf16.push_back(hi);
-                                utf16.push_back(lo);
-                            } else {
-                                // invalid codepoint -> replace with U+FFFD
-                                utf16.push_back(static_cast<char16_t>(0xFFFD));
-                            }
-                        }
-
-                        // Perform rendering using a default font (delegating to the font module).
-                        try {
-                            SdlTtfGuard guard;
-                            // TODO: replace with global font-server cache; use demo font path as default
-                            FontHandle fh("assets/fonts/NotoSans-Regular.ttf", 24);
-                            SdlColor white{255,255,255,255};
-                            auto rendered = render_text_utf16_rgba_u8(fh.font, utf16, white, 0);
-                            // Assign into provided tensor pointer (replace contents)
-                            *target_ptr = rendered;
-                            // Push the tensor pointer back to indicate success
-                            if (!raw_stack_push_torch(*rs, target_ptr)) {
-                                // push failed: leave as-is but do not delete
-                            }
-                            // After rendering, clear and free managed payload if any
-                            {
-                                int led_idx = (meta.contact_idx - kModuleFrameContactBase) % kModuleExtraLedCount;
-                                GP_CanvasContext* canvas_single2 = gp_canvas_get_singleton();
-                                if (canvas_single2) {
-                                    gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 1, led_idx, nullptr);
-                                    gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 0, led_idx, nullptr);
-                                    void* mp = gp_canvas_pop_managed_event_payload(canvas_single2, mod_idx, led_idx);
-                                    if (mp) {
-                                        raw_stack_destroy_frame(reinterpret_cast<RawStackFrame*>(mp));
-                                    }
-                                }
-                            }
-                        } catch (...) {
-                            // On failure, restore popped ints and push target back unchanged
-                            if (target_ptr) {
-                                raw_stack_push_torch(*rs, target_ptr);
-                            }
-                            for (auto it = popped_ints.rbegin(); it != popped_ints.rend(); ++it) {
-                                if (it->tid == ValueTypeRegistry::global().builtin(VT_INT64) || it->tid == ValueTypeRegistry::global().builtin(VT_UINT64)) {
-                                    int64_t v = it->v;
-                                    raw_stack_push_typed(*rs, &v, it->tid);
-                                } else {
-                                    int32_t v32 = static_cast<int32_t>(it->v);
-                                    raw_stack_push_typed(*rs, &v32, it->tid);
-                                }
-                            }
-                        }
-#endif
                         break;
                     }
                     case ModuleToolKind::RectRgba: {

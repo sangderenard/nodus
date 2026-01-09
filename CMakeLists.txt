@@ -80,19 +80,7 @@ endif()
 # SDL3 (vcpkg)
 find_package(SDL3 CONFIG REQUIRED)
 
-# SDL3_ttf (vcpkg exports SDL3_ttf::SDL3_ttf)
-find_package(SDL3_ttf CONFIG REQUIRED)
-
-# Ensure SDL_TTF::SDL_TTF alias exists for downstream compatibility
-if(NOT TARGET SDL_TTF::SDL_TTF)
-  if(TARGET SDL3_ttf::SDL3_ttf-shared)
-    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf-shared)
-  elseif(TARGET SDL3_ttf::SDL3_ttf-static)
-    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf-static)
-  elseif(TARGET SDL3_ttf::SDL3_ttf)
-    add_library(SDL_TTF::SDL_TTF ALIAS SDL3_ttf::SDL3_ttf)
-  endif()
-endif()
+## SDL3_ttf removed (custom font renderer in progress)
 
 # OpenMP
 if(MSVC)
@@ -378,19 +366,12 @@ endif()
 if(NODUS_ENABLE_TORCH AND TARGET nodus_torch_includes)
   target_link_libraries(canvas_tables PUBLIC nodus_torch_includes)
 endif()
-if(TARGET SDL_TTF::SDL_TTF)
-  target_link_libraries(canvas_tables PRIVATE SDL_TTF::SDL_TTF)
-endif()
-
 if(TARGET SDL3::SDL3)
   target_include_directories(canvas_tables PUBLIC $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)
 else()
   message(FATAL_ERROR "SDL3 not available; SDL2 support removed. Install SDL3 or enable network fetch.")
 endif()
 
-if(TARGET SDL_TTF::SDL_TTF)
-  target_include_directories(canvas_tables PUBLIC $<TARGET_PROPERTY:SDL_TTF::SDL_TTF,INTERFACE_INCLUDE_DIRECTORIES>)
-endif()
 target_compile_features(canvas_tables PUBLIC cxx_std_20)
 target_compile_definitions(canvas_tables PUBLIC
   NODUS_ENABLE_TORCH=$<IF:$<BOOL:${NODUS_ENABLE_TORCH}>,1,0>
@@ -412,14 +393,8 @@ endif()
 if(NODUS_ENABLE_TORCH AND TARGET nodus_torch_includes)
   target_link_libraries(canvas_tables_static PUBLIC nodus_torch_includes)
 endif()
-if(TARGET SDL_TTF::SDL_TTF)
-  target_link_libraries(canvas_tables_static PRIVATE SDL_TTF::SDL_TTF)
-endif()
 if(TARGET SDL3::SDL3)
   target_include_directories(canvas_tables_static PUBLIC $<TARGET_PROPERTY:SDL3::SDL3,INTERFACE_INCLUDE_DIRECTORIES>)
-endif()
-if(TARGET SDL_TTF::SDL_TTF)
-  target_include_directories(canvas_tables_static PUBLIC $<TARGET_PROPERTY:SDL_TTF::SDL_TTF,INTERFACE_INCLUDE_DIRECTORIES>)
 endif()
 target_compile_features(canvas_tables_static PUBLIC cxx_std_20)
 target_compile_definitions(canvas_tables_static PUBLIC
@@ -486,11 +461,41 @@ add_executable(test_tensor_backend_smoke
 target_link_libraries(test_tensor_backend_smoke PRIVATE canvas_tables_static)
 add_test(NAME tensor_backend_smoke_test COMMAND test_tensor_backend_smoke)
 
+add_executable(test_tensor_coo_matrix
+  tests/tensor_coo_matrix_test.cpp
+)
+target_link_libraries(test_tensor_coo_matrix PRIVATE canvas_tables_static)
+add_test(NAME tensor_coo_matrix_test COMMAND test_tensor_coo_matrix)
+
 add_executable(test_tensor_registry
   tests/tensor_registry_test.cpp
 )
 target_link_libraries(test_tensor_registry PRIVATE canvas_tables_static)
 add_test(NAME tensor_registry_test COMMAND test_tensor_registry)
+
+add_executable(test_graph_sparse
+  tests/graph_sparse_test.cpp
+)
+target_link_libraries(test_graph_sparse PRIVATE canvas_tables_static)
+add_test(NAME graph_sparse_test COMMAND test_graph_sparse)
+
+add_executable(test_thread_pool
+  tests/thread_pool_test.cpp
+)
+target_link_libraries(test_thread_pool PRIVATE canvas_tables_static)
+add_test(NAME thread_pool_test COMMAND test_thread_pool)
+
+add_executable(test_tensor_compare
+  tests/tensor_compare_test.cpp
+)
+target_link_libraries(test_tensor_compare PRIVATE canvas_tables_static)
+add_test(NAME tensor_compare_test COMMAND test_tensor_compare)
+
+add_executable(test_edge_fifo_sparse_delta
+  tests/edge_fifo_sparse_delta_test.cpp
+)
+target_link_libraries(test_edge_fifo_sparse_delta PRIVATE canvas_tables_static)
+add_test(NAME edge_fifo_sparse_delta_test COMMAND test_edge_fifo_sparse_delta)
 
 add_executable(test_tensor_ops_lowering
   tests/tensor_ops_lowering_test.cpp

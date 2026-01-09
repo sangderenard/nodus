@@ -1,3 +1,11 @@
+#include "common/tensors/abstraction/tensor_types.h"
+#include "common/tensors/abstraction/coo_matrix.h"
+#include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
+#include "common/tensors/abstraction/tensor_backend.h"
+
+#include <unordered_map>
+#include <cmath>
 extern "C" {
 #include "mem_backend.h"
 #include "value_types.h"
@@ -563,11 +571,24 @@ struct EdgeTensorFifo {
 
     std::vector<int32_t> shape;
     std::unique_ptr<Impl> impl;
+    nodus::tensors::TensorLayout layout = nodus::tensors::TensorLayout::Dense;
+    nodus::tensors::TensorDType dtype = nodus::tensors::TensorDType::Unknown;
     std::vector<float> last_sample;
     std::vector<uint8_t> last_sample_bytes;
     bool last_sample_valid = false;
     bool last_sample_bytes_valid = false;
     bool delta_mode = false;
+    nodus::tensors::AbstractTensorHandle tensor_storage{};
+    nodus::tensors::TensorBackend* tensor_storage_backend = nullptr;
+    bool delta_sparse_mode = false;
+    bool delta_sparse_accumulate = false;
+    float delta_sparse_threshold = 0.0f;
+    int active_sparse_accum = 0;
+    struct SparseAccumState {
+        std::unordered_map<uint32_t, std::vector<uint8_t>> values;
+    };
+    SparseAccumState sparse_accum[2];
+    std::mutex sparse_mu;
     std::vector<float> order_history;
     std::vector<float> order_integrator;
     std::vector<float> scratch;
@@ -592,8 +613,16 @@ struct EdgeTensorFifo {
 
     void configure_default() { configure(std::vector<int32_t>{1}, 16, 0); }
 
-    void configure(const std::vector<int32_t>& dims, size_t slot_count, size_t topk, size_t elem_size_bytes = sizeof(float), int32_t type_id_in = -1) {
+    void configure(const std::vector<int32_t>& dims,
+                   size_t slot_count,
+                   size_t topk,
+                   size_t elem_size_bytes = sizeof(float),
+                   int32_t type_id_in = -1,
+                   nodus::tensors::TensorLayout layout_in = nodus::tensors::TensorLayout::Dense,
+                   nodus::tensors::TensorDType dtype_in = nodus::tensors::TensorDType::Unknown) {
         if (!impl) impl.reset(new Impl());
+        layout = layout_in;
+        dtype = dtype_in;
         shape = dims;
         if (shape.empty()) shape.push_back(1);
         size_t stride_local = 1;
@@ -682,6 +711,21 @@ struct EdgeTensorFifo {
     size_t elem_count() const { return impl ? impl->stride : 0; }
 
     void set_delta_mode(bool enabled) { delta_mode = enabled; }
+    void set_delta_sparse_mode(bool enabled, bool accumulate, float threshold) {
+        delta_sparse_mode = enabled;
+        delta_sparse_accumulate = enabled && accumulate;
+        delta_sparse_threshold = std::max(0.0f, threshold);
+    }
+    bool delta_sparse_enabled() const { return delta_sparse_mode; }
+    bool delta_sparse_accumulate_enabled() const { return delta_sparse_accumulate; }
+    void set_tensor_storage(nodus::tensors::AbstractTensorHandle handle,
+                            nodus::tensors::TensorBackend* backend) {
+        tensor_storage = handle;
+        tensor_storage_backend = backend;
+    }
+    bool has_tensor_storage() const {
+        return nodus::tensors::abstract_tensor_handle_is_valid(tensor_storage) && tensor_storage_backend != nullptr;
+    }
     void set_order_mode(int32_t mode) {
         order_mode = std::clamp(mode, -kMaxOrder, kMaxOrder);
         order_history_count = 0;
@@ -708,6 +752,168 @@ struct EdgeTensorFifo {
             std::memcpy(out_mask, dirty_mask.data(), static_cast<size_t>(copy_len));
         }
         return copy_len;
+    }
+
+    void update_last_sample_bytes(const void* sample_bytes, size_t bytes) {
+        if (!impl) return;
+        size_t need = impl->stride * impl->elem_size;
+        if (!sample_bytes || bytes < need) {
+            last_sample_bytes_valid = false;
+            last_sample_valid = false;
+            return;
+        }
+        if (last_sample_bytes.size() != need) last_sample_bytes.resize(need);
+        std::memcpy(last_sample_bytes.data(), sample_bytes, need);
+        last_sample_bytes_valid = true;
+        if (impl->elem_size == sizeof(float)) {
+            if (last_sample.size() != impl->stride) last_sample.resize(impl->stride);
+            std::memcpy(last_sample.data(), sample_bytes, impl->stride * sizeof(float));
+            last_sample_valid = true;
+        } else {
+            last_sample_valid = false;
+        }
+    }
+
+    bool compute_sparse_delta(const void* sample_bytes,
+                              size_t bytes,
+                              std::vector<uint32_t>& out_linear,
+                              std::vector<uint8_t>& out_values) {
+        if (!impl || !sample_bytes) return false;
+        size_t elem_size = impl->elem_size;
+        size_t count = impl->stride;
+        size_t need = count * elem_size;
+        if (bytes < need) return false;
+        out_linear.clear();
+        out_values.clear();
+        out_linear.reserve(count);
+        out_values.reserve(need);
+        const uint8_t* cur = reinterpret_cast<const uint8_t*>(sample_bytes);
+        const uint8_t* prev = last_sample_bytes_valid ? last_sample_bytes.data() : nullptr;
+        bool use_f32 = (elem_size == sizeof(float));
+        bool use_f64 = (elem_size == sizeof(double));
+        for (size_t i = 0; i < count; ++i) {
+            bool changed = false;
+            const size_t off = i * elem_size;
+            if (!prev) {
+                changed = true;
+            } else if (use_f32) {
+                float a = 0.0f;
+                float b = 0.0f;
+                std::memcpy(&a, cur + off, sizeof(float));
+                std::memcpy(&b, prev + off, sizeof(float));
+                changed = std::fabs(static_cast<double>(a - b)) > static_cast<double>(delta_sparse_threshold);
+            } else if (use_f64) {
+                double a = 0.0;
+                double b = 0.0;
+                std::memcpy(&a, cur + off, sizeof(double));
+                std::memcpy(&b, prev + off, sizeof(double));
+                changed = std::fabs(a - b) > static_cast<double>(delta_sparse_threshold);
+            } else {
+                for (size_t b = 0; b < elem_size; ++b) {
+                    if (cur[off + b] != prev[off + b]) {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if (changed) {
+                out_linear.push_back(static_cast<uint32_t>(i));
+                out_values.insert(out_values.end(), cur + off, cur + off + elem_size);
+            }
+        }
+        return true;
+    }
+
+    bool build_sparse_from_linear(const std::vector<uint32_t>& linear,
+                                  const std::vector<uint8_t>& values_bytes,
+                                  nodus::tensors::COOMatrix* out_sparse) {
+        if (!out_sparse || !impl) return false;
+        const uint32_t nnz = static_cast<uint32_t>(linear.size());
+        nodus::tensors::TensorShape tshape{};
+        tshape.dims.reserve(shape.size());
+        for (int32_t d : shape) tshape.dims.push_back(static_cast<uint32_t>(std::max(1, d)));
+        auto* backend = &nodus::tensors::in_memory_backend_singleton();
+        nodus::tensors::COOMatrix tmp = nodus::tensors::COOMatrix::create(
+            tshape,
+            nnz,
+            dtype,
+            backend,
+            nodus::tensors::TensorDType::U32,
+            nodus::tensors::CooIndexLayout::RowMajor);
+        if (!tmp.valid()) return false;
+        auto* mem_backend = backend;
+        void* idx_data = nullptr;
+        size_t idx_bytes = 0;
+        if (!mem_backend->map(tmp.indices.handle(), &idx_data, &idx_bytes)) return false;
+        void* val_data = nullptr;
+        size_t val_bytes = 0;
+        if (!mem_backend->map(tmp.values.handle(), &val_data, &val_bytes)) {
+            mem_backend->unmap(tmp.indices.handle());
+            return false;
+        }
+        auto* idx_out = static_cast<uint32_t*>(idx_data);
+        auto* val_out = static_cast<uint8_t*>(val_data);
+        const uint32_t rank = static_cast<uint32_t>(tshape.dims.size());
+        std::vector<uint32_t> coords(rank);
+        for (uint32_t i = 0; i < nnz; ++i) {
+            uint32_t lin = linear[i];
+            uint64_t idx = lin;
+            for (uint32_t r = rank; r-- > 0;) {
+                uint32_t dim = tshape.dims[r];
+                coords[r] = dim ? static_cast<uint32_t>(idx % dim) : 0u;
+                idx /= dim ? dim : 1u;
+            }
+            for (uint32_t r = 0; r < rank; ++r) {
+                idx_out[i * rank + r] = coords[r];
+            }
+            size_t off = static_cast<size_t>(i) * impl->elem_size;
+            if (off + impl->elem_size <= values_bytes.size()) {
+                std::memcpy(val_out + off, values_bytes.data() + off, impl->elem_size);
+            }
+        }
+        mem_backend->unmap(tmp.indices.handle());
+        mem_backend->unmap(tmp.values.handle());
+        *out_sparse = std::move(tmp);
+        return true;
+    }
+
+    void accumulate_sparse_delta(const std::vector<uint32_t>& linear,
+                                 const std::vector<uint8_t>& values_bytes) {
+        if (!impl) return;
+        std::lock_guard<std::mutex> lock(sparse_mu);
+        SparseAccumState& acc = sparse_accum[active_sparse_accum];
+        const size_t elem_size = impl->elem_size;
+        for (size_t i = 0; i < linear.size(); ++i) {
+            uint32_t lin = linear[i];
+            std::vector<uint8_t> buf(elem_size);
+            size_t off = i * elem_size;
+            if (off + elem_size <= values_bytes.size()) {
+                std::memcpy(buf.data(), values_bytes.data() + off, elem_size);
+            }
+            acc.values[lin] = std::move(buf);
+        }
+    }
+
+    bool take_sparse_accum(nodus::tensors::COOMatrix* out_sparse) {
+        if (!out_sparse || !impl) return false;
+        SparseAccumState local;
+        {
+            std::lock_guard<std::mutex> lock(sparse_mu);
+            int take_idx = active_sparse_accum;
+            active_sparse_accum = 1 - active_sparse_accum;
+            sparse_accum[active_sparse_accum].values.clear();
+            local.values.swap(sparse_accum[take_idx].values);
+        }
+        std::vector<uint32_t> linear;
+        std::vector<uint8_t> values_bytes;
+        linear.reserve(local.values.size());
+        values_bytes.reserve(local.values.size() * impl->elem_size);
+        for (const auto& kv : local.values) {
+            linear.push_back(kv.first);
+            const auto& buf = kv.second;
+            values_bytes.insert(values_bytes.end(), buf.begin(), buf.end());
+        }
+        return build_sparse_from_linear(linear, values_bytes, out_sparse);
     }
 
 private:
@@ -1629,6 +1835,8 @@ public:
         s.top_k = impl ? static_cast<int32_t>(impl->top_k) : 0;
         s.elem_size = impl ? static_cast<int32_t>(impl->elem_size) : static_cast<int32_t>(sizeof(float));
         s.type_id = impl ? impl->type_id : -1;
+        s.layout = static_cast<int32_t>(layout);
+        s.dtype = static_cast<int32_t>(dtype);
         return s;
     }
 };

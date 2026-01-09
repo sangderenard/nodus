@@ -59,6 +59,10 @@ AbstractTensor AbstractTensor::wrap(AbstractTensorHandle handle,
     return out;
 }
 
+void AbstractTensor::set_dtype(TensorDType dtype) {
+    desc_.dtype = dtype;
+}
+
 void AbstractTensor::reset() {
     if (owns_handle_ && backend_ && abstract_tensor_handle_is_valid(handle_)) {
         backend_->destroy(handle_);
