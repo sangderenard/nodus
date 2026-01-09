@@ -317,6 +317,9 @@ static void ensure_edge_fifos(GP_TableContext* ctx) {
     // keep subscriber slot maps in sync with edges
     while (ctx->edge_subscriber_slots.size() < ctx->edges.size()) ctx->edge_subscriber_slots.emplace_back();
     if (ctx->edge_subscriber_slots.size() > ctx->edges.size()) ctx->edge_subscriber_slots.resize(ctx->edges.size());
+    // keep sparse baseline buffers aligned with edges
+    while (ctx->edge_sparse_baseline.size() < ctx->edges.size()) ctx->edge_sparse_baseline.emplace_back();
+    if (ctx->edge_sparse_baseline.size() > ctx->edges.size()) ctx->edge_sparse_baseline.resize(ctx->edges.size());
 }
 
 // Apply stage port bindings to an edge's FIFO: output keys claim writer, input keys subscribe.

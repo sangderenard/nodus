@@ -606,8 +606,71 @@ struct EdgeTensorFifo {
     std::mutex dirty_mu;
 
     EdgeTensorFifo() : impl(new Impl()) {}
-    EdgeTensorFifo(EdgeTensorFifo&&) noexcept = default;
-    EdgeTensorFifo& operator=(EdgeTensorFifo&&) noexcept = default;
+    EdgeTensorFifo(EdgeTensorFifo&& other) noexcept
+        : shape(std::move(other.shape)),
+          impl(std::move(other.impl)),
+          layout(other.layout),
+          dtype(other.dtype),
+          last_sample(std::move(other.last_sample)),
+          last_sample_bytes(std::move(other.last_sample_bytes)),
+          last_sample_valid(other.last_sample_valid),
+          last_sample_bytes_valid(other.last_sample_bytes_valid),
+          delta_mode(other.delta_mode),
+          tensor_storage(std::move(other.tensor_storage)),
+          tensor_storage_backend(other.tensor_storage_backend),
+          delta_sparse_mode(other.delta_sparse_mode),
+          delta_sparse_accumulate(other.delta_sparse_accumulate),
+          delta_sparse_threshold(other.delta_sparse_threshold),
+          active_sparse_accum(other.active_sparse_accum),
+          sparse_accum{std::move(other.sparse_accum[0]), std::move(other.sparse_accum[1])},
+          order_history(std::move(other.order_history)),
+          order_integrator(std::move(other.order_integrator)),
+          scratch(std::move(other.scratch)),
+          order_mode(other.order_mode),
+          order_history_count(other.order_history_count),
+          order_history_cursor(other.order_history_cursor),
+          dirty_grid_x_req(other.dirty_grid_x_req),
+          dirty_grid_y_req(other.dirty_grid_y_req),
+          dirty_grid_x(other.dirty_grid_x),
+          dirty_grid_y(other.dirty_grid_y),
+          dirty_threshold(other.dirty_threshold),
+          dirty_mask(std::move(other.dirty_mask)),
+          dirty_seq(other.dirty_seq.load(std::memory_order_relaxed)) {}
+
+    EdgeTensorFifo& operator=(EdgeTensorFifo&& other) noexcept {
+        if (this == &other) return *this;
+        shape = std::move(other.shape);
+        impl = std::move(other.impl);
+        layout = other.layout;
+        dtype = other.dtype;
+        last_sample = std::move(other.last_sample);
+        last_sample_bytes = std::move(other.last_sample_bytes);
+        last_sample_valid = other.last_sample_valid;
+        last_sample_bytes_valid = other.last_sample_bytes_valid;
+        delta_mode = other.delta_mode;
+        tensor_storage = std::move(other.tensor_storage);
+        tensor_storage_backend = other.tensor_storage_backend;
+        delta_sparse_mode = other.delta_sparse_mode;
+        delta_sparse_accumulate = other.delta_sparse_accumulate;
+        delta_sparse_threshold = other.delta_sparse_threshold;
+        active_sparse_accum = other.active_sparse_accum;
+        sparse_accum[0] = std::move(other.sparse_accum[0]);
+        sparse_accum[1] = std::move(other.sparse_accum[1]);
+        order_history = std::move(other.order_history);
+        order_integrator = std::move(other.order_integrator);
+        scratch = std::move(other.scratch);
+        order_mode = other.order_mode;
+        order_history_count = other.order_history_count;
+        order_history_cursor = other.order_history_cursor;
+        dirty_grid_x_req = other.dirty_grid_x_req;
+        dirty_grid_y_req = other.dirty_grid_y_req;
+        dirty_grid_x = other.dirty_grid_x;
+        dirty_grid_y = other.dirty_grid_y;
+        dirty_threshold = other.dirty_threshold;
+        dirty_mask = std::move(other.dirty_mask);
+        dirty_seq.store(other.dirty_seq.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
     EdgeTensorFifo(const EdgeTensorFifo&) = delete;
     EdgeTensorFifo& operator=(const EdgeTensorFifo&) = delete;
 

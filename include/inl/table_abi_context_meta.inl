@@ -30,6 +30,8 @@ struct GP_TableContext {
     std::vector<float> edge_flow_phase;
     std::vector<GP_TableEdgeBatchMetadata> edge_batch_metadata;
     std::vector<uint32_t> edge_subgroup_flags;
+    // Per-edge baseline buffers used for sparse delta consumption keyed by subscriber.
+    std::vector<std::unordered_map<uint64_t, std::vector<uint8_t>>> edge_sparse_baseline;
     // per-edge persistent unique id used for ThreadManager registration
     std::vector<uint64_t> edge_ids;
     uint64_t next_edge_id = 1;

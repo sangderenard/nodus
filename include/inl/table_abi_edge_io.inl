@@ -1,5 +1,6 @@
 // Edge list helpers
 #include "console_logger.h"
+#include <cmath>
 #ifndef printf
 #define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
@@ -247,6 +248,7 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
     EdgeTensorFifo fifo;
     fifo.configure_default();
     ctx->edge_fifos.push_back(std::move(fifo));
+    ctx->edge_sparse_baseline.emplace_back();
     // reset prospective state when a real edge is added
     ctx->prospective_initialized = false;
     // create a rope entry in the simulator (if available)
@@ -358,6 +360,7 @@ int32_t gp_table_clear_edges(GP_TableContext* ctx) {
     ctx->edge_batch_metadata.clear();
     ctx->edge_subgroup_flags.clear();
     ctx->edge_subscriber_slots.clear();
+    ctx->edge_sparse_baseline.clear();
     // reset rope simulator mapping and recreate sim to free resources
     ctx->rope_id_to_sim_idx.clear();
     if (!ctx->rope_ids.empty()) printf("gp_table_clear_edges: ctx=%p clearing %zu rope_ids\n", (void*)ctx, ctx->rope_ids.size());
@@ -1095,6 +1098,18 @@ int32_t gp_table_edge_set_backend(GP_TableContext* ctx, int32_t edge_idx, gp_mem
     return 1;
 }
 
+extern "C" int32_t gp_table_edge_set_tensor_storage(GP_TableContext* ctx,
+                                                    int32_t edge_idx,
+                                                    nodus::tensors::AbstractTensorHandle handle,
+                                                    nodus::tensors::TensorBackend* backend) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    fifo.set_tensor_storage(handle, backend);
+    return 1;
+}
+
 // Swap the backend attached to an edge FIFO at runtime. If `copy_over` is
 // non-zero, attempt to copy existing FIFO storage from the old backend (or
 // host storage) into the new backend. Returns 1 on success, 0 on failure.
@@ -1360,6 +1375,117 @@ int32_t gp_table_edge_set_delta_mode(GP_TableContext* ctx, int32_t edge_idx, int
     return 1;
 }
 
+int32_t gp_table_edge_set_delta_sparse_mode(GP_TableContext* ctx,
+                                            int32_t edge_idx,
+                                            int32_t delta_sparse_mode,
+                                            int32_t accumulate_mode,
+                                            float threshold) {
+    if (!ctx) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    if (static_cast<size_t>(edge_idx) >= ctx->edge_sparse_baseline.size()) ctx->edge_sparse_baseline.resize(ctx->edge_fifos.size());
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].set_delta_sparse_mode(delta_sparse_mode != 0, accumulate_mode != 0, threshold);
+    if (!delta_sparse_mode && static_cast<size_t>(edge_idx) < ctx->edge_sparse_baseline.size()) {
+        ctx->edge_sparse_baseline[static_cast<size_t>(edge_idx)].clear();
+    }
+    return 1;
+}
+
+int32_t gp_table_edge_consume_sparse(GP_TableContext* ctx,
+                                     int32_t edge_idx,
+                                     unsigned long long subscriber_key,
+                                     void** out_sparse) {
+    if (!ctx || !out_sparse) return 0;
+    *out_sparse = nullptr;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!fifo.impl || !fifo.impl->configured) return 0;
+    if (!fifo.delta_sparse_enabled()) return 0;
+
+    const size_t elem_size = fifo.impl->elem_size;
+    const size_t stride = fifo.impl->stride;
+    const size_t bytes = stride * elem_size;
+    if (bytes == 0) return 0;
+
+    if (static_cast<size_t>(edge_idx) >= ctx->edge_sparse_baseline.size()) ctx->edge_sparse_baseline.resize(ctx->edge_fifos.size());
+    auto &baseline_map = ctx->edge_sparse_baseline[static_cast<size_t>(edge_idx)];
+    std::vector<uint8_t> &baseline = baseline_map[subscriber_key];
+    if (baseline.size() != bytes) baseline.assign(bytes, 0u);
+
+    std::vector<uint8_t> sample(bytes);
+    size_t wrote = 0;
+    if (!fifo.pop(subscriber_key, sample.data(), bytes, wrote) || wrote != bytes) return 0;
+
+    const float threshold = fifo.delta_sparse_threshold;
+    const bool accumulate = fifo.delta_sparse_accumulate_enabled();
+    std::unordered_map<uint32_t, std::vector<uint8_t>> accum;
+
+    auto apply_diff = [&](const std::vector<uint8_t>& prev, const std::vector<uint8_t>& cur) {
+        const bool use_f32 = elem_size == sizeof(float);
+        const bool use_f64 = elem_size == sizeof(double);
+        for (size_t i = 0; i < stride; ++i) {
+            const size_t off = i * elem_size;
+            bool changed = false;
+            if (use_f32) {
+                float a = 0.0f; float b = 0.0f;
+                std::memcpy(&a, cur.data() + off, sizeof(float));
+                std::memcpy(&b, prev.data() + off, sizeof(float));
+                changed = std::fabs(static_cast<double>(a - b)) > static_cast<double>(threshold);
+            } else if (use_f64) {
+                double a = 0.0; double b = 0.0;
+                std::memcpy(&a, cur.data() + off, sizeof(double));
+                std::memcpy(&b, prev.data() + off, sizeof(double));
+                changed = std::fabs(a - b) > static_cast<double>(threshold);
+            } else {
+                for (size_t b = 0; b < elem_size; ++b) {
+                    if (prev[off + b] != cur[off + b]) { changed = true; break; }
+                }
+            }
+            if (changed) {
+                std::vector<uint8_t> buf(elem_size);
+                std::memcpy(buf.data(), cur.data() + off, elem_size);
+                accum[static_cast<uint32_t>(i)] = std::move(buf);
+            }
+        }
+    };
+
+    apply_diff(baseline, sample);
+
+    if (accumulate) {
+        std::vector<uint8_t> next(bytes);
+        size_t wrote_next = 0;
+        while (fifo.pop(subscriber_key, next.data(), bytes, wrote_next)) {
+            if (wrote_next != bytes) break;
+            apply_diff(sample, next);
+            sample.swap(next);
+        }
+    }
+
+    std::vector<uint32_t> linear;
+    std::vector<uint8_t> values;
+    linear.reserve(accum.size());
+    values.reserve(accum.size() * elem_size);
+    for (const auto& kv : accum) {
+        linear.push_back(kv.first);
+        values.insert(values.end(), kv.second.begin(), kv.second.end());
+    }
+
+    nodus::tensors::COOMatrix sparse;
+    if (!fifo.build_sparse_from_linear(linear, values, &sparse)) return 0;
+    auto* heap_sparse = new nodus::tensors::COOMatrix(std::move(sparse));
+    *out_sparse = heap_sparse;
+
+    baseline = std::move(sample);
+    return 1;
+}
+
+void gp_table_edge_free_sparse(void* sparse) {
+    if (!sparse) return;
+    auto* ptr = reinterpret_cast<nodus::tensors::COOMatrix*>(sparse);
+    delete ptr;
+}
+
 int32_t gp_table_edge_set_order_mode(GP_TableContext* ctx, int32_t edge_idx, int32_t order_mode) {
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);
@@ -1410,6 +1536,7 @@ int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx) {
     erase_at(ctx->edge_subgroup_flags);
     erase_at(ctx->edge_ids);
     erase_at(ctx->edge_subscriber_slots);
+    erase_at(ctx->edge_sparse_baseline);
     erase_at(ctx->relax_value);
     erase_at(ctx->relax_vel);
     // remove any id->sim mapping for the removed edge id
