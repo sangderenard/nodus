@@ -51,4 +51,38 @@ class Atlas {
   std::vector<TokenPath> tokens_;
 };
 
+inline NodeId Atlas::add_node(const AtlasNode& node) {
+  AtlasNode stored = node;
+  stored.id = static_cast<NodeId>(nodes_.size());
+  nodes_.push_back(stored);
+  return stored.id;
+}
+
+inline EdgeId Atlas::add_edge(const AtlasEdge& edge) {
+  AtlasEdge stored = edge;
+  stored.id = static_cast<EdgeId>(edges_.size());
+  edges_.push_back(stored);
+  if (stored.id >= postings_.size()) postings_.resize(stored.id + 1);
+  return stored.id;
+}
+
+inline void Atlas::append_posting(EdgeId edge, Posting posting) {
+  if (edge >= postings_.size()) postings_.resize(edge + 1);
+  postings_[edge].push_back(posting);
+}
+
+inline void Atlas::consume_token(TokenPath path) {
+  tokens_.push_back(path);
+}
+
+inline std::span<const EdgeId> Atlas::token_edges(TokenId token) const {
+  if (token >= tokens_.size()) return {};
+  return tokens_[token].edges;
+}
+
+inline std::span<const Posting> Atlas::postings_for_edge(EdgeId edge) const {
+  if (edge >= postings_.size()) return {};
+  return postings_[edge];
+}
+
 }  // namespace nodus::tensors::hspir

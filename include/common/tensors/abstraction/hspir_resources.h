@@ -37,9 +37,21 @@ struct DeviceModel {
 
 class ResourceTable {
  public:
-  FrameId add_frame(Frame frame);
-  FontFaceId add_font(FontFace font);
-  DeviceModelId add_device(DeviceModel device);
+  FrameId add_frame(Frame frame) {
+    frame.id = static_cast<FrameId>(frames_.size());
+    frames_.push_back(frame);
+    return frame.id;
+  }
+  FontFaceId add_font(FontFace font) {
+    font.id = static_cast<FontFaceId>(fonts_.size());
+    fonts_.push_back(font);
+    return font.id;
+  }
+  DeviceModelId add_device(DeviceModel device) {
+    device.id = static_cast<DeviceModelId>(devices_.size());
+    devices_.push_back(device);
+    return device.id;
+  }
 
  private:
   std::vector<Frame> frames_;

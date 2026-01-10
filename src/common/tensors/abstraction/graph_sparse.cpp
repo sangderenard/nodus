@@ -79,8 +79,22 @@ bool SparseGraph::validate(bool check_id_kinds,
 bool port_rule_eval(const PortFlagRule& rule, uint32_t flags_a, uint32_t flags_b) {
     switch (rule.op) {
         case PortRuleOp::MaskedEqual:
+            // For type masks, treat "no type" (masked == 0) as "not comparable".
+            // This prevents rules like (type == type) from matching logistic/untagged ports.
+            if (rule.mask_a == kPortTypeMask && rule.mask_b == kPortTypeMask) {
+                const uint32_t a = (flags_a & rule.mask_a);
+                const uint32_t b = (flags_b & rule.mask_b);
+                if (a == 0u || b == 0u) return false;
+                return a == b;
+            }
             return (flags_a & rule.mask_a) == (flags_b & rule.mask_b);
         case PortRuleOp::MaskedNotEqual:
+            if (rule.mask_a == kPortTypeMask && rule.mask_b == kPortTypeMask) {
+                const uint32_t a = (flags_a & rule.mask_a);
+                const uint32_t b = (flags_b & rule.mask_b);
+                if (a == 0u || b == 0u) return false;
+                return a != b;
+            }
             return (flags_a & rule.mask_a) != (flags_b & rule.mask_b);
         case PortRuleOp::MaskedBothZero:
             return ((flags_a & rule.mask_a) == 0u) && ((flags_b & rule.mask_b) == 0u);
@@ -107,18 +121,23 @@ bool port_pair_allowed(uint32_t flags_a,
                         uint32_t pass1_count,
                         const PortFlagRule* pass2_rules,
                         uint32_t pass2_count) {
+    // Semantics:
+    // - pass1 acts as an allow-list override (if any rule matches => allowed)
+    // - pass2 acts as a deny-list override (if any rule matches => denied)
     bool allowed = allow_by_default;
     if (pass1_rules && pass1_count > 0) {
         for (uint32_t i = 0; i < pass1_count; ++i) {
             if (port_rule_eval(pass1_rules[i], flags_a, flags_b)) {
-                allowed = !allowed;
+                allowed = true;
+                break;
             }
         }
     }
     if (pass2_rules && pass2_count > 0) {
         for (uint32_t i = 0; i < pass2_count; ++i) {
             if (port_rule_eval(pass2_rules[i], flags_a, flags_b)) {
-                allowed = !allowed;
+                allowed = false;
+                break;
             }
         }
     }
@@ -170,12 +189,15 @@ bool validate_port_connections(const COOMatrix& connections,
 
     const uint64_t conn_count = conn_idx_desc.shape.element_count() / 2;
     const uint64_t flag_count = flags_desc.shape.element_count();
-    const uint32_t flag_rank = static_cast<uint32_t>(flags_idx_desc.shape.dims.size());
+    // COO index tensors are typically shaped [nnz, rank]. For rank-1 COO tables,
+    // shape.dims.size() will still be 2, but the coordinate rank is dims[1] (== 1).
+    const uint32_t flag_coord_rank = static_cast<uint32_t>(
+        (flags_idx_desc.shape.dims.size() == 2) ? flags_idx_desc.shape.dims[1] : flags_idx_desc.shape.dims.size());
 
     std::unordered_map<uint32_t, uint32_t> flag_map;
     flag_map.reserve(static_cast<size_t>(flag_count));
     for (uint64_t i = 0; i < flag_count; ++i) {
-        const uint32_t port_id = (flag_rank == 1) ? flag_idx[i] : flag_idx[i * 2 + 0];
+        const uint32_t port_id = (flag_coord_rank == 1) ? flag_idx[i] : flag_idx[i * flag_coord_rank + 0];
         flag_map[port_id] = flag_vals[i];
     }
 

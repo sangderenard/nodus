@@ -352,11 +352,22 @@ else()
 endif()
 
 find_package(Eigen3 REQUIRED)
+find_package(PNG REQUIRED)
+find_package(Freetype REQUIRED)
+find_package(HarfBuzz CONFIG REQUIRED)
+        # vcpkg provides a lowercase harfbuzz target; alias the canonical HarfBuzz::HarfBuzz name for compatibility.
+        if(TARGET harfbuzz AND NOT TARGET HarfBuzz::HarfBuzz)
+          add_library(HarfBuzz::HarfBuzz ALIAS harfbuzz)
+        endif()
+# vcpkg currently publishes the imported target harfbuzz (lower-case); alias HarfBuzz::HarfBuzz to that target.
+if(TARGET harfbuzz AND NOT TARGET HarfBuzz::HarfBuzz)
+  add_library(HarfBuzz::HarfBuzz ALIAS harfbuzz)
+endif()
 
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen)
+target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables PUBLIC Torch::Torch)
 endif()
@@ -383,7 +394,7 @@ target_compile_definitions(canvas_tables PUBLIC
 target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen)
+target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables_static PUBLIC Torch::Torch)
 endif()
@@ -479,6 +490,20 @@ add_executable(test_graph_sparse
 target_link_libraries(test_graph_sparse PRIVATE canvas_tables_static)
 add_test(NAME graph_sparse_test COMMAND test_graph_sparse)
 
+add_executable(test_kpath_pipeline
+  tests/kpath_pipeline_test.cpp
+)
+target_link_libraries(test_kpath_pipeline PRIVATE canvas_tables_static)
+target_compile_features(test_kpath_pipeline PRIVATE cxx_std_20)
+add_test(NAME kpath_pipeline_test COMMAND test_kpath_pipeline)
+
+add_executable(test_kpath_toolpath_facilities
+  tests/kpath_toolpath_facilities_test.cpp
+)
+target_link_libraries(test_kpath_toolpath_facilities PRIVATE canvas_tables_static)
+target_compile_features(test_kpath_toolpath_facilities PRIVATE cxx_std_20)
+add_test(NAME kpath_toolpath_facilities_test COMMAND test_kpath_toolpath_facilities)
+
 add_executable(test_thread_pool
   tests/thread_pool_test.cpp
 )
@@ -514,6 +539,40 @@ target_compile_definitions(test_tool_dll PRIVATE
   NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
 )
 add_test(NAME tool_dll_test COMMAND test_tool_dll)
+
+# Many unit tests use assert() for both validation and required side effects
+# (e.g., assert(backend.map(...)) to populate output pointers). In non-Debug
+# configurations the standard NDEBUG definition compiles those expressions out,
+# which can leave pointers uninitialized and lead to crashes.
+#
+# Ensure asserts remain enabled for test translation units in non-Debug builds.
+set(NODUS_TEST_TARGETS
+  test_thread_manager
+  test_frame_serialization
+  test_edge_backend_coordination
+  test_meta_edge_snapshot_wrapper
+  test_mem_backend_manifest
+  test_tensor_backend_smoke
+  test_tensor_coo_matrix
+  test_tensor_registry
+  test_graph_sparse
+  test_thread_pool
+  test_tensor_compare
+  test_edge_fifo_sparse_delta
+  test_tensor_ops_lowering
+  test_tool_dll
+  test_kpath_toolpath_facilities
+)
+
+foreach(_NODUS_TEST_TARGET IN LISTS NODUS_TEST_TARGETS)
+  if(TARGET ${_NODUS_TEST_TARGET})
+    if(MSVC)
+      target_compile_options(${_NODUS_TEST_TARGET} PRIVATE $<$<NOT:$<CONFIG:Debug>>:/UNDEBUG>)
+    else()
+      target_compile_options(${_NODUS_TEST_TARGET} PRIVATE $<$<NOT:$<CONFIG:Debug>>:-UNDEBUG>)
+    endif()
+  endif()
+endforeach()
 
 option(ENABLE_EIGEN_SIM "Enable Eigen-accelerated rope simulation" OFF)
 if(ENABLE_EIGEN_SIM)

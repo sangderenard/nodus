@@ -1,13 +1,18 @@
 #include "common/tensors/abstraction/graph_sparse.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
 
-#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <vector>
 
 using namespace nodus::tensors;
+
+static bool require_or_report(bool condition, const char* what) {
+    if (condition) return true;
+    std::cerr << "graph_sparse_test: failed: " << what << "\n";
+    return false;
+}
 
 static COOMatrix make_table(uint32_t rows, uint32_t cols, uint32_t nnz, TensorBackend* backend) {
     TensorShape shape{};
@@ -21,13 +26,14 @@ static COOMatrix make_flags_table(uint32_t port_count, uint32_t nnz, TensorBacke
     return COOMatrix::create(shape, nnz, TensorDType::U32, backend, TensorDType::U32, CooIndexLayout::RowMajor);
 }
 
-static void write_u32(InMemoryBackend& backend, const AbstractTensor& t, const std::vector<uint32_t>& data) {
+static bool write_u32(InMemoryBackend& backend, const AbstractTensor& t, const std::vector<uint32_t>& data) {
     void* raw = nullptr;
     size_t bytes = 0;
-    assert(backend.map(t.handle(), &raw, &bytes));
-    assert(bytes >= data.size() * sizeof(uint32_t));
+    if (!require_or_report(backend.map(t.handle(), &raw, &bytes), "backend.map")) return false;
+    if (!require_or_report(bytes >= data.size() * sizeof(uint32_t), "mapped bytes too small")) return false;
     std::memcpy(raw, data.data(), data.size() * sizeof(uint32_t));
     backend.unmap(t.handle());
+    return true;
 }
 
 static SparseGraph build_graph(InMemoryBackend& backend,
@@ -45,16 +51,16 @@ static SparseGraph build_graph(InMemoryBackend& backend,
 
     const uint32_t node_id = graph_make_id(GraphObjectKind::Node, 1);
     const uint32_t edge_id = graph_make_id(GraphObjectKind::Edge, 3);
-    write_u32(backend, graph.nodes.values, {node_id});
-    write_u32(backend, graph.edges.values, {edge_id});
+    if (!write_u32(backend, graph.nodes.values, {node_id})) return {};
+    if (!write_u32(backend, graph.edges.values, {edge_id})) return {};
 
     std::vector<uint32_t> indices(port_count);
     for (uint32_t i = 0; i < port_count; ++i) indices[i] = i;
-    write_u32(backend, graph.port_flags.indices, indices);
-    write_u32(backend, graph.port_flags.values, port_flags);
+    if (!write_u32(backend, graph.port_flags.indices, indices)) return {};
+    if (!write_u32(backend, graph.port_flags.values, port_flags)) return {};
 
-    write_u32(backend, graph.connections.indices, connection_pairs);
-    write_u32(backend, graph.connections.values, std::vector<uint32_t>(connection_pairs.size() / 2, 0u));
+    if (!write_u32(backend, graph.connections.indices, connection_pairs)) return {};
+    if (!write_u32(backend, graph.connections.values, std::vector<uint32_t>(connection_pairs.size() / 2, 0u))) return {};
 
     return graph;
 }
@@ -67,9 +73,9 @@ int main() {
     const uint32_t port_id = graph_make_id(GraphObjectKind::Port, 2);
     const uint32_t edge_id = graph_make_id(GraphObjectKind::Edge, 3);
 
-    assert(graph_id_is_node(node_id));
-    assert(graph_id_is_port(port_id));
-    assert(graph_id_is_edge(edge_id));
+    if (!require_or_report(graph_id_is_node(node_id), "graph_id_is_node")) return 1;
+    if (!require_or_report(graph_id_is_port(port_id), "graph_id_is_port")) return 1;
+    if (!require_or_report(graph_id_is_edge(edge_id), "graph_id_is_edge")) return 1;
     PortFlagRule pass1[] = {
         {kPortFlagOutput | kPortFlagOptionalOutput, kPortFlagInput | kPortFlagOptionalInput, PortRuleOp::And},
         {kPortFlagInput | kPortFlagOptionalInput, kPortFlagOutput | kPortFlagOptionalOutput, PortRuleOp::And},
@@ -102,14 +108,14 @@ int main() {
         4, 5,  // logistic -> logistic (both zero)
         6, 3   // meta optional in/out (C) -> optional input (B)
     });
-    assert(valid_graph.validate(true, true, false, pass1, 3, pass2, 1));
+    if (!require_or_report(valid_graph.validate(true, true, false, pass1, 3, pass2, 1), "valid_graph.validate")) return 1;
 
     SparseGraph invalid_graph = build_graph(backend, flags, {
         0, 1,  // output (A) -> input (A) (type match => disallow in pass2)
         1, 3,  // input (A) -> optional input (B) (no output on src)
         4, 6   // logistic -> meta (no IO bits to satisfy pass1)
     });
-    assert(!invalid_graph.validate(true, true, false, pass1, 3, pass2, 1));
+    if (!require_or_report(!invalid_graph.validate(true, true, false, pass1, 3, pass2, 1), "invalid_graph.validate")) return 1;
 
     std::cout << "graph_sparse_test: ok\n";
     return 0;

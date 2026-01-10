@@ -8,7 +8,12 @@ This document consolidates the HSPIR + PathTape conversation into a single outli
 3. **Tape layer** – `StepTape` stores axis deltas plus channel values in SoA form with provenance per step.
 4. **Resources layer** – frames, transforms, fonts, and devices bind the abstract tape to concrete deployment targets.
 5. **Programs & bundles** – tokens compile into `Program` artifacts referencing schema, atlas, resources, and the final tape; sidecars carry provenance and embeddings.
-6. **Backends** – raster, mesh, CNC, robot exporters consume the shared tape and honor orientation, metric, axis_mask, and tool constraints.
+6. **Backends** - raster, mesh, CNC, robot exporters consume the shared tape and honor orientation, metric, axis_mask, and tool constraints.
+
+## Builder/Instantiation support
+- `path_tape_builder.h` provides `StepTapeBuilder` for axis/channel population and provenance wiring.
+- `hspir_schema_builder.h` instantiates `MetricSchema` with channel definitions before locking.
+- `hspir_atlas_builder.h` and `hspir_resources_builder.h` gather atlas tokens and resource tables while keeping the public structures immutable.
 
 ## Execution workflow
 1. Build atlas/node graph & token paths.

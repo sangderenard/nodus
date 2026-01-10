@@ -582,7 +582,9 @@ int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, co
     size_t topk = spec->top_k > 0 ? static_cast<size_t>(spec->top_k) : size_t(0);
     size_t elem_size = spec->elem_size > 0 ? static_cast<size_t>(spec->elem_size) : sizeof(float);
     int32_t type_id = spec->type_id;
-    ctx->edge_fifos[static_cast<size_t>(edge_idx)].configure(dims, slots, topk, elem_size, type_id);
+    nodus::tensors::TensorLayout layout = static_cast<nodus::tensors::TensorLayout>(spec->layout);
+    nodus::tensors::TensorDType dtype = static_cast<nodus::tensors::TensorDType>(spec->dtype);
+    ctx->edge_fifos[static_cast<size_t>(edge_idx)].configure(dims, slots, topk, elem_size, type_id, layout, dtype);
     sync_edge_tensor_for_idx(ctx, static_cast<size_t>(edge_idx));
     // Invalidate type-id snapshot after edge reconfigure so readers will refresh.
     std::atomic_store(&ctx->type_ids_snapshot, std::shared_ptr<std::vector<int32_t>>(nullptr));
@@ -1415,7 +1417,18 @@ int32_t gp_table_edge_consume_sparse(GP_TableContext* ctx,
 
     std::vector<uint8_t> sample(bytes);
     size_t wrote = 0;
-    if (!fifo.pop(subscriber_key, sample.data(), bytes, wrote) || wrote != bytes) return 0;
+    if (!fifo.pop(subscriber_key, sample.data(), bytes, wrote) || wrote != bytes) {
+        // No token available: still return a valid empty sparse result.
+        // This keeps the API convenient for callers that "drain" after
+        // coalescing/accumulation (see edge_fifo_sparse_delta_test).
+        nodus::tensors::COOMatrix sparse;
+        const std::vector<uint32_t> linear;
+        const std::vector<uint8_t> values;
+        if (!fifo.build_sparse_from_linear(linear, values, &sparse)) return 0;
+        auto* heap_sparse = new nodus::tensors::COOMatrix(std::move(sparse));
+        *out_sparse = heap_sparse;
+        return 1;
+    }
 
     const float threshold = fifo.delta_sparse_threshold;
     const bool accumulate = fifo.delta_sparse_accumulate_enabled();

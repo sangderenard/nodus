@@ -37,7 +37,7 @@ dev_bundle/
 # Local build presets
 /build_test/
 /build_real/
-
+vcpkg_installed/
 # Python
 __pycache__/
 *.pyc

@@ -56,7 +56,11 @@ struct StepProvenance {
 // Immutable, SoA tape of per-axis deltas and channel values.
 class StepTape {
  public:
-  explicit StepTape(TapeLayout layout);
+  explicit StepTape(TapeLayout layout)
+      : layout_(layout),
+        axis_deltas_(static_cast<size_t>(layout.axis_count) * layout.step_count, 0.0f),
+        channel_values_(static_cast<size_t>(layout.channel_count) * layout.step_count, 0.0f),
+        provenance_(layout.step_count) {}
   StepTape(const StepTape&) = delete;
   StepTape& operator=(const StepTape&) = delete;
   StepTape(StepTape&&) noexcept = default;
@@ -66,19 +70,44 @@ class StepTape {
   float axis_delta(AxisIndex axis, StepIndex step) const;
   float channel_value(ChannelIndex channel, StepIndex step) const;
 
-  void set_axis_delta(AxisIndex axis, StepIndex step, float delta);
-  void set_channel_value(ChannelIndex channel, StepIndex step, float value);
-  void set_provenance(StepIndex step, StepProvenance prov);
+  void set_axis_delta(AxisIndex axis, StepIndex step, float delta) {
+    axis_deltas_[index(axis, step)] = delta;
+  }
+  void set_channel_value(ChannelIndex channel, StepIndex step, float value) {
+    channel_values_[index(channel, step)] = value;
+  }
+  void set_provenance(StepIndex step, StepProvenance prov) {
+    if (step < provenance_.size()) provenance_[step] = prov;
+  }
 
-  std::span<const float> axis_deltas(AxisIndex axis) const;
-  std::span<const float> channel_values(ChannelIndex channel) const;
-  std::span<const StepProvenance> provenance() const;
+  std::span<const float> axis_deltas(AxisIndex axis) const {
+    return axis_span(axis);
+  }
+  std::span<const float> channel_values(ChannelIndex channel) const {
+    return channel_span(channel);
+  }
+  std::span<const StepProvenance> provenance() const { return provenance_; }
 
  private:
   TapeLayout layout_;
   std::vector<float> axis_deltas_;  // axis_count * step_count
   std::vector<float> channel_values_;  // channel_count * step_count
   std::vector<StepProvenance> provenance_;  // size = step_count
+
+  size_t index(AxisIndex axis, StepIndex step) const {
+    return static_cast<size_t>(axis) * layout_.step_count + step;
+  }
+  size_t index(ChannelIndex channel, StepIndex step) const {
+    return static_cast<size_t>(channel) * layout_.step_count + step;
+  }
+  std::span<const float> axis_span(AxisIndex axis) const {
+    size_t start = static_cast<size_t>(axis) * layout_.step_count;
+    return {axis_deltas_.data() + start, layout_.step_count};
+  }
+  std::span<const float> channel_span(ChannelIndex channel) const {
+    size_t start = static_cast<size_t>(channel) * layout_.step_count;
+    return {channel_values_.data() + start, layout_.step_count};
+  }
 };
 
 }  // namespace nodus::tensors::path_tape
