@@ -93,6 +93,8 @@ struct OffsetContourOptions final {
   float capture_tool_width = 0.0f;
   float capture_calibration_scale = 1.0f;
   float capture_finishing_allowance = 0.0f;
+
+  bool enable_lead_in = true;
 };
 
 struct FillPlanConfig final {

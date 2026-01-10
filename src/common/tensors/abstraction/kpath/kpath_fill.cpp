@@ -239,76 +239,130 @@ static void emit_hatch_segments_evenodd(const std::vector<std::vector<Pt>>& loop
   }
 }
 
+static bool point_inside(const std::vector<Pt>& loop, Pt p) {
+  bool inside = false;
+  size_t n = loop.size();
+  if (n < 3) return false;
+  for (size_t i = 0, j = n - 1; i < n; j = i++) {
+    const Pt& pi = loop[i];
+    const Pt& pj = loop[j];
+    bool intersect = ((pi.y > p.y) != (pj.y > p.y)) &&
+                     (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y + kEps) + pi.x);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+static bool point_inside_any(const std::vector<std::vector<Pt>>& loops, Pt p) {
+  for (const auto& loop : loops) {
+    if (point_inside(loop, p)) return true;
+  }
+  return false;
+}
+
 static void emit_offset_path(const std::vector<Pt>& off,
+                             const std::vector<Pt>& base_loop,
+                             const std::vector<std::vector<Pt>>& loops,
                              const OffsetContourOptions& options,
                              ArmatureProgram& out,
                              float safe_z,
-                             float cut_z) {
+                             float cut_z,
+                             float loop_area) {
   if (off.size() < 2) return;
 
-  Pt start = off.front();
-  Pt entry_dir = normalize(Pt{off[1].x - off[0].x, off[1].y - off[0].y});
-  if (std::fabs(entry_dir.x) < kEps && std::fabs(entry_dir.y) < kEps && off.size() >= 3) {
-    entry_dir = normalize(Pt{off[2].x - off[1].x, off[2].y - off[1].y});
+  size_t entry_idx = 0;
+  float max_len_sq = 0.0f;
+  for (size_t i = 0; i < off.size(); ++i) {
+    const Pt& a = off[i];
+    const Pt& b = off[(i + 1) % off.size()];
+    float dx = b.x - a.x;
+    float dy = b.y - a.y;
+    float len_sq = dx * dx + dy * dy;
+    if (len_sq > max_len_sq) {
+      max_len_sq = len_sq;
+      entry_idx = i;
+    }
   }
 
-  Pt exit_dir = normalize(Pt{off.front().x - off.back().x, off.front().y - off.back().y});
-  if (std::fabs(exit_dir.x) < kEps && std::fabs(exit_dir.y) < kEps && off.size() >= 3) {
-    exit_dir = normalize(Pt{off[off.size() - 1].x - off[off.size() - 2].x,
-                           off[off.size() - 1].y - off[off.size() - 2].y});
+  const Pt& start = off[entry_idx];
+  const Pt& prev = off[(entry_idx + off.size() - 1) % off.size()];
+  const Pt& next = off[(entry_idx + 1) % off.size()];
+
+  Pt tangent_back = normalize(Pt{start.x - prev.x, start.y - prev.y});
+  if (std::fabs(tangent_back.x) < kEps && std::fabs(tangent_back.y) < kEps) {
+    tangent_back = normalize(Pt{next.x - start.x, next.y - start.y});
   }
-  if (std::fabs(exit_dir.x) < kEps && std::fabs(exit_dir.y) < kEps) exit_dir = entry_dir;
+  Pt tangent_forward = normalize(Pt{next.x - start.x, next.y - start.y});
+  if (std::fabs(tangent_forward.x) < kEps && std::fabs(tangent_forward.y) < kEps) tangent_forward = tangent_back;
 
   float lead_in = std::max(options.lead_in_length, 0.0f);
   float lead_out = std::max(options.lead_out_length, 0.0f);
 
   Pt lead_start = start;
+  bool built_lead = false;
+  if (options.enable_lead_in && lead_in > kEps &&
+      (std::fabs(tangent_forward.x) > kEps || std::fabs(tangent_forward.y) > kEps)) {
+    Pt candidate{start.x - tangent_forward.x * lead_in, start.y - tangent_forward.y * lead_in};
+    bool has_clearance = true;
+    const int samples = 4;
+    for (int s = 0; s < samples; ++s) {
+      float t = static_cast<float>(s + 1) / static_cast<float>(samples);
+      Pt sample{candidate.x + tangent_forward.x * lead_in * t,
+                candidate.y + tangent_forward.y * lead_in * t};
+      if (point_inside_any(loops, sample)) {
+        has_clearance = false;
+        break;
+      }
+    }
+    if (has_clearance) {
+      lead_start = candidate;
+      built_lead = true;
+    }
+  }
+
   Pt lead_exit = start;
-
-  if (lead_in > kEps) {
-    float ang = options.lead_sweep_degrees * (kPi / 180.0f);
-    float c = std::cos(ang);
-    float s = std::sin(ang);
-    Pt swept = rot(entry_dir, c, s);
-    lead_start = Pt{start.x - swept.x * lead_in, start.y - swept.y * lead_in};
+  if (lead_out > kEps && (std::fabs(tangent_forward.x) > kEps || std::fabs(tangent_forward.y) > kEps)) {
+    lead_exit.x += tangent_forward.x * lead_out;
+    lead_exit.y += tangent_forward.y * lead_out;
   }
 
-  if (lead_out > kEps) {
-    lead_exit = Pt{start.x + exit_dir.x * lead_out, start.y + exit_dir.y * lead_out};
-  }
-
-  ToolPoint rapid{lead_start.x, lead_start.y, safe_z, false};
-  out.points.push_back(rapid);
-
-  ToolPoint plunge{lead_start.x, lead_start.y, cut_z, true};
-  out.points.push_back(plunge);
-
-  if (std::fabs(lead_start.x - start.x) > kEps || std::fabs(lead_start.y - start.y) > kEps) {
+  if (built_lead)
+    out.points.push_back(ToolPoint{lead_start.x, lead_start.y, safe_z, false});
+  else
+    out.points.push_back(ToolPoint{start.x, start.y, safe_z, false});
+  out.points.push_back(ToolPoint{lead_start.x, lead_start.y, cut_z, true});
+  if (built_lead) {
     out.points.push_back(ToolPoint{start.x, start.y, cut_z, true});
   }
 
   for (size_t i = 1; i < off.size(); ++i) {
-    out.points.push_back(ToolPoint{off[i].x, off[i].y, cut_z, true});
+    const Pt& p = off[(entry_idx + i) % off.size()];
+    out.points.push_back(ToolPoint{p.x, p.y, cut_z, true});
   }
-
-  // Close loop.
   out.points.push_back(ToolPoint{start.x, start.y, cut_z, true});
 
   if (lead_out > kEps) {
     out.points.push_back(ToolPoint{lead_exit.x, lead_exit.y, cut_z, true});
   }
 
-  ToolPoint lift;
-  lift.x = (lead_out > kEps) ? lead_exit.x : start.x;
-  lift.y = (lead_out > kEps) ? lead_exit.y : start.y;
-  lift.z = safe_z;
-  lift.engaged = false;
-  out.points.push_back(lift);
+  Pt lift_p = (lead_out > kEps) ? lead_exit : start;
+  out.points.push_back(ToolPoint{lift_p.x, lift_p.y, safe_z, false});
 }
 
 // Minkowski-like offset via mitered edge-offset intersection. Falls back to
 // vertex-normal approximation if intersections fail. Positive offset expands,
 // negative shrinks (outline units).
+static float signed_area(const std::vector<Pt>& loop) {
+  if (loop.size() < 3) return 0.0f;
+  float area = 0.0f;
+  for (size_t i = 1; i < loop.size(); ++i) {
+    const Pt& a = loop[i - 1];
+    const Pt& b = loop[i];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return area * 0.5f;
+}
+
 static bool plan_offset_contour(const std::vector<std::vector<Pt>>& loops,
                                 float offset,
                                 const OffsetContourOptions& options,
@@ -322,6 +376,10 @@ static bool plan_offset_contour(const std::vector<std::vector<Pt>>& loops,
   for (const auto& loop : loops) {
     if (loop.size() < 2) continue;
     size_t N = loop.size();
+    float area = signed_area(loop);
+    // Keep offsets pointing "outward" relative to material: outer loops (CCW) use +offset,
+    // holes (likely CW) get offset flipped so the tool stays consistent.
+    float loop_offset = (area < 0.0f) ? -offset : offset;
 
     std::vector<Pt> off;
     off.clear();
@@ -343,10 +401,10 @@ static bool plan_offset_contour(const std::vector<std::vector<Pt>>& loops,
       Pt n_cur = norms[i];
 
       // Offset lines for edges i-1 and i.
-      Pt p_prev0{loop[(i + N - 1) % N].x + n_prev.x * offset, loop[(i + N - 1) % N].y + n_prev.y * offset};
-      Pt p_prev1{p.x + n_prev.x * offset, p.y + n_prev.y * offset};
-      Pt p_cur0{p.x + n_cur.x * offset, p.y + n_cur.y * offset};
-      Pt p_cur1{loop[(i + 1) % N].x + n_cur.x * offset, loop[(i + 1) % N].y + n_cur.y * offset};
+      Pt p_prev0{loop[(i + N - 1) % N].x + n_prev.x * loop_offset, loop[(i + N - 1) % N].y + n_prev.y * loop_offset};
+      Pt p_prev1{p.x + n_prev.x * loop_offset, p.y + n_prev.y * loop_offset};
+      Pt p_cur0{p.x + n_cur.x * loop_offset, p.y + n_cur.y * loop_offset};
+      Pt p_cur1{loop[(i + 1) % N].x + n_cur.x * loop_offset, loop[(i + 1) % N].y + n_cur.y * loop_offset};
 
       Pt d_prev{p_prev1.x - p_prev0.x, p_prev1.y - p_prev0.y};
       Pt d_cur{p_cur1.x - p_cur0.x, p_cur1.y - p_cur0.y};
@@ -368,7 +426,7 @@ static bool plan_offset_contour(const std::vector<std::vector<Pt>>& loops,
         float vx = corner.x - p.x;
         float vy = corner.y - p.y;
         float miter_len = std::sqrt(vx * vx + vy * vy);
-        float limit = std::max(mlimit, 1.0f) * std::fabs(offset);
+        float limit = std::max(mlimit, 1.0f) * std::fabs(loop_offset);
         if (miter_len > limit) {
           beveled = true;
           // Bevel: end of prev offset edge and start of next offset edge.
@@ -393,7 +451,7 @@ static bool plan_offset_contour(const std::vector<std::vector<Pt>>& loops,
       buf.loops.push_back(std::move(stored));
     }
 
-    emit_offset_path(off, options, out, safe_z, cut_z);
+    emit_offset_path(off, loop, loops, options, out, safe_z, cut_z, area);
   }
 
   return true;

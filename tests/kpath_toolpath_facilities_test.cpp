@@ -4,6 +4,8 @@
 #include "common/tensors/abstraction/kpath/kpath_kinematics.h"
 #include "common/tensors/abstraction/kpath/kpath_raster.h"
 #include "common/tensors/abstraction/kpath/kpath_shaper.h"
+#include "common/tensors/abstraction/kpath/kpath_pipeline.h"
+#include "common/tensors/abstraction/kpath/kpath_program.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -71,6 +73,23 @@ static CodepointSequence to_codepoints_ascii(const std::string& s) {
   seq.codepoints.reserve(s.size());
   for (unsigned char ch : s) seq.codepoints.push_back(static_cast<uint32_t>(ch));
   return seq;
+}
+
+static GlyphOutline translate_outline(const GlyphOutline& outline, float dx, float dy) {
+  GlyphOutline result;
+  result.glyph_id = outline.glyph_id;
+  result.segments.reserve(outline.segments.size());
+  for (const auto& seg : outline.segments) {
+    OutlineSegment translated = seg;
+    translated.x1 += dx;
+    translated.y1 += dy;
+    translated.x2 += dx;
+    translated.y2 += dy;
+    translated.x3 += dx;
+    translated.y3 += dy;
+    result.segments.push_back(translated);
+  }
+  return result;
 }
 
 static bool log_cluster(const Cluster& cluster, size_t index) {
@@ -162,69 +181,30 @@ static bool validate_atlas_from_shaping() {
   const std::string text = "HELLO";
   for (unsigned char ch : text) seq.codepoints.push_back(static_cast<uint32_t>(ch));
 
-  std::vector<Cluster> clusters;
-  if (!require_or_report(shaper.shape(seq, clusters), "shape() failed")) return false;
-  if (!require_or_report(!clusters.empty(), "expected clusters")) return false;
-
   AtlasBuilder atlas_builder;
-
-  // One token is the whole input string.
-  std::vector<EdgeId> token_edges;
-  token_edges.reserve(clusters.size());
-
-  // Create codepoint nodes and glyph nodes; connect each cluster as a layout edge.
-  // For now, we validate that HarfBuzz advances are preserved through the edge fields.
-  for (size_t i = 0; i < clusters.size(); ++i) {
-    const Cluster& cl = clusters[i];
-
-    const uint32_t cp = seq.codepoints[std::min(cl.start, seq.codepoints.size() - 1)];
-    NodeId cp_node = atlas_builder.add_node(AtlasNode{AtlasNodeKind::Codepoint, cp, AtlasNode::kNoMetadata});
-
-    const uint32_t glyph_id = cl.glyph_ids.front();
-    GlyphOutline outline;
-    if (!require_or_report(shaper.extract_outline(glyph_id, outline), "extract_outline() failed while building atlas")) return false;
-
-    NodeMetadata meta;
-    meta.outline = std::move(outline);
-    meta.winding = RotDir::Zero;
-    const uint32_t meta_idx = atlas_builder.add_node_metadata(std::move(meta));
-
-    NodeId glyph_node = atlas_builder.add_node(AtlasNode{AtlasNodeKind::Glyph, glyph_id, meta_idx});
-
-    AtlasEdge e;
-    e.src = cp_node;
-    e.dst = glyph_node;
-    e.label = 1;
-    e.advance_x = cl.advance_x;
-    e.advance_y = cl.advance_y;
-    e.offset_x = 0.0f;
-    e.offset_y = 0.0f;
-    e.cluster_id = static_cast<uint32_t>(cl.start);
-    EdgeId edge_id = atlas_builder.add_edge(e);
-    token_edges.push_back(edge_id);
+  TokenLayoutPlan plan;
+  if (!require_or_report(build_token_from_sequence(atlas_builder, shaper, seq, plan),
+                         "build_token_from_sequence() failed")) {
+    return false;
   }
-
-  TokenId token = atlas_builder.add_token(std::span<const EdgeId>(token_edges.data(), token_edges.size()));
-
-  // Add postings: one posting per edge for this token.
-  for (size_t i = 0; i < token_edges.size(); ++i) {
-    atlas_builder.add_posting(token_edges[i], Posting{token, static_cast<uint32_t>(i), 1});
-  }
-
   Atlas atlas = atlas_builder.finalize();
-  auto edges = atlas.token_edges(token);
-  if (!require_or_report(edges.size() == token_edges.size(), "atlas token_edges count mismatch")) return false;
 
-  for (size_t i = 0; i < edges.size(); ++i) {
-    const AtlasEdge& e = atlas.edge(edges[i]);
-    if (!require_or_report(e.advance_x > 0.0f, "atlas edge advance_x must be > 0")) return false;
-    auto postings = atlas.edge_postings(edges[i]);
-    if (!require_or_report(postings.size() == 1, "each atlas edge should have exactly one posting")) return false;
-    if (!require_or_report(postings[0].token == token, "posting token mismatch")) return false;
+  if (!require_or_report(!plan.edges.empty(), "plan edges empty")) return false;
 
-    const NodeMetadata* nm = atlas.node_metadata(e.dst);
-    if (!require_or_report(nm != nullptr, "glyph node metadata missing")) return false;
-    if (!require_or_report(!nm->outline.segments.empty(), "glyph outline segments empty in metadata")) return false;
+  MetricSchema schema = MetricSchema::MakeCoreV01();
+  StepTape tape;
+  if (!require_or_report(compile_token_to_tape(atlas, plan, schema, tape),
+                         "compile_token_to_tape() failed")) {
+    return false;
+  }
+
+  auto axis0 = tape.axis_delta(0);
+  auto axis1 = tape.axis_delta(1);
+  if (!require_or_report(axis0.size() == plan.edges.size(), "axis count mismatch")) return false;
+  for (size_t i = 0; i < plan.edges.size(); ++i) {
+    const AtlasEdge& e = atlas.edge(plan.edges[i]);
+    if (!require_or_report(axis0[i] == e.advance_x, "axis0 mismatch")) return false;
+    if (!require_or_report(axis1[i] == e.advance_y, "axis1 mismatch")) return false;
   }
 
   std::cout << "[KPATH-FACILITIES] OK: atlas built+validated from shaping" << std::endl;
@@ -350,6 +330,7 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
 
   AtlasBuilder atlas_builder;
   ArmatureProgram program;
+  std::vector<GlyphOutline> pangram_outlines;
 
   // Layout in font space: we treat advance_x as x translation.
   float pen_x = 0.0f;
@@ -376,8 +357,8 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
       NodeId cp_node = atlas_builder.add_node(AtlasNode{AtlasNodeKind::Codepoint, cp, AtlasNode::kNoMetadata});
 
       const uint32_t glyph_id = cl.glyph_ids.front();
-      GlyphOutline outline;
-      if (!require_or_report(shaper.extract_outline(glyph_id, outline), "extract_outline() failed while building pangram atlas")) return false;
+    GlyphOutline outline;
+    if (!require_or_report(shaper.extract_outline(glyph_id, outline), "extract_outline() failed while building pangram atlas")) return false;
 
       // Metadata per glyph.
       NodeMetadata meta;
@@ -400,7 +381,8 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
       token_edges.push_back(edge_id);
 
       // Add this glyph outline into the program at the current pen position.
-      append_glyph_outline_to_program(program, outline, local_x, pen_y, 0.0f, /*samples*/16);
+    append_glyph_outline_to_program(program, outline, local_x, pen_y, 0.0f, /*samples*/16);
+    pangram_outlines.push_back(translate_outline(outline, local_x, pen_y));
 
       // Advance: for clusters that contain multiple glyphs, distribute advance crudely.
       float per_glyph_adv = cl.advance_x;
@@ -455,23 +437,16 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
   // Optional: demonstrate a basic filled-toolpath plan for one glyph.
   std::cout << "[KPATH-FACILITIES] Faculty: fill planning (even-odd hatch)" << std::endl;
   {
-    // Pick a glyph we know exists from the pangram: 'o'
-    CodepointSequence seq = to_codepoints_ascii("o");
-    std::vector<Cluster> clusters;
-    if (!require_or_report(shaper.shape(seq, clusters), "shape() failed for fill glyph")) return false;
-    if (!require_or_report(!clusters.empty(), "shape() returned zero clusters for fill glyph")) return false;
-    if (!require_or_report(!clusters.front().glyph_ids.empty(), "fill glyph had no glyph ids")) return false;
-
-    GlyphOutline outline;
-    if (!require_or_report(shaper.extract_outline(clusters.front().glyph_ids.front(), outline), "extract_outline() failed for fill glyph")) return false;
+    if (pangram_outlines.empty()) {
+      std::cerr << "[KPATH-FACILITIES] FAILED: no outlines captured for pangram fill\n";
+      return false;
+    }
 
     ArmatureProgram fill_prog;
     FillPlanConfig fill_cfg;
     fill_cfg.rule = FillRule::EvenOdd;
     fill_cfg.pattern = FillPattern::Hatch;
 
-    // Calibrate the tool footprint in raster space (impulse response), then
-    // drive fill spacing from an explicit percentile/threshold definition.
     ToolCalibration cal = calibrate_gaussian_tool_impulse(128, tool);
     float r_val_05 = cal.radius_at_value_fraction(0.05f);
     float r_cum_95 = cal.radius_at_cumulative_fraction(0.95f);
@@ -480,39 +455,38 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
           << " r@5%=" << r_val_05
           << " r@95%energy=" << r_cum_95 << "\n";
 
-    // Compute an outline->image mapping so we can convert calibrated radii in
-    // pixel space into outline-space distances (for deterministic spacing).
-    // Use a quick outline-only program as the reference.
-    ArmatureProgram outline_program = glyph_outline_to_armature_program(outline, 0.0f, /*samples*/16);
+    ArmatureProgram outline_program = glyph_outline_to_armature_program(pangram_outlines.front(), 0.0f, /*samples*/16);
     ProgramMapping outline_mapping = compute_program_mapping(outline_program, 256, 256, /*margin=*/12.0f);
-
-    // For fill spacing we use a value-threshold radius. Convert px->outline units.
     float eff_radius_px = std::max(r_val_05, 1.0f);
     float eff_radius_outline = eff_radius_px / std::max(outline_mapping.scale, 1e-6f);
     fill_cfg.tool.tool_width = 2.0f * eff_radius_outline;
-    fill_cfg.tool.stepover = 0.0f; // auto = tool_width * (1 - overlap)
+    fill_cfg.tool.stepover = 0.0f;
     fill_cfg.tool.overlap = 0.85f;
     fill_cfg.tool.angle_degrees = 25.0f;
     fill_cfg.safe_z = machine.safe_z;
     fill_cfg.cut_z = machine.cut_z;
-
     fill_cfg.kerf = KerfMode::Center;
-    if (!require_or_report(plan_fill_for_glyph_outline(outline, fill_prog, fill_cfg), "fill plan generation failed")) return false;
 
-    TensorCanvas2D fill_energy(256, 256);
-    TensorCanvas2D fill_temp(256, 256);
-    rasterize_program_gaussian_with_thermal(fill_prog, fill_energy, fill_temp, machine, tool, /*margin=*/12.0f);
+    bool filled_any = false;
+    for (const auto& outline : pangram_outlines) {
+      ArmatureProgram glyph_fill;
+      if (plan_fill_for_glyph_outline(outline, glyph_fill, fill_cfg)) {
+        fill_prog.points.insert(fill_prog.points.end(), glyph_fill.points.begin(), glyph_fill.points.end());
+        filled_any = true;
+      }
+    }
+    if (!require_or_report(filled_any, "fill plan generation failed")) return false;
+
+    TensorCanvas2D fill_energy(1400, 220);
+    TensorCanvas2D fill_temp(1400, 220);
+    rasterize_program_gaussian_with_thermal(fill_prog, fill_energy, fill_temp, machine, tool, /*margin=*/14.0f);
     if (!require_or_report(fill_energy.max_value() > 0.001f, "fill raster energy should be non-zero")) return false;
 
-    const std::string fill_path = make_output_path_next_to_exe(argv0, "kpath_glyph_fill.png");
+    const std::string fill_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill.png");
     auto fill_px = fill_energy.to_u8_normalized();
     (void)write_png_grayscale_u8(fill_path, fill_energy.width, fill_energy.height, fill_px);
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << fill_path << " (energy_max=" << fill_energy.max_value() << ")\n";
 
-    // RGB debug visualization:
-    // - R: outline loops with CW winding
-    // - G: hatch fill program
-    // - B: outline loops with CCW winding
     struct Pt2 {
       float x = 0.0f;
       float y = 0.0f;
@@ -558,9 +532,8 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
       prog.points.push_back(lift);
     };
 
-    // Flatten the glyph outline into loops (same fixed-step approach as the fill planner).
-    std::vector<std::vector<Pt2>> loops;
-    {
+    auto flatten_loops = [](const GlyphOutline& outline) -> std::vector<std::vector<Pt2>> {
+      std::vector<std::vector<Pt2>> loops;
       std::vector<Pt2> cur_loop;
       Pt2 cur{0, 0};
       Pt2 start{0, 0};
@@ -635,15 +608,18 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
         }
       }
       if (!cur_loop.empty()) loops.push_back(cur_loop);
-    }
+      return loops;
+    };
 
     ArmatureProgram outline_cw;
     ArmatureProgram outline_ccw;
-    for (const auto& loop : loops) {
-      float a = area2(loop);
-      // Note: sign depends on the coordinate convention; here we treat a<0 as CW.
-      if (a < 0.0f) emit_loop(outline_cw, loop, machine.safe_z, machine.cut_z);
-      else emit_loop(outline_ccw, loop, machine.safe_z, machine.cut_z);
+    for (const auto& outline : pangram_outlines) {
+      auto loops = flatten_loops(outline);
+      for (const auto& loop : loops) {
+        float a = area2(loop);
+        if (a < 0.0f) emit_loop(outline_cw, loop, machine.safe_z, machine.cut_z);
+        else emit_loop(outline_ccw, loop, machine.safe_z, machine.cut_z);
+      }
     }
 
     ArmatureProgram master;
@@ -652,12 +628,12 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     master.points.insert(master.points.end(), outline_ccw.points.begin(), outline_ccw.points.end());
     master.points.insert(master.points.end(), fill_prog.points.begin(), fill_prog.points.end());
 
-    ProgramMapping mapping = compute_program_mapping(master, 256, 256, /*margin=*/12.0f);
+    ProgramMapping mapping = compute_program_mapping(master, 1400, 220, /*margin=*/14.0f);
 
-    TensorCanvas2D ch_r(256, 256);
-    TensorCanvas2D ch_g(256, 256);
-    TensorCanvas2D ch_b(256, 256);
-    TensorCanvas2D tmp(256, 256);
+    TensorCanvas2D ch_r(1400, 220);
+    TensorCanvas2D ch_g(1400, 220);
+    TensorCanvas2D ch_b(1400, 220);
+    TensorCanvas2D tmp(1400, 220);
     rasterize_program_gaussian_with_thermal_mapped(outline_cw, ch_r, tmp, machine, tool, mapping);
     rasterize_program_gaussian_with_thermal_mapped(fill_prog, ch_g, tmp, machine, tool, mapping);
     rasterize_program_gaussian_with_thermal_mapped(outline_ccw, ch_b, tmp, machine, tool, mapping);
@@ -665,35 +641,31 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     auto r_u8 = ch_r.to_u8_normalized();
     auto g_u8 = ch_g.to_u8_normalized();
     auto b_u8 = ch_b.to_u8_normalized();
+    const size_t rgb_px = static_cast<size_t>(ch_r.width) * ch_r.height;
     std::vector<uint8_t> rgb;
-    rgb.resize(static_cast<size_t>(256) * 256 * 3);
-    for (size_t i = 0; i < static_cast<size_t>(256) * 256; ++i) {
-      rgb[3 * i + 0] = r_u8[i];
-      rgb[3 * i + 1] = g_u8[i];
-      rgb[3 * i + 2] = b_u8[i];
+    rgb.resize(rgb_px * 3);
+    for (size_t i = 0; i < rgb_px; ++i) {
+      rgb[3 * i + 0] = (i < r_u8.size()) ? r_u8[i] : 0;
+      rgb[3 * i + 1] = (i < g_u8.size()) ? g_u8[i] : 0;
+      rgb[3 * i + 2] = (i < b_u8.size()) ? b_u8[i] : 0;
     }
 
-    const std::string rgb_path = make_output_path_next_to_exe(argv0, "kpath_glyph_fill_rgb.png");
-    (void)write_png_rgb_u8(rgb_path, 256, 256, rgb);
+    const std::string rgb_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill_rgb.png");
+    (void)write_png_rgb_u8(rgb_path, ch_r.width, ch_r.height, rgb);
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << rgb_path << " (R=CW outline, G=fill, B=CCW outline)\n";
 
-    // Kerf/side debug RGB: R=inside fill, G=center fill, B=outside fill.
     ArmatureProgram fill_inside;
     ArmatureProgram fill_outside;
     ArmatureProgram contour_inside;
     ArmatureProgram contour_center;
     ArmatureProgram contour_outside;
     OffsetContourBuffer contour_registry;
-    // Demonstrate a 5-axis/gimbal projection: convert the fill program into a
-    // beam program with a standoff and project back to the surface, proving we
-    // can render via a non-top-down emitter.
     GimbalProgram gimbal_prog;
     {
       gimbal_prog.beams.reserve(fill_prog.points.size());
-      const float standoff = 20.0f; // distance from nozzle to surface
+      const float standoff = 20.0f;
       for (const auto& p : fill_prog.points) {
         BeamPoint b;
-        // Point the beam toward -Z; place origin above the surface point.
         b.dx = 0.0f; b.dy = 0.0f; b.dz = -1.0f;
         b.ox = p.x;
         b.oy = p.y;
@@ -707,11 +679,15 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     {
       FillPlanConfig cfg_in = fill_cfg;
       cfg_in.kerf = KerfMode::Inside;
-      (void)plan_fill_for_glyph_outline(outline, fill_inside, cfg_in);
+      for (const auto& outline : pangram_outlines) {
+        (void)plan_fill_for_glyph_outline(outline, fill_inside, cfg_in);
+      }
 
       FillPlanConfig cfg_out = fill_cfg;
       cfg_out.kerf = KerfMode::Outside;
-      (void)plan_fill_for_glyph_outline(outline, fill_outside, cfg_out);
+      for (const auto& outline : pangram_outlines) {
+        (void)plan_fill_for_glyph_outline(outline, fill_outside, cfg_out);
+      }
     }
 
     contour_registry.tool_width = fill_cfg.tool.tool_width;
@@ -728,10 +704,11 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     contour_opts.capture_calibration_scale = eff_radius_outline;
     contour_opts.capture_finishing_allowance = contour_registry.finishing_allowance;
 
-    // Generate offset contour toolpaths (Minkowski-ish) for inside/center/outside placement.
-    plan_offset_contour_for_outline(outline, -eff_radius_outline, contour_inside, machine.safe_z, machine.cut_z, contour_opts);
-    plan_offset_contour_for_outline(outline, 0.0f, contour_center, machine.safe_z, machine.cut_z, contour_opts);
-    plan_offset_contour_for_outline(outline, +eff_radius_outline, contour_outside, machine.safe_z, machine.cut_z, contour_opts);
+    for (const auto& outline : pangram_outlines) {
+      plan_offset_contour_for_outline(outline, -eff_radius_outline, contour_inside, machine.safe_z, machine.cut_z, contour_opts);
+      plan_offset_contour_for_outline(outline, 0.0f, contour_center, machine.safe_z, machine.cut_z, contour_opts);
+      plan_offset_contour_for_outline(outline, +eff_radius_outline, contour_outside, machine.safe_z, machine.cut_z, contour_opts);
+    }
 
     if (!require_or_report(!contour_registry.loops.empty(), "offset contour registry captured loops")) return false;
 
@@ -743,11 +720,11 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     master_kerf.points.insert(master_kerf.points.end(), fill_prog.points.begin(), fill_prog.points.end());
     master_kerf.points.insert(master_kerf.points.end(), gimbal_surface.points.begin(), gimbal_surface.points.end());
 
-    ProgramMapping mapping_kerf = compute_program_mapping(master_kerf, 256, 256, /*margin=*/12.0f);
+    ProgramMapping mapping_kerf = compute_program_mapping(master_kerf, 1400, 220, /*margin=*/14.0f);
 
-    TensorCanvas2D k_r(256, 256);
-    TensorCanvas2D k_g(256, 256);
-    TensorCanvas2D k_b(256, 256);
+    TensorCanvas2D k_r(1400, 220);
+    TensorCanvas2D k_g(1400, 220);
+    TensorCanvas2D k_b(1400, 220);
     rasterize_program_gaussian_with_thermal_mapped(contour_inside, k_r, tmp, machine, tool, mapping_kerf);
     rasterize_program_gaussian_with_thermal_mapped(fill_prog, k_g, tmp, machine, tool, mapping_kerf);
     rasterize_program_gaussian_with_thermal_mapped(contour_outside, k_b, tmp, machine, tool, mapping_kerf);
@@ -755,18 +732,91 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     auto kr_u8 = k_r.to_u8_normalized();
     auto kg_u8 = k_g.to_u8_normalized();
     auto kb_u8 = k_b.to_u8_normalized();
+    const size_t kerf_px = static_cast<size_t>(k_r.width) * k_r.height;
     std::vector<uint8_t> kerf_rgb;
-    kerf_rgb.resize(static_cast<size_t>(256) * 256 * 3);
-    for (size_t i = 0; i < static_cast<size_t>(256) * 256; ++i) {
-      kerf_rgb[3 * i + 0] = kr_u8[i];
-      kerf_rgb[3 * i + 1] = kg_u8[i];
-      kerf_rgb[3 * i + 2] = kb_u8[i];
+    kerf_rgb.resize(kerf_px * 3);
+    for (size_t i = 0; i < kerf_px; ++i) {
+      kerf_rgb[3 * i + 0] = (i < kr_u8.size()) ? kr_u8[i] : 0;
+      kerf_rgb[3 * i + 1] = (i < kg_u8.size()) ? kg_u8[i] : 0;
+      kerf_rgb[3 * i + 2] = (i < kb_u8.size()) ? kb_u8[i] : 0;
     }
-    const std::string kerf_path = make_output_path_next_to_exe(argv0, "kpath_glyph_fill_kerf_rgb.png");
-    (void)write_png_rgb_u8(kerf_path, 256, 256, kerf_rgb);
+    const std::string kerf_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill_kerf_rgb.png");
+    (void)write_png_rgb_u8(kerf_path, k_r.width, k_r.height, kerf_rgb);
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << kerf_path << " (R=inside-contour, G=fill, B=outside-contour)\n";
   }
 
+  return true;
+}
+
+static bool validate_program_api_facilities() {
+  std::cout << "[KPATH-FACILITIES] Faculty: codepoint->program->tensor pipeline" << std::endl;
+
+  Shaper shaper;
+  std::string font_path;
+  try {
+    font_path = resolve_font_path();
+  } catch (const std::exception& err) {
+    std::cerr << "[KPATH-FACILITIES] FAILED: " << err.what() << std::endl;
+    return false;
+  }
+  if (!require_or_report(shaper.load_font(font_path, 18.0f), "load_font() failed for program API")) return false;
+
+  const std::string text = "NODUS";
+  ProgramBuildParams build_params;
+  build_params.samples_per_segment = 12;
+
+  ArmatureProgram utf8_program;
+  if (!require_or_report(build_armature_program_from_utf8(shaper, text, utf8_program, build_params),
+                         "build_armature_program_from_utf8() failed")) {
+    return false;
+  }
+
+  CodepointSequence seq = codepoints_from_utf8(text);
+  ArmatureProgram seq_program;
+  if (!require_or_report(build_armature_program_from_sequence(shaper, seq, seq_program, build_params),
+                         "build_armature_program_from_sequence() failed")) {
+    return false;
+  }
+
+  if (!require_or_report(!utf8_program.points.empty(), "utf8 program empty")) return false;
+  if (!require_or_report(!seq_program.points.empty(), "sequence program empty")) return false;
+  if (!require_or_report(utf8_program.points.size() == seq_program.points.size(),
+                         "utf8/sequence program point counts diverged")) {
+    return false;
+  }
+
+  ProgramRasterParams raster_params;
+  raster_params.margin = 6.0f;
+  raster_params.initialization_value = 0.2f;
+  raster_params.deposition_value = -1.1f;
+
+  MachineControlConfig machine;
+  machine.step_px = 0.5f;
+  machine.feed_rate_px_per_s = 550.0f;
+  machine.enable_thermal_guard = false;
+  GaussianToolParams tool;
+  tool.sigma_px = 1.75f;
+
+  TensorCanvas2D tensor;
+  if (!require_or_report(rasterize_program_into_minimal_tensor(utf8_program, tensor, machine, tool, raster_params),
+                         "rasterize_program_into_minimal_tensor() failed")) {
+    return false;
+  }
+
+  if (!require_or_report(tensor.width > 0 && tensor.height > 0, "tensor dimensions empty")) return false;
+
+  bool has_deposition = false;
+  for (float v : tensor.values) {
+    if (std::fabs(v - raster_params.initialization_value) > 1e-4f) {
+      has_deposition = true;
+      break;
+    }
+  }
+  if (!require_or_report(has_deposition, "tensor never deviated from initialization")) return false;
+
+  std::cout << "[KPATH-FACILITIES] program tensor dims=" << tensor.width << "x" << tensor.height
+            << " init=" << raster_params.initialization_value
+            << " deposit=" << raster_params.deposition_value << std::endl;
   return true;
 }
 
@@ -776,6 +826,7 @@ int main(int argc, char** argv) {
   if (!validate_armature_graph_facilities()) return 1;
   if (!validate_raster_png_facility(argc > 0 ? argv[0] : "kpath_toolpath_facilities_test")) return 1;
   if (!validate_pangram_atlas_and_png(argc > 0 ? argv[0] : "kpath_toolpath_facilities_test")) return 1;
+  if (!validate_program_api_facilities()) return 1;
   std::cout << "[KPATH-FACILITIES] All faculties validated." << std::endl;
   return 0;
 }
