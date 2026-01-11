@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kpath_planar_toolpath.h"
 #include "kpath_raster.h"
 #include "kpath_shaper.h"
 
@@ -95,6 +96,11 @@ struct OffsetContourOptions final {
   float capture_finishing_allowance = 0.0f;
 
   bool enable_lead_in = true;
+
+  // Geometric tolerance in outline-space units used when flattening curves
+  // for offset and hatch computations. If <= 0, legacy fixed-step flattening
+  // is used for speed and determinism.
+  float tolerance = 0.0f;
 };
 
 struct FillPlanConfig final {
@@ -105,6 +111,10 @@ struct FillPlanConfig final {
 
   // A small padding applied to the scan domain.
   float bounds_pad = 1.0f;
+
+  // Geometric tolerance in outline-space units used when flattening curves
+  // for hatch computations. If <= 0, legacy fixed-step flattening is used.
+  float tolerance = 0.0f;
 
   // Z conventions for emitted toolpaths.
   float safe_z = -1.0f;
@@ -126,5 +136,33 @@ bool plan_offset_contour_for_outline(const GlyphOutline& outline,
                                     float safe_z = -1.0f,
                                     float cut_z = 0.0f,
                                     const OffsetContourOptions& options = {});
+
+// Iteratively refines a fill by planning successive passes with shrinking tool widths.
+// `outlines` are the outlines that describe the workpiece, and `coverage_loops`
+// receives the offset contours generated during the first pass so the caller can
+// decide how much finishing allowance remains. Returns true when any pass emits points.
+bool plan_iterative_fill(const std::vector<GlyphOutline>& outlines,
+                         ArmatureProgram& out_program,
+                         const FillPlanConfig& base_cfg,
+                         const GaussianToolParams& tool,
+                         OffsetContourBuffer* coverage_loops = nullptr,
+                         float finishing_allowance = 0.0f,
+                         size_t max_passes = 4);
+
+// --- Planner-stage planar toolpaths ---
+// These are the preferred APIs going forward: they emit planar spans/loops
+// annotated with ToolMode and winding, leaving armature/tool actuation to the
+// solver stage.
+
+bool plan_planar_fill_for_glyph_outline(const GlyphOutline& outline,
+                                       PlanarToolpath& out_path,
+                                       const FillPlanConfig& cfg);
+
+bool plan_planar_offset_contour_for_outline(const GlyphOutline& outline,
+                                            float offset,
+                                            PlanarToolpath& out_path,
+                                            float safe_z = -1.0f,
+                                            float cut_z = 0.0f,
+                                            const OffsetContourOptions& options = {});
 
 } // namespace nodus::tensors::kpath

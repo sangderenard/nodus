@@ -37,7 +37,18 @@ struct Cluster final {
   float advance_y = 0.0f;
 };
 
-enum class OutlineOp : uint8_t { MoveTo, LineTo, QuadTo, CubicTo, Close };
+// Outline operations describing vector geometry. Arc/Sin are custom analytical
+// primitives that are sampled later by raster/toolpath converters; the rest are
+// standard move/Bezier/close.
+enum class OutlineOp : uint8_t {
+  MoveTo,
+  LineTo,
+  QuadTo,
+  CubicTo,
+  Arc,   // circle arc: center, radius, start angle, sweep angle (radians)
+  Sin,   // sinusoid along chord: end point, amplitude, cycles, phase
+  Close
+};
 
 struct OutlineSegment final {
   OutlineOp op;

@@ -83,6 +83,15 @@ static RotDir compute_outline_winding(const GlyphOutline& outline) {
 
 } // namespace
 
+static CodepointSequence slice_sequence(const CodepointSequence& seq, size_t start, size_t count) {
+  CodepointSequence out;
+  if (seq.codepoints.empty() || count == 0) return out;
+  const size_t end = std::min(seq.codepoints.size(), start + count);
+  if (start >= end) return out;
+  out.codepoints.insert(out.codepoints.end(), seq.codepoints.begin() + start, seq.codepoints.begin() + end);
+  return out;
+}
+
 bool build_token_from_sequence(AtlasBuilder& builder,
                                Shaper& shaper,
                                const CodepointSequence& sequence,
@@ -136,6 +145,106 @@ bool build_token_from_sequence(AtlasBuilder& builder,
 
   out_plan.token = token;
   out_plan.edges = std::move(edges);
+  return true;
+}
+
+bool build_tokens_from_sequence(AtlasBuilder& builder,
+                                Shaper& shaper,
+                                const CodepointSequence& sequence,
+                                std::vector<TokenLayoutPlan>& out_plans,
+                                const TokenizeOptions& tokenize_opts) {
+  out_plans.clear();
+  if (sequence.codepoints.empty()) return false;
+
+  const auto spans = tokenize_codepoints(sequence, tokenize_opts);
+  if (spans.empty()) return false;
+
+  out_plans.reserve(spans.size());
+  for (const auto& span : spans) {
+    if (span.count == 0) continue;
+    if (span.kind != TokenKind::Word) continue; // for now, only build word tokens.
+    CodepointSequence sub = slice_sequence(sequence, span.start, span.count);
+    TokenLayoutPlan plan;
+    if (!build_token_from_sequence(builder, shaper, sub, plan)) {
+      return false;
+    }
+    out_plans.push_back(std::move(plan));
+  }
+
+  return !out_plans.empty();
+}
+
+bool build_external_glyph_token(AtlasBuilder& builder,
+                                const GlyphOutline& outline,
+                                TokenLayoutPlan& out_plan) {
+  if (outline.segments.empty()) return false;
+
+  NodeMetadata meta;
+  meta.outline = outline;
+  meta.winding = compute_outline_winding(outline);
+  const uint32_t meta_idx = builder.add_node_metadata(std::move(meta));
+
+  // Standalone glyph node.
+  NodeId glyph_node = builder.add_node(AtlasNode{AtlasNodeKind::Glyph, outline.glyph_id, meta_idx});
+
+  // Represent a "token unto itself" as a single self-edge.
+  AtlasEdge edge{};
+  edge.src = glyph_node;
+  edge.dst = glyph_node;
+  edge.label = 0;
+  edge.advance_x = 0.0f;
+  edge.advance_y = 0.0f;
+  edge.offset_x = 0.0f;
+  edge.offset_y = 0.0f;
+  edge.cluster_id = 0;
+  EdgeId edge_id = builder.add_edge(edge);
+
+  const EdgeId edges[] = {edge_id};
+  TokenId token = builder.add_token(std::span<const EdgeId>(edges, 1));
+  builder.add_posting(edge_id, Posting{token, 0, 1});
+
+  out_plan.token = token;
+  out_plan.edges = {edge_id};
+  out_plan.advance_x = {0.0f};
+  out_plan.advance_y = {0.0f};
+  return true;
+}
+
+bool build_codepoint_glyph_token(AtlasBuilder& builder,
+                                 uint32_t codepoint,
+                                 const GlyphOutline& outline,
+                                 float advance_x,
+                                 float advance_y,
+                                 TokenLayoutPlan& out_plan) {
+  if (outline.segments.empty()) return false;
+
+  NodeId cp_node = builder.add_node(AtlasNode{AtlasNodeKind::Codepoint, codepoint, AtlasNode::kNoMetadata});
+
+  NodeMetadata meta;
+  meta.outline = outline;
+  meta.winding = compute_outline_winding(outline);
+  const uint32_t meta_idx = builder.add_node_metadata(std::move(meta));
+  NodeId glyph_node = builder.add_node(AtlasNode{AtlasNodeKind::Glyph, outline.glyph_id, meta_idx});
+
+  AtlasEdge edge{};
+  edge.src = cp_node;
+  edge.dst = glyph_node;
+  edge.label = 1;
+  edge.advance_x = advance_x;
+  edge.advance_y = advance_y;
+  edge.offset_x = 0.0f;
+  edge.offset_y = 0.0f;
+  edge.cluster_id = 0;
+  const EdgeId edge_id = builder.add_edge(edge);
+
+  const EdgeId edges[] = {edge_id};
+  const TokenId token = builder.add_token(std::span<const EdgeId>(edges, 1));
+  builder.add_posting(edge_id, Posting{token, 0, 1});
+
+  out_plan.token = token;
+  out_plan.edges = {edge_id};
+  out_plan.advance_x = {advance_x};
+  out_plan.advance_y = {advance_y};
   return true;
 }
 

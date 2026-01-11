@@ -1,9 +1,12 @@
 #include "common/tensors/abstraction/kpath/kpath_armature_graph.h"
 #include "common/tensors/abstraction/kpath/kpath_atlas.h"
 #include "common/tensors/abstraction/kpath/kpath_fill.h"
+#include "common/tensors/abstraction/kpath/kpath_geoglyph.h"
 #include "common/tensors/abstraction/kpath/kpath_kinematics.h"
 #include "common/tensors/abstraction/kpath/kpath_raster.h"
+#include "common/tensors/abstraction/kpath/kpath_relgeo.h"
 #include "common/tensors/abstraction/kpath/kpath_shaper.h"
+#include "common/tensors/abstraction/kpath/kpath_tokenizer.h"
 #include "common/tensors/abstraction/kpath/kpath_pipeline.h"
 #include "common/tensors/abstraction/kpath/kpath_program.h"
 
@@ -332,9 +335,16 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
   ArmatureProgram program;
   std::vector<GlyphOutline> pangram_outlines;
 
+  // Explicit page layout (in outline units), rendered with a fixed mapping so
+  // additional shapes do not change the text scale.
+  const float page_origin_x = 20.0f;
+  const float page_origin_y = 32.0f;
+  const float page_scale = 2.2f; // outline-units -> pixels
+  const float page_margin_px = 14.0f;
+
   // Layout in font space: we treat advance_x as x translation.
-  float pen_x = 0.0f;
-  float pen_y = 0.0f;
+  float pen_x = page_origin_x;
+  float pen_y = page_origin_y;
   const float word_spacing = 8.0f;
 
   // Build each word as its own token: a list of edges for its clusters.
@@ -400,8 +410,69 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     pen_x = local_x + word_spacing;
   }
 
+  // Inject geometric PUA glyphs (no font dependency) into the atlas/program.
+  {
+    const float glyph_line_y = pen_y + 34.0f;
+    float gx = page_origin_x;
+    for (uint32_t cp : default_geoglyph_codepoints()) {
+      GeoGlyph g;
+      if (!require_or_report(make_geoglyph(cp, /*size*/26.0f, g), "make_geoglyph() failed")) return false;
+
+      TokenLayoutPlan plan;
+      if (!require_or_report(build_codepoint_glyph_token(atlas_builder, cp, g.outline, g.advance_x, g.advance_y, plan),
+                             "build_codepoint_glyph_token() failed")) {
+        return false;
+      }
+
+      append_glyph_outline_to_program(program, g.outline, gx, glyph_line_y, 0.0f, /*samples*/16);
+      pangram_outlines.push_back(translate_outline(g.outline, gx, glyph_line_y));
+      gx += g.advance_x;
+    }
+  }
+
+  // Inject a relational-geometry glyph: equilateral triangle built from circle intersections.
+  {
+    const uint32_t cp = 0xE010u; // PUA
+
+    RelGlyph rg;
+    rg.codepoint = cp;
+    rg.glyph_id = 0xF2000000u | (cp & 0x0000FFFFu);
+    rg.advance_y = 0.0f;
+
+    const float s = 26.0f;
+    RelPointId A = rg.program.add_point(RelPointFixed{0.0f, 0.0f});
+    RelPointId B = rg.program.add_point(RelPointFixed{s, 0.0f});
+
+    RelCircle ca;
+    ca.center = A;
+    ca.radius = RelRadiusDistance{A, B};
+    RelCircle cb;
+    cb.center = B;
+    cb.radius = RelRadiusDistance{A, B};
+
+    RelPointId C = rg.program.add_point(RelPointCircleCircleIntersection{ca, cb, RelPick::HigherY});
+    rg.program.add_contour({A, B, C}, /*closed*/true);
+    rg.advance_x = s + 0.15f * s;
+
+    GlyphOutline outline;
+    std::string err;
+    if (!require_or_report(compile_relglyph_outline(rg, outline, 0.0f, 0.0f, 1.0f, &err), err.c_str())) return false;
+
+    TokenLayoutPlan plan;
+    if (!require_or_report(build_codepoint_glyph_token(atlas_builder, cp, outline, rg.advance_x, rg.advance_y, plan),
+                           "build_codepoint_glyph_token() failed for relglyph")) {
+      return false;
+    }
+
+    const float glyph_line_y = pen_y + 78.0f;
+    const float gx = page_origin_x;
+    append_glyph_outline_to_program(program, outline, gx, glyph_line_y, 0.0f, /*samples*/16);
+    pangram_outlines.push_back(translate_outline(outline, gx, glyph_line_y));
+  }
+
   Atlas atlas = atlas_builder.finalize();
-  if (!require_or_report(atlas.node(NodeId{0}).payload == 0, "atlas sanity check")) return false;
+  if (!require_or_report(atlas.node(NodeId{0}).kind == AtlasNodeKind::Codepoint, "atlas sanity check (node0 kind)")) return false;
+  if (!require_or_report(atlas.node(NodeId{0}).payload == static_cast<uint32_t>('t'), "atlas sanity check (node0 payload)")) return false;
 
   // Render the composed atlas program.
   TensorCanvas2D energy(1400, 220);
@@ -419,7 +490,12 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
   GaussianToolParams tool;
   tool.sigma_px = 1.6f;
 
-  rasterize_program_gaussian_with_thermal(program, energy, temp, machine, tool, /*margin=*/14.0f);
+  ProgramMapping mapping;
+  mapping.min_x = 0.0f;
+  mapping.min_y = 0.0f;
+  mapping.scale = page_scale;
+  mapping.margin = page_margin_px;
+  rasterize_program_gaussian_with_thermal_mapped(program, energy, temp, machine, tool, mapping);
   if (!require_or_report(energy.max_value() > 0.001f, "pangram atlas raster energy should be non-zero")) return false;
 
   const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_atlas_pangram.png");
@@ -479,7 +555,7 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
 
     TensorCanvas2D fill_energy(1400, 220);
     TensorCanvas2D fill_temp(1400, 220);
-    rasterize_program_gaussian_with_thermal(fill_prog, fill_energy, fill_temp, machine, tool, /*margin=*/14.0f);
+    rasterize_program_gaussian_with_thermal_mapped(fill_prog, fill_energy, fill_temp, machine, tool, mapping);
     if (!require_or_report(fill_energy.max_value() > 0.001f, "fill raster energy should be non-zero")) return false;
 
     const std::string fill_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill.png");
@@ -591,6 +667,46 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
             }
             break;
           }
+          case OutlineOp::Arc: {
+            const float cx = seg.x1;
+            const float cy = seg.y1;
+            const float r = std::max(seg.x2, 1e-6f);
+            const float start = seg.y2;
+            const float sweep = seg.x3;
+            uint32_t arc_steps = std::max<uint32_t>(4, static_cast<uint32_t>(std::ceil(std::fabs(sweep) / (3.14159265f / 8.0f))));
+            arc_steps = std::max<uint32_t>(arc_steps, steps);
+            for (uint32_t i = 1; i <= arc_steps; ++i) {
+              float t = static_cast<float>(i) / static_cast<float>(arc_steps);
+              float ang = start + sweep * t;
+              Pt2 p{cx + r * std::cos(ang), cy + r * std::sin(ang)};
+              push(p);
+            }
+            break;
+          }
+          case OutlineOp::Sin: {
+            Pt2 start_pt{cur.x, cur.y};
+            Pt2 end_pt{seg.x1, seg.y1};
+            float dx = end_pt.x - start_pt.x;
+            float dy = end_pt.y - start_pt.y;
+            float len = std::max(std::sqrt(dx * dx + dy * dy), 1e-6f);
+            float amp = seg.x2;
+            float cycles = seg.y2;
+            float phase = seg.x3;
+            uint32_t sin_steps = std::max<uint32_t>(steps, static_cast<uint32_t>(std::ceil(len / 0.75f) + std::fabs(cycles) * 4.0f));
+            float tx_dir = dx / len;
+            float ty_dir = dy / len;
+            float nx_dir = -ty_dir;
+            float ny_dir = tx_dir;
+            for (uint32_t i = 1; i <= sin_steps; ++i) {
+              float t = static_cast<float>(i) / static_cast<float>(sin_steps);
+              float base_x = start_pt.x + dx * t;
+              float base_y = start_pt.y + dy * t;
+              float s = std::sin((2.0f * 3.14159265f * cycles * t) + phase);
+              Pt2 p{base_x + nx_dir * amp * s, base_y + ny_dir * amp * s};
+              push(p);
+            }
+            break;
+          }
           case OutlineOp::Close: {
             if (have_loop) {
               if (cur_loop.size() >= 2) {
@@ -660,9 +776,9 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     ArmatureProgram contour_center;
     ArmatureProgram contour_outside;
     OffsetContourBuffer contour_registry;
-    GimbalProgram gimbal_prog;
+    BeamProgram beam_prog;
     {
-      gimbal_prog.beams.reserve(fill_prog.points.size());
+      beam_prog.beams.reserve(fill_prog.points.size());
       const float standoff = 20.0f;
       for (const auto& p : fill_prog.points) {
         BeamPoint b;
@@ -671,11 +787,11 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
         b.oy = p.y;
         b.oz = standoff;
         b.engaged = p.engaged;
-        gimbal_prog.beams.push_back(b);
+        beam_prog.beams.push_back(b);
       }
     }
     ArmatureProgram gimbal_surface;
-    (void)project_beam_program_to_plane(gimbal_prog, /*plane_z=*/0.0f, gimbal_surface);
+    (void)project_beam_program_to_plane(beam_prog, /*plane_z=*/0.0f, gimbal_surface);
     {
       FillPlanConfig cfg_in = fill_cfg;
       cfg_in.kerf = KerfMode::Inside;
@@ -820,6 +936,84 @@ static bool validate_program_api_facilities() {
   return true;
 }
 
+static bool validate_word_tokenization_and_external_glyph_token() {
+  std::cout << "[KPATH-FACILITIES] Faculty: word-aware tokenization + external glyph token injection" << std::endl;
+
+  Shaper shaper;
+  std::string font_path;
+  try {
+    font_path = resolve_font_path();
+  } catch (const std::exception& err) {
+    std::cerr << "[KPATH-FACILITIES] FAILED: " << err.what() << std::endl;
+    return false;
+  }
+  if (!require_or_report(shaper.load_font(font_path, 18.0f), "load_font() failed for tokenizer")) return false;
+
+  // Tokenization heuristics: keep internal apostrophes/hyphens.
+  const std::string sample = "don't co-operate rock-n-roll l'homme";
+  CodepointSequence seq = codepoints_from_utf8(sample);
+  TokenizeOptions opts;
+  opts.emit_nonword_tokens = false;
+  opts.keep_internal_apostrophes = true;
+  opts.keep_internal_hyphens = true;
+
+  const auto spans = tokenize_codepoints(seq, opts);
+  if (!require_or_report(spans.size() == 4, "expected 4 word tokens from sample string")) return false;
+
+  auto span_contains = [&](const TokenSpan& span, uint32_t cp) -> bool {
+    const size_t end = std::min(seq.codepoints.size(), span.start + span.count);
+    for (size_t i = span.start; i < end; ++i) {
+      if (seq.codepoints[i] == cp) return true;
+    }
+    return false;
+  };
+  if (!require_or_report(span_contains(spans[0], static_cast<uint32_t>('\'')), "expected apostrophe to remain inside token")) return false;
+  if (!require_or_report(span_contains(spans[1], static_cast<uint32_t>('-')), "expected hyphen to remain inside token")) return false;
+
+  AtlasBuilder atlas_builder;
+  std::vector<TokenLayoutPlan> plans;
+  if (!require_or_report(build_tokens_from_sequence(atlas_builder, shaper, seq, plans, opts),
+                         "build_tokens_from_sequence() failed")) {
+    return false;
+  }
+  if (!require_or_report(plans.size() == 4, "expected 4 atlas token plans")) return false;
+
+  // External glyph token: extract an outline once, then inject it as a standalone token.
+  {
+    CodepointSequence a_seq = codepoints_from_utf8("A");
+    std::vector<Cluster> clusters;
+    if (!require_or_report(shaper.shape(a_seq, clusters) && !clusters.empty() && !clusters.front().glyph_ids.empty(),
+                           "shape() failed for external glyph injection")) {
+      return false;
+    }
+    const uint32_t glyph_id = clusters.front().glyph_ids.front();
+    GlyphOutline outline;
+    if (!require_or_report(shaper.extract_outline(glyph_id, outline), "extract_outline() failed for injection")) return false;
+
+    TokenLayoutPlan injected;
+    if (!require_or_report(build_external_glyph_token(atlas_builder, outline, injected),
+                           "build_external_glyph_token() failed")) {
+      return false;
+    }
+    if (!require_or_report(injected.edges.size() == 1, "external glyph token should have exactly 1 edge")) return false;
+  }
+
+  Atlas atlas = atlas_builder.finalize();
+  MetricSchema schema = MetricSchema::MakeCoreV01();
+
+  // Compile one of the word tokens and make sure it yields tape.
+  {
+    StepTape tape;
+    if (!require_or_report(compile_token_to_tape(atlas, plans.front(), schema, tape), "compile_token_to_tape() failed for word token")) {
+      return false;
+    }
+    if (!require_or_report(tape.layout().step_count == plans.front().edges.size(), "word token tape length mismatch")) return false;
+  }
+
+  std::cout << "[KPATH-FACILITIES] OK: tokenization and external glyph injection validated" << std::endl;
+  return true;
+}
+
 int main(int argc, char** argv) {
   if (!validate_shaper_smoke()) return 1;
   if (!validate_atlas_from_shaping()) return 1;
@@ -827,6 +1021,7 @@ int main(int argc, char** argv) {
   if (!validate_raster_png_facility(argc > 0 ? argv[0] : "kpath_toolpath_facilities_test")) return 1;
   if (!validate_pangram_atlas_and_png(argc > 0 ? argv[0] : "kpath_toolpath_facilities_test")) return 1;
   if (!validate_program_api_facilities()) return 1;
+  if (!validate_word_tokenization_and_external_glyph_token()) return 1;
   std::cout << "[KPATH-FACILITIES] All faculties validated." << std::endl;
   return 0;
 }

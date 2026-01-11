@@ -348,7 +348,7 @@ ProgramMapping compute_program_mapping(const ArmatureProgram& reference_program,
   return m;
 }
 
-bool project_beam_program_to_plane(const GimbalProgram& beam_prog,
+bool project_beam_program_to_plane(const BeamProgram& beam_prog,
                                    float plane_z,
                                    ArmatureProgram& out_program) {
   out_program.points.clear();
@@ -505,6 +505,78 @@ void append_glyph_outline_to_program(ArmatureProgram& program,
         }
         break;
       }
+      case OutlineOp::Arc: {
+        if (need_plunge) {
+          ToolPoint plunge{cur.x, cur.y, cut_z, true};
+          push_point(plunge);
+          need_plunge = false;
+        }
+        // Parameters: x1/y1=center, x2=radius, y2=start angle (rad), x3=sweep (rad)
+        const float cx = seg.x1 + tx;
+        const float cy = seg.y1 + ty;
+        const float r = std::max(seg.x2, kEps);
+        const float start = seg.y2;
+        const float sweep = seg.x3;
+        // Adaptive samples: keep chord error small; base on 45-degree chunks.
+        float abs_sweep = std::fabs(sweep);
+        uint32_t steps = std::max<uint32_t>(4, static_cast<uint32_t>(std::ceil(abs_sweep / (kPi / 8.0f))));
+        for (uint32_t i = 1; i <= steps; ++i) {
+          float t = static_cast<float>(i) / static_cast<float>(steps);
+          float ang = start + sweep * t;
+          ToolPoint p;
+          p.x = cx + r * std::cos(ang);
+          p.y = cy + r * std::sin(ang);
+          p.z = tz;
+          p.engaged = true;
+          push_point(p);
+        }
+        break;
+      }
+      case OutlineOp::Sin: {
+        if (need_plunge) {
+          ToolPoint plunge{cur.x, cur.y, cut_z, true};
+          push_point(plunge);
+          need_plunge = false;
+        }
+        // Parameters: x1/y1=end point; x2=amplitude; y2=cycles; x3=phase (rad).
+        ToolPoint start_pt = cur;
+        ToolPoint end_pt{seg.x1 + tx, seg.y1 + ty, tz, true};
+        const float amp = seg.x2;
+        const float cycles = seg.y2;
+        const float phase = seg.x3;
+
+        float dx = end_pt.x - start_pt.x;
+        float dy = end_pt.y - start_pt.y;
+        float len = std::max(std::sqrt(dx * dx + dy * dy), kEps);
+
+        // Base samples on segment length and cycles to keep good fidelity.
+        uint32_t steps = std::max<uint32_t>(
+          6u,
+          static_cast<uint32_t>(std::ceil(len / 0.75f) + std::fabs(cycles) * 4.0f));
+        steps = std::max<uint32_t>(steps, samples_per_segment);
+
+        // Unit tangent and normal.
+        float tx_dir = dx / len;
+        float ty_dir = dy / len;
+        float nx_dir = -ty_dir;
+        float ny_dir = tx_dir;
+
+        for (uint32_t i = 1; i <= steps; ++i) {
+          float t = static_cast<float>(i) / static_cast<float>(steps);
+          float base_x = start_pt.x + dx * t;
+          float base_y = start_pt.y + dy * t;
+          float s = std::sin((2.0f * kPi * cycles * t) + phase);
+          float off_x = nx_dir * amp * s;
+          float off_y = ny_dir * amp * s;
+          ToolPoint p;
+          p.x = base_x + off_x;
+          p.y = base_y + off_y;
+          p.z = tz;
+          p.engaged = true;
+          push_point(p);
+        }
+        break;
+      }
       case OutlineOp::Close: {
         if (need_plunge) {
           ToolPoint plunge{cur.x, cur.y, cut_z, true};
@@ -582,16 +654,24 @@ void rasterize_program_gaussian_with_thermal(const ArmatureProgram& program,
   float dt = step / feed;
 
   if (!machine.enable_thermal_guard) {
+    bool have_last = false;
+    ToolPoint last{};
     for (const auto& p : exec_pts) {
       if (!p.engaged) continue;
+      if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
       gaussian_stamp_energy(out_energy, kernel, p.x, p.y, energy_step);
+      last = p;
+      have_last = true;
     }
     out_temp.clear(0.0f);
     return;
   }
 
+  bool have_last = false;
+  ToolPoint last{};
   for (const auto& p : exec_pts) {
     if (!p.engaged) continue;
+    if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
     gaussian_stamp_energy_and_temp(out_energy,
                                    out_temp,
                                    kernel,
@@ -602,6 +682,8 @@ void rasterize_program_gaussian_with_thermal(const ArmatureProgram& program,
                                    std::max(machine.cooling_tau_s, 0.0f),
                                    machine.energy_to_temp,
                                    std::max(machine.max_temp, 0.0f));
+    last = p;
+    have_last = true;
   }
 }
 
@@ -648,16 +730,24 @@ void rasterize_program_gaussian_with_thermal_mapped(const ArmatureProgram& progr
   float dt = step / feed;
 
   if (!machine.enable_thermal_guard) {
+    bool have_last = false;
+    ToolPoint last{};
     for (const auto& p : exec_pts) {
       if (!p.engaged) continue;
+      if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
       gaussian_stamp_energy(out_energy, kernel, p.x, p.y, energy_step);
+      last = p;
+      have_last = true;
     }
     out_temp.clear(0.0f);
     return;
   }
 
+  bool have_last = false;
+  ToolPoint last{};
   for (const auto& p : exec_pts) {
     if (!p.engaged) continue;
+    if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
     gaussian_stamp_energy_and_temp(out_energy,
                                    out_temp,
                                    kernel,
@@ -668,6 +758,8 @@ void rasterize_program_gaussian_with_thermal_mapped(const ArmatureProgram& progr
                                    std::max(machine.cooling_tau_s, 0.0f),
                                    machine.energy_to_temp,
                                    std::max(machine.max_temp, 0.0f));
+    last = p;
+    have_last = true;
   }
 }
 

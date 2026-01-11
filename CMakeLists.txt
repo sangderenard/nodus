@@ -298,6 +298,18 @@ target_include_directories(modloader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(modloader PRIVATE canvas_tables)
 target_compile_features(modloader PUBLIC cxx_std_17)
 
+# Developer helper: interrogate shaping and outline metadata without running the full canvas.
+add_executable(kpath_shaper_tool tools/kpath_shaper_tool.cpp)
+target_include_directories(kpath_shaper_tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(kpath_shaper_tool PRIVATE canvas_tables_static)
+target_compile_features(kpath_shaper_tool PUBLIC cxx_std_20)
+
+# Demo: compile relational geometry into kpath outlines and rasterize a composed scene to PNG.
+add_executable(kpath_relgeo_scene_demo tools/kpath_relgeo_scene_demo.cpp)
+target_include_directories(kpath_relgeo_scene_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(kpath_relgeo_scene_demo PRIVATE canvas_tables_static)
+target_compile_features(kpath_relgeo_scene_demo PUBLIC cxx_std_20)
+
 find_package(OpenGL REQUIRED)
 
 if(NODUS_ENABLE_TORCH)
@@ -490,6 +502,20 @@ add_executable(test_graph_sparse
 target_link_libraries(test_graph_sparse PRIVATE canvas_tables_static)
 add_test(NAME graph_sparse_test COMMAND test_graph_sparse)
 
+add_executable(test_graph_ir
+  tests/graph_ir_test.cpp
+)
+target_link_libraries(test_graph_ir PRIVATE canvas_tables_static)
+target_compile_features(test_graph_ir PRIVATE cxx_std_20)
+add_test(NAME graph_ir_test COMMAND test_graph_ir)
+
+add_executable(test_graph_sparse_builder
+  tests/graph_sparse_builder_test.cpp
+)
+target_link_libraries(test_graph_sparse_builder PRIVATE canvas_tables_static)
+target_compile_features(test_graph_sparse_builder PRIVATE cxx_std_20)
+add_test(NAME graph_sparse_builder_test COMMAND test_graph_sparse_builder)
+
 add_executable(test_kpath_pipeline
   tests/kpath_pipeline_test.cpp
 )
@@ -503,6 +529,27 @@ add_executable(test_kpath_toolpath_facilities
 target_link_libraries(test_kpath_toolpath_facilities PRIVATE canvas_tables_static)
 target_compile_features(test_kpath_toolpath_facilities PRIVATE cxx_std_20)
 add_test(NAME kpath_toolpath_facilities_test COMMAND test_kpath_toolpath_facilities)
+
+add_executable(test_kpath_api_fill_token
+  tests/kpath_api_fill_token_test.cpp
+)
+target_link_libraries(test_kpath_api_fill_token PRIVATE canvas_tables_static)
+target_compile_features(test_kpath_api_fill_token PRIVATE cxx_std_20)
+add_test(NAME kpath_api_fill_token_test COMMAND test_kpath_api_fill_token)
+
+add_executable(test_kpath_functional_intersection
+  tests/kpath_functional_intersection_test.cpp
+)
+target_link_libraries(test_kpath_functional_intersection PRIVATE canvas_tables_static)
+target_compile_features(test_kpath_functional_intersection PRIVATE cxx_std_20)
+add_test(NAME kpath_functional_intersection_test COMMAND test_kpath_functional_intersection)
+
+add_executable(test_kpath_media_raycast
+  tests/kpath_media_raycast_test.cpp
+)
+target_link_libraries(test_kpath_media_raycast PRIVATE canvas_tables_static)
+target_compile_features(test_kpath_media_raycast PRIVATE cxx_std_20)
+add_test(NAME kpath_media_raycast_test COMMAND test_kpath_media_raycast)
 
 add_executable(test_thread_pool
   tests/thread_pool_test.cpp
@@ -562,6 +609,8 @@ set(NODUS_TEST_TARGETS
   test_tensor_ops_lowering
   test_tool_dll
   test_kpath_toolpath_facilities
+  test_kpath_functional_intersection
+  test_kpath_media_raycast
 )
 
 foreach(_NODUS_TEST_TARGET IN LISTS NODUS_TEST_TARGETS)

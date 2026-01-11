@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -65,6 +66,30 @@ namespace {
   return cp;
 }
 
+[[nodiscard]] uint32_t decode_utf16_codepoint(std::u16string_view text, size_t& idx) {
+  constexpr uint32_t kReplacement = 0xFFFD;
+  if (idx >= text.size()) return kReplacement;
+
+  const uint16_t lead = static_cast<uint16_t>(text[idx]);
+  ++idx;
+
+  // Not a surrogate.
+  if (lead < 0xD800u || lead > 0xDFFFu) return static_cast<uint32_t>(lead);
+
+  // Lone low surrogate.
+  if (lead >= 0xDC00u) return kReplacement;
+
+  // High surrogate; must have a following low surrogate.
+  if (idx >= text.size()) return kReplacement;
+  const uint16_t trail = static_cast<uint16_t>(text[idx]);
+  if (trail < 0xDC00u || trail > 0xDFFFu) return kReplacement;
+  ++idx;
+
+  const uint32_t hi = static_cast<uint32_t>(lead - 0xD800u);
+  const uint32_t lo = static_cast<uint32_t>(trail - 0xDC00u);
+  return 0x10000u + ((hi << 10) | lo);
+}
+
 [[nodiscard]] bool compute_program_bounds(const ArmatureProgram& program,
                                          float& min_x,
                                          float& min_y,
@@ -92,6 +117,16 @@ CodepointSequence codepoints_from_utf8(const std::string& utf8_text) {
   size_t idx = 0;
   while (idx < utf8_text.size()) {
     result.codepoints.push_back(decode_utf8_codepoint(utf8_text, idx));
+  }
+  return result;
+}
+
+CodepointSequence codepoints_from_utf16(std::u16string_view utf16_text) {
+  CodepointSequence result;
+  result.codepoints.reserve(utf16_text.size());
+  size_t idx = 0;
+  while (idx < utf16_text.size()) {
+    result.codepoints.push_back(decode_utf16_codepoint(utf16_text, idx));
   }
   return result;
 }

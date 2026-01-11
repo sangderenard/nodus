@@ -20,7 +20,7 @@ struct ArmatureProgram final {
   std::vector<ToolPoint> points;
 };
 
-// Beam-based (gimbaled) program: origin+direction for each shot/step.
+// Beam-based program: origin+direction for each shot/step.
 struct BeamPoint final {
   float ox = 0.0f;
   float oy = 0.0f;
@@ -31,7 +31,7 @@ struct BeamPoint final {
   bool engaged = true;
 };
 
-struct GimbalProgram final {
+struct BeamProgram final {
   std::vector<BeamPoint> beams;
 };
 
@@ -138,7 +138,7 @@ ProgramMapping compute_program_mapping(const ArmatureProgram& reference_program,
 // Convert a beam program (origins + directions) into surface hits on a plane
 // at z = plane_z. Ignores beams whose direction does not intersect the plane.
 // Keeps engagement flag.
-bool project_beam_program_to_plane(const GimbalProgram& beam_prog,
+bool project_beam_program_to_plane(const BeamProgram& beam_prog,
                                    float plane_z,
                                    ArmatureProgram& out_program);
 

@@ -1,5 +1,7 @@
 #include "common/tensors/abstraction/kpath/kpath_fill.h"
 
+#include "common/tensors/abstraction/kpath/kpath_planar_toolpath.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -33,10 +35,188 @@ static void bounds_update(float x, float y, float& min_x, float& min_y, float& m
   max_y = std::max(max_y, y);
 }
 
+static uint32_t f32_bits(float v) {
+  uint32_t u = 0;
+  static_assert(sizeof(uint32_t) == sizeof(float));
+  std::memcpy(&u, &v, sizeof(uint32_t));
+  return u;
+}
+
+static uint64_t fnv1a_u64(const void* data, size_t len) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  uint64_t h = 14695981039346656037ull;
+  for (size_t i = 0; i < len; ++i) {
+    h ^= static_cast<uint64_t>(p[i]);
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+static uint64_t hash_combine_u64(uint64_t a, uint64_t b) {
+  // A simple reversible-ish mix.
+  a ^= b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2);
+  return a;
+}
+
+static uint64_t hash_outline(const GlyphOutline& outline) {
+  uint64_t h = 14695981039346656037ull;
+  h = hash_combine_u64(h, static_cast<uint64_t>(outline.glyph_id));
+  for (const auto& seg : outline.segments) {
+    const uint8_t op = static_cast<uint8_t>(seg.op);
+    h = hash_combine_u64(h, fnv1a_u64(&op, sizeof(op)));
+    const uint32_t bits[6] = {f32_bits(seg.x1), f32_bits(seg.y1), f32_bits(seg.x2), f32_bits(seg.y2), f32_bits(seg.x3), f32_bits(seg.y3)};
+    h = hash_combine_u64(h, fnv1a_u64(bits, sizeof(bits)));
+  }
+  h = hash_combine_u64(h, static_cast<uint64_t>(outline.segments.size()));
+  return h;
+}
+
+static uint64_t hash_fill_cfg(const FillPlanConfig& cfg) {
+  uint64_t h = 14695981039346656037ull;
+  const uint32_t u[10] = {
+    static_cast<uint32_t>(cfg.rule),
+    static_cast<uint32_t>(cfg.pattern),
+    static_cast<uint32_t>(cfg.kerf),
+    f32_bits(cfg.tool.tool_width),
+    f32_bits(cfg.tool.stepover),
+    f32_bits(cfg.tool.overlap),
+    f32_bits(cfg.tool.angle_degrees),
+    static_cast<uint32_t>(cfg.tool.crosshatch ? 1u : 0u),
+    f32_bits(cfg.tool.cross_angle_degrees),
+    f32_bits(cfg.tool.offset_miter_limit),
+  };
+  h = hash_combine_u64(h, fnv1a_u64(u, sizeof(u)));
+  const uint32_t u2[5] = {f32_bits(cfg.bounds_pad), f32_bits(cfg.tolerance), f32_bits(cfg.safe_z), f32_bits(cfg.cut_z), 0u};
+  h = hash_combine_u64(h, fnv1a_u64(u2, sizeof(u2)));
+  return h;
+}
+
+static uint64_t hash_offset_opts(const OffsetContourOptions& opt) {
+  uint64_t h = 14695981039346656037ull;
+  const uint32_t u[8] = {
+    f32_bits(opt.miter_limit),
+    f32_bits(opt.lead_in_length),
+    f32_bits(opt.lead_out_length),
+    f32_bits(opt.lead_sweep_degrees),
+    static_cast<uint32_t>(opt.enable_lead_in ? 1u : 0u),
+    f32_bits(opt.capture_tool_width),
+    f32_bits(opt.capture_calibration_scale),
+    f32_bits(opt.capture_finishing_allowance),
+  };
+  h = hash_combine_u64(h, fnv1a_u64(u, sizeof(u)));
+  const uint32_t u2[1] = {f32_bits(opt.tolerance)};
+  h = hash_combine_u64(h, fnv1a_u64(u2, sizeof(u2)));
+  // Intentionally do NOT hash capture pointer.
+  return h;
+}
+
+struct PlanCacheEntry final {
+  uint64_t key{};
+  PlanarToolpath path;
+};
+
+static PlanarToolpath* cache_find(std::vector<PlanCacheEntry>& cache, uint64_t key) {
+  for (auto& e : cache) {
+    if (e.key == key) return &e.path;
+  }
+  return nullptr;
+}
+
+static void cache_store(std::vector<PlanCacheEntry>& cache, uint64_t key, PlanarToolpath value, size_t cap = 256) {
+  if (PlanarToolpath* existing = cache_find(cache, key)) {
+    *existing = std::move(value);
+    return;
+  }
+  if (cache.size() >= cap) {
+    // Deterministic eviction: FIFO.
+    cache.erase(cache.begin());
+  }
+  cache.push_back(PlanCacheEntry{key, std::move(value)});
+}
+
+static float dist_point_to_line(Pt p, Pt a, Pt b) {
+  float vx = b.x - a.x;
+  float vy = b.y - a.y;
+  float wx = p.x - a.x;
+  float wy = p.y - a.y;
+  float denom = vx * vx + vy * vy;
+  if (denom < kEps) {
+    float dx = p.x - a.x;
+    float dy = p.y - a.y;
+    return std::sqrt(dx * dx + dy * dy);
+  }
+  float t = (wx * vx + wy * vy) / denom;
+  t = std::clamp(t, 0.0f, 1.0f);
+  float projx = a.x + t * vx;
+  float projy = a.y + t * vy;
+  float dx = p.x - projx;
+  float dy = p.y - projy;
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+static void flatten_quad_adaptive(Pt p0, Pt p1, Pt p2, float tol, std::vector<Pt>& out) {
+  // Iterative subdivision stack.
+  struct Q { Pt a, b, c; };
+  std::vector<Q> stack;
+  stack.push_back(Q{p0, p1, p2});
+
+  auto flat_enough = [&](const Q& q) {
+    return dist_point_to_line(q.b, q.a, q.c) <= tol;
+  };
+
+  while (!stack.empty()) {
+    Q q = stack.back();
+    stack.pop_back();
+    if (flat_enough(q)) {
+      out.push_back(q.c);
+      continue;
+    }
+    // Subdivide at t=0.5 via De Casteljau.
+    Pt ab{0.5f * (q.a.x + q.b.x), 0.5f * (q.a.y + q.b.y)};
+    Pt bc{0.5f * (q.b.x + q.c.x), 0.5f * (q.b.y + q.c.y)};
+    Pt mid{0.5f * (ab.x + bc.x), 0.5f * (ab.y + bc.y)};
+    // Push right then left so left is processed first (deterministic order).
+    stack.push_back(Q{mid, bc, q.c});
+    stack.push_back(Q{q.a, ab, mid});
+  }
+}
+
+static void flatten_cubic_adaptive(Pt p0, Pt p1, Pt p2, Pt p3, float tol, std::vector<Pt>& out) {
+  struct C { Pt a, b, c, d; };
+  std::vector<C> stack;
+  stack.push_back(C{p0, p1, p2, p3});
+
+  auto flat_enough = [&](const C& c) {
+    float d1 = dist_point_to_line(c.b, c.a, c.d);
+    float d2 = dist_point_to_line(c.c, c.a, c.d);
+    return std::max(d1, d2) <= tol;
+  };
+
+  while (!stack.empty()) {
+    C c = stack.back();
+    stack.pop_back();
+    if (flat_enough(c)) {
+      out.push_back(c.d);
+      continue;
+    }
+    // De Casteljau at t=0.5
+    Pt ab{0.5f * (c.a.x + c.b.x), 0.5f * (c.a.y + c.b.y)};
+    Pt bc{0.5f * (c.b.x + c.c.x), 0.5f * (c.b.y + c.c.y)};
+    Pt cd{0.5f * (c.c.x + c.d.x), 0.5f * (c.c.y + c.d.y)};
+    Pt abbc{0.5f * (ab.x + bc.x), 0.5f * (ab.y + bc.y)};
+    Pt bccd{0.5f * (bc.x + cd.x), 0.5f * (bc.y + cd.y)};
+    Pt mid{0.5f * (abbc.x + bccd.x), 0.5f * (abbc.y + bccd.y)};
+    // Push right then left for deterministic order.
+    stack.push_back(C{mid, bccd, cd, c.d});
+    stack.push_back(C{c.a, ab, abbc, mid});
+  }
+}
+
 // Very simple curve flattening (fixed steps). Good enough for now; we can swap
 // to adaptive subdivision later.
 static void flatten_outline(const GlyphOutline& outline,
                             std::vector<std::vector<Pt>>& out_loops,
+                            float tolerance,
                             uint32_t steps_per_curve = 16) {
   out_loops.clear();
   std::vector<Pt> cur_loop;
@@ -71,13 +251,18 @@ static void flatten_outline(const GlyphOutline& outline,
         Pt p0{seg.x1, seg.y1};
         Pt p1{seg.x2, seg.y2};
         Pt p2{seg.x3, seg.y3};
-        for (uint32_t i = 1; i <= steps_per_curve; ++i) {
-          float t = static_cast<float>(i) / static_cast<float>(steps_per_curve);
-          float a = 1.0f - t;
-          Pt p;
-          p.x = a * a * p0.x + 2.0f * a * t * p1.x + t * t * p2.x;
-          p.y = a * a * p0.y + 2.0f * a * t * p1.y + t * t * p2.y;
-          push(p);
+        if (tolerance > 0.0f) {
+          flatten_quad_adaptive(p0, p1, p2, tolerance, cur_loop);
+          cur = cur_loop.back();
+        } else {
+          for (uint32_t i = 1; i <= steps_per_curve; ++i) {
+            float t = static_cast<float>(i) / static_cast<float>(steps_per_curve);
+            float a = 1.0f - t;
+            Pt p;
+            p.x = a * a * p0.x + 2.0f * a * t * p1.x + t * t * p2.x;
+            p.y = a * a * p0.y + 2.0f * a * t * p1.y + t * t * p2.y;
+            push(p);
+          }
         }
         break;
       }
@@ -86,16 +271,83 @@ static void flatten_outline(const GlyphOutline& outline,
         Pt p1{seg.x1, seg.y1};
         Pt p2{seg.x2, seg.y2};
         Pt p3{seg.x3, seg.y3};
-        for (uint32_t i = 1; i <= steps_per_curve; ++i) {
-          float t = static_cast<float>(i) / static_cast<float>(steps_per_curve);
-          float a = 1.0f - t;
-          Pt p;
-          p.x = a * a * a * p0.x + 3.0f * a * a * t * p1.x + 3.0f * a * t * t * p2.x + t * t * t * p3.x;
-          p.y = a * a * a * p0.y + 3.0f * a * a * t * p1.y + 3.0f * a * t * t * p2.y + t * t * t * p3.y;
+        if (tolerance > 0.0f) {
+          flatten_cubic_adaptive(p0, p1, p2, p3, tolerance, cur_loop);
+          cur = cur_loop.back();
+        } else {
+          for (uint32_t i = 1; i <= steps_per_curve; ++i) {
+            float t = static_cast<float>(i) / static_cast<float>(steps_per_curve);
+            float a = 1.0f - t;
+            Pt p;
+            p.x = a * a * a * p0.x + 3.0f * a * a * t * p1.x + 3.0f * a * t * t * p2.x + t * t * t * p3.x;
+            p.y = a * a * a * p0.y + 3.0f * a * a * t * p1.y + 3.0f * a * t * t * p2.y + t * t * t * p3.y;
+            push(p);
+          }
+        }
+        break;
+      }
+      case OutlineOp::Arc: {
+        // Params: x1/y1=center, x2=radius, y2=start angle (rad), x3=sweep (rad)
+        const float cx = seg.x1;
+        const float cy = seg.y1;
+        const float r = std::max(seg.x2, kEps);
+        const float start = seg.y2;
+        const float sweep = seg.x3;
+        uint32_t steps = std::max<uint32_t>(4, static_cast<uint32_t>(std::ceil(std::fabs(sweep) / (kPi / 8.0f))));
+        if (tolerance > 0.0f) {
+          // Sagitta <= tol: r*(1-cos(dtheta/2)) <= tol
+          const float tol = std::max(tolerance, 1e-4f);
+          const float ratio = std::clamp(1.0f - tol / r, -1.0f, 1.0f);
+          float dtheta = 2.0f * std::acos(ratio);
+          if (!(dtheta > 0.0f)) dtheta = kPi / 8.0f;
+          steps = std::max<uint32_t>(steps, static_cast<uint32_t>(std::ceil(std::fabs(sweep) / dtheta)));
+        } else {
+          steps = std::max<uint32_t>(steps, steps_per_curve);
+        }
+        for (uint32_t i = 1; i <= steps; ++i) {
+          float t = static_cast<float>(i) / static_cast<float>(steps);
+          float ang = start + sweep * t;
+          Pt p{cx + r * std::cos(ang), cy + r * std::sin(ang)};
           push(p);
         }
         break;
       }
+      case OutlineOp::Sin: {
+        // Params: x1/y1=end point; x2=amplitude; y2=cycles; x3=phase (rad)
+        Pt start_pt{cur.x, cur.y};
+        Pt end_pt{seg.x1, seg.y1};
+        float dx = end_pt.x - start_pt.x;
+        float dy = end_pt.y - start_pt.y;
+        float len = std::max(std::sqrt(dx * dx + dy * dy), kEps);
+        float amp = seg.x2;
+        float cycles = seg.y2;
+        float phase = seg.x3;
+
+        uint32_t steps = std::max<uint32_t>(steps_per_curve,
+            static_cast<uint32_t>(std::ceil(len / 0.75f) + std::fabs(cycles) * 4.0f));
+        if (tolerance > 0.0f) {
+          // Heuristic: more samples for higher amplitude and tighter tolerances.
+          const float tol = std::max(tolerance, 1e-4f);
+          float amp_factor = std::max(std::fabs(amp) / tol, 1.0f);
+          steps = std::max<uint32_t>(steps, static_cast<uint32_t>(std::ceil(amp_factor * 8.0f + std::fabs(cycles) * 8.0f)));
+        }
+
+        float tx_dir = dx / len;
+        float ty_dir = dy / len;
+        float nx_dir = -ty_dir;
+        float ny_dir = tx_dir;
+
+        for (uint32_t i = 1; i <= steps; ++i) {
+          float t = static_cast<float>(i) / static_cast<float>(steps);
+          float base_x = start_pt.x + dx * t;
+          float base_y = start_pt.y + dy * t;
+          float s = std::sin((2.0f * kPi * cycles * t) + phase);
+          Pt p{base_x + nx_dir * amp * s, base_y + ny_dir * amp * s};
+          push(p);
+        }
+        break;
+      }
+      
       case OutlineOp::Close: {
         if (have_loop) {
           // Ensure closure.
@@ -472,7 +724,7 @@ static float compute_stepover(const ToolGeometry& tool) {
 
 bool plan_fill_for_glyph_outline(const GlyphOutline& outline, ArmatureProgram& out_program, const FillPlanConfig& cfg) {
   std::vector<std::vector<Pt>> loops;
-  flatten_outline(outline, loops, 20);
+  flatten_outline(outline, loops, cfg.tolerance, 20);
   if (loops.empty()) return false;
 
   // For now: only EvenOdd + Hatch.
@@ -491,6 +743,65 @@ bool plan_fill_for_glyph_outline(const GlyphOutline& outline, ArmatureProgram& o
   return !out_program.points.empty();
 }
 
+bool plan_iterative_fill(const std::vector<GlyphOutline>& outlines,
+                         ArmatureProgram& out_program,
+                         const FillPlanConfig& base_cfg,
+                         const GaussianToolParams& tool,
+                         OffsetContourBuffer* coverage_loops,
+                         float finishing_allowance,
+                         size_t max_passes) {
+  if (outlines.empty()) return false;
+
+  out_program.points.clear();
+  bool emitted = false;
+  (void)tool;
+  float width = std::max(base_cfg.tool.tool_width, 0.5f);
+  float reduction_factor = 0.65f;
+
+  OffsetContourOptions capture_opts;
+  if (coverage_loops) {
+    coverage_loops->loops.clear();
+    capture_opts.capture = coverage_loops;
+    capture_opts.capture_tool_width = width;
+    capture_opts.capture_calibration_scale = 1.0f;
+    capture_opts.capture_finishing_allowance = finishing_allowance;
+    capture_opts.tolerance = base_cfg.tolerance;
+  }
+
+  for (size_t pass = 0; pass < max_passes; ++pass) {
+    if (width <= finishing_allowance) break;
+
+    FillPlanConfig cfg = base_cfg;
+    cfg.tool.tool_width = width;
+    cfg.tool.stepover = compute_stepover(cfg.tool);
+
+    ArmatureProgram pass_prog;
+    bool pass_ok = false;
+    for (const auto& outline : outlines) {
+      ArmatureProgram glyph_prog;
+      if (plan_fill_for_glyph_outline(outline, glyph_prog, cfg)) {
+        pass_prog.points.insert(pass_prog.points.end(), glyph_prog.points.begin(), glyph_prog.points.end());
+        pass_ok = true;
+      }
+    }
+    if (!pass_ok) break;
+
+    if (capture_opts.capture) {
+      for (const auto& outline : outlines) {
+        ArmatureProgram dummy;
+        (void)plan_offset_contour_for_outline(outline, width * 0.5f, dummy, cfg.safe_z, cfg.cut_z, capture_opts);
+      }
+      capture_opts.capture = nullptr; // only capture once
+    }
+
+    out_program.points.insert(out_program.points.end(), pass_prog.points.begin(), pass_prog.points.end());
+    emitted = true;
+    width *= reduction_factor;
+  }
+
+  return emitted;
+}
+
 // Exported offset-contour generator: flatten the outline and emit an offset
 // contour toolpath. This is implemented here (outside the anonymous helpers)
 // so it matches the header declaration and links properly.
@@ -500,84 +811,106 @@ bool plan_offset_contour_for_outline(const GlyphOutline& outline,
                                      float safe_z,
                                      float cut_z,
                                      const OffsetContourOptions& options) {
-  struct P2 { float x, y; };
-  std::vector<std::vector<P2>> loops;
-  loops.clear();
+  std::vector<std::vector<Pt>> loops;
+  flatten_outline(outline, loops, options.tolerance, 20);
+  if (loops.empty()) return false;
+  return plan_offset_contour(loops, offset, options, out_program, safe_z, cut_z);
+}
 
-  std::vector<P2> cur_loop;
-  P2 cur{0.0f, 0.0f};
-  P2 start{0.0f, 0.0f};
-  bool have_loop = false;
+namespace {
 
-  auto push = [&](P2 p) {
-    cur_loop.push_back(p);
-    cur = p;
-  };
+static bool nearly_equal(float a, float b, float eps = 1e-4f) {
+  return std::fabs(a - b) <= eps;
+}
 
-  const uint32_t steps_per_curve = 20;
-  for (const auto& seg : outline.segments) {
-    switch (seg.op) {
-      case OutlineOp::MoveTo: {
-        if (!cur_loop.empty()) { loops.push_back(cur_loop); cur_loop.clear(); }
-        cur = P2{seg.x1, seg.y1}; start = cur; have_loop = true; push(cur);
-        break;
-      }
-      case OutlineOp::LineTo: {
-        push(P2{seg.x3, seg.y3}); break;
-      }
-      case OutlineOp::QuadTo: {
-        P2 p0{seg.x1, seg.y1}; P2 p1{seg.x2, seg.y2}; P2 p2{seg.x3, seg.y3};
-        for (uint32_t i = 1; i <= steps_per_curve; ++i) {
-          float t = static_cast<float>(i) / static_cast<float>(steps_per_curve);
-          float a = 1.0f - t;
-          P2 p;
-          p.x = a * a * p0.x + 2.0f * a * t * p1.x + t * t * p2.x;
-          p.y = a * a * p0.y + 2.0f * a * t * p1.y + t * t * p2.y;
-          push(p);
-        }
-        break;
-      }
-      case OutlineOp::CubicTo: {
-        P2 p0{cur.x, cur.y}; P2 p1{seg.x1, seg.y1}; P2 p2{seg.x2, seg.y2}; P2 p3{seg.x3, seg.y3};
-        for (uint32_t i = 1; i <= steps_per_curve; ++i) {
-          float t = static_cast<float>(i) / static_cast<float>(steps_per_curve);
-          float a = 1.0f - t;
-          P2 p;
-          p.x = a * a * a * p0.x + 3.0f * a * a * t * p1.x + 3.0f * a * t * t * p2.x + t * t * t * p3.x;
-          p.y = a * a * a * p0.y + 3.0f * a * a * t * p1.y + 3.0f * a * t * t * p2.y + t * t * t * p3.y;
-          push(p);
-        }
-        break;
-      }
-      case OutlineOp::Close: {
-        if (have_loop) {
-          if (cur_loop.size() >= 2) {
-            P2 last = cur_loop.back();
-            if (std::fabs(last.x - start.x) > kEps || std::fabs(last.y - start.y) > kEps) cur_loop.push_back(start);
-          }
-          loops.push_back(cur_loop);
-          cur_loop.clear();
-          have_loop = false;
-        }
-        break;
-      }
+static void append_span_from_points(PlanarToolpath& out,
+                                    ToolMode mode,
+                                    const std::vector<ToolPoint>& pts,
+                                    size_t begin,
+                                    size_t end) {
+  if (end <= begin) return;
+  PlanarSpan span;
+  span.tool_mode = mode;
+  span.points.reserve(end - begin);
+  for (size_t i = begin; i < end; ++i) {
+    span.points.push_back(Vec2{pts[i].x, pts[i].y});
+  }
+  if (span.points.size() >= 2) {
+    const Vec2& first = span.points.front();
+    const Vec2& last = span.points.back();
+    span.closed = nearly_equal(first.x, last.x) && nearly_equal(first.y, last.y);
+  }
+  span.winding = planar_winding(span);
+  out.spans.push_back(std::move(span));
+}
+
+static void planarize_armature_program(const ArmatureProgram& prog,
+                                       ToolMode engaged_mode,
+                                       PlanarToolpath& out) {
+  out.clear();
+  if (prog.points.empty()) return;
+
+  const auto& pts = prog.points;
+  size_t seg_begin = 0;
+  bool cur_engaged = pts[0].engaged;
+
+  for (size_t i = 1; i < pts.size(); ++i) {
+    if (pts[i].engaged != cur_engaged) {
+      append_span_from_points(out, cur_engaged ? engaged_mode : ToolMode::Travel, pts, seg_begin, i);
+      seg_begin = i;
+      cur_engaged = pts[i].engaged;
     }
   }
-  if (!cur_loop.empty()) loops.push_back(cur_loop);
+  append_span_from_points(out, cur_engaged ? engaged_mode : ToolMode::Travel, pts, seg_begin, pts.size());
+}
 
-  if (loops.empty()) return false;
+} // namespace
 
-  // Reuse the robust/miter-limited offset routine in float space.
-  std::vector<std::vector<Pt>> floops;
-  floops.reserve(loops.size());
-  for (const auto& loop : loops) {
-    std::vector<Pt> lf;
-    lf.reserve(loop.size());
-    for (const auto& p : loop) lf.push_back(Pt{p.x, p.y});
-    floops.push_back(std::move(lf));
+bool plan_planar_fill_for_glyph_outline(const GlyphOutline& outline,
+                                       PlanarToolpath& out_path,
+                                       const FillPlanConfig& cfg) {
+  static std::vector<PlanCacheEntry> s_cache;
+  const uint64_t key = hash_combine_u64(hash_outline(outline), hash_combine_u64(hash_fill_cfg(cfg), 0xF11F11F11ull));
+  if (PlanarToolpath* cached = cache_find(s_cache, key)) {
+    out_path = *cached;
+    return !out_path.empty();
   }
 
-  return plan_offset_contour(floops, offset, options, out_program, safe_z, cut_z);
+  ArmatureProgram tmp;
+  if (!plan_fill_for_glyph_outline(outline, tmp, cfg)) {
+    out_path.clear();
+    return false;
+  }
+  planarize_armature_program(tmp, ToolMode::Cut, out_path);
+  cache_store(s_cache, key, out_path);
+  return !out_path.empty();
+}
+
+bool plan_planar_offset_contour_for_outline(const GlyphOutline& outline,
+                                            float offset,
+                                            PlanarToolpath& out_path,
+                                            float safe_z,
+                                            float cut_z,
+                                            const OffsetContourOptions& options) {
+  static std::vector<PlanCacheEntry> s_cache;
+  uint64_t h = hash_outline(outline);
+  h = hash_combine_u64(h, fnv1a_u64(&offset, sizeof(offset)));
+  h = hash_combine_u64(h, fnv1a_u64(&safe_z, sizeof(safe_z)));
+  h = hash_combine_u64(h, fnv1a_u64(&cut_z, sizeof(cut_z)));
+  const uint64_t key = hash_combine_u64(h, hash_combine_u64(hash_offset_opts(options), 0x0FF5E7u));
+  if (PlanarToolpath* cached = cache_find(s_cache, key)) {
+    out_path = *cached;
+    return !out_path.empty();
+  }
+
+  ArmatureProgram tmp;
+  if (!plan_offset_contour_for_outline(outline, offset, tmp, safe_z, cut_z, options)) {
+    out_path.clear();
+    return false;
+  }
+  planarize_armature_program(tmp, ToolMode::Cut, out_path);
+  cache_store(s_cache, key, out_path);
+  return !out_path.empty();
 }
 
 } // namespace nodus::tensors::kpath

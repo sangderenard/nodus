@@ -4,6 +4,7 @@
 #include "kpath_shaper.h"
 
 #include <cstdint>
+#include <string_view>
 #include <string>
 
 namespace nodus::tensors::kpath {
@@ -23,6 +24,10 @@ struct ProgramRasterParams final {
 
 // Converts a UTF-8 string into the scalar codepoints expected by the shaper.
 CodepointSequence codepoints_from_utf8(const std::string& utf8_text);
+
+// Converts UTF-16 code units into the scalar codepoints expected by the shaper.
+// Invalid sequences are replaced with U+FFFD.
+CodepointSequence codepoints_from_utf16(std::u16string_view utf16_text);
 
 // Shapes a codepoint sequence and fills an armature program that follows the
 // resulting outline, clearing `out_program` before appending.
