@@ -11,6 +11,7 @@
 #include "common/tensors/abstraction/kpath/kpath_tokenizer.h"
 #include "common/tensors/abstraction/kpath/kpath_pipeline.h"
 #include "common/tensors/abstraction/kpath/kpath_program.h"
+#include "common/tensors/abstraction/kpath/kpath_image_export.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -307,15 +308,12 @@ static bool validate_raster_png_facility(const char* argv0) {
   float max_v = energy.max_value();
   if (!require_or_report(max_v > 0.001f, "rasterized canvas should have non-zero energy")) return false;
 
-  auto pixels = energy.to_u8_normalized();
-  if (!require_or_report(pixels.size() == static_cast<size_t>(energy.width) * energy.height, "pixel buffer size mismatch")) return false;
-
   const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_glyph_gaussian.png");
-  bool ok = write_png_grayscale_u8(out_path, energy.width, energy.height, pixels);
-  if (!require_or_report(ok, "write_png_grayscale_u8() failed")) return false;
+  if (!require_or_report(export_canvas_to_png(energy, out_path), "export_canvas_to_png failed")) return false;
 
-  float max_t = temp.max_value();
-  std::cout << "[KPATH-FACILITIES] wrote PNG: " << out_path << " (max=" << max_v << ", max_temp=" << max_t << ")" << std::endl;
+  if (!require_or_report(export_canvas_to_png(temp, make_output_path_next_to_exe(argv0, "kpath_glyph_gaussian_temp.png")),
+                         "export_canvas_to_png(temp) failed")) return false;
+  std::cout << "[KPATH-FACILITIES] wrote PNG: " << out_path << " (max=" << max_v << ", temp_max=" << temp.max_value() << ")" << std::endl;
   return true;
 }
 
@@ -609,13 +607,10 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
   if (!require_or_report(energy.max_value() > 0.001f, "pangram atlas raster energy should be non-zero")) return false;
 
   const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_atlas_pangram.png");
-  auto pixels = energy.to_u8_normalized();
-  bool ok = write_png_grayscale_u8(out_path, energy.width, energy.height, pixels);
-  if (!require_or_report(ok, "pangram atlas PNG write failed")) return false;
+  if (!require_or_report(export_canvas_to_png(energy, out_path), "export_canvas_to_png energy failed")) return false;
 
   const std::string temp_path = make_output_path_next_to_exe(argv0, "kpath_atlas_pangram_temp.png");
-  auto tpx = temp.to_u8_normalized();
-  (void)write_png_grayscale_u8(temp_path, temp.width, temp.height, tpx);
+  require_or_report(export_canvas_to_png(temp, temp_path), "export_canvas_to_png temp failed");
 
   std::cout << "[KPATH-FACILITIES] wrote PNG: " << out_path << " (energy_max=" << energy.max_value() << ")\n";
   std::cout << "[KPATH-FACILITIES] wrote PNG: " << temp_path << " (temp_max=" << temp.max_value() << ")\n";
@@ -667,8 +662,7 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     if (!require_or_report(fill_energy.max_value() > 0.001f, "fill raster energy should be non-zero")) return false;
 
     const std::string fill_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill.png");
-    auto fill_px = fill_energy.to_u8_normalized();
-    (void)write_png_grayscale_u8(fill_path, fill_energy.width, fill_energy.height, fill_px);
+    if (!require_or_report(export_canvas_to_png(fill_energy, fill_path), "export_canvas_to_png fill failed")) return 1;
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << fill_path << " (energy_max=" << fill_energy.max_value() << ")\n";
 
     struct Pt2 {
@@ -862,20 +856,9 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     rasterize_program_gaussian_with_thermal_transformed(fill_prog, ch_g, tmp, machine, tool, xform);
     rasterize_program_gaussian_with_thermal_transformed(outline_ccw, ch_b, tmp, machine, tool, xform);
 
-    auto r_u8 = ch_r.to_u8_normalized();
-    auto g_u8 = ch_g.to_u8_normalized();
-    auto b_u8 = ch_b.to_u8_normalized();
-    const size_t rgb_px = static_cast<size_t>(ch_r.width) * ch_r.height;
-    std::vector<uint8_t> rgb;
-    rgb.resize(rgb_px * 3);
-    for (size_t i = 0; i < rgb_px; ++i) {
-      rgb[3 * i + 0] = (i < r_u8.size()) ? r_u8[i] : 0;
-      rgb[3 * i + 1] = (i < g_u8.size()) ? g_u8[i] : 0;
-      rgb[3 * i + 2] = (i < b_u8.size()) ? b_u8[i] : 0;
-    }
-
     const std::string rgb_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill_rgb.png");
-    (void)write_png_rgb_u8(rgb_path, ch_r.width, ch_r.height, rgb);
+    if (!require_or_report(export_canvas_rgb(ch_r, ch_g, ch_b, rgb_path),
+                           "export_canvas_rgb failed")) return 1;
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << rgb_path << " (R=CW outline, G=fill, B=CCW outline)\n";
 
     ArmatureProgram fill_inside;
@@ -953,19 +936,9 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     rasterize_program_gaussian_with_thermal_transformed(fill_prog, k_g, tmp, machine, tool, xform_kerf);
     rasterize_program_gaussian_with_thermal_transformed(contour_outside, k_b, tmp, machine, tool, xform_kerf);
 
-    auto kr_u8 = k_r.to_u8_normalized();
-    auto kg_u8 = k_g.to_u8_normalized();
-    auto kb_u8 = k_b.to_u8_normalized();
-    const size_t kerf_px = static_cast<size_t>(k_r.width) * k_r.height;
-    std::vector<uint8_t> kerf_rgb;
-    kerf_rgb.resize(kerf_px * 3);
-    for (size_t i = 0; i < kerf_px; ++i) {
-      kerf_rgb[3 * i + 0] = (i < kr_u8.size()) ? kr_u8[i] : 0;
-      kerf_rgb[3 * i + 1] = (i < kg_u8.size()) ? kg_u8[i] : 0;
-      kerf_rgb[3 * i + 2] = (i < kb_u8.size()) ? kb_u8[i] : 0;
-    }
     const std::string kerf_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill_kerf_rgb.png");
-    (void)write_png_rgb_u8(kerf_path, k_r.width, k_r.height, kerf_rgb);
+    if (!require_or_report(export_canvas_rgb(k_r, k_g, k_b, kerf_path),
+                           "export_canvas_rgb kerf failed")) return 1;
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << kerf_path << " (R=inside-contour, G=fill, B=outside-contour)\n";
   }
 

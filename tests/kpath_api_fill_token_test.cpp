@@ -6,6 +6,7 @@
 #include "common/tensors/abstraction/kpath/kpath_fill.h"
 #include "common/tensors/abstraction/kpath/kpath_raster.h"
 #include "common/tensors/abstraction/kpath/kpath_shaper.h"
+#include "common/tensors/abstraction/kpath/kpath_image_export.h"
 
 #include <algorithm>
 #include <array>
@@ -214,8 +215,8 @@ static bool make_fill_from_token(const std::string& token,
     rgb[3 * i + 2] = (i < b_u8.size()) ? b_u8[i] : 0;
   }
 
-  const std::string out_path = "kpath_api_fill_rgb.png";
-  (void)write_png_rgb_u8(out_path, ch_r.width, ch_r.height, rgb);
+  const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_api_fill_rgb.png");
+  if (!require_or_report(export_canvas_rgb(ch_r, ch_g, ch_b, out_path), "export_canvas_rgb failed")) return false;
   std::cout << "[KPATH-API] wrote PNG: " << out_path << "\n";
   auto report_peak = [](const std::array<uint32_t, 256>& h) {
     uint32_t peak_v = 0; uint32_t peak_bin = 0;

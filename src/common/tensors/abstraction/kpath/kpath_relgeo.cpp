@@ -356,6 +356,11 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
       return setp(RelVec2{e.x, e.y});
     }
 
+    if (std::holds_alternative<RelPointFree>(def.expr)) {
+      if (out_error) *out_error = "relgeo.free_point requires a solver or anchors";
+      return false;
+    }
+
     if (std::holds_alternative<RelPointLerp>(def.expr)) {
       const auto& e = std::get<RelPointLerp>(def.expr);
       if (!eval_rec(e.a) || !eval_rec(e.b)) return false;

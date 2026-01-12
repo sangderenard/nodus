@@ -113,6 +113,9 @@ struct RelPointFixed final {
   float y = 0.0f;
 };
 
+// A free point has no coordinates in the relational system.
+struct RelPointFree final {};
+
 struct RelPointLerp final {
   RelPointId a{};
   RelPointId b{};
@@ -162,7 +165,8 @@ struct RelPointLineLineIntersection final {
 };
 
 using RelPointExpr =
-  std::variant<RelPointFixed,
+  std::variant<RelPointFree,
+         RelPointFixed,
          RelPointLerp,
          RelPointOffset,
          RelPointCircleCircleIntersection,

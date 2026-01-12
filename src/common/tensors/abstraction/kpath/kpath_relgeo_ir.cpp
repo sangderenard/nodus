@@ -1827,6 +1827,8 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
         return false;
       }
       if (!out_program.set_point_expr(pid, RelPointFixed{static_cast<float>(x), static_cast<float>(y)})) return false;
+    } else if (nr.kind == "relgeo.free_point") {
+      if (!out_program.set_point_expr(pid, RelPointFree{})) return false;
     } else if (nr.kind == "relgeo.lerp") {
       uint32_t a = 0, b = 0;
       double u = 0.0;

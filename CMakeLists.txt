@@ -581,6 +581,13 @@ target_link_libraries(test_relgeo_esat_smoke PRIVATE canvas_tables_static)
 target_compile_features(test_relgeo_esat_smoke PRIVATE cxx_std_20)
 add_test(NAME relgeo_esat_smoke_test COMMAND test_relgeo_esat_smoke)
 
+add_executable(test_relgeo_stencil_grid_render
+  tests/relgeo_stencil_grid_render_test.cpp
+)
+target_link_libraries(test_relgeo_stencil_grid_render PRIVATE canvas_tables_static)
+target_compile_features(test_relgeo_stencil_grid_render PRIVATE cxx_std_20)
+add_test(NAME relgeo_stencil_grid_render_test COMMAND test_relgeo_stencil_grid_render)
+
 add_executable(test_graph_sparse_builder
   tests/graph_sparse_builder_test.cpp
 )
@@ -683,6 +690,7 @@ set(NODUS_TEST_TARGETS
   test_kpath_toolpath_facilities
   test_kpath_functional_intersection
   test_kpath_media_raycast
+  test_relgeo_stencil_grid_render
 )
 
 foreach(_NODUS_TEST_TARGET IN LISTS NODUS_TEST_TARGETS)

@@ -1,6 +1,7 @@
 #include "common/tensors/abstraction/kpath/kpath_raster.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
+#include "common/tensors/abstraction/kpath/kpath_image_export.h"
 
 #include <filesystem>
 #include <iostream>
@@ -131,10 +132,9 @@ int main(int argc, char** argv) {
     ProgramRasterTransform xform = plan_program_raster_transform_refined(program, machine, render_scale, margin_px, tool);
     rasterize_program_gaussian_with_thermal_transformed(program, energy, temp, machine, tool, xform);
 
-    const std::vector<uint8_t> pixels = energy.to_u8_normalized();
     const std::string out_path = make_output_path_next_to_exe((argc > 0) ? argv[0] : "kpath_relgeo_scene_demo",
                                                               "kpath_relgeo_scene.png");
-    if (!write_png_grayscale_u8(out_path, energy.width, energy.height, pixels)) {
+    if (!export_canvas_to_png(energy, out_path)) {
       std::cerr << "Failed to write PNG: " << out_path << "\n";
       return 1;
     }
