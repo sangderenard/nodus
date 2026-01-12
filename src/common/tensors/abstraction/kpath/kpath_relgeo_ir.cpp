@@ -1,6 +1,9 @@
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
 
+#include "common/tensors/abstraction/graph_sparse.h"
+
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 
 namespace nodus::tensors::kpath {
@@ -27,11 +30,65 @@ static std::optional<std::string> as_string(const GraphIrValue& v) {
   return std::nullopt;
 }
 
+static std::optional<bool> as_bool(const GraphIrValue& v) {
+  if (const auto* p = std::get_if<bool>(&v)) return *p;
+  if (const auto* d = std::get_if<double>(&v)) return *d >= 0.5;
+  return std::nullopt;
+}
+
+static std::string to_lower(std::string_view s) {
+  std::string result(s);
+  std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return result;
+}
+
+static std::optional<bool> direction_from_string(std::string_view s) {
+  const std::string lowered = to_lower(s);
+  if (lowered == "forward" || lowered == "fwd" || lowered == "front") return true;
+  if (lowered == "reverse" || lowered == "rev" || lowered == "backward" || lowered == "back") return false;
+  return std::nullopt;
+}
+
+static std::optional<bool> parse_tangent_direction(const GraphIrValue& v) {
+  if (const auto* p = std::get_if<bool>(&v)) return *p;
+  if (const auto* d = std::get_if<double>(&v)) return *d >= 0.5;
+  if (const auto* s = std::get_if<std::string>(&v)) return direction_from_string(*s);
+  return std::nullopt;
+}
+
 static std::optional<RelPick> parse_pick(std::string_view s) {
   if (s == "HigherY" || s == "higher_y" || s == "hy") return RelPick::HigherY;
   if (s == "LowerY" || s == "lower_y" || s == "ly") return RelPick::LowerY;
   if (s == "HigherX" || s == "higher_x" || s == "hx") return RelPick::HigherX;
   if (s == "LowerX" || s == "lower_x" || s == "lx") return RelPick::LowerX;
+  return std::nullopt;
+}
+
+static std::optional<RelContourWinding> parse_contour_winding_string(std::string_view s) {
+  const std::string lowered = to_lower(s);
+  if (lowered == "ccw" || lowered == "counterclockwise" || lowered == "counter_clockwise" || lowered == "outer") {
+    return RelContourWinding::CCW;
+  }
+  if (lowered == "cw" || lowered == "clockwise" || lowered == "hole" || lowered == "inner") {
+    return RelContourWinding::CW;
+  }
+  return std::nullopt;
+}
+
+static std::optional<RelContourWinding> parse_contour_winding_value(const GraphIrValue& v) {
+  if (const auto* s = std::get_if<std::string>(&v)) return parse_contour_winding_string(*s);
+  if (const auto* d = std::get_if<double>(&v)) {
+    if (*d > 0.0) return RelContourWinding::CCW;
+    if (*d < 0.0) return RelContourWinding::CW;
+    return RelContourWinding::Unknown;
+  }
+  if (const auto* u = std::get_if<uint32_t>(&v)) {
+    if (*u == 0u) return RelContourWinding::Unknown;
+    if (*u == 1u) return RelContourWinding::CCW;
+    if (*u == 2u) return RelContourWinding::CW;
+  }
   return std::nullopt;
 }
 
@@ -80,19 +137,149 @@ static void emit_node_ccint(GraphIrContext& ctx,
   }
 }
 
-static void emit_node_contour(GraphIrContext& ctx, const std::vector<uint32_t>& verts, bool closed) {
+static uint32_t emit_node_segment(GraphIrContext& ctx, uint32_t a, uint32_t b) {
+  if (!ctx.edits) return 0;
+  const uint32_t n = ctx.edits->add_node("relgeo.segment");
+  ctx.edits->set_attr(n, "a", static_cast<uint32_t>(a));
+  ctx.edits->set_attr(n, "b", static_cast<uint32_t>(b));
+  return n;
+}
+
+static uint32_t emit_node_line(GraphIrContext& ctx, uint32_t a, uint32_t b) {
+  if (!ctx.edits) return 0;
+  const uint32_t n = ctx.edits->add_node("relgeo.line");
+  ctx.edits->set_attr(n, "a", static_cast<uint32_t>(a));
+  ctx.edits->set_attr(n, "b", static_cast<uint32_t>(b));
+  return n;
+}
+
+static uint32_t emit_node_ray(GraphIrContext& ctx, uint32_t origin, uint32_t through) {
+  if (!ctx.edits) return 0;
+  const uint32_t n = ctx.edits->add_node("relgeo.ray");
+  ctx.edits->set_attr(n, "origin", static_cast<uint32_t>(origin));
+  ctx.edits->set_attr(n, "through", static_cast<uint32_t>(through));
+  return n;
+}
+
+static uint32_t emit_node_angle(GraphIrContext& ctx, uint32_t a, uint32_t v, uint32_t b) {
+  if (!ctx.edits) return 0;
+  const uint32_t n = ctx.edits->add_node("relgeo.angle");
+  ctx.edits->set_attr(n, "a", static_cast<uint32_t>(a));
+  ctx.edits->set_attr(n, "v", static_cast<uint32_t>(v));
+  ctx.edits->set_attr(n, "b", static_cast<uint32_t>(b));
+  return n;
+}
+
+static uint32_t emit_node_llint(GraphIrContext& ctx, uint32_t l0, uint32_t l1) {
+  if (!ctx.edits) return 0;
+  const uint32_t n = ctx.edits->add_node("relgeo.llint");
+  ctx.edits->set_attr(n, "l0", static_cast<uint32_t>(l0));
+  ctx.edits->set_attr(n, "l1", static_cast<uint32_t>(l1));
+  return n;
+}
+
+static void emit_edge_relation(GraphIrContext& ctx, std::string_view kind, uint32_t a, uint32_t b) {
+  if (!ctx.edits) return;
+  const uint32_t e = ctx.edits->add_edge(kind);
+  ctx.edits->set_attr(e, "a", static_cast<uint32_t>(a));
+  ctx.edits->set_attr(e, "b", static_cast<uint32_t>(b));
+}
+
+static uint32_t emit_node_ratio(GraphIrContext& ctx, uint32_t n, uint32_t d) {
+  if (!ctx.edits) return 0;
+  const uint32_t node_id = ctx.edits->add_node("relgeo.ratio");
+  ctx.edits->set_attr(node_id, "n", static_cast<uint32_t>(n));
+  ctx.edits->set_attr(node_id, "d", static_cast<uint32_t>(d));
+  return node_id;
+}
+
+static uint32_t emit_node_lerp_ratio(GraphIrContext& ctx, uint32_t a, uint32_t b, uint32_t ratio) {
+  if (!ctx.edits) return 0;
+  const uint32_t node_id = ctx.edits->add_node("relgeo.lerp_ratio");
+  ctx.edits->set_attr(node_id, "a", static_cast<uint32_t>(a));
+  ctx.edits->set_attr(node_id, "b", static_cast<uint32_t>(b));
+  ctx.edits->set_attr(node_id, "u", static_cast<uint32_t>(ratio));
+  return node_id;
+}
+
+static void emit_node_contour(GraphIrContext& ctx,
+                              const std::vector<uint32_t>& verts,
+                              bool closed,
+                              RelContourWinding winding) {
   if (!ctx.edits) return;
   const uint32_t n = ctx.edits->add_node("relgeo.contour");
-  ctx.edits->set_attr(n, "closed", closed ? 1.0 : 0.0);
+  ctx.edits->set_attr(n, "closed", closed);
+  if (winding == RelContourWinding::CCW) ctx.edits->set_attr(n, "winding", static_cast<uint32_t>(1u));
+  if (winding == RelContourWinding::CW) ctx.edits->set_attr(n, "winding", static_cast<uint32_t>(2u));
   for (size_t i = 0; i < verts.size(); ++i) {
     ctx.edits->set_attr(n, "v" + std::to_string(i), static_cast<uint32_t>(verts[i]));
   }
+}
+
+static std::string segment_kind_to_string(RelParametricSegment::Kind kind) {
+  switch (kind) {
+    case RelParametricSegment::Kind::Line:
+      return "line";
+    case RelParametricSegment::Kind::Quadratic:
+      return "quadratic";
+    case RelParametricSegment::Kind::Cubic:
+      return "cubic";
+    case RelParametricSegment::Kind::SinWave:
+      return "sin";
+  }
+  return "line";
+}
+
+static std::optional<RelParametricSegment::Kind> parse_segment_kind(std::string_view s) {
+  const std::string lowered = to_lower(s);
+  if (lowered == "line") return RelParametricSegment::Kind::Line;
+  if (lowered == "quadratic") return RelParametricSegment::Kind::Quadratic;
+  if (lowered == "cubic") return RelParametricSegment::Kind::Cubic;
+  if (lowered == "sin" || lowered == "sinwave") return RelParametricSegment::Kind::SinWave;
+  return std::nullopt;
+}
+
+static uint32_t emit_node_parametric(GraphIrContext& ctx,
+                                     RelParametricSegment::Kind kind,
+                                     uint32_t start,
+                                     uint32_t end,
+                                     double u,
+                                     bool tangent_forward,
+                                     std::optional<uint32_t> ctrl1 = std::nullopt,
+                                     std::optional<uint32_t> ctrl2 = std::nullopt,
+                                     std::optional<double> amplitude = std::nullopt,
+                                     std::optional<double> cycles = std::nullopt,
+                                     std::optional<double> phase = std::nullopt) {
+  if (!ctx.edits) return 0;
+  const uint32_t n = ctx.edits->add_node("relgeo.parametric");
+  ctx.edits->set_attr(n, "segment_kind", segment_kind_to_string(kind));
+  ctx.edits->set_attr(n, "start", start);
+  ctx.edits->set_attr(n, "end", end);
+  ctx.edits->set_attr(n, "u", u);
+  ctx.edits->set_attr(n, "tangent_forward", tangent_forward);
+  if (ctrl1) ctx.edits->set_attr(n, "ctrl1", static_cast<uint32_t>(*ctrl1));
+  if (ctrl2) ctx.edits->set_attr(n, "ctrl2", static_cast<uint32_t>(*ctrl2));
+  if (amplitude) ctx.edits->set_attr(n, "amplitude", *amplitude);
+  if (cycles) ctx.edits->set_attr(n, "cycles", *cycles);
+  if (phase) ctx.edits->set_attr(n, "phase", *phase);
+  return n;
 }
 
 } // namespace
 
 GraphIrOperatorSet make_relgeo_ir_ops() {
   GraphIrOperatorSet set;
+
+  set.add(GraphIrOpSpec{"free", 0, 0, "free() -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>&, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "free(): ctx.edits is null";
+              return false;
+            }
+            const uint32_t node_id = ctx.edits->add_node("relgeo.free_point");
+            out = node_id;
+            return true;
+          });
 
   set.add(GraphIrOpSpec{"pt", 2, 2, "pt(x: f64, y: f64) -> u32 point"},
           [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
@@ -187,7 +374,215 @@ GraphIrOperatorSet make_relgeo_ir_ops() {
             return true;
           });
 
-  set.add(GraphIrOpSpec{"contour", 2, 0xFFFFFFFFu, "contour(p0: u32, p1: u32, ..., [\"open\"|\"closed\"]) -> void"},
+  set.add(GraphIrOpSpec{"segment", 2, 2, "segment(a: u32, b: u32) -> u32 segment"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "segment(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "segment(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_segment(ctx, static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"line", 2, 2, "line(a: u32, b: u32) -> u32 line"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "line(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "line(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_line(ctx, static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"ray", 2, 2, "ray(origin: u32, through: u32) -> u32 ray"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "ray(): ctx.edits is null";
+              return false;
+            }
+            auto origin = as_u32(args[0]);
+            auto through = as_u32(args[1]);
+            if (!origin || !through) {
+              err = "ray(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_ray(ctx, static_cast<uint32_t>(*origin), static_cast<uint32_t>(*through));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"angle", 3, 3, "angle(a: u32, v: u32, b: u32) -> u32 angle"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "angle(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto v = as_u32(args[1]);
+            auto b = as_u32(args[2]);
+            if (!a || !v || !b) {
+              err = "angle(): expected (u32,u32,u32)";
+              return false;
+            }
+            out = emit_node_angle(ctx, static_cast<uint32_t>(*a), static_cast<uint32_t>(*v), static_cast<uint32_t>(*b));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"llint", 2, 2, "llint(l0: u32, l1: u32) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "llint(): ctx.edits is null";
+              return false;
+            }
+            auto l0 = as_u32(args[0]);
+            auto l1 = as_u32(args[1]);
+            if (!l0 || !l1) {
+              err = "llint(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_llint(ctx, static_cast<uint32_t>(*l0), static_cast<uint32_t>(*l1));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"param_line", 3, 4, "param_line(start: u32, end: u32, u: f64[, dir: string|bool]) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "param_line(): ctx.edits is null";
+              return false;
+            }
+            auto start = as_u32(args[0]);
+            auto end = as_u32(args[1]);
+            auto u = as_f64(args[2]);
+            if (!start || !end || !u) {
+              err = "param_line(): expected (u32,u32,number[,string|bool])";
+              return false;
+            }
+            bool tangent_forward = true;
+            if (args.size() == 4) {
+              auto dir = parse_tangent_direction(args[3]);
+              if (!dir) {
+                err = "param_line(): invalid direction argument";
+                return false;
+              }
+              tangent_forward = *dir;
+            }
+            const uint32_t node_id =
+                emit_node_parametric(ctx, RelParametricSegment::Kind::Line, static_cast<uint32_t>(*start),
+                                     static_cast<uint32_t>(*end), *u, tangent_forward);
+            out = node_id;
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"param_quad", 4, 5, "param_quad(start: u32, ctrl: u32, end: u32, u: f64[, dir: string|bool]) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "param_quad(): ctx.edits is null";
+              return false;
+            }
+            auto start = as_u32(args[0]);
+            auto ctrl = as_u32(args[1]);
+            auto end = as_u32(args[2]);
+            auto u = as_f64(args[3]);
+            if (!start || !ctrl || !end || !u) {
+              err = "param_quad(): expected (u32,u32,u32,number[,string|bool])";
+              return false;
+            }
+            bool tangent_forward = true;
+            if (args.size() == 5) {
+              auto dir = parse_tangent_direction(args[4]);
+              if (!dir) {
+                err = "param_quad(): invalid direction argument";
+                return false;
+              }
+              tangent_forward = *dir;
+            }
+            const uint32_t node_id =
+                emit_node_parametric(ctx, RelParametricSegment::Kind::Quadratic, static_cast<uint32_t>(*start),
+                                     static_cast<uint32_t>(*end), *u, tangent_forward, static_cast<uint32_t>(*ctrl));
+            out = node_id;
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"param_cubic", 5, 6, "param_cubic(start: u32, ctrl0: u32, ctrl1: u32, end: u32, u: f64[, dir: string|bool]) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "param_cubic(): ctx.edits is null";
+              return false;
+            }
+            auto start = as_u32(args[0]);
+            auto ctrl0 = as_u32(args[1]);
+            auto ctrl1 = as_u32(args[2]);
+            auto end = as_u32(args[3]);
+            auto u = as_f64(args[4]);
+            if (!start || !ctrl0 || !ctrl1 || !end || !u) {
+              err = "param_cubic(): expected (u32,u32,u32,u32,number[,string|bool])";
+              return false;
+            }
+            bool tangent_forward = true;
+            if (args.size() == 6) {
+              auto dir = parse_tangent_direction(args[5]);
+              if (!dir) {
+                err = "param_cubic(): invalid direction argument";
+                return false;
+              }
+              tangent_forward = *dir;
+            }
+            const uint32_t node_id =
+                emit_node_parametric(ctx, RelParametricSegment::Kind::Cubic, static_cast<uint32_t>(*start),
+                                     static_cast<uint32_t>(*end), *u, tangent_forward,
+                                     static_cast<uint32_t>(*ctrl0), static_cast<uint32_t>(*ctrl1));
+            out = node_id;
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"param_sin", 6, 7, "param_sin(start: u32, end: u32, u: f64, amplitude: f64, cycles: f64, phase: f64[, dir: string|bool]) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "param_sin(): ctx.edits is null";
+              return false;
+            }
+            auto start = as_u32(args[0]);
+            auto end = as_u32(args[1]);
+            auto u = as_f64(args[2]);
+            auto amplitude = as_f64(args[3]);
+            auto cycles = as_f64(args[4]);
+            auto phase = as_f64(args[5]);
+            if (!start || !end || !u || !amplitude || !cycles || !phase) {
+              err = "param_sin(): expected (u32,u32,number,number,number,number[,string|bool])";
+              return false;
+            }
+            bool tangent_forward = true;
+            if (args.size() == 7) {
+              auto dir = parse_tangent_direction(args[6]);
+              if (!dir) {
+                err = "param_sin(): invalid direction argument";
+                return false;
+              }
+              tangent_forward = *dir;
+            }
+            const uint32_t node_id =
+                emit_node_parametric(ctx, RelParametricSegment::Kind::SinWave, static_cast<uint32_t>(*start),
+                                     static_cast<uint32_t>(*end), *u, tangent_forward,
+                                     {} /*ctrl1*/, {} /*ctrl2*/, *amplitude, *cycles, *phase);
+            out = node_id;
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"contour",
+                        2,
+                        0xFFFFFFFFu,
+                        "contour(p0: u32, p1: u32, ..., [\"open\"|\"closed\"], [\"ccw\"|\"cw\"|\"outer\"|\"inner\"]) -> void"},
           [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
             if (!ctx.edits) {
               err = "contour(): ctx.edits is null";
@@ -195,15 +590,29 @@ GraphIrOperatorSet make_relgeo_ir_ops() {
             }
 
             bool closed = true;
+            RelContourWinding winding = RelContourWinding::Unknown;
             size_t n = args.size();
-            if (n >= 1) {
-              if (auto last_s = as_string(args.back())) {
-                std::string v = *last_s;
-                std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (v == "open") closed = false;
-                if (v == "closed") closed = true;
-                n -= 1;
+
+            // Allow up to two trailing strings for closure and winding (in any order).
+            while (n >= 1) {
+              auto last_s = as_string(args[n - 1]);
+              if (!last_s) break;
+              const std::string lowered = to_lower(*last_s);
+
+              bool consumed = false;
+              if (lowered == "open") {
+                closed = false;
+                consumed = true;
+              } else if (lowered == "closed") {
+                closed = true;
+                consumed = true;
+              } else if (auto w = parse_contour_winding_string(lowered)) {
+                winding = *w;
+                consumed = true;
               }
+
+              if (!consumed) break;
+              n -= 1;
             }
 
             if (n < 2) {
@@ -222,12 +631,423 @@ GraphIrOperatorSet make_relgeo_ir_ops() {
               raw.push_back(*pid);
             }
 
-            emit_node_contour(ctx, raw, closed);
+            emit_node_contour(ctx, raw, closed, winding);
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"parallel", 2, 2, "parallel(l0: u32, l1: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "parallel(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "parallel(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.parallel", static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"perp", 2, 2, "perp(l0: u32, l1: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "perp(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "perp(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.perp", static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"incident", 2, 2, "incident(p: u32, l: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "incident(): ctx.edits is null";
+              return false;
+            }
+            auto p = as_u32(args[0]);
+            auto l = as_u32(args[1]);
+            if (!p || !l) {
+              err = "incident(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.incident", static_cast<uint32_t>(*p), static_cast<uint32_t>(*l));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"coincident", 2, 2, "coincident(p0: u32, p1: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "coincident(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "coincident(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.coincident", static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
             out = std::monostate{};
             return true;
           });
 
   return set;
+}
+
+GraphIrOperatorSet make_relgeo_ir_ops_pure() {
+  GraphIrOperatorSet set;
+
+  // Allow the noun+relation vocabulary plus contouring.
+  // Deliberately omit float-based operators (offset/ccint/param_*).
+
+  set.add(GraphIrOpSpec{"free", 0, 0, "free() -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>&, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "free(): ctx.edits is null";
+              return false;
+            }
+            const uint32_t node_id = ctx.edits->add_node("relgeo.free_point");
+            out = node_id;
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"pt", 2, 2, "pt(x: f64, y: f64) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "pt(): ctx.edits is null";
+              return false;
+            }
+            auto x = as_f64(args[0]);
+            auto y = as_f64(args[1]);
+            if (!x || !y) {
+              err = "pt(): expected (number, number)";
+              return false;
+            }
+            const uint32_t node_id = ctx.edits->add_node("relgeo.point");
+            ctx.edits->set_attr(node_id, "x", *x);
+            ctx.edits->set_attr(node_id, "y", *y);
+            out = node_id;
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"segment", 2, 2, "segment(a: u32, b: u32) -> u32 segment"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "segment(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "segment(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_segment(ctx, static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"line", 2, 2, "line(a: u32, b: u32) -> u32 line"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "line(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "line(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_line(ctx, static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"ray", 2, 2, "ray(origin: u32, through: u32) -> u32 ray"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "ray(): ctx.edits is null";
+              return false;
+            }
+            auto origin = as_u32(args[0]);
+            auto through = as_u32(args[1]);
+            if (!origin || !through) {
+              err = "ray(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_ray(ctx, static_cast<uint32_t>(*origin), static_cast<uint32_t>(*through));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"angle", 3, 3, "angle(a: u32, v: u32, b: u32) -> u32 angle"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "angle(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto v = as_u32(args[1]);
+            auto b = as_u32(args[2]);
+            if (!a || !v || !b) {
+              err = "angle(): expected (u32,u32,u32)";
+              return false;
+            }
+            out = emit_node_angle(ctx, static_cast<uint32_t>(*a), static_cast<uint32_t>(*v), static_cast<uint32_t>(*b));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"llint", 2, 2, "llint(l0: u32, l1: u32) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "llint(): ctx.edits is null";
+              return false;
+            }
+            auto l0 = as_u32(args[0]);
+            auto l1 = as_u32(args[1]);
+            if (!l0 || !l1) {
+              err = "llint(): expected (u32,u32)";
+              return false;
+            }
+            out = emit_node_llint(ctx, static_cast<uint32_t>(*l0), static_cast<uint32_t>(*l1));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"ratio", 2, 2, "ratio(n: u32, d: u32) -> u32 ratio"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "ratio(): ctx.edits is null";
+              return false;
+            }
+            auto n = as_u32(args[0]);
+            auto d = as_u32(args[1]);
+            if (!n || !d || *d == 0u) {
+              err = "ratio(): expected (u32,u32) with d!=0";
+              return false;
+            }
+            out = emit_node_ratio(ctx, static_cast<uint32_t>(*n), static_cast<uint32_t>(*d));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"lerp_ratio", 3, 3, "lerp_ratio(a: u32, b: u32, u: u32ratio) -> u32 point"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "lerp_ratio(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            auto u = as_u32(args[2]);
+            if (!a || !b || !u) {
+              err = "lerp_ratio(): expected (u32,u32,u32)";
+              return false;
+            }
+            out = emit_node_lerp_ratio(ctx, static_cast<uint32_t>(*a), static_cast<uint32_t>(*b), static_cast<uint32_t>(*u));
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"contour",
+                        2,
+                        0xFFFFFFFFu,
+                        "contour(p0: u32, p1: u32, ..., [\"open\"|\"closed\"], [\"ccw\"|\"cw\"|\"outer\"|\"inner\"]) -> void"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "contour(): ctx.edits is null";
+              return false;
+            }
+
+            bool closed = true;
+            RelContourWinding winding = RelContourWinding::Unknown;
+            size_t n = args.size();
+
+            while (n >= 1) {
+              auto last_s = as_string(args[n - 1]);
+              if (!last_s) break;
+              const std::string lowered = to_lower(*last_s);
+
+              bool consumed = false;
+              if (lowered == "open") {
+                closed = false;
+                consumed = true;
+              } else if (lowered == "closed") {
+                closed = true;
+                consumed = true;
+              } else if (auto w = parse_contour_winding_string(lowered)) {
+                winding = *w;
+                consumed = true;
+              }
+
+              if (!consumed) break;
+              n -= 1;
+            }
+
+            if (n < 2) {
+              err = "contour(): requires at least 2 points";
+              return false;
+            }
+
+            std::vector<uint32_t> raw;
+            raw.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+              auto pid = as_u32(args[i]);
+              if (!pid) {
+                err = "contour(): point args must be u32";
+                return false;
+              }
+              raw.push_back(*pid);
+            }
+
+            emit_node_contour(ctx, raw, closed, winding);
+            out = std::monostate{};
+            return true;
+          });
+
+  // Relations as edges.
+  set.add(GraphIrOpSpec{"parallel", 2, 2, "parallel(l0: u32, l1: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "parallel(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "parallel(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.parallel", static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"perp", 2, 2, "perp(l0: u32, l1: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "perp(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "perp(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.perp", static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"incident", 2, 2, "incident(p: u32, l: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "incident(): ctx.edits is null";
+              return false;
+            }
+            auto p = as_u32(args[0]);
+            auto l = as_u32(args[1]);
+            if (!p || !l) {
+              err = "incident(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.incident", static_cast<uint32_t>(*p), static_cast<uint32_t>(*l));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"coincident", 2, 2, "coincident(p0: u32, p1: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "coincident(): ctx.edits is null";
+              return false;
+            }
+            auto a = as_u32(args[0]);
+            auto b = as_u32(args[1]);
+            if (!a || !b) {
+              err = "coincident(): expected (u32,u32)";
+              return false;
+            }
+            emit_edge_relation(ctx, "relgeo.coincident", static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            out = std::monostate{};
+            return true;
+          });
+
+  return set;
+}
+
+bool relgeo_validate_pure_ir(std::string_view src, std::string* out_error) {
+  GraphIrProgram program;
+  GraphIrError perr;
+  if (!graph_ir_parse(src, program, &perr)) {
+    if (out_error) {
+      std::ostringstream oss;
+      oss << "parse error at " << perr.at.line << ":" << perr.at.col << ": " << perr.message;
+      *out_error = oss.str();
+    }
+    return false;
+  }
+
+  GraphEditBuilder edits;
+  GraphIrContext ctx;
+  ctx.edits = &edits;
+
+  GraphIrError eerr;
+  const GraphIrOperatorSet ops = make_relgeo_ir_ops_pure();
+  if (!graph_ir_eval(program, ops, ctx, &eerr)) {
+    if (out_error) {
+      std::ostringstream oss;
+      oss << "eval error at " << eerr.at.line << ":" << eerr.at.col << ": " << eerr.message;
+      *out_error = oss.str();
+    }
+    return false;
+  }
+
+  // Additional structural checks could go here (e.g. ensure sufficient anchors are provided
+  // for a constraint solver to obtain a numeric embedding).
+  return true;
+}
+
+bool relgeo_edits_from_pure_ir(std::string_view src, std::vector<nodus::tensors::GraphEdit>& out_edits, std::string* out_error) {
+  out_edits.clear();
+
+  GraphIrProgram program;
+  GraphIrError perr;
+  if (!graph_ir_parse(src, program, &perr)) {
+    if (out_error) {
+      std::ostringstream oss;
+      oss << "parse error at " << perr.at.line << ":" << perr.at.col << ": " << perr.message;
+      *out_error = oss.str();
+    }
+    return false;
+  }
+
+  GraphEditBuilder edits;
+  GraphIrContext ctx;
+  ctx.edits = &edits;
+
+  GraphIrError eerr;
+  const GraphIrOperatorSet ops = make_relgeo_ir_ops_pure();
+  if (!graph_ir_eval(program, ops, ctx, &eerr)) {
+    if (out_error) {
+      std::ostringstream oss;
+      oss << "eval error at " << eerr.at.line << ":" << eerr.at.col << ": " << eerr.message;
+      *out_error = oss.str();
+    }
+    return false;
+  }
+
+  out_edits.assign(edits.edits().begin(), edits.edits().end());
+  return true;
 }
 
 bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::string* out_error) {
@@ -264,27 +1084,56 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
     std::string kind;
     std::unordered_map<std::string, GraphIrValue> attrs;
   };
+  struct EdgeRec {
+    std::string kind;
+    std::unordered_map<std::string, GraphIrValue> attrs;
+  };
   std::unordered_map<uint32_t, NodeRec> nodes;
+  std::unordered_map<uint32_t, EdgeRec> edges;
   std::vector<uint32_t> point_nodes;
+  std::vector<uint32_t> segment_nodes;
+  std::vector<uint32_t> line_nodes;
+  std::vector<uint32_t> ray_nodes;
+  std::vector<uint32_t> angle_nodes;
   std::vector<uint32_t> contour_nodes;
+  std::vector<uint32_t> relation_edges;
 
   for (const auto& e : edits.edits()) {
     if (e.kind == GraphEditKind::AddNode) {
       nodes[e.a].kind = e.key;
       if (e.key.rfind("relgeo.", 0) == 0) {
         if (e.key == "relgeo.contour") contour_nodes.push_back(e.a);
+        else if (e.key == "relgeo.segment") segment_nodes.push_back(e.a);
+        else if (e.key == "relgeo.line") line_nodes.push_back(e.a);
+        else if (e.key == "relgeo.ray") ray_nodes.push_back(e.a);
+        else if (e.key == "relgeo.angle") angle_nodes.push_back(e.a);
         else point_nodes.push_back(e.a);
       }
       continue;
     }
+    if (e.kind == GraphEditKind::AddEdge) {
+      edges[e.a].kind = e.key;
+      if (e.key.rfind("relgeo.", 0) == 0) relation_edges.push_back(e.a);
+      continue;
+    }
     if (e.kind == GraphEditKind::SetAttr) {
-      nodes[e.a].attrs[e.key] = e.value;
+      const GraphObjectKind kind = graph_id_kind(e.a);
+      if (kind == GraphObjectKind::Node) {
+        nodes[e.a].attrs[e.key] = e.value;
+      } else if (kind == GraphObjectKind::Edge) {
+        edges[e.a].attrs[e.key] = e.value;
+      }
       continue;
     }
   }
 
   std::sort(point_nodes.begin(), point_nodes.end());
+  std::sort(segment_nodes.begin(), segment_nodes.end());
+  std::sort(line_nodes.begin(), line_nodes.end());
+  std::sort(ray_nodes.begin(), ray_nodes.end());
+  std::sort(angle_nodes.begin(), angle_nodes.end());
   std::sort(contour_nodes.begin(), contour_nodes.end());
+  std::sort(relation_edges.begin(), relation_edges.end());
 
   // Map graph node ids -> RelPointId (dense 1..N).
   out_program = RelProgram{};
@@ -320,6 +1169,28 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
     return true;
   };
 
+  auto get_bool_attr = [&](uint32_t nid, const char* key, bool& out_b) -> bool {
+    auto itn = nodes.find(nid);
+    if (itn == nodes.end()) return false;
+    auto ita = itn->second.attrs.find(key);
+    if (ita == itn->second.attrs.end()) return false;
+    auto b = as_bool(ita->second);
+    if (!b) return false;
+    out_b = *b;
+    return true;
+  };
+
+  auto get_edge_u32_attr = [&](uint32_t eid, const char* key, uint32_t& out_u) -> bool {
+    auto itn = edges.find(eid);
+    if (itn == edges.end()) return false;
+    auto ita = itn->second.attrs.find(key);
+    if (ita == itn->second.attrs.end()) return false;
+    auto u = as_u32(ita->second);
+    if (!u) return false;
+    out_u = *u;
+    return true;
+  };
+
   // First pass: allocate point ids.
   for (uint32_t nid : point_nodes) {
     // exclude contours
@@ -335,6 +1206,72 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
       if (nodes[nid].kind == "relgeo.contour") continue;
       nid_to_pid[nid] = RelPointId(next++);
     }
+  }
+
+  // Noun nodes.
+  std::unordered_map<uint32_t, RelSegmentId> nid_to_sid;
+  for (uint32_t nid : segment_nodes) {
+    uint32_t a = 0, b = 0;
+    if (!get_u32_attr(nid, "a", a) || !get_u32_attr(nid, "b", b)) {
+      if (out_error) *out_error = "relgeo.segment missing a/b";
+      return false;
+    }
+    auto ia = nid_to_pid.find(a);
+    auto ib = nid_to_pid.find(b);
+    if (ia == nid_to_pid.end() || ib == nid_to_pid.end()) {
+      if (out_error) *out_error = "relgeo.segment references unknown point";
+      return false;
+    }
+    nid_to_sid[nid] = out_program.add_segment(ia->second, ib->second);
+  }
+
+  std::unordered_map<uint32_t, RelLineId> nid_to_lid;
+  for (uint32_t nid : line_nodes) {
+    uint32_t a = 0, b = 0;
+    if (!get_u32_attr(nid, "a", a) || !get_u32_attr(nid, "b", b)) {
+      if (out_error) *out_error = "relgeo.line missing a/b";
+      return false;
+    }
+    auto ia = nid_to_pid.find(a);
+    auto ib = nid_to_pid.find(b);
+    if (ia == nid_to_pid.end() || ib == nid_to_pid.end()) {
+      if (out_error) *out_error = "relgeo.line references unknown point";
+      return false;
+    }
+    nid_to_lid[nid] = out_program.add_line(ia->second, ib->second);
+  }
+
+  std::unordered_map<uint32_t, RelRayId> nid_to_rid;
+  for (uint32_t nid : ray_nodes) {
+    uint32_t origin = 0, through = 0;
+    if (!get_u32_attr(nid, "origin", origin) || !get_u32_attr(nid, "through", through)) {
+      if (out_error) *out_error = "relgeo.ray missing origin/through";
+      return false;
+    }
+    auto io = nid_to_pid.find(origin);
+    auto it = nid_to_pid.find(through);
+    if (io == nid_to_pid.end() || it == nid_to_pid.end()) {
+      if (out_error) *out_error = "relgeo.ray references unknown point";
+      return false;
+    }
+    nid_to_rid[nid] = out_program.add_ray(io->second, it->second);
+  }
+
+  std::unordered_map<uint32_t, RelAngleId> nid_to_aid;
+  for (uint32_t nid : angle_nodes) {
+    uint32_t a = 0, v = 0, b = 0;
+    if (!get_u32_attr(nid, "a", a) || !get_u32_attr(nid, "v", v) || !get_u32_attr(nid, "b", b)) {
+      if (out_error) *out_error = "relgeo.angle missing a/v/b";
+      return false;
+    }
+    auto ia = nid_to_pid.find(a);
+    auto iv = nid_to_pid.find(v);
+    auto ib = nid_to_pid.find(b);
+    if (ia == nid_to_pid.end() || iv == nid_to_pid.end() || ib == nid_to_pid.end()) {
+      if (out_error) *out_error = "relgeo.angle references unknown point";
+      return false;
+    }
+    nid_to_aid[nid] = out_program.add_angle(ia->second, iv->second, ib->second);
   }
 
   // Third pass: set expressions for each point.
@@ -380,9 +1317,125 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
       RelCircle C0{nid_to_pid[c0], RelRadiusConstant{static_cast<float>(r0)}};
       RelCircle C1{nid_to_pid[c1], RelRadiusConstant{static_cast<float>(r1)}};
       if (!out_program.set_point_expr(pid, RelPointCircleCircleIntersection{C0, C1, pick})) return false;
+    } else if (nr.kind == "relgeo.llint") {
+      uint32_t l0 = 0, l1 = 0;
+      if (!get_u32_attr(nid, "l0", l0) || !get_u32_attr(nid, "l1", l1)) {
+        if (out_error) *out_error = "relgeo.llint missing l0/l1";
+        return false;
+      }
+      auto il0 = nid_to_lid.find(l0);
+      auto il1 = nid_to_lid.find(l1);
+      if (il0 == nid_to_lid.end() || il1 == nid_to_lid.end()) {
+        if (out_error) *out_error = "relgeo.llint references unknown line";
+        return false;
+      }
+      if (!out_program.set_point_expr(pid, RelPointLineLineIntersection{il0->second, il1->second})) return false;
+    } else if (nr.kind == "relgeo.parametric") {
+      std::string kind_s;
+      if (!get_str_attr(nid, "segment_kind", kind_s)) {
+        if (out_error) *out_error = "relgeo.parametric missing segment_kind";
+        return false;
+      }
+      auto kind_opt = parse_segment_kind(kind_s);
+      if (!kind_opt) {
+        if (out_error) *out_error = "relgeo.parametric invalid segment_kind";
+        return false;
+      }
+      RelParametricSegment seg;
+      seg.kind = *kind_opt;
+
+      auto resolve_point = [&](const char* key, RelPointId& out, const char* msg) -> bool {
+        uint32_t raw = 0;
+        if (!get_u32_attr(nid, key, raw)) {
+          if (out_error) *out_error = msg;
+          return false;
+        }
+        auto it = nid_to_pid.find(raw);
+        if (it == nid_to_pid.end()) {
+          if (out_error) *out_error = std::string(msg) + " references unknown point";
+          return false;
+        }
+        out = it->second;
+        return true;
+      };
+
+      if (!resolve_point("start", seg.start, "relgeo.parametric missing start")) return false;
+      if (!resolve_point("end", seg.end, "relgeo.parametric missing end")) return false;
+      if (seg.kind == RelParametricSegment::Kind::Quadratic || seg.kind == RelParametricSegment::Kind::Cubic) {
+        if (!resolve_point("ctrl1", seg.ctrl1, "relgeo.parametric missing ctrl1")) return false;
+      }
+      if (seg.kind == RelParametricSegment::Kind::Cubic) {
+        if (!resolve_point("ctrl2", seg.ctrl2, "relgeo.parametric missing ctrl2")) return false;
+      }
+
+      if (seg.kind == RelParametricSegment::Kind::SinWave) {
+        double amp = 0.0, cycles = 0.0, phase = 0.0;
+        if (!get_f64_attr(nid, "amplitude", amp) || !get_f64_attr(nid, "cycles", cycles) || !get_f64_attr(nid, "phase", phase)) {
+          if (out_error) *out_error = "relgeo.parametric sin segment missing amplitude/cycles/phase";
+          return false;
+        }
+        seg.amplitude = static_cast<float>(amp);
+        seg.cycles = static_cast<float>(cycles);
+        seg.phase = static_cast<float>(phase);
+      }
+
+      double u = 0.0;
+      if (!get_f64_attr(nid, "u", u)) {
+        if (out_error) *out_error = "relgeo.parametric missing u";
+        return false;
+      }
+
+      bool tangent_forward = true;
+      if (auto it = nr.attrs.find("tangent_forward"); it != nr.attrs.end()) {
+        auto tf = as_bool(it->second);
+        if (!tf) {
+          if (out_error) *out_error = "relgeo.parametric invalid tangent_forward value";
+          return false;
+        }
+        tangent_forward = *tf;
+      }
+      seg.tangent_forward = tangent_forward;
+
+      if (!out_program.set_point_expr(pid, RelPointParametric{seg, static_cast<float>(u)})) return false;
     } else {
       if (out_error) *out_error = "unknown relgeo node kind: " + nr.kind;
       return false;
+    }
+  }
+
+  // Relation edges -> assertions.
+  for (uint32_t eid : relation_edges) {
+    const auto it = edges.find(eid);
+    if (it == edges.end()) continue;
+    const std::string& k = it->second.kind;
+
+    uint32_t a = 0, b = 0;
+    if (!get_edge_u32_attr(eid, "a", a) || !get_edge_u32_attr(eid, "b", b)) continue;
+
+    if (k == "relgeo.coincident") {
+      auto ia = nid_to_pid.find(a);
+      auto ib = nid_to_pid.find(b);
+      if (ia != nid_to_pid.end() && ib != nid_to_pid.end()) {
+        out_program.add_assertion(RelAssertCoincident{ia->second, ib->second});
+      }
+    } else if (k == "relgeo.incident") {
+      auto ip = nid_to_pid.find(a);
+      auto il = nid_to_lid.find(b);
+      if (ip != nid_to_pid.end() && il != nid_to_lid.end()) {
+        out_program.add_assertion(RelAssertPointOnLine{ip->second, il->second});
+      }
+    } else if (k == "relgeo.parallel") {
+      auto il0 = nid_to_lid.find(a);
+      auto il1 = nid_to_lid.find(b);
+      if (il0 != nid_to_lid.end() && il1 != nid_to_lid.end()) {
+        out_program.add_assertion(RelAssertParallelLines{il0->second, il1->second});
+      }
+    } else if (k == "relgeo.perp") {
+      auto il0 = nid_to_lid.find(a);
+      auto il1 = nid_to_lid.find(b);
+      if (il0 != nid_to_lid.end() && il1 != nid_to_lid.end()) {
+        out_program.add_assertion(RelAssertPerpendicularLines{il0->second, il1->second});
+      }
     }
   }
 
@@ -394,6 +1447,11 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
     if (auto it = nr.attrs.find("closed"); it != nr.attrs.end()) {
       auto v = as_f64(it->second);
       if (v) closed = (*v >= 0.5);
+    }
+
+    RelContourWinding winding = RelContourWinding::Unknown;
+    if (auto it = nr.attrs.find("winding"); it != nr.attrs.end()) {
+      if (auto w = parse_contour_winding_value(it->second)) winding = *w;
     }
 
     // gather v0..vN
@@ -422,7 +1480,7 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
       }
       verts.push_back(it->second);
     }
-    out_program.add_contour(std::move(verts), closed);
+    out_program.add_contour(std::move(verts), closed, winding);
   }
   return true;
 }

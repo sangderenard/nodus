@@ -149,13 +149,14 @@ static bool make_fill_from_token(const std::string& token,
 
   if (outlines.empty()) return false;
 
-  // Calibrate tool footprint and derive an outline-space tool width.
-  const uint32_t canvas_w = 900;
-  const uint32_t canvas_h = 260;
-  ProgramMapping outline_mapping = compute_program_mapping(outline_program, canvas_w, canvas_h, /*margin=*/14.0f);
+  // Choose a stable render scale for tests and derive outline-space tool width.
+  // Sizing is driven from the refined toolpath polyline bounds.
+  const float render_scale = 3.0f; // pixels per outline unit
+  const float margin_px = 14.0f;
+
   ToolCalibration cal = calibrate_gaussian_tool_impulse(256, tool);
   float eff_radius_px = std::max(cal.radius_at_value_fraction(0.05f), 1.0f);
-  float eff_radius_outline = eff_radius_px / std::max(outline_mapping.scale, 1e-6f);
+  float eff_radius_outline = eff_radius_px / std::max(render_scale, 1e-6f);
 
   FillPlanConfig fill_cfg;
   fill_cfg.rule = FillRule::EvenOdd;
@@ -184,18 +185,17 @@ static bool make_fill_from_token(const std::string& token,
   master.points.insert(master.points.end(), outline_program.points.begin(), outline_program.points.end());
   master.points.insert(master.points.end(), fill_prog.points.begin(), fill_prog.points.end());
 
-  ProgramMapping mapping = compute_program_mapping(master, canvas_w, canvas_h, /*margin=*/14.0f);
+  ProgramRasterTransform xform = plan_program_raster_transform_refined(master, machine, render_scale, margin_px, tool);
+  out_energy.resize(xform.width_px, xform.height_px, 0.0f);
+  out_temp.resize(xform.width_px, xform.height_px, 0.0f);
+  rasterize_program_gaussian_with_thermal_transformed(fill_prog, out_energy, out_temp, machine, tool, xform);
 
-  out_energy = TensorCanvas2D(canvas_w, canvas_h);
-  out_temp = TensorCanvas2D(canvas_w, canvas_h);
-  rasterize_program_gaussian_with_thermal_mapped(fill_prog, out_energy, out_temp, machine, tool, mapping);
-
-  TensorCanvas2D ch_r(canvas_w, canvas_h);
-  TensorCanvas2D ch_g(canvas_w, canvas_h);
-  TensorCanvas2D ch_b(canvas_w, canvas_h);
-  TensorCanvas2D tmp(canvas_w, canvas_h);
-  rasterize_program_gaussian_with_thermal_mapped(outline_program, ch_r, tmp, machine, tool, mapping);
-  rasterize_program_gaussian_with_thermal_mapped(fill_prog, ch_g, tmp, machine, tool, mapping);
+  TensorCanvas2D ch_r(xform.width_px, xform.height_px);
+  TensorCanvas2D ch_g(xform.width_px, xform.height_px);
+  TensorCanvas2D ch_b(xform.width_px, xform.height_px);
+  TensorCanvas2D tmp(xform.width_px, xform.height_px);
+  rasterize_program_gaussian_with_thermal_transformed(outline_program, ch_r, tmp, machine, tool, xform);
+  rasterize_program_gaussian_with_thermal_transformed(fill_prog, ch_g, tmp, machine, tool, xform);
   // Leave B empty for contrast.
 
   auto r_u8 = ch_r.to_u8_normalized();
@@ -285,7 +285,6 @@ int main(int argc, char** argv) {
   machine.max_temp = 4.0f;
 
   GaussianToolParams tool;
-  tool.sigma_px = 1.6f;
 
   ArmatureProgram fill_prog;
   TensorCanvas2D energy;

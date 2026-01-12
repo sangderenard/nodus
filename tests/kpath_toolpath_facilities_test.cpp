@@ -5,6 +5,8 @@
 #include "common/tensors/abstraction/kpath/kpath_kinematics.h"
 #include "common/tensors/abstraction/kpath/kpath_raster.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
+#include "common/tensors/abstraction/kpath/kpath_relgeo_solve.h"
+#include "common/tensors/abstraction/kpath/kpath_ui_layout.h"
 #include "common/tensors/abstraction/kpath/kpath_shaper.h"
 #include "common/tensors/abstraction/kpath/kpath_tokenizer.h"
 #include "common/tensors/abstraction/kpath/kpath_pipeline.h"
@@ -15,6 +17,7 @@
 #include <iostream>
 #include <cmath>
 #include <sstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -284,8 +287,8 @@ static bool validate_raster_png_facility(const char* argv0) {
   ArmatureProgram program = glyph_outline_to_armature_program(outline, /*nominal_z=*/0.0f, /*samples_per_segment=*/24);
   if (!require_or_report(!program.points.empty(), "ArmatureProgram contained no sampled points")) return false;
 
-  TensorCanvas2D energy(256, 256);
-  TensorCanvas2D temp(256, 256);
+  TensorCanvas2D energy;
+  TensorCanvas2D temp;
   MachineControlConfig machine;
   machine.step_px = 0.75f;
   machine.energy_per_px = 1.25f;
@@ -296,9 +299,11 @@ static bool validate_raster_png_facility(const char* argv0) {
   machine.max_temp = 4.0f;
 
   GaussianToolParams tool;
-  tool.sigma_px = 2.0f;
 
-  rasterize_program_gaussian_with_thermal(program, energy, temp, machine, tool, /*margin=*/12.0f);
+  const float render_scale = 4.0f; // pixels per outline unit
+  const float margin_px = 12.0f;
+  ProgramRasterTransform xform = plan_program_raster_transform_refined(program, machine, render_scale, margin_px, tool);
+  rasterize_program_gaussian_with_thermal_transformed(program, energy, temp, machine, tool, xform);
   float max_v = energy.max_value();
   if (!require_or_report(max_v > 0.001f, "rasterized canvas should have non-zero energy")) return false;
 
@@ -430,6 +435,30 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     }
   }
 
+  {
+    const float shape_line_y = pen_y + 118.0f;
+    const float shape_spacing = 78.0f;
+    float shape_x = page_origin_x;
+    RelGlyph square_shape = make_rel_square_panel(0xE011u, 28.0f);
+    if (!require_or_report(add_relglyph_shape(atlas_builder, program, pangram_outlines, square_shape, shape_x, shape_line_y, "param square"),
+                           "param square glyph build failed")) {
+      return false;
+    }
+    shape_x += shape_spacing;
+    // A straight-sided hex (line midpoint) and a wavy-sided hex (sin midpoint).
+    RelGlyph hex_straight = make_rel_hex_panel(0xE012u, 22.0f, /*waviness_amplitude*/0.0f);
+    if (!require_or_report(add_relglyph_shape(atlas_builder, program, pangram_outlines, hex_straight, shape_x, shape_line_y, "param hex line"),
+                           "param hex line glyph build failed")) {
+      return false;
+    }
+    shape_x += shape_spacing;
+    RelGlyph hex_wavy = make_rel_hex_panel(0xE013u, 22.0f, /*waviness_amplitude*/22.0f * 0.08f);
+    if (!require_or_report(add_relglyph_shape(atlas_builder, program, pangram_outlines, hex_wavy, shape_x, shape_line_y, "param hex sin"),
+                           "param hex sin glyph build failed")) {
+      return false;
+    }
+  }
+
   // Inject a relational-geometry glyph: equilateral triangle built from circle intersections.
   {
     const uint32_t cp = 0xE010u; // PUA
@@ -451,7 +480,7 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     cb.radius = RelRadiusDistance{A, B};
 
     RelPointId C = rg.program.add_point(RelPointCircleCircleIntersection{ca, cb, RelPick::HigherY});
-    rg.program.add_contour({A, B, C}, /*closed*/true);
+    rg.program.add_contour({A, B, C}, /*closed*/true, RelContourWinding::CCW);
     rg.advance_x = s + 0.15f * s;
 
     GlyphOutline outline;
@@ -470,13 +499,99 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     pangram_outlines.push_back(translate_outline(outline, gx, glyph_line_y));
   }
 
+  // Inject a pure-IR + constraint-solved relational-geometry glyph: a panel diagram constructed
+  // from midlines, parallels, and intersections ("word as geometry diagram" demo).
+  {
+    const uint32_t cp = 0xE014u; // PUA
+
+    RelGlyph rg;
+    rg.codepoint = cp;
+    rg.glyph_id = 0xF2000000u | (cp & 0x0000FFFFu);
+    rg.advance_y = 0.0f;
+
+    const float s = 28.0f;
+    // A square, its diagonals, and an interior "frame" built from constrained parallels.
+    // Notes:
+    // - free() points provide symbolic degrees of freedom.
+    // - parallel() constraints orient helper lines; llint() turns them into constructed points.
+    const std::string ir =
+      "a = pt(0, 0);\n"
+      "b = pt(" + std::to_string(s) + ", 0);\n"
+      "c = pt(" + std::to_string(s) + ", " + std::to_string(s) + ");\n"
+      "d = pt(0, " + std::to_string(s) + ");\n"
+      "half = ratio(1, 2);\n"
+      "mab = lerp_ratio(a, b, half);\n"
+      "mbc = lerp_ratio(b, c, half);\n"
+      "mcd = lerp_ratio(c, d, half);\n"
+      "mda = lerp_ratio(d, a, half);\n"
+      "lab = line(a, b);\n"
+      "lbc = line(b, c);\n"
+      "lac = line(a, c);\n"
+      "lbd = line(b, d);\n"
+      "o = llint(lac, lbd);\n"
+      "u1 = free();\n"
+      "u2 = free();\n"
+      "u3 = free();\n"
+      "u4 = free();\n"
+      "lv0 = line(mab, u1);\n"
+      "parallel(lv0, lbc);\n"
+      "lh0 = line(mbc, u2);\n"
+      "parallel(lh0, lab);\n"
+      "p0 = llint(lv0, lh0);\n"
+      "lv1 = line(mcd, u3);\n"
+      "parallel(lv1, lbc);\n"
+      "lh1 = line(mda, u4);\n"
+      "parallel(lh1, lab);\n"
+      "p1 = llint(lv1, lh1);\n"
+      // Outer border (closed), plus interior construction strokes (open).
+      "contour(a, b, c, d, \"closed\", \"ccw\");\n"
+      "contour(a, c, \"open\");\n"
+      "contour(b, d, \"open\");\n"
+      "contour(mab, mcd, \"open\");\n"
+      "contour(mbc, mda, \"open\");\n"
+      "contour(p0, o, p1, \"open\");\n";
+
+    RelGeoSolveInputs sin;
+    sin.eps = 1e-4f;
+    sin.max_passes = 64;
+
+    std::string solve_err;
+    if (!require_or_report(relgeo_program_from_pure_ir_solved(ir, sin, rg.program, &solve_err), solve_err.c_str())) return false;
+    rg.advance_x = s + 0.25f * s;
+
+    GlyphOutline outline;
+    std::string err;
+    if (!require_or_report(compile_relglyph_outline(rg, outline, 0.0f, 0.0f, 1.0f, &err), err.c_str())) return false;
+
+    TokenLayoutPlan plan;
+    if (!require_or_report(build_codepoint_glyph_token(atlas_builder, cp, outline, rg.advance_x, rg.advance_y, plan),
+                           "build_codepoint_glyph_token() failed for pure-ir relglyph")) {
+      return false;
+    }
+
+    const float glyph_line_y = pen_y + 78.0f;
+    const float gx = page_origin_x + 92.0f; // place next to the triangle demo
+    append_glyph_outline_to_program(program, outline, gx, glyph_line_y, 0.0f, /*samples*/16);
+    pangram_outlines.push_back(translate_outline(outline, gx, glyph_line_y));
+  }
+
+  {
+    const std::vector<std::string> panel_words = {"kpath", "geometry", "layout"};
+    const float panel_x = page_origin_x + 360.0f;
+    const float panel_y = pen_y + 12.0f;
+    const float panel_size = 90.0f;
+    if (!require_or_report(append_ui_panel_with_text(atlas_builder, program, pangram_outlines, shaper, panel_words, panel_x, panel_y, panel_size),
+                           "UI panel text layout failed")) {
+      return false;
+    }
+  }
   Atlas atlas = atlas_builder.finalize();
   if (!require_or_report(atlas.node(NodeId{0}).kind == AtlasNodeKind::Codepoint, "atlas sanity check (node0 kind)")) return false;
   if (!require_or_report(atlas.node(NodeId{0}).payload == static_cast<uint32_t>('t'), "atlas sanity check (node0 payload)")) return false;
 
   // Render the composed atlas program.
-  TensorCanvas2D energy(1400, 220);
-  TensorCanvas2D temp(1400, 220);
+  TensorCanvas2D energy;
+  TensorCanvas2D temp;
 
   MachineControlConfig machine;
   machine.step_px = 0.65f;
@@ -488,14 +603,9 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
   machine.max_temp = 4.0f;
 
   GaussianToolParams tool;
-  tool.sigma_px = 1.6f;
 
-  ProgramMapping mapping;
-  mapping.min_x = 0.0f;
-  mapping.min_y = 0.0f;
-  mapping.scale = page_scale;
-  mapping.margin = page_margin_px;
-  rasterize_program_gaussian_with_thermal_mapped(program, energy, temp, machine, tool, mapping);
+  ProgramRasterTransform page_xform = plan_program_raster_transform_refined(program, machine, page_scale, page_margin_px, tool);
+  rasterize_program_gaussian_with_thermal_transformed(program, energy, temp, machine, tool, page_xform);
   if (!require_or_report(energy.max_value() > 0.001f, "pangram atlas raster energy should be non-zero")) return false;
 
   const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_atlas_pangram.png");
@@ -531,10 +641,8 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
           << " r@5%=" << r_val_05
           << " r@95%energy=" << r_cum_95 << "\n";
 
-    ArmatureProgram outline_program = glyph_outline_to_armature_program(pangram_outlines.front(), 0.0f, /*samples*/16);
-    ProgramMapping outline_mapping = compute_program_mapping(outline_program, 256, 256, /*margin=*/12.0f);
     float eff_radius_px = std::max(r_val_05, 1.0f);
-    float eff_radius_outline = eff_radius_px / std::max(outline_mapping.scale, 1e-6f);
+    float eff_radius_outline = eff_radius_px / std::max(page_scale, 1e-6f);
     fill_cfg.tool.tool_width = 2.0f * eff_radius_outline;
     fill_cfg.tool.stepover = 0.0f;
     fill_cfg.tool.overlap = 0.85f;
@@ -553,9 +661,9 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     }
     if (!require_or_report(filled_any, "fill plan generation failed")) return false;
 
-    TensorCanvas2D fill_energy(1400, 220);
-    TensorCanvas2D fill_temp(1400, 220);
-    rasterize_program_gaussian_with_thermal_mapped(fill_prog, fill_energy, fill_temp, machine, tool, mapping);
+    TensorCanvas2D fill_energy;
+    TensorCanvas2D fill_temp;
+    rasterize_program_gaussian_with_thermal_transformed(fill_prog, fill_energy, fill_temp, machine, tool, page_xform);
     if (!require_or_report(fill_energy.max_value() > 0.001f, "fill raster energy should be non-zero")) return false;
 
     const std::string fill_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill.png");
@@ -744,15 +852,15 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     master.points.insert(master.points.end(), outline_ccw.points.begin(), outline_ccw.points.end());
     master.points.insert(master.points.end(), fill_prog.points.begin(), fill_prog.points.end());
 
-    ProgramMapping mapping = compute_program_mapping(master, 1400, 220, /*margin=*/14.0f);
+    ProgramRasterTransform xform = plan_program_raster_transform_refined(master, machine, page_scale, page_margin_px, tool);
 
-    TensorCanvas2D ch_r(1400, 220);
-    TensorCanvas2D ch_g(1400, 220);
-    TensorCanvas2D ch_b(1400, 220);
-    TensorCanvas2D tmp(1400, 220);
-    rasterize_program_gaussian_with_thermal_mapped(outline_cw, ch_r, tmp, machine, tool, mapping);
-    rasterize_program_gaussian_with_thermal_mapped(fill_prog, ch_g, tmp, machine, tool, mapping);
-    rasterize_program_gaussian_with_thermal_mapped(outline_ccw, ch_b, tmp, machine, tool, mapping);
+    TensorCanvas2D ch_r;
+    TensorCanvas2D ch_g;
+    TensorCanvas2D ch_b;
+    TensorCanvas2D tmp;
+    rasterize_program_gaussian_with_thermal_transformed(outline_cw, ch_r, tmp, machine, tool, xform);
+    rasterize_program_gaussian_with_thermal_transformed(fill_prog, ch_g, tmp, machine, tool, xform);
+    rasterize_program_gaussian_with_thermal_transformed(outline_ccw, ch_b, tmp, machine, tool, xform);
 
     auto r_u8 = ch_r.to_u8_normalized();
     auto g_u8 = ch_g.to_u8_normalized();
@@ -836,14 +944,14 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     master_kerf.points.insert(master_kerf.points.end(), fill_prog.points.begin(), fill_prog.points.end());
     master_kerf.points.insert(master_kerf.points.end(), gimbal_surface.points.begin(), gimbal_surface.points.end());
 
-    ProgramMapping mapping_kerf = compute_program_mapping(master_kerf, 1400, 220, /*margin=*/14.0f);
+    ProgramRasterTransform xform_kerf = plan_program_raster_transform_refined(master_kerf, machine, page_scale, page_margin_px, tool);
 
-    TensorCanvas2D k_r(1400, 220);
-    TensorCanvas2D k_g(1400, 220);
-    TensorCanvas2D k_b(1400, 220);
-    rasterize_program_gaussian_with_thermal_mapped(contour_inside, k_r, tmp, machine, tool, mapping_kerf);
-    rasterize_program_gaussian_with_thermal_mapped(fill_prog, k_g, tmp, machine, tool, mapping_kerf);
-    rasterize_program_gaussian_with_thermal_mapped(contour_outside, k_b, tmp, machine, tool, mapping_kerf);
+    TensorCanvas2D k_r;
+    TensorCanvas2D k_g;
+    TensorCanvas2D k_b;
+    rasterize_program_gaussian_with_thermal_transformed(contour_inside, k_r, tmp, machine, tool, xform_kerf);
+    rasterize_program_gaussian_with_thermal_transformed(fill_prog, k_g, tmp, machine, tool, xform_kerf);
+    rasterize_program_gaussian_with_thermal_transformed(contour_outside, k_b, tmp, machine, tool, xform_kerf);
 
     auto kr_u8 = k_r.to_u8_normalized();
     auto kg_u8 = k_g.to_u8_normalized();
@@ -911,7 +1019,6 @@ static bool validate_program_api_facilities() {
   machine.feed_rate_px_per_s = 550.0f;
   machine.enable_thermal_guard = false;
   GaussianToolParams tool;
-  tool.sigma_px = 1.75f;
 
   TensorCanvas2D tensor;
   if (!require_or_report(rasterize_program_into_minimal_tensor(utf8_program, tensor, machine, tool, raster_params),

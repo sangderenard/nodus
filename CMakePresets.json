@@ -10,7 +10,6 @@
         "VCPKG_FEATURE_FLAGS": "manifests"
       },
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
         "MODULE_LIBRARY_MODE": "regular"
       }
@@ -24,7 +23,6 @@
         "VCPKG_FEATURE_FLAGS": "manifests"
       },
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
         "MODULE_LIBRARY_MODE": "test",
         "GENERATE_TEST_MODULE_LIBRARY": "ON"
@@ -39,7 +37,6 @@
         "VCPKG_FEATURE_FLAGS": "manifests"
       },
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
         "MODULE_LIBRARY_MODE": "real",
         "GENERATE_REAL_MODULE_LIBRARY": "ON"

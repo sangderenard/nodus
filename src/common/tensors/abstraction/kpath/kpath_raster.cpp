@@ -112,9 +112,25 @@ struct GaussianKernel final {
   }
 };
 
+static uint32_t gaussian_kernel_radius_px(float sigma_px) {
+  const float sigma = std::max(sigma_px, 0.0f);
+  if (sigma <= 0.5f) return 0;
+  return static_cast<uint32_t>(std::ceil(3.0f * std::max(sigma, 0.25f)));
+}
+
 static GaussianKernel make_gaussian_kernel(float sigma_px) {
   GaussianKernel k;
-  k.sigma = std::max(sigma_px, 0.25f);
+  // Fast path: treat very small sigma as a point-stamp (single pixel).
+  // This avoids kernel allocation and the convolution loops.
+  k.sigma = std::max(sigma_px, 0.0f);
+  if (k.sigma <= 0.5f) {
+    k.radius = 0;
+    k.weights = {1.0f};
+    return k;
+  }
+
+  // Clamp to a small minimum to keep the discrete kernel stable.
+  k.sigma = std::max(k.sigma, 0.25f);
   k.radius = static_cast<int>(std::ceil(3.0f * k.sigma));
   int s = 2 * k.radius + 1;
   k.weights.resize(static_cast<size_t>(s) * s);
@@ -141,6 +157,13 @@ static void gaussian_stamp_energy(TensorCanvas2D& canvas,
                                   float cx,
                                   float cy,
                                   float energy) {
+  if (kernel.radius == 0) {
+    uint32_t x = static_cast<uint32_t>(std::clamp(static_cast<int>(std::floor(cx)), 0, static_cast<int>(canvas.width - 1)));
+    uint32_t y = static_cast<uint32_t>(std::clamp(static_cast<int>(std::floor(cy)), 0, static_cast<int>(canvas.height - 1)));
+    canvas.at(x, y) += energy;
+    return;
+  }
+
   int r = kernel.radius;
   int x0 = static_cast<int>(std::floor(cx)) - r;
   int x1 = static_cast<int>(std::floor(cx)) + r;
@@ -230,6 +253,33 @@ static void gaussian_stamp_energy_and_temp(TensorCanvas2D& energy_canvas,
                                            float cooling_tau,
                                            float energy_to_temp,
                                            float max_temp) {
+  if (kernel.radius == 0) {
+    float decay = 1.0f;
+    if (cooling_tau > kEps) {
+      decay = std::exp(-dt / cooling_tau);
+    }
+
+    int cx_i = std::clamp(static_cast<int>(std::floor(cx)), 0, static_cast<int>(temp_canvas.width - 1));
+    int cy_i = std::clamp(static_cast<int>(std::floor(cy)), 0, static_cast<int>(temp_canvas.height - 1));
+    uint32_t x = static_cast<uint32_t>(cx_i);
+    uint32_t y = static_cast<uint32_t>(cy_i);
+
+    float center_temp = temp_canvas.at(x, y) * decay;
+    float scale = 1.0f;
+    if (max_temp > kEps && center_temp > max_temp) {
+      scale = max_temp / center_temp;
+      scale = std::clamp(scale, 0.0f, 1.0f);
+    }
+
+    float e = energy * scale;
+    energy_canvas.at(x, y) += e;
+
+    float prev_t = temp_canvas.at(x, y);
+    float new_t = prev_t * decay + e * energy_to_temp;
+    temp_canvas.at(x, y) = new_t;
+    return;
+  }
+
   int r = kernel.radius;
   int x0 = static_cast<int>(std::floor(cx)) - r;
   int x1 = static_cast<int>(std::floor(cx)) + r;
@@ -348,6 +398,185 @@ ProgramMapping compute_program_mapping(const ArmatureProgram& reference_program,
   return m;
 }
 
+bool compute_program_bounds(const ArmatureProgram& program, ProgramBounds& out_bounds) {
+  if (program.points.empty()) return false;
+
+  float min_x = std::numeric_limits<float>::infinity();
+  float min_y = std::numeric_limits<float>::infinity();
+  float max_x = -std::numeric_limits<float>::infinity();
+  float max_y = -std::numeric_limits<float>::infinity();
+  for (const auto& p : program.points) {
+    min_x = std::min(min_x, p.x);
+    min_y = std::min(min_y, p.y);
+    max_x = std::max(max_x, p.x);
+    max_y = std::max(max_y, p.y);
+  }
+
+  out_bounds.min_x = min_x;
+  out_bounds.min_y = min_y;
+  out_bounds.max_x = max_x;
+  out_bounds.max_y = max_y;
+  return true;
+}
+
+ProgramRasterPlan plan_program_raster(const ArmatureProgram& program,
+                                      float pixels_per_unit,
+                                      float margin_px,
+                                      const GaussianToolParams& tool) {
+  ProgramRasterPlan plan;
+  if (program.points.empty()) return plan;
+
+  ProgramBounds b;
+  if (!compute_program_bounds(program, b)) return plan;
+
+  const float s = std::max(pixels_per_unit, 1e-6f);
+  const float span_x = std::max(b.max_x - b.min_x, 1.0f);
+  const float span_y = std::max(b.max_y - b.min_y, 1.0f);
+
+  // Ensure the kernel footprint stays inside the tensor even when stamping at the margin.
+  // For a radius-r kernel, we need >= r+1 pixels of padding to avoid the (w-1) boundary
+  // when floor(cx) lands at the last in-bounds pixel.
+  const float r = static_cast<float>(gaussian_kernel_radius_px(tool.sigma_px));
+  const float margin = std::max(0.0f, margin_px) + r + 1.0f;
+
+  const float width_f = span_x * s + 2.0f * margin;
+  const float height_f = span_y * s + 2.0f * margin;
+
+  plan.width_px = static_cast<uint32_t>(std::max(1.0f, std::ceil(width_f)));
+  plan.height_px = static_cast<uint32_t>(std::max(1.0f, std::ceil(height_f)));
+
+  plan.mapping.min_x = b.min_x;
+  plan.mapping.min_y = b.min_y;
+  plan.mapping.scale = s;
+  plan.mapping.margin = margin;
+  return plan;
+}
+
+ProgramRasterTransform plan_program_raster_transform_refined(const ArmatureProgram& reference_program,
+                                                            const MachineControlConfig& machine,
+                                                            float pixels_per_unit,
+                                                            float margin_px,
+                                                            const GaussianToolParams& tool) {
+  ProgramRasterTransform xform;
+  if (reference_program.points.empty()) return xform;
+
+  const float scale = std::max(pixels_per_unit, 1e-6f);
+  const uint32_t r_px = gaussian_kernel_radius_px(tool.sigma_px);
+  const float pad = std::max(0.0f, margin_px) + static_cast<float>(r_px) + 1.0f;
+
+  std::vector<ToolPoint> scaled;
+  scaled.reserve(reference_program.points.size());
+  for (const auto& p : reference_program.points) {
+    ToolPoint q = p;
+    q.x = p.x * scale;
+    q.y = p.y * scale;
+    scaled.push_back(q);
+  }
+
+  // Refine into a pixel-space polyline and track bounds over engaged points.
+  std::vector<ToolPoint> exec_pts = resample_polyline_equal_arclen(scaled, machine.step_px);
+  float min_x = std::numeric_limits<float>::infinity();
+  float min_y = std::numeric_limits<float>::infinity();
+  float max_x = -std::numeric_limits<float>::infinity();
+  float max_y = -std::numeric_limits<float>::infinity();
+  bool any = false;
+  for (const auto& p : exec_pts) {
+    if (!p.engaged) continue;
+    any = true;
+    min_x = std::min(min_x, p.x);
+    min_y = std::min(min_y, p.y);
+    max_x = std::max(max_x, p.x);
+    max_y = std::max(max_y, p.y);
+  }
+  if (!any) return xform;
+
+  const float span_x = std::max(max_x - min_x, 1.0f);
+  const float span_y = std::max(max_y - min_y, 1.0f);
+
+  xform.width_px = static_cast<uint32_t>(std::max(1.0f, std::ceil(span_x + 2.0f * pad)));
+  xform.height_px = static_cast<uint32_t>(std::max(1.0f, std::ceil(span_y + 2.0f * pad)));
+  xform.scale = scale;
+  xform.shift_x = -min_x + pad;
+  xform.shift_y = -min_y + pad;
+  return xform;
+}
+
+void rasterize_program_gaussian_with_thermal_transformed(const ArmatureProgram& program,
+                                                        TensorCanvas2D& out_energy,
+                                                        TensorCanvas2D& out_temp,
+                                                        const MachineControlConfig& machine,
+                                                        const GaussianToolParams& tool,
+                                                        const ProgramRasterTransform& xform) {
+  if (xform.width_px == 0 || xform.height_px == 0) return;
+
+  if (out_energy.width != xform.width_px || out_energy.height != xform.height_px) {
+    out_energy.resize(xform.width_px, xform.height_px, 0.0f);
+  } else {
+    out_energy.clear(0.0f);
+  }
+  if (out_temp.width != xform.width_px || out_temp.height != xform.height_px) {
+    out_temp.resize(xform.width_px, xform.height_px, 0.0f);
+  } else {
+    out_temp.clear(0.0f);
+  }
+
+  if (program.points.empty()) return;
+
+  GaussianKernel kernel = make_gaussian_kernel(tool.sigma_px);
+
+  std::vector<ToolPoint> img_pts;
+  img_pts.reserve(program.points.size());
+  for (const auto& p : program.points) {
+    ToolPoint ip = p;
+    const float x = p.x * xform.scale + xform.shift_x;
+    const float y_unflipped = p.y * xform.scale + xform.shift_y;
+    ip.x = x;
+    ip.y = (static_cast<float>(xform.height_px) - 1.0f) - y_unflipped;
+    img_pts.push_back(ip);
+  }
+
+  std::vector<ToolPoint> exec_pts = resample_polyline_equal_arclen(img_pts, machine.step_px);
+  if (exec_pts.size() < 2) return;
+
+  const float step = std::max(machine.step_px, 0.05f);
+  const float energy_step = machine.energy_per_px * step;
+  const float feed = std::max(machine.feed_rate_px_per_s, 1.0f);
+  const float dt = step / feed;
+
+  if (!machine.enable_thermal_guard) {
+    bool have_last = false;
+    ToolPoint last{};
+    for (const auto& p : exec_pts) {
+      if (!p.engaged) continue;
+      if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
+      gaussian_stamp_energy(out_energy, kernel, p.x, p.y, energy_step);
+      last = p;
+      have_last = true;
+    }
+    out_temp.clear(0.0f);
+    return;
+  }
+
+  bool have_last = false;
+  ToolPoint last{};
+  for (const auto& p : exec_pts) {
+    if (!p.engaged) continue;
+    if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
+    gaussian_stamp_energy_and_temp(out_energy,
+                                   out_temp,
+                                   kernel,
+                                   p.x,
+                                   p.y,
+                                   energy_step,
+                                   dt,
+                                   std::max(machine.cooling_tau_s, 0.0f),
+                                   machine.energy_to_temp,
+                                   std::max(machine.max_temp, 0.0f));
+    last = p;
+    have_last = true;
+  }
+}
+
 bool project_beam_program_to_plane(const BeamProgram& beam_prog,
                                    float plane_z,
                                    ArmatureProgram& out_program) {
@@ -368,6 +597,17 @@ bool project_beam_program_to_plane(const BeamProgram& beam_prog,
 }
 
 TensorCanvas2D::TensorCanvas2D(uint32_t w, uint32_t h) : width(w), height(h), values(w * h, 0.0f) {}
+
+void TensorCanvas2D::reserve(uint32_t w, uint32_t h) {
+  values.reserve(static_cast<size_t>(w) * h);
+}
+
+void TensorCanvas2D::resize(uint32_t w, uint32_t h, float init_value) {
+  width = w;
+  height = h;
+  values.resize(static_cast<size_t>(w) * h);
+  std::fill(values.begin(), values.end(), init_value);
+}
 
 float& TensorCanvas2D::at(uint32_t x, uint32_t y) {
   return values[static_cast<size_t>(y) * width + x];
@@ -430,12 +670,31 @@ void append_glyph_outline_to_program(ArmatureProgram& program,
   const float cut_z = tz;
   const float safe_z = std::min(kDefaultSafeZ, cut_z - 1.0f);
 
-  ToolPoint cur{tx, ty, safe_z, false};
-  ToolPoint subpath_start{tx, ty, safe_z, false};
+  // When appending multiple outlines into a single program, the starting cursor
+  // must be the program's last emitted point. Using a fabricated (tx,ty,safe_z)
+  // cursor can accidentally suppress the first MoveTo for geometry that begins
+  // at (0,0), which then creates an unintended engaged connection.
+  ToolPoint cur = program.points.empty() ? ToolPoint{tx, ty, safe_z, false} : program.points.back();
+  ToolPoint subpath_start = cur;
   bool have_subpath = false;
   bool need_plunge = false;
 
   auto push_point = [&](const ToolPoint& p) {
+    // Avoid emitting identical consecutive points (common at joins/degenerate segments).
+    // This prevents zero-length segments, which can otherwise lead to uneven energy deposition.
+    if (!program.points.empty()) {
+      constexpr float kDupEps = 1e-6f;
+      const ToolPoint& last_emitted = program.points.back();
+      const float dx = p.x - last_emitted.x;
+      const float dy = p.y - last_emitted.y;
+      const float dz = p.z - last_emitted.z;
+      const bool same_xy = (dx * dx + dy * dy) <= (kDupEps * kDupEps);
+      const bool same_z = std::fabs(dz) <= kDupEps;
+      const bool same_engaged = (p.engaged == last_emitted.engaged);
+      if (same_xy && same_z && same_engaged) {
+        return;
+      }
+    }
     program.points.push_back(p);
     cur = p;
   };
@@ -607,7 +866,7 @@ void rasterize_program_gaussian_with_thermal(const ArmatureProgram& program,
   if (out_energy.width == 0 || out_energy.height == 0) return;
   out_energy.clear(0.0f);
   if (out_temp.width != out_energy.width || out_temp.height != out_energy.height) {
-    out_temp = TensorCanvas2D(out_energy.width, out_energy.height);
+    out_temp.resize(out_energy.width, out_energy.height, 0.0f);
   }
   out_temp.clear(0.0f);
 
@@ -696,7 +955,7 @@ void rasterize_program_gaussian_with_thermal_mapped(const ArmatureProgram& progr
   if (out_energy.width == 0 || out_energy.height == 0) return;
   out_energy.clear(0.0f);
   if (out_temp.width != out_energy.width || out_temp.height != out_energy.height) {
-    out_temp = TensorCanvas2D(out_energy.width, out_energy.height);
+    out_temp.resize(out_energy.width, out_energy.height, 0.0f);
   }
   out_temp.clear(0.0f);
 

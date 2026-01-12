@@ -12,7 +12,14 @@ What's included
 - Third-party: `stb_easy_font.h` (from https://github.com/nothings/stb)
 
 Build (from this folder)
-1. `cmake -S . -B build`
+1. Configure/build:
+
+	- Configure: `cmake -S . -B build`
+	- Build: `cmake --build build --config Release`
+
+	vcpkg is used for dependencies. The configure step auto-detects vcpkg via `VCPKG_ROOT` / `VCPKG_INSTALLATION_ROOT`, `vcpkg` on `PATH`, or common locations like `C:/vcpkg`.
+
+	(Optional) You can also use CMake presets: `cmake --preset regular && cmake --build --preset regular-build`.
 2. `cmake --build build --config Release`
 
 Run the demo (from this folder)

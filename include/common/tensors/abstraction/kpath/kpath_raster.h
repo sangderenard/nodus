@@ -77,6 +77,14 @@ struct TensorCanvas2D final {
   TensorCanvas2D() = default;
   TensorCanvas2D(uint32_t w, uint32_t h);
 
+  // Ensures underlying storage can hold at least w*h elements without changing
+  // the logical dimensions.
+  void reserve(uint32_t w, uint32_t h);
+
+  // Resize the logical tensor dimensions. Preserves allocated capacity when
+  // possible and clears values to `init_value`.
+  void resize(uint32_t w, uint32_t h, float init_value = 0.0f);
+
   float& at(uint32_t x, uint32_t y);
   float at(uint32_t x, uint32_t y) const;
   void clear(float v = 0.0f);
@@ -88,11 +96,78 @@ struct TensorCanvas2D final {
   std::vector<uint8_t> to_u8_normalized() const;
 };
 
+struct ProgramBounds final {
+  float min_x = 0.0f;
+  float min_y = 0.0f;
+  float max_x = 0.0f;
+  float max_y = 0.0f;
+};
+
+// Computes bounds over all points in a program. Returns false if program is empty.
+bool compute_program_bounds(const ArmatureProgram& program, ProgramBounds& out_bounds);
+
 // Tool parameters for a Gaussian "energy kernel".
 // Note: sigma is purely a tool parameter now; z does not modulate thickness.
 struct GaussianToolParams final {
-  float sigma_px = 2.5f;
+  // Default to an effectively single-pixel tool footprint.
+  // The rasterizer treats sufficiently small sigma as a point-stamp fast path.
+  float sigma_px = 0.35f;
 };
+
+// A shared mapping from outline space to image space so multiple raster passes
+// (e.g., RGB channels) can be aligned exactly.
+struct ProgramMapping final {
+  float min_x = 0.0f;
+  float min_y = 0.0f;
+  float scale = 1.0f;
+  float margin = 0.0f;
+};
+
+struct ProgramRasterPlan final {
+  uint32_t width_px = 0;
+  uint32_t height_px = 0;
+  ProgramMapping mapping;
+};
+
+// Plans a raster output for a program at a caller-chosen scale (pixels per program unit).
+// This is intentionally NOT a "fit to existing canvas" mapping: instead it computes
+// the canvas size required to cover the program at the given scale.
+ProgramRasterPlan plan_program_raster(const ArmatureProgram& program,
+                                      float pixels_per_unit,
+                                      float margin_px,
+                                      const GaussianToolParams& tool);
+
+// A raster plan expressed as a direct affine transform on program points:
+//   x_img = x_prog * scale + shift_x
+//   y_img = (height_px - 1) - (y_prog * scale + shift_y)
+// where (shift_x, shift_y) are chosen based on the refined toolpath polyline.
+struct ProgramRasterTransform final {
+  uint32_t width_px = 0;
+  uint32_t height_px = 0;
+  float scale = 1.0f;   // pixels per program unit
+  float shift_x = 0.0f; // pixels
+  float shift_y = 0.0f; // pixels
+};
+
+// Plans output dimensions by first compiling the program into a resampled toolpath
+// polyline (using machine.step_px in pixel space), tracking min/max during that
+// refinement step, then choosing a tight tensor size with sufficient padding for
+// the Gaussian kernel footprint.
+ProgramRasterTransform plan_program_raster_transform_refined(const ArmatureProgram& reference_program,
+                                                            const MachineControlConfig& machine,
+                                                            float pixels_per_unit,
+                                                            float margin_px,
+                                                            const GaussianToolParams& tool);
+
+// Rasterizes using the provided refined transform. This funnels all toolpaths
+// through the same refinement step (image-space polyline resampling) while keeping
+// multiple passes aligned (e.g., outline + fill).
+void rasterize_program_gaussian_with_thermal_transformed(const ArmatureProgram& program,
+                                                        TensorCanvas2D& out_energy,
+                                                        TensorCanvas2D& out_temp,
+                                                        const MachineControlConfig& machine,
+                                                        const GaussianToolParams& tool,
+                                                        const ProgramRasterTransform& xform);
 
 // Simple calibration summary for a tool kernel.
 // This is currently based on the rasterizer's impulse response (single stamp).
@@ -120,15 +195,6 @@ struct ToolCalibration final {
 // measuring radial falloff. This is deterministic and independent of any path.
 ToolCalibration calibrate_gaussian_tool_impulse(uint32_t canvas_size_px,
                                                const GaussianToolParams& tool);
-
-// A shared mapping from outline space to image space so multiple raster passes
-// (e.g., RGB channels) can be aligned exactly.
-struct ProgramMapping final {
-  float min_x = 0.0f;
-  float min_y = 0.0f;
-  float scale = 1.0f;
-  float margin = 0.0f;
-};
 
 ProgramMapping compute_program_mapping(const ArmatureProgram& reference_program,
                                        uint32_t canvas_width,

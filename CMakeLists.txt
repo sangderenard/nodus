@@ -1,4 +1,69 @@
 cmake_minimum_required(VERSION 3.15)
+
+# ---------------------------------------------------------------------------
+# vcpkg bootstrap
+#
+# This repo relies on vcpkg (manifest mode) for core dependencies (e.g. SDL3).
+# If you configure with plain `cmake -S . -B build` and delete the build
+# directory, any previously-cached toolchain path is lost. Auto-detect vcpkg
+# via environment variables so a clean build directory still configures.
+# ---------------------------------------------------------------------------
+set(_NODUS_NEEDS_TOOLCHAIN FALSE)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(_NODUS_NEEDS_TOOLCHAIN TRUE)
+elseif(CMAKE_TOOLCHAIN_FILE STREQUAL "")
+  set(_NODUS_NEEDS_TOOLCHAIN TRUE)
+elseif(NOT EXISTS "${CMAKE_TOOLCHAIN_FILE}")
+  set(_NODUS_NEEDS_TOOLCHAIN TRUE)
+endif()
+
+if(_NODUS_NEEDS_TOOLCHAIN)
+  if(DEFINED ENV{VCPKG_ROOT} AND EXISTS "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "vcpkg toolchain file" FORCE)
+  elseif(DEFINED ENV{VCPKG_INSTALLATION_ROOT} AND EXISTS "$ENV{VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake")
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "vcpkg toolchain file" FORCE)
+  else()
+    # Try PATH: if vcpkg is on PATH we can infer its root from the executable location.
+    find_program(_NODUS_VCPKG_EXE NAMES vcpkg vcpkg.exe)
+    if(_NODUS_VCPKG_EXE)
+      get_filename_component(_NODUS_VCPKG_ROOT "${_NODUS_VCPKG_EXE}" DIRECTORY)
+      if(EXISTS "${_NODUS_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+        set(CMAKE_TOOLCHAIN_FILE "${_NODUS_VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "vcpkg toolchain file" FORCE)
+      endif()
+    endif()
+
+    # Common locations (best-effort; only applied if found).
+    if(_NODUS_NEEDS_TOOLCHAIN AND (NOT DEFINED CMAKE_TOOLCHAIN_FILE OR CMAKE_TOOLCHAIN_FILE STREQUAL "" OR NOT EXISTS "${CMAKE_TOOLCHAIN_FILE}"))
+      foreach(_NODUS_VCPKG_GUESS IN ITEMS
+        "${CMAKE_SOURCE_DIR}/vcpkg"
+        "${CMAKE_SOURCE_DIR}/../vcpkg"
+        "C:/vcpkg"
+        "C:/src/vcpkg"
+      )
+        if(EXISTS "${_NODUS_VCPKG_GUESS}/scripts/buildsystems/vcpkg.cmake")
+          set(CMAKE_TOOLCHAIN_FILE "${_NODUS_VCPKG_GUESS}/scripts/buildsystems/vcpkg.cmake" CACHE FILEPATH "vcpkg toolchain file" FORCE)
+          break()
+        endif()
+      endforeach()
+    endif()
+  endif()
+endif()
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/vcpkg.json" AND (NOT DEFINED CMAKE_TOOLCHAIN_FILE OR CMAKE_TOOLCHAIN_FILE STREQUAL "" OR NOT EXISTS "${CMAKE_TOOLCHAIN_FILE}"))
+  message(FATAL_ERROR
+    "vcpkg manifest detected (vcpkg.json) but vcpkg toolchain was not found.\n"
+    "Set VCPKG_ROOT (or VCPKG_INSTALLATION_ROOT) to your vcpkg install, or add vcpkg to PATH, then re-run:\n"
+    "  cmake -S . -B build\n"
+    "Or configure with an explicit toolchain:\n"
+    "  cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake\n"
+  )
+endif()
+
+if(NOT DEFINED ENV{VCPKG_FEATURE_FLAGS})
+  # Helps older vcpkg builds default to manifest behavior.
+  set(ENV{VCPKG_FEATURE_FLAGS} "manifests")
+endif()
+
 project(canvas_tables LANGUAGES CXX)
 
 ## Dependencies are built in isolation under dev_bundle/deps/*

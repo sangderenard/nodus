@@ -173,39 +173,27 @@ bool rasterize_program_into_minimal_tensor(const ArmatureProgram& program,
                                            const ProgramRasterParams& params) {
   if (program.points.empty()) return false;
 
-  float min_x = 0.0f;
-  float min_y = 0.0f;
-  float max_x = 0.0f;
-  float max_y = 0.0f;
-  if (!compute_program_bounds(program, min_x, min_y, max_x, max_y)) {
-    return false;
-  }
-
-  float margin = std::max(0.0f, params.margin);
-  float span_x = std::max(max_x - min_x, 1.0f);
-  float span_y = std::max(max_y - min_y, 1.0f);
-  float width_f = span_x + margin * 2.0f;
-  float height_f = span_y + margin * 2.0f;
-
-  uint32_t width = static_cast<uint32_t>(std::max(1.0f, std::ceil(width_f)));
-  uint32_t height = static_cast<uint32_t>(std::max(1.0f, std::ceil(height_f)));
-
-  ProgramMapping mapping = compute_program_mapping(program, width, height, margin);
+  // Minimal tensor is defined as a 1:1 program-unit-to-pixel raster with margin.
+  // This avoids the implicit fit-scaling that can otherwise vary by aspect/rounding.
+  ProgramRasterPlan plan = plan_program_raster(program,
+                                               /*pixels_per_unit=*/1.0f,
+                                               /*margin_px=*/params.margin,
+                                               tool);
+  if (plan.width_px == 0 || plan.height_px == 0) return false;
 
   MachineControlConfig machine_copy = machine;
   machine_copy.energy_per_px = params.deposition_value;
 
-  TensorCanvas2D canvas(width, height);
-  TensorCanvas2D temp(width, height);
-  rasterize_program_gaussian_with_thermal_mapped(program, canvas, temp, machine_copy, tool, mapping);
+  out_texture.resize(plan.width_px, plan.height_px, 0.0f);
+  TensorCanvas2D temp;
+  temp.resize(plan.width_px, plan.height_px, 0.0f);
+  rasterize_program_gaussian_with_thermal_mapped(program, out_texture, temp, machine_copy, tool, plan.mapping);
 
   if (params.initialization_value != 0.0f) {
-    for (float& v : canvas.values) {
+    for (float& v : out_texture.values) {
       v += params.initialization_value;
     }
   }
-
-  out_texture = std::move(canvas);
   return true;
 }
 
