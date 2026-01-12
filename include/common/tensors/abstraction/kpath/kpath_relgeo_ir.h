@@ -41,6 +41,7 @@ namespace nodus::tensors::kpath {
 // - contour(p0: u32, p1: u32, ..., ["open"|"closed"], ["ccw"|"cw"|"outer"|"inner"]) -> void
 // - parallel(l0: u32, l1: u32) -> void edge
 // - perp(l0: u32, l1: u32) -> void edge
+// - perp_at(v: u32, a: u32, b: u32) -> void edge
 // - incident(p: u32, l: u32) -> void edge
 // - coincident(p0: u32, p1: u32) -> void edge
 // - point_on_circle(p: u32, circle: u32circle) -> void edge

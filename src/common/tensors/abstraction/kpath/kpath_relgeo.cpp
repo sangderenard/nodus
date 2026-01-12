@@ -618,6 +618,36 @@ bool RelProgram::validate(std::string* out_error) const {
       }
       continue;
     }
+    if (std::holds_alternative<RelAssertPerpAt>(a)) {
+      const auto& pp = std::get<RelAssertPerpAt>(a);
+      RelVec2 v{}, a0{}, b0{};
+      if (!getp(pp.v, v) || !getp(pp.a, a0) || !getp(pp.b, b0)) {
+        if (out_error) {
+          *out_error = "assert perp-at: invalid point id (v=" + std::to_string(pp.v.v) + ", a=" +
+                       std::to_string(pp.a.v) + ", b=" + std::to_string(pp.b.v) + ")";
+        }
+        return false;
+      }
+      const RelVec2 va = sub(a0, v);
+      const RelVec2 vb = sub(b0, v);
+      if (len(va) < kEps || len(vb) < kEps) {
+        if (out_error) *out_error = "assert perp-at: degenerate segment";
+        return false;
+      }
+      const float c = std::fabs(dot(va, vb)) / (len(va) * len(vb));
+      const float ang = std::acos(std::clamp(c, 0.0f, 1.0f));
+      const float dev = std::fabs(ang - 1.5707963267948966f);
+      if (dev > pp.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert perp-at failed: v=" << pp.v.v << ", a=" << pp.a.v << ", b=" << pp.b.v
+              << ", dev=" << dev << " > tol=" << pp.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
 
     // Circle/arc constraints are stored symbolically for now.
     // Validate ids are well-formed, but do not attempt numeric satisfaction here.

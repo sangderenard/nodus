@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace nodus::tensors::kpath {
 
@@ -18,8 +19,13 @@ struct RelGeoEsatOptions final {
 enum class RelGeoEsatTermKind : uint8_t {
   Point,
   Dist,
+  Dist2,
   CircleRadius,
   ConstLength,
+  ConstRational,
+  Add,
+  Mul,
+  Sqrt,
   LineDir,
   LineDirPerp,
   AngleBetweenLines,
@@ -32,20 +38,31 @@ struct RelGeoEsatTerm final {
   // For most terms, payload is packed into these fields.
   // - Point: a = point id
   // - Dist:  a = point id (min), b = point id (max)
+  // - Dist2: a = point id (min), b = point id (max)
   // - CircleRadius: a = circle id
   // - ConstLength: c = micro-units
+  // - ConstRational: c = signed numerator, b = denominator (both reduced)
+  // - Add: a = term id (min), b = term id (max)
+  // - Mul: a = term id (min), b = term id (max)
+  // - Sqrt: a = term id
   // - LineDir: a = line id
   // - LineDirPerp: a = line id
   // - AngleBetweenLines: a = line id (min), b = line id (max)
-  // - ConstAnglePiFrac: a = signed numerator, b = denominator (both reduced)
+  // - ConstAnglePiFrac: c = signed numerator, b = denominator (both reduced)
   uint32_t a = 0;
   uint32_t b = 0;
   int64_t c = 0;
 
   static RelGeoEsatTerm point(RelPointId p);
   static RelGeoEsatTerm dist(RelPointId p, RelPointId q);
+  static RelGeoEsatTerm dist2(RelPointId p, RelPointId q);
   static RelGeoEsatTerm radius(RelCircleId circle);
   static RelGeoEsatTerm const_length(float value);
+  static RelGeoEsatTerm const_rational(int32_t num, uint32_t den);
+  // These constructors take term ids from RelGeoEsatResult::term_id().
+  static RelGeoEsatTerm add(uint32_t left_term, uint32_t right_term);
+  static RelGeoEsatTerm mul(uint32_t left_term, uint32_t right_term);
+  static RelGeoEsatTerm sqrt(uint32_t term);
   static RelGeoEsatTerm dir(RelLineId line);
   static RelGeoEsatTerm dir_perp(RelLineId line);
   static RelGeoEsatTerm angle_between(RelLineId l0, RelLineId l1);
@@ -58,6 +75,7 @@ struct RelGeoEsatTerm final {
 
 struct RelGeoEsatResult final {
   bool are_equal(const RelGeoEsatTerm& x, const RelGeoEsatTerm& y) const;
+  std::optional<uint32_t> term_id(const RelGeoEsatTerm& term) const;
 
  private:
   friend RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOptions& options);

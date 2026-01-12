@@ -237,6 +237,14 @@ static void emit_edge_relation(GraphIrContext& ctx, std::string_view kind, uint3
   ctx.edits->set_attr(e, "b", static_cast<uint32_t>(b));
 }
 
+static void emit_edge_perp_at(GraphIrContext& ctx, uint32_t v, uint32_t a, uint32_t b) {
+  if (!ctx.edits) return;
+  const uint32_t e = ctx.edits->add_edge("relgeo.perp_at");
+  ctx.edits->set_attr(e, "v", static_cast<uint32_t>(v));
+  ctx.edits->set_attr(e, "a", static_cast<uint32_t>(a));
+  ctx.edits->set_attr(e, "b", static_cast<uint32_t>(b));
+}
+
 static void emit_edge_fixed_radius(GraphIrContext& ctx, uint32_t circle, double r) {
   if (!ctx.edits) return;
   const uint32_t e = ctx.edits->add_edge("relgeo.fixed_radius");
@@ -841,6 +849,42 @@ GraphIrOperatorSet make_relgeo_ir_ops() {
               return false;
             }
             emit_edge_relation(ctx, "relgeo.perp", static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"perp_at", 3, 3, "perp_at(v: u32, a: u32, b: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "perp_at(): ctx.edits is null";
+              return false;
+            }
+            auto v = as_u32(args[0]);
+            auto a = as_u32(args[1]);
+            auto b = as_u32(args[2]);
+            if (!v || !a || !b) {
+              err = "perp_at(): expected (u32,u32,u32)";
+              return false;
+            }
+            emit_edge_perp_at(ctx, static_cast<uint32_t>(*v), static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
+            out = std::monostate{};
+            return true;
+          });
+
+  set.add(GraphIrOpSpec{"perp_at", 3, 3, "perp_at(v: u32, a: u32, b: u32) -> void edge"},
+          [](const GraphIrOpSpec&, const std::vector<GraphIrValue>& args, GraphIrValue& out, GraphIrContext& ctx, std::string& err) {
+            if (!ctx.edits) {
+              err = "perp_at(): ctx.edits is null";
+              return false;
+            }
+            auto v = as_u32(args[0]);
+            auto a = as_u32(args[1]);
+            auto b = as_u32(args[2]);
+            if (!v || !a || !b) {
+              err = "perp_at(): expected (u32,u32,u32)";
+              return false;
+            }
+            emit_edge_perp_at(ctx, static_cast<uint32_t>(*v), static_cast<uint32_t>(*a), static_cast<uint32_t>(*b));
             out = std::monostate{};
             return true;
           });
@@ -1900,6 +1944,47 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
   }
 
   // Relation edges -> assertions.
+  auto line_endpoints = [&](RelLineId lid, RelPointId& out_a, RelPointId& out_b) -> bool {
+    if (!lid) return false;
+    const size_t idx = static_cast<size_t>(lid.v - 1);
+    if (idx >= out_program.lines().size()) return false;
+    const RelLineDef& def = out_program.lines()[idx];
+    out_a = def.a;
+    out_b = def.b;
+    return true;
+  };
+
+  auto shared_line_vertex = [&](RelLineId l0, RelLineId l1, RelPointId& out_v, RelPointId& out_a, RelPointId& out_b) -> bool {
+    RelPointId l0a{}, l0b{}, l1a{}, l1b{};
+    if (!line_endpoints(l0, l0a, l0b) || !line_endpoints(l1, l1a, l1b)) return false;
+    if ((l0a == l1a && l0b == l1b) || (l0a == l1b && l0b == l1a)) return false;
+    if (l0a == l1a) {
+      out_v = l0a;
+      out_a = l0b;
+      out_b = l1b;
+      return true;
+    }
+    if (l0a == l1b) {
+      out_v = l0a;
+      out_a = l0b;
+      out_b = l1a;
+      return true;
+    }
+    if (l0b == l1a) {
+      out_v = l0b;
+      out_a = l0a;
+      out_b = l1b;
+      return true;
+    }
+    if (l0b == l1b) {
+      out_v = l0b;
+      out_a = l0a;
+      out_b = l1a;
+      return true;
+    }
+    return false;
+  };
+
   for (uint32_t eid : relation_edges) {
     const auto it = edges.find(eid);
     if (it == edges.end()) continue;
@@ -1932,6 +2017,20 @@ bool relgeo_program_from_ir(std::string_view src, RelProgram& out_program, std::
       auto il1 = nid_to_lid.find(b);
       if (il0 != nid_to_lid.end() && il1 != nid_to_lid.end()) {
         out_program.add_assertion(RelAssertPerpendicularLines{il0->second, il1->second});
+        RelPointId v{}, pa{}, pb{};
+        if (shared_line_vertex(il0->second, il1->second, v, pa, pb)) {
+          out_program.add_assertion(RelAssertPerpAt{v, pa, pb});
+        }
+      }
+    } else if (k == "relgeo.perp_at") {
+      uint32_t v = 0, pa = 0, pb = 0;
+      if (get_edge_u32_attr(eid, "v", v) && get_edge_u32_attr(eid, "a", pa) && get_edge_u32_attr(eid, "b", pb)) {
+        auto iv = nid_to_pid.find(v);
+        auto ia = nid_to_pid.find(pa);
+        auto ib = nid_to_pid.find(pb);
+        if (iv != nid_to_pid.end() && ia != nid_to_pid.end() && ib != nid_to_pid.end()) {
+          out_program.add_assertion(RelAssertPerpAt{iv->second, ia->second, ib->second});
+        }
       }
     } else if (k == "relgeo.point_on_circle") {
       auto ip = nid_to_pid.find(a);

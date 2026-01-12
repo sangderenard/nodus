@@ -61,6 +61,35 @@ int main() {
     if (!require_or_report(lr.are_equal(ab02, half_pi), "expected angle_between(L0,L2) == pi/2 from perp")) return 1;
   }
 
+  // Pythagorean: Dist2(a,b) == Dist2(a,v) + Dist2(v,b) for a right triangle at v.
+  {
+    RelProgram tp;
+    const RelPointId a = tp.add_point(RelPointFixed{0.0f, 0.0f});
+    const RelPointId v = tp.add_point(RelPointFixed{1.0f, 0.0f});
+    const RelPointId b = tp.add_point(RelPointFixed{1.0f, 1.0f});
+
+    tp.add_assertion(RelAssertPerpAt{v, a, b});
+
+    const RelGeoEsatResult tr = relgeo_esaturate(tp);
+
+    const RelGeoEsatTerm d2_ab = RelGeoEsatTerm::dist2(a, b);
+    const RelGeoEsatTerm d2_av = RelGeoEsatTerm::dist2(a, v);
+    const RelGeoEsatTerm d2_vb = RelGeoEsatTerm::dist2(v, b);
+
+    const auto id_d2_av = tr.term_id(d2_av);
+    const auto id_d2_vb = tr.term_id(d2_vb);
+    const auto id_d2_ab = tr.term_id(d2_ab);
+    if (!require_or_report(id_d2_av.has_value(), "expected dist2(a,v) term")) return 1;
+    if (!require_or_report(id_d2_vb.has_value(), "expected dist2(v,b) term")) return 1;
+    if (!require_or_report(id_d2_ab.has_value(), "expected dist2(a,b) term")) return 1;
+
+    const RelGeoEsatTerm sum = RelGeoEsatTerm::add(*id_d2_av, *id_d2_vb);
+    if (!require_or_report(tr.are_equal(d2_ab, sum), "expected dist2(a,b) == dist2(a,v)+dist2(v,b)")) return 1;
+
+    const RelGeoEsatTerm sqrt_d2 = RelGeoEsatTerm::sqrt(*id_d2_ab);
+    if (!require_or_report(tr.are_equal(RelGeoEsatTerm::dist(a, b), sqrt_d2), "expected dist(a,b) == sqrt(dist2(a,b))")) return 1;
+  }
+
   std::cout << "[REL-GEO-ESAT] OK\n";
   return 0;
 }

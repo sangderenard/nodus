@@ -314,6 +314,11 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     } else if (er.kind == "relgeo.point_on_circle") {
       uint32_t p = 0;
       if (get_u32_attr_edge(eid, "a", p)) required_points.insert(p);
+    } else if (er.kind == "relgeo.perp_at") {
+      uint32_t v = 0, a = 0, b = 0;
+      if (get_u32_attr_edge(eid, "v", v)) required_points.insert(v);
+      if (get_u32_attr_edge(eid, "a", a)) required_points.insert(a);
+      if (get_u32_attr_edge(eid, "b", b)) required_points.insert(b);
     } else if (er.kind == "relgeo.tangent") {
       // line endpoints will be pulled in by line nodes; circle pulls by circle nodes.
     } else if (er.kind == "relgeo.fixed_radius") {

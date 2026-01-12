@@ -30,8 +30,12 @@ Start small with a first-order, mostly-equational term language:
 
 - `Point(p)`
 - `Dist(p,q)` (a length term; symmetric)
+- `Dist2(p,q)` (squared length; symmetric)
 - `Radius(circle)`
 - `ConstLength(c)` (exact/quantized literal)
+- `ConstRational(n/d)` (reduced, signed numerator)
+- `Add(x,y)`, `Mul(x,y)` (commutative)
+- `Sqrt(x)` (uninterpreted unless rules apply)
 
 Then expand:
 
@@ -55,6 +59,11 @@ Example: `PointOnCircle(p,C)` implies the equational fact:
 - `Dist(center(C), p) == Radius(C)`
 
 while `Tangent(line,C)` is existential without an explicit tangency point, so it stays as a predicate until we have more structure.
+
+Right-triangle facts are witnessed explicitly:
+
+- `PerpAt(v,a,b)` implies `Dist2(a,b) == Add(Dist2(a,v), Dist2(v,b))`
+- `Dist(p,q) == Sqrt(Dist2(p,q))` (length alias)
 
 ## Integration points in code
 

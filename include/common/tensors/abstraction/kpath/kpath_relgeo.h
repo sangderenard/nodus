@@ -252,6 +252,14 @@ struct RelAssertPerpendicularLines final {
   float tol = 1e-3f; // angular tolerance (radians)
 };
 
+// Segments (v->a) and (v->b) are perpendicular, i.e. right angle at v.
+struct RelAssertPerpAt final {
+  RelPointId v{};
+  RelPointId a{};
+  RelPointId b{};
+  float tol = 1e-3f; // angular tolerance (radians)
+};
+
 // Symbolic constraints involving circle/arc nouns.
 // These are stored as logical assertions; they do not necessarily imply the program
 // is numerically solvable without additional anchors.
@@ -279,6 +287,7 @@ using RelAssertion = std::variant<RelAssertPointOnLine,
                                   RelAssertCoincident,
                                   RelAssertParallelLines,
                                   RelAssertPerpendicularLines,
+                                  RelAssertPerpAt,
                                   RelAssertPointOnCircle,
                                   RelAssertTangentLineCircle,
                                   RelAssertFixedRadius,

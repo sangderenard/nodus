@@ -44,6 +44,25 @@ static void reduce_pi_frac(int32_t& num, uint32_t& den) {
   }
 }
 
+static void reduce_rational(int32_t& num, uint32_t& den) {
+  if (den == 0u) {
+    num = 0;
+    den = 1u;
+    return;
+  }
+  if (num == 0) {
+    den = 1u;
+    return;
+  }
+
+  const uint32_t absn = static_cast<uint32_t>(num < 0 ? -static_cast<int64_t>(num) : static_cast<int64_t>(num));
+  const uint32_t g = gcd_u32(absn, den);
+  if (g > 1u) {
+    num = static_cast<int32_t>(static_cast<int64_t>(num) / static_cast<int64_t>(g));
+    den /= g;
+  }
+}
+
 struct TermHash {
   size_t operator()(const RelGeoEsatTerm& t) const noexcept {
     // Simple mixing.
@@ -115,6 +134,16 @@ RelGeoEsatTerm RelGeoEsatTerm::dist(RelPointId p, RelPointId q) {
   return t;
 }
 
+RelGeoEsatTerm RelGeoEsatTerm::dist2(RelPointId p, RelPointId q) {
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::Dist2;
+  const uint32_t a = std::min(p.v, q.v);
+  const uint32_t b = std::max(p.v, q.v);
+  t.a = a;
+  t.b = b;
+  return t;
+}
+
 RelGeoEsatTerm RelGeoEsatTerm::radius(RelCircleId circle) {
   RelGeoEsatTerm t;
   t.kind = RelGeoEsatTermKind::CircleRadius;
@@ -126,6 +155,42 @@ RelGeoEsatTerm RelGeoEsatTerm::const_length(float value) {
   RelGeoEsatTerm t;
   t.kind = RelGeoEsatTermKind::ConstLength;
   t.c = to_microunits(value);
+  return t;
+}
+
+RelGeoEsatTerm RelGeoEsatTerm::const_rational(int32_t num, uint32_t den) {
+  reduce_rational(num, den);
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::ConstRational;
+  t.c = static_cast<int64_t>(num);
+  t.b = den;
+  return t;
+}
+
+RelGeoEsatTerm RelGeoEsatTerm::add(uint32_t left_term, uint32_t right_term) {
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::Add;
+  const uint32_t a = std::min(left_term, right_term);
+  const uint32_t b = std::max(left_term, right_term);
+  t.a = a;
+  t.b = b;
+  return t;
+}
+
+RelGeoEsatTerm RelGeoEsatTerm::mul(uint32_t left_term, uint32_t right_term) {
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::Mul;
+  const uint32_t a = std::min(left_term, right_term);
+  const uint32_t b = std::max(left_term, right_term);
+  t.a = a;
+  t.b = b;
+  return t;
+}
+
+RelGeoEsatTerm RelGeoEsatTerm::sqrt(uint32_t term) {
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::Sqrt;
+  t.a = term;
   return t;
 }
 
@@ -196,6 +261,13 @@ bool RelGeoEsatResult::are_equal(const RelGeoEsatTerm& x, const RelGeoEsatTerm& 
   return impl_->are_equal(x, y);
 }
 
+std::optional<uint32_t> RelGeoEsatResult::term_id(const RelGeoEsatTerm& term) const {
+  if (!impl_) return std::nullopt;
+  const auto it = impl_->term_to_id.find(term);
+  if (it == impl_->term_to_id.end()) return std::nullopt;
+  return it->second;
+}
+
 RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOptions& options) {
   RelGeoEsatResult result;
   result.impl_ = std::make_shared<RelGeoEsatResult::Impl>();
@@ -221,6 +293,9 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
 
   std::vector<uint32_t> mentioned_lines;
   mentioned_lines.reserve(program.lines().size());
+
+  std::vector<RelAssertPerpAt> perp_at;
+  perp_at.reserve(8);
 
   const auto mention_point = [&](RelPointId pid) {
     if (!pid) return;
@@ -254,6 +329,14 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
       result.impl_->equate(RelGeoEsatTerm::dir(perp->b), RelGeoEsatTerm::dir_perp(perp->a));
       mention_line(perp->a);
       mention_line(perp->b);
+      continue;
+    }
+
+    if (const auto* perp = std::get_if<RelAssertPerpAt>(&a)) {
+      perp_at.push_back(*perp);
+      mention_point(perp->v);
+      mention_point(perp->a);
+      mention_point(perp->b);
       continue;
     }
 
@@ -292,6 +375,29 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
     result.impl_->intern(RelGeoEsatTerm::dir(RelLineId(lv)));
     result.impl_->intern(RelGeoEsatTerm::dir_perp(RelLineId(lv)));
   }
+
+  const auto equate_dist_sqrt = [&](RelPointId a, RelPointId b) {
+    const uint32_t d2 = result.impl_->intern(RelGeoEsatTerm::dist2(a, b));
+    const RelGeoEsatTerm root = RelGeoEsatTerm::sqrt(d2);
+    result.impl_->equate(RelGeoEsatTerm::dist(a, b), root);
+  };
+
+  for (const auto& perp : perp_at) {
+    const uint32_t d2_av = result.impl_->intern(RelGeoEsatTerm::dist2(perp.a, perp.v));
+    const uint32_t d2_vb = result.impl_->intern(RelGeoEsatTerm::dist2(perp.v, perp.b));
+    const RelGeoEsatTerm sum = RelGeoEsatTerm::add(d2_av, d2_vb);
+    result.impl_->equate(RelGeoEsatTerm::dist2(perp.a, perp.b), sum);
+    equate_dist_sqrt(perp.a, perp.b);
+    equate_dist_sqrt(perp.a, perp.v);
+    equate_dist_sqrt(perp.v, perp.b);
+  }
+
+  const uint32_t sqrt2 = result.impl_->intern(RelGeoEsatTerm::sqrt(
+    result.impl_->intern(RelGeoEsatTerm::const_rational(2, 1))));
+  const uint32_t zero_rat = result.impl_->intern(RelGeoEsatTerm::const_rational(0, 1));
+  const uint32_t zero_len = result.impl_->intern(RelGeoEsatTerm::const_length(0.0f));
+  result.impl_->equate(RelGeoEsatTerm::sqrt(zero_rat), RelGeoEsatTerm::const_rational(0, 1));
+  result.impl_->equate(RelGeoEsatTerm::sqrt(zero_len), RelGeoEsatTerm::const_length(0.0f));
 
   // Basic saturation:
   // - if Point(a) == Point(b), then Dist(a,x) == Dist(b,x) for mentioned x.
@@ -360,6 +466,16 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
             changed |= result.impl_->equate(RelGeoEsatTerm::angle_between(RelLineId(l0v), RelLineId(l1v)), half_pi);
           }
         }
+      }
+    }
+
+    for (const auto& perp : perp_at) {
+      const RelGeoEsatTerm d2_av = RelGeoEsatTerm::dist2(perp.a, perp.v);
+      const RelGeoEsatTerm d2_vb = RelGeoEsatTerm::dist2(perp.v, perp.b);
+      if (result.impl_->are_equal(d2_av, d2_vb)) {
+        const uint32_t dist_av = result.impl_->intern(RelGeoEsatTerm::dist(perp.v, perp.a));
+        const RelGeoEsatTerm scaled = RelGeoEsatTerm::mul(sqrt2, dist_av);
+        changed |= result.impl_->equate(RelGeoEsatTerm::dist(perp.a, perp.b), scaled);
       }
     }
 
