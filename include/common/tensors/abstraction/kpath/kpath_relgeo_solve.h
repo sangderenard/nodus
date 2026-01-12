@@ -37,7 +37,8 @@ struct RelGeoSolveOutput final {
 //
 // Notes:
 // - This currently supports deterministic propagation of a small subset of node kinds
-//   (pt/free/lerp/offset/ratio/lerp_ratio/llint) plus relation checks when resolvable.
+//   (pt/free/lerp/offset/ratio/lerp_ratio/llint) plus a small set of circle/arc constraints
+//   (circle/point_on_circle/tangent/fixed_radius/arc_angle) when resolvable.
 // - Underconstrained graphs will return an error listing unsolved required points.
 bool relgeo_solve_points_from_pure_ir(std::string_view src,
                                      const RelGeoSolveInputs& in,

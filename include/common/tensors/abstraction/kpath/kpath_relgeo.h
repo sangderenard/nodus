@@ -23,6 +23,9 @@ struct RelContourTag {};
 struct RelLineTag {};
 struct RelRayTag {};
 struct RelAngleTag {};
+struct RelCircleTag {};
+struct RelArcTag {};
+struct RelBezierTag {};
 
 using RelPointId = Id<RelPointTag>;
 using RelSegmentId = Id<RelSegmentTag>;
@@ -30,6 +33,9 @@ using RelContourId = Id<RelContourTag>;
 using RelLineId = Id<RelLineTag>;
 using RelRayId = Id<RelRayTag>;
 using RelAngleId = Id<RelAngleTag>;
+using RelCircleId = Id<RelCircleTag>;
+using RelArcId = Id<RelArcTag>;
+using RelBezierId = Id<RelBezierTag>;
 
 struct RelVec2 final {
   float x = 0.0f;
@@ -57,6 +63,49 @@ using RelRadiusExpr = std::variant<RelRadiusConstant, RelRadiusDistance>;
 struct RelCircle final {
   RelPointId center{};
   RelRadiusExpr radius;
+};
+
+struct RelCircleDef final {
+  RelCircleId id{};
+  RelCircle circle;
+};
+
+struct RelArcOnCircleAngles final {
+  RelCircleId circle{};
+  float a0 = 0.0f;
+  float a1 = 0.0f;
+  bool ccw = true;
+};
+
+// Arc defined by endpoints on a circle plus a normal sign to pick direction.
+// normal_z > 0 => CCW, normal_z < 0 => CW.
+struct RelArcOnCircleEndpoints final {
+  RelCircleId circle{};
+  RelPointId start{};
+  RelPointId end{};
+  float normal_z = 1.0f;
+};
+
+// Arc through three points (p0=start, p1=mid, p2=end). The circle and direction are implied.
+struct RelArc3 final {
+  RelPointId p0{};
+  RelPointId p1{};
+  RelPointId p2{};
+};
+
+using RelArcExpr = std::variant<RelArcOnCircleAngles, RelArcOnCircleEndpoints, RelArc3>;
+
+struct RelArcDef final {
+  RelArcId id{};
+  RelArcExpr expr;
+};
+
+struct RelBezierDef final {
+  RelBezierId id{};
+  RelPointId p0{};
+  RelPointId c0{};
+  RelPointId c1{};
+  RelPointId p1{};
 };
 
 struct RelPointFixed final {
@@ -153,6 +202,26 @@ struct RelAngleDef final {
   RelPointId b{};
 };
 
+struct RelCircleEval final {
+  RelVec2 center{};
+  float r = 0.0f;
+};
+
+struct RelArcEval final {
+  RelVec2 center{};
+  float r = 0.0f;
+  float a0 = 0.0f;
+  float a1 = 0.0f;
+  bool ccw = true;
+};
+
+struct RelBezierEval final {
+  RelVec2 p0{};
+  RelVec2 c0{};
+  RelVec2 c1{};
+  RelVec2 p1{};
+};
+
 enum class RelContourWinding : uint8_t {
   Unknown = 0,
   CCW = 1,
@@ -183,8 +252,37 @@ struct RelAssertPerpendicularLines final {
   float tol = 1e-3f; // angular tolerance (radians)
 };
 
-using RelAssertion =
-  std::variant<RelAssertPointOnLine, RelAssertCoincident, RelAssertParallelLines, RelAssertPerpendicularLines>;
+// Symbolic constraints involving circle/arc nouns.
+// These are stored as logical assertions; they do not necessarily imply the program
+// is numerically solvable without additional anchors.
+struct RelAssertPointOnCircle final {
+  RelPointId p{};
+  RelCircleId circle{};
+};
+
+struct RelAssertTangentLineCircle final {
+  RelLineId line{};
+  RelCircleId circle{};
+};
+
+struct RelAssertFixedRadius final {
+  RelCircleId circle{};
+  float r = 0.0f;
+};
+
+struct RelAssertArcAngle final {
+  RelArcId arc{};
+  float angle = 0.0f; // radians
+};
+
+using RelAssertion = std::variant<RelAssertPointOnLine,
+                                  RelAssertCoincident,
+                                  RelAssertParallelLines,
+                                  RelAssertPerpendicularLines,
+                                  RelAssertPointOnCircle,
+                                  RelAssertTangentLineCircle,
+                                  RelAssertFixedRadius,
+                                  RelAssertArcAngle>;
 
 struct RelContourDef final {
   RelContourId id{};
@@ -205,6 +303,9 @@ class RelProgram final {
   RelLineId add_line(RelPointId a, RelPointId b);
   RelRayId add_ray(RelPointId origin, RelPointId through);
   RelAngleId add_angle(RelPointId a, RelPointId v, RelPointId b);
+  RelCircleId add_circle(RelCircle circle);
+  RelArcId add_arc(RelArcExpr expr);
+  RelBezierId add_bezier(RelPointId p0, RelPointId c0, RelPointId c1, RelPointId p1);
   RelContourId add_contour(std::vector<RelPointId> vertices,
                            bool closed = true,
                            RelContourWinding winding = RelContourWinding::Unknown);
@@ -216,6 +317,9 @@ class RelProgram final {
   const std::vector<RelLineDef>& lines() const { return lines_; }
   const std::vector<RelRayDef>& rays() const { return rays_; }
   const std::vector<RelAngleDef>& angles() const { return angles_; }
+  const std::vector<RelCircleDef>& circles() const { return circles_; }
+  const std::vector<RelArcDef>& arcs() const { return arcs_; }
+  const std::vector<RelBezierDef>& beziers() const { return beziers_; }
   const std::vector<RelContourDef>& contours() const { return contours_; }
   const std::vector<RelAssertion>& assertions() const { return assertions_; }
 
@@ -224,6 +328,11 @@ class RelProgram final {
 
   // Convenience: evaluate a single point.
   std::optional<RelVec2> eval_point(RelPointId id) const;
+
+  // Higher-level noun evaluation.
+  std::optional<RelCircleEval> eval_circle(RelCircleId id) const;
+  std::optional<RelArcEval> eval_arc(RelArcId id) const;
+  std::optional<RelBezierEval> eval_bezier(RelBezierId id) const;
 
   // Validates post-conditions (incidence/coincidence) by evaluating and checking assertions.
   bool validate(std::string* out_error = nullptr) const;
@@ -234,6 +343,9 @@ class RelProgram final {
   std::vector<RelLineDef> lines_;
   std::vector<RelRayDef> rays_;
   std::vector<RelAngleDef> angles_;
+  std::vector<RelCircleDef> circles_;
+  std::vector<RelArcDef> arcs_;
+  std::vector<RelBezierDef> beziers_;
   std::vector<RelContourDef> contours_;
   std::vector<RelAssertion> assertions_;
 };

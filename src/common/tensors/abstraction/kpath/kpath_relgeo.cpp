@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -17,6 +18,13 @@ static float dot(RelVec2 a, RelVec2 b) { return a.x * b.x + a.y * b.y; }
 
 static float len(RelVec2 v) { return std::sqrt(v.x * v.x + v.y * v.y); }
 
+static bool normalize(RelVec2 v, RelVec2& out) {
+  const float l = len(v);
+  if (l < kEps) return false;
+  out = RelVec2{v.x / l, v.y / l};
+  return true;
+}
+
 static RelVec2 sub(RelVec2 a, RelVec2 b) { return RelVec2{a.x - b.x, a.y - b.y}; }
 
 static float cross(RelVec2 a, RelVec2 b) { return a.x * b.y - a.y * b.x; }
@@ -25,6 +33,49 @@ static float dist(RelVec2 a, RelVec2 b) {
   const float dx = a.x - b.x;
   const float dy = a.y - b.y;
   return std::sqrt(dx * dx + dy * dy);
+}
+
+static float wrap_0_2pi(float a) {
+  float r = std::fmod(a, kTwoPi);
+  if (r < 0.0f) r += kTwoPi;
+  return r;
+}
+
+static float wrap_ccw_delta(float delta) {
+  float d = std::fmod(delta, kTwoPi);
+  if (d < 0.0f) d += kTwoPi;
+  return d;
+}
+
+static bool angle_is_between_ccw(float a0, float a1, float am) {
+  // All angles are expected wrapped to [0,2pi).
+  const float d01 = wrap_ccw_delta(a1 - a0);
+  const float d0m = wrap_ccw_delta(am - a0);
+  return d0m <= d01 + 1e-5f;
+}
+
+static bool circumcircle(RelVec2 p0, RelVec2 p1, RelVec2 p2, RelVec2& out_center, float& out_r) {
+  // Compute circumcenter using determinant formula.
+  // https://mathworld.wolfram.com/Circumcircle.html
+  const float ax = p0.x;
+  const float ay = p0.y;
+  const float bx = p1.x;
+  const float by = p1.y;
+  const float cx = p2.x;
+  const float cy = p2.y;
+
+  const float d = 2.0f * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+  if (std::fabs(d) < kEps) return false;
+
+  const float a2 = ax * ax + ay * ay;
+  const float b2 = bx * bx + by * by;
+  const float c2 = cx * cx + cy * cy;
+
+  const float ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
+  const float uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+  out_center = RelVec2{ux, uy};
+  out_r = dist(out_center, p0);
+  return out_r > kEps;
 }
 
 static bool circle_circle_intersections(RelVec2 c0, float r0, RelVec2 c1, float r1, RelVec2& out_a, RelVec2& out_b) {
@@ -227,6 +278,24 @@ RelAngleId RelProgram::add_angle(RelPointId a, RelPointId v, RelPointId b) {
   return id;
 }
 
+RelCircleId RelProgram::add_circle(RelCircle circle) {
+  RelCircleId id(static_cast<uint32_t>(circles_.size() + 1));
+  circles_.push_back(RelCircleDef{id, std::move(circle)});
+  return id;
+}
+
+RelArcId RelProgram::add_arc(RelArcExpr expr) {
+  RelArcId id(static_cast<uint32_t>(arcs_.size() + 1));
+  arcs_.push_back(RelArcDef{id, std::move(expr)});
+  return id;
+}
+
+RelBezierId RelProgram::add_bezier(RelPointId p0, RelPointId c0, RelPointId c1, RelPointId p1) {
+  RelBezierId id(static_cast<uint32_t>(beziers_.size() + 1));
+  beziers_.push_back(RelBezierDef{id, p0, c0, c1, p1});
+  return id;
+}
+
 RelContourId RelProgram::add_contour(std::vector<RelPointId> vertices, bool closed, RelContourWinding winding) {
   RelContourId id(static_cast<uint32_t>(contours_.size() + 1));
   contours_.push_back(RelContourDef{id, std::move(vertices), closed, winding});
@@ -261,13 +330,15 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
   eval_rec = [&](RelPointId id) -> bool {
     auto idx_opt = idx_of(id);
     if (!idx_opt) {
-      if (out_error) *out_error = "invalid point id";
+      if (out_error) {
+        *out_error = "invalid point id " + std::to_string(id.v) + " (points=" + std::to_string(points_.size()) + ")";
+      }
       return false;
     }
     const size_t idx = *idx_opt;
     if (marks[idx] == Mark::Done) return true;
     if (marks[idx] == Mark::Visiting) {
-      if (out_error) *out_error = "cycle detected in relational program";
+      if (out_error) *out_error = "cycle detected in relational program (at point id " + std::to_string(id.v) + ")";
       return false;
     }
     marks[idx] = Mark::Visiting;
@@ -378,7 +449,10 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
       const auto il0 = idx_of_line(e.l0);
       const auto il1 = idx_of_line(e.l1);
       if (!il0 || !il1) {
-        if (out_error) *out_error = "invalid line id";
+        if (out_error) {
+          *out_error = "invalid line id in line-line intersection (l0=" + std::to_string(e.l0.v) + ", l1=" +
+                       std::to_string(e.l1.v) + ")";
+        }
         return false;
       }
       const RelLineDef& l0 = lines_[*il0];
@@ -428,17 +502,34 @@ bool RelProgram::validate(std::string* out_error) const {
     return getp(l.a, a) && getp(l.b, b);
   };
 
+  auto has_circle = [&](RelCircleId id) -> bool {
+    if (!id) return false;
+    const size_t idx = static_cast<size_t>(id.v - 1);
+    return idx < circles_.size();
+  };
+  auto has_arc = [&](RelArcId id) -> bool {
+    if (!id) return false;
+    const size_t idx = static_cast<size_t>(id.v - 1);
+    return idx < arcs_.size();
+  };
+
   for (const auto& a : assertions_) {
     if (std::holds_alternative<RelAssertCoincident>(a)) {
       const auto& c = std::get<RelAssertCoincident>(a);
       RelVec2 pa{}, pb{};
       if (!getp(c.a, pa) || !getp(c.b, pb)) {
-        if (out_error) *out_error = "assert coincident: invalid point id";
+        if (out_error) {
+          *out_error = "assert coincident: invalid point id (a=" + std::to_string(c.a.v) + ", b=" + std::to_string(c.b.v) + ")";
+        }
         return false;
       }
       const float d = dist(pa, pb);
       if (d > c.tol) {
-        if (out_error) *out_error = "assert coincident failed";
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert coincident failed: a=" << c.a.v << ", b=" << c.b.v << ", d=" << d << " > tol=" << c.tol;
+          *out_error = oss.str();
+        }
         return false;
       }
       continue;
@@ -447,7 +538,9 @@ bool RelProgram::validate(std::string* out_error) const {
       const auto& inc = std::get<RelAssertPointOnLine>(a);
       RelVec2 p{}, a0{}, b0{};
       if (!getp(inc.p, p) || !getline(inc.line, a0, b0)) {
-        if (out_error) *out_error = "assert point-on-line: invalid ids";
+        if (out_error) {
+          *out_error = "assert point-on-line: invalid ids (p=" + std::to_string(inc.p.v) + ", line=" + std::to_string(inc.line.v) + ")";
+        }
         return false;
       }
       const RelVec2 ab = sub(b0, a0);
@@ -460,7 +553,12 @@ bool RelProgram::validate(std::string* out_error) const {
       const float area2 = std::fabs(cross(ab, ap));
       const float dist_line = area2 / denom;
       if (dist_line > inc.tol) {
-        if (out_error) *out_error = "assert point-on-line failed";
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert point-on-line failed: p=" << inc.p.v << ", line=" << inc.line.v << ", dist=" << dist_line
+              << " > tol=" << inc.tol;
+          *out_error = oss.str();
+        }
         return false;
       }
       continue;
@@ -469,7 +567,9 @@ bool RelProgram::validate(std::string* out_error) const {
       const auto& pl = std::get<RelAssertParallelLines>(a);
       RelVec2 a0{}, a1{}, b0{}, b1{};
       if (!getline(pl.a, a0, a1) || !getline(pl.b, b0, b1)) {
-        if (out_error) *out_error = "assert parallel: invalid line id";
+        if (out_error) {
+          *out_error = "assert parallel: invalid line id (a=" + std::to_string(pl.a.v) + ", b=" + std::to_string(pl.b.v) + ")";
+        }
         return false;
       }
       const RelVec2 da = sub(a1, a0);
@@ -481,7 +581,11 @@ bool RelProgram::validate(std::string* out_error) const {
       const float s = std::fabs(cross(da, db)) / (len(da) * len(db));
       const float ang = std::asin(std::clamp(s, 0.0f, 1.0f));
       if (ang > pl.tol) {
-        if (out_error) *out_error = "assert parallel failed";
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert parallel failed: a=" << pl.a.v << ", b=" << pl.b.v << ", angle=" << ang << " > tol=" << pl.tol;
+          *out_error = oss.str();
+        }
         return false;
       }
       continue;
@@ -490,7 +594,9 @@ bool RelProgram::validate(std::string* out_error) const {
       const auto& pp = std::get<RelAssertPerpendicularLines>(a);
       RelVec2 a0{}, a1{}, b0{}, b1{};
       if (!getline(pp.a, a0, a1) || !getline(pp.b, b0, b1)) {
-        if (out_error) *out_error = "assert perpendicular: invalid line id";
+        if (out_error) {
+          *out_error = "assert perpendicular: invalid line id (a=" + std::to_string(pp.a.v) + ", b=" + std::to_string(pp.b.v) + ")";
+        }
         return false;
       }
       const RelVec2 da = sub(a1, a0);
@@ -503,7 +609,58 @@ bool RelProgram::validate(std::string* out_error) const {
       const float ang = std::acos(std::clamp(c, 0.0f, 1.0f));
       const float dev = std::fabs(ang - 1.5707963267948966f);
       if (dev > pp.tol) {
-        if (out_error) *out_error = "assert perpendicular failed";
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert perpendicular failed: a=" << pp.a.v << ", b=" << pp.b.v << ", dev=" << dev << " > tol=" << pp.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    // Circle/arc constraints are stored symbolically for now.
+    // Validate ids are well-formed, but do not attempt numeric satisfaction here.
+    if (std::holds_alternative<RelAssertPointOnCircle>(a)) {
+      const auto& pc = std::get<RelAssertPointOnCircle>(a);
+      if (!pc.p || !has_circle(pc.circle)) {
+        if (out_error) {
+          *out_error = "assert point-on-circle: invalid ids (p=" + std::to_string(pc.p.v) + ", circle=" +
+                       std::to_string(pc.circle.v) + ")";
+        }
+        return false;
+      }
+      continue;
+    }
+    if (std::holds_alternative<RelAssertTangentLineCircle>(a)) {
+      const auto& tc = std::get<RelAssertTangentLineCircle>(a);
+      if (!tc.line || !has_circle(tc.circle)) {
+        if (out_error) {
+          *out_error = "assert tangent: invalid ids (line=" + std::to_string(tc.line.v) + ", circle=" +
+                       std::to_string(tc.circle.v) + ")";
+        }
+        return false;
+      }
+      continue;
+    }
+    if (std::holds_alternative<RelAssertFixedRadius>(a)) {
+      const auto& fr = std::get<RelAssertFixedRadius>(a);
+      if (!has_circle(fr.circle) || fr.r <= 0.0f) {
+        if (out_error) {
+          *out_error = "assert fixed-radius: invalid (circle=" + std::to_string(fr.circle.v) + ", r=" +
+                       std::to_string(fr.r) + ")";
+        }
+        return false;
+      }
+      continue;
+    }
+    if (std::holds_alternative<RelAssertArcAngle>(a)) {
+      const auto& aa = std::get<RelAssertArcAngle>(a);
+      if (!has_arc(aa.arc) || aa.angle <= 0.0f) {
+        if (out_error) {
+          *out_error = "assert arc-angle: invalid (arc=" + std::to_string(aa.arc.v) + ", angle=" +
+                       std::to_string(aa.angle) + ")";
+        }
         return false;
       }
       continue;
@@ -520,6 +677,113 @@ std::optional<RelVec2> RelProgram::eval_point(RelPointId id) const {
   const size_t idx = static_cast<size_t>(id.v - 1);
   if (idx >= pos.size()) return std::nullopt;
   return pos[idx];
+}
+
+std::optional<RelCircleEval> RelProgram::eval_circle(RelCircleId id) const {
+  if (!id) return std::nullopt;
+  const size_t idx = static_cast<size_t>(id.v - 1);
+  if (idx >= circles_.size()) return std::nullopt;
+
+  std::vector<RelVec2> pos;
+  if (!evaluate(pos, nullptr)) return std::nullopt;
+
+  const RelCircle& c = circles_[idx].circle;
+  if (!c.center) return std::nullopt;
+  const size_t ic = static_cast<size_t>(c.center.v - 1);
+  if (ic >= pos.size()) return std::nullopt;
+  const RelVec2 center = pos[ic];
+
+  auto eval_radius = [&](const RelRadiusExpr& r, float& out_r) -> bool {
+    if (std::holds_alternative<RelRadiusConstant>(r)) {
+      out_r = std::get<RelRadiusConstant>(r).r;
+      return out_r > 0.0f;
+    }
+    const auto& d = std::get<RelRadiusDistance>(r);
+    if (!d.a || !d.b) return false;
+    const size_t ia = static_cast<size_t>(d.a.v - 1);
+    const size_t ib = static_cast<size_t>(d.b.v - 1);
+    if (ia >= pos.size() || ib >= pos.size()) return false;
+    out_r = dist(pos[ia], pos[ib]);
+    return out_r > 0.0f;
+  };
+
+  float r = 0.0f;
+  if (!eval_radius(c.radius, r)) return std::nullopt;
+  return RelCircleEval{center, r};
+}
+
+std::optional<RelBezierEval> RelProgram::eval_bezier(RelBezierId id) const {
+  if (!id) return std::nullopt;
+  const size_t idx = static_cast<size_t>(id.v - 1);
+  if (idx >= beziers_.size()) return std::nullopt;
+
+  std::vector<RelVec2> pos;
+  if (!evaluate(pos, nullptr)) return std::nullopt;
+
+  const RelBezierDef& b = beziers_[idx];
+  auto getp = [&](RelPointId pid, RelVec2& out) -> bool {
+    if (!pid) return false;
+    const size_t ip = static_cast<size_t>(pid.v - 1);
+    if (ip >= pos.size()) return false;
+    out = pos[ip];
+    return true;
+  };
+
+  RelBezierEval out;
+  if (!getp(b.p0, out.p0) || !getp(b.c0, out.c0) || !getp(b.c1, out.c1) || !getp(b.p1, out.p1)) return std::nullopt;
+  return out;
+}
+
+std::optional<RelArcEval> RelProgram::eval_arc(RelArcId id) const {
+  if (!id) return std::nullopt;
+  const size_t idx = static_cast<size_t>(id.v - 1);
+  if (idx >= arcs_.size()) return std::nullopt;
+
+  std::vector<RelVec2> pos;
+  if (!evaluate(pos, nullptr)) return std::nullopt;
+
+  const RelArcExpr& e = arcs_[idx].expr;
+
+  auto getp = [&](RelPointId pid, RelVec2& out) -> bool {
+    if (!pid) return false;
+    const size_t ip = static_cast<size_t>(pid.v - 1);
+    if (ip >= pos.size()) return false;
+    out = pos[ip];
+    return true;
+  };
+
+  if (std::holds_alternative<RelArcOnCircleAngles>(e)) {
+    const auto& a = std::get<RelArcOnCircleAngles>(e);
+    auto ce = eval_circle(a.circle);
+    if (!ce) return std::nullopt;
+    return RelArcEval{ce->center, ce->r, wrap_0_2pi(a.a0), wrap_0_2pi(a.a1), a.ccw};
+  }
+
+  if (std::holds_alternative<RelArcOnCircleEndpoints>(e)) {
+    const auto& a = std::get<RelArcOnCircleEndpoints>(e);
+    auto ce = eval_circle(a.circle);
+    if (!ce) return std::nullopt;
+    RelVec2 p0{}, p1{};
+    if (!getp(a.start, p0) || !getp(a.end, p1)) return std::nullopt;
+    const float a0 = wrap_0_2pi(std::atan2(p0.y - ce->center.y, p0.x - ce->center.x));
+    const float a1 = wrap_0_2pi(std::atan2(p1.y - ce->center.y, p1.x - ce->center.x));
+    const bool ccw = a.normal_z >= 0.0f;
+    return RelArcEval{ce->center, ce->r, a0, a1, ccw};
+  }
+
+  const auto& a3 = std::get<RelArc3>(e);
+  RelVec2 p0{}, p1{}, p2{};
+  if (!getp(a3.p0, p0) || !getp(a3.p1, p1) || !getp(a3.p2, p2)) return std::nullopt;
+  RelVec2 center{};
+  float r = 0.0f;
+  if (!circumcircle(p0, p1, p2, center, r)) return std::nullopt;
+
+  const float a0 = wrap_0_2pi(std::atan2(p0.y - center.y, p0.x - center.x));
+  const float a2 = wrap_0_2pi(std::atan2(p2.y - center.y, p2.x - center.x));
+  const float am = wrap_0_2pi(std::atan2(p1.y - center.y, p1.x - center.x));
+
+  const bool ccw = angle_is_between_ccw(a0, a2, am);
+  return RelArcEval{center, r, a0, a2, ccw};
 }
 
 bool compile_relglyph_outline(const RelGlyph& glyph,

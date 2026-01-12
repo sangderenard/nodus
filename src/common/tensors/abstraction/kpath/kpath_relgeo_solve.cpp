@@ -28,6 +28,12 @@ static std::optional<uint32_t> as_u32(const GraphIrValue& v) {
   return std::nullopt;
 }
 
+static std::optional<bool> as_bool(const GraphIrValue& v) {
+  if (const auto* p = std::get_if<bool>(&v)) return *p;
+  if (const auto* d = std::get_if<double>(&v)) return *d >= 0.5;
+  return std::nullopt;
+}
+
 struct NodeRec final {
   std::string kind;
   std::unordered_map<std::string, GraphIrValue> attrs;
@@ -62,6 +68,10 @@ static float len(RelVec2 a) {
   return std::sqrt(dot(a, a));
 }
 
+static float dist(RelVec2 a, RelVec2 b) {
+  return len(sub(a, b));
+}
+
 static bool line_line_intersection(RelVec2 p0, RelVec2 p1, RelVec2 q0, RelVec2 q1, float eps, RelVec2& out) {
   const RelVec2 r = sub(p1, p0);
   const RelVec2 s = sub(q1, q0);
@@ -94,6 +104,34 @@ static bool normalize(RelVec2 v, float eps, RelVec2& out) {
   if (l <= eps) return false;
   out = RelVec2{v.x / l, v.y / l};
   return true;
+}
+
+static RelVec2 project_point_to_line(RelVec2 p, RelVec2 a, RelVec2 b, float eps) {
+  const RelVec2 ab = sub(b, a);
+  const float dd = dot(ab, ab);
+  if (dd <= eps) return a;
+  const float t = dot(sub(p, a), ab) / dd;
+  return add(a, mul(ab, t));
+}
+
+static RelVec2 project_point_to_circle(RelVec2 p, RelVec2 center, float r, float eps) {
+  RelVec2 dir;
+  if (!normalize(sub(p, center), eps, dir)) {
+    dir = RelVec2{1.0f, 0.0f};
+  }
+  return add(center, mul(dir, r));
+}
+
+static float signed_distance_to_line(RelVec2 p, RelVec2 a, RelVec2 b, float eps, RelVec2* out_unit_normal = nullptr) {
+  RelVec2 dir;
+  if (!normalize(sub(b, a), eps, dir)) {
+    if (out_unit_normal) *out_unit_normal = RelVec2{0.0f, 0.0f};
+    return 0.0f;
+  }
+  RelVec2 n = perp(dir);
+  // n is already unit since dir is unit.
+  if (out_unit_normal) *out_unit_normal = n;
+  return dot(sub(p, a), n);
 }
 
 static uint64_t mix_u64(uint64_t x) {
@@ -179,6 +217,17 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     return true;
   };
 
+  auto get_f64_attr_edge = [&](uint32_t eid, const char* key, double& out_d) -> bool {
+    auto ite = edges.find(eid);
+    if (ite == edges.end()) return false;
+    auto ita = ite->second.attrs.find(key);
+    if (ita == ite->second.attrs.end()) return false;
+    auto d = as_f64(ita->second);
+    if (!d) return false;
+    out_d = *d;
+    return true;
+  };
+
   // Figure out which point nodes are required (reachable from contours/nouns/relations).
   std::unordered_set<uint32_t> required_points;
 
@@ -227,6 +276,29 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     } else if (nr.kind == "relgeo.point" || nr.kind == "relgeo.free_point") {
       // A base point is required if referenced.
       // (We do not force all points in the graph to be solved.)
+    } else if (nr.kind == "relgeo.circle") {
+      uint32_t center = 0;
+      if (get_u32_attr_node(nid, "center", center)) required_points.insert(center);
+      uint32_t through = 0;
+      if (get_u32_attr_node(nid, "through", through)) required_points.insert(through);
+    } else if (nr.kind == "relgeo.arc3") {
+      uint32_t p0 = 0, p1 = 0, p2 = 0;
+      if (get_u32_attr_node(nid, "p0", p0)) required_points.insert(p0);
+      if (get_u32_attr_node(nid, "p1", p1)) required_points.insert(p1);
+      if (get_u32_attr_node(nid, "p2", p2)) required_points.insert(p2);
+    } else if (nr.kind == "relgeo.arcse") {
+      uint32_t start = 0, end = 0, circle = 0;
+      if (get_u32_attr_node(nid, "circle", circle)) {
+        // circle will pull in its center/through via the circle node scan.
+      }
+      if (get_u32_attr_node(nid, "start", start)) required_points.insert(start);
+      if (get_u32_attr_node(nid, "end", end)) required_points.insert(end);
+    } else if (nr.kind == "relgeo.bezier") {
+      uint32_t p0 = 0, c0 = 0, c1 = 0, p1 = 0;
+      if (get_u32_attr_node(nid, "p0", p0)) required_points.insert(p0);
+      if (get_u32_attr_node(nid, "c0", c0)) required_points.insert(c0);
+      if (get_u32_attr_node(nid, "c1", c1)) required_points.insert(c1);
+      if (get_u32_attr_node(nid, "p1", p1)) required_points.insert(p1);
     }
   }
 
@@ -239,6 +311,15 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     } else if (er.kind == "relgeo.incident") {
       uint32_t p = 0;
       if (get_u32_attr_edge(eid, "a", p)) required_points.insert(p);
+    } else if (er.kind == "relgeo.point_on_circle") {
+      uint32_t p = 0;
+      if (get_u32_attr_edge(eid, "a", p)) required_points.insert(p);
+    } else if (er.kind == "relgeo.tangent") {
+      // line endpoints will be pulled in by line nodes; circle pulls by circle nodes.
+    } else if (er.kind == "relgeo.fixed_radius") {
+      // radius constraint will operate on circle's points.
+    } else if (er.kind == "relgeo.arc_angle") {
+      // arc constraint will operate on arc endpoints/circle.
     }
   }
 
@@ -331,6 +412,17 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     std::unordered_map<uint32_t, LineDef> lines;
     lines.reserve(64);
 
+    struct CircleDef {
+      uint32_t center_id = 0;
+      uint32_t through_id = 0; // 0 if constant radius
+      float r = 0.0f;
+      RelVec2 center{};
+      bool ok = false;
+    };
+
+    std::unordered_map<uint32_t, CircleDef> circles;
+    circles.reserve(64);
+
     // Recompute derived points first (order-independent; they will update over passes as inputs move).
     for (const auto& [nid, nr] : nodes) {
       if (nr.kind == "relgeo.lerp") {
@@ -377,6 +469,39 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       ld.length = len(d);
       ld.ok = normalize(d, in.eps, ld.dir);
       lines[nid] = ld;
+    }
+
+    // Cache circle centers and radii.
+    for (const auto& [nid, nr] : nodes) {
+      if (nr.kind != "relgeo.circle") continue;
+      uint32_t center_id = 0;
+      if (!get_u32_attr_node(nid, "center", center_id)) continue;
+      auto ic = points.find(center_id);
+      if (ic == points.end()) continue;
+      CircleDef cd;
+      cd.center_id = center_id;
+      cd.center = ic->second;
+
+      // Constant radius.
+      double rconst = 0.0;
+      if (get_f64_attr_node(nid, "r", rconst)) {
+        cd.r = static_cast<float>(rconst);
+        cd.ok = cd.r > in.eps;
+        circles[nid] = cd;
+        continue;
+      }
+
+      // Through-point radius.
+      uint32_t through_id = 0;
+      if (get_u32_attr_node(nid, "through", through_id)) {
+        auto itp = points.find(through_id);
+        if (itp != points.end()) {
+          cd.through_id = through_id;
+          cd.r = dist(cd.center, itp->second);
+          cd.ok = cd.r > in.eps;
+          circles[nid] = cd;
+        }
+      }
     }
 
     // Update llint points using current line estimates.
@@ -522,6 +647,153 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         }
         continue;
       }
+
+      if (er.kind == "relgeo.point_on_circle") {
+        uint32_t p = 0, c = 0;
+        if (!get_u32_attr_edge(eid, "a", p) || !get_u32_attr_edge(eid, "b", c)) continue;
+        auto ip = points.find(p);
+        auto ic = circles.find(c);
+        if (ip == points.end() || ic == circles.end() || !ic->second.ok) continue;
+
+        const bool mp = is_movable(p);
+        const bool mc = is_movable(ic->second.center_id);
+
+        if (mp) {
+          const RelVec2 target = project_point_to_circle(ip->second, ic->second.center, ic->second.r, in.eps);
+          const RelVec2 delta = sub(target, ip->second);
+          max_delta = std::max(max_delta, len(delta));
+          set_point_blend(p, target, alpha);
+        } else if (mc) {
+          // Move center along current direction so that fixed p lies on the circle.
+          RelVec2 dir;
+          if (!normalize(sub(ic->second.center, ip->second), in.eps, dir)) dir = RelVec2{1.0f, 0.0f};
+          const RelVec2 target_center = add(ip->second, mul(dir, ic->second.r));
+          const RelVec2 delta = sub(target_center, ic->second.center);
+          max_delta = std::max(max_delta, len(delta));
+          set_point_blend(ic->second.center_id, target_center, alpha);
+        }
+        continue;
+      }
+
+      if (er.kind == "relgeo.fixed_radius") {
+        uint32_t c = 0;
+        double r = 0.0;
+        if (!get_u32_attr_edge(eid, "a", c) || !get_f64_attr_edge(eid, "r", r)) continue;
+        auto ic = circles.find(c);
+        if (ic == circles.end()) continue;
+        if (r <= 0.0) continue;
+
+        // Only meaningful for through-point circles; constant-radius circles are already fixed.
+        if (ic->second.through_id == 0) continue;
+        const uint32_t center_id = ic->second.center_id;
+        const uint32_t through_id = ic->second.through_id;
+
+        auto ip_center = points.find(center_id);
+        auto ip_through = points.find(through_id);
+        if (ip_center == points.end() || ip_through == points.end()) continue;
+
+        const bool mt = is_movable(through_id);
+        const bool mc = is_movable(center_id);
+        if (!mt && !mc) continue;
+
+        const float rf = static_cast<float>(r);
+        if (mt) {
+          const RelVec2 target = project_point_to_circle(ip_through->second, ip_center->second, rf, in.eps);
+          const RelVec2 delta = sub(target, ip_through->second);
+          max_delta = std::max(max_delta, len(delta));
+          set_point_blend(through_id, target, alpha);
+        } else if (mc) {
+          // Move center relative to fixed through point.
+          RelVec2 dir;
+          if (!normalize(sub(ip_center->second, ip_through->second), in.eps, dir)) dir = RelVec2{1.0f, 0.0f};
+          const RelVec2 target_center = add(ip_through->second, mul(dir, rf));
+          const RelVec2 delta = sub(target_center, ip_center->second);
+          max_delta = std::max(max_delta, len(delta));
+          set_point_blend(center_id, target_center, alpha);
+        }
+        continue;
+      }
+
+      if (er.kind == "relgeo.tangent") {
+        uint32_t l = 0, c = 0;
+        if (!get_u32_attr_edge(eid, "a", l) || !get_u32_attr_edge(eid, "b", c)) continue;
+        auto il = lines.find(l);
+        auto ic = circles.find(c);
+        if (il == lines.end() || ic == circles.end()) continue;
+        if (!il->second.ok || !ic->second.ok) continue;
+
+        const uint32_t a_id = il->second.a_id;
+        const uint32_t b_id = il->second.b_id;
+        const uint32_t center_id = ic->second.center_id;
+        const bool ma = is_movable(a_id);
+        const bool mb = is_movable(b_id);
+        const bool mc = is_movable(center_id);
+        if (!ma && !mb && !mc) continue;
+
+        RelVec2 n;
+        const float sd = signed_distance_to_line(ic->second.center, il->second.a, il->second.b, in.eps, &n);
+        if (len(n) <= in.eps) continue;
+
+        // Want |sd| == r. Translate along n.
+        const float want = (sd >= 0.0f ? ic->second.r : -ic->second.r);
+        const float delta_s = want - sd;
+        const RelVec2 delta = mul(n, delta_s);
+        max_delta = std::max(max_delta, len(delta));
+
+        if (ma || mb) {
+          if (ma) translate_point(a_id, delta, alpha);
+          if (mb) translate_point(b_id, delta, alpha);
+        } else if (mc) {
+          translate_point(center_id, mul(delta, -1.0f), alpha);
+        }
+        continue;
+      }
+
+      if (er.kind == "relgeo.arc_angle") {
+        uint32_t arc = 0;
+        double angle = 0.0;
+        if (!get_u32_attr_edge(eid, "a", arc) || !get_f64_attr_edge(eid, "angle", angle)) continue;
+        auto itn = nodes.find(arc);
+        if (itn == nodes.end()) continue;
+        if (itn->second.kind != "relgeo.arcse") continue;
+
+        uint32_t circle = 0, start_id = 0, end_id = 0;
+        if (!get_u32_attr_node(arc, "circle", circle) || !get_u32_attr_node(arc, "start", start_id) || !get_u32_attr_node(arc, "end", end_id)) continue;
+        auto ic = circles.find(circle);
+        if (ic == circles.end() || !ic->second.ok) continue;
+        auto is = points.find(start_id);
+        auto ie = points.find(end_id);
+        if (is == points.end() || ie == points.end()) continue;
+
+        bool ccw = true;
+        if (auto it = nodes[arc].attrs.find("ccw"); it != nodes[arc].attrs.end()) {
+          if (auto b = as_bool(it->second)) ccw = *b;
+        }
+
+        const bool ms = is_movable(start_id);
+        const bool me = is_movable(end_id);
+        if (!ms && !me) continue;
+
+        const float a0 = std::atan2(is->second.y - ic->second.center.y, is->second.x - ic->second.center.x);
+        const float da = static_cast<float>(angle);
+        const float a1 = ccw ? (a0 + da) : (a0 - da);
+        const RelVec2 target_end = add(ic->second.center, RelVec2{ic->second.r * std::cos(a1), ic->second.r * std::sin(a1)});
+
+        if (me) {
+          const RelVec2 delta = sub(target_end, ie->second);
+          max_delta = std::max(max_delta, len(delta));
+          set_point_blend(end_id, target_end, alpha);
+        } else if (ms) {
+          // Move start instead, keeping end fixed.
+          const float a_end = std::atan2(ie->second.y - ic->second.center.y, ie->second.x - ic->second.center.x);
+          const float a_start = ccw ? (a_end - da) : (a_end + da);
+          const RelVec2 target_start = add(ic->second.center, RelVec2{ic->second.r * std::cos(a_start), ic->second.r * std::sin(a_start)});
+          const RelVec2 delta = sub(target_start, is->second);
+          max_delta = std::max(max_delta, len(delta));
+          set_point_blend(start_id, target_start, alpha);
+        }
+        continue;
+      }
     }
 
     if (max_delta <= in.eps) break;
@@ -537,8 +809,15 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (ia == points.end() || ib == points.end()) continue;
       const float dx = ia->second.x - ib->second.x;
       const float dy = ia->second.y - ib->second.y;
-      if (std::sqrt(dx * dx + dy * dy) > 5.0f * in.eps) {
-        if (out_error) *out_error = "relgeo.coincident not satisfied (after solve)";
+      const float d = std::sqrt(dx * dx + dy * dy);
+      const float tol = 5.0f * in.eps;
+      if (d > tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "constraint failed: edge " << eid << " relgeo.coincident(a=" << a << ", b=" << b << "): d=" << d
+              << " > tol=" << tol;
+          *out_error = oss.str();
+        }
         return false;
       }
     }
@@ -554,8 +833,18 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       auto ia = points.find(a);
       auto ib = points.find(b);
       if (ia == points.end() || ib == points.end()) continue;
-      if (!point_on_line(ip->second, ia->second, ib->second, 5.0f * in.eps)) {
-        if (out_error) *out_error = "relgeo.incident not satisfied (after solve)";
+      const float tol = 5.0f * in.eps;
+      if (!point_on_line(ip->second, ia->second, ib->second, tol)) {
+        if (out_error) {
+          const RelVec2 ab = sub(ib->second, ia->second);
+          const float denom = std::max(len(ab), in.eps);
+          const float area2 = std::fabs(cross(sub(ip->second, ia->second), ab));
+          const float dist_line = area2 / denom;
+          std::ostringstream oss;
+          oss << "constraint failed: edge " << eid << " relgeo.incident(p=" << p << ", line=" << l << "): dist="
+              << dist_line << " > tol=" << tol;
+          *out_error = oss.str();
+        }
         return false;
       }
     }
@@ -579,15 +868,165 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       const float c = std::fabs(cross(u0, u1));
       const float dp = std::fabs(dot(u0, u1));
       if (er.kind == "relgeo.parallel") {
-        if (c > 5.0f * in.eps) {
-          if (out_error) *out_error = "relgeo.parallel not satisfied (after solve)";
+        const float tol = 5.0f * in.eps;
+        if (c > tol) {
+          if (out_error) {
+            std::ostringstream oss;
+            oss << "constraint failed: edge " << eid << " relgeo.parallel(l0=" << l0 << ", l1=" << l1 << "): |cross|="
+                << c << " > tol=" << tol;
+            *out_error = oss.str();
+          }
           return false;
         }
       } else {
-        if (dp > 5.0f * in.eps) {
-          if (out_error) *out_error = "relgeo.perp not satisfied (after solve)";
+        const float tol = 5.0f * in.eps;
+        if (dp > tol) {
+          if (out_error) {
+            std::ostringstream oss;
+            oss << "constraint failed: edge " << eid << " relgeo.perp(l0=" << l0 << ", l1=" << l1 << "): |dot|=" << dp
+                << " > tol=" << tol;
+            *out_error = oss.str();
+          }
           return false;
         }
+      }
+    }
+
+    if (er.kind == "relgeo.point_on_circle") {
+      uint32_t p = 0, c = 0;
+      if (!get_u32_attr_edge(eid, "a", p) || !get_u32_attr_edge(eid, "b", c)) continue;
+      auto ip = points.find(p);
+      auto cn = nodes.find(c);
+      if (ip == points.end() || cn == nodes.end() || cn->second.kind != "relgeo.circle") continue;
+
+      uint32_t center_id = 0;
+      if (!get_u32_attr_node(c, "center", center_id)) continue;
+      auto ic = points.find(center_id);
+      if (ic == points.end()) continue;
+
+      float r = 0.0f;
+      double rconst = 0.0;
+      if (get_f64_attr_node(c, "r", rconst)) {
+        r = static_cast<float>(rconst);
+      } else {
+        uint32_t through = 0;
+        if (!get_u32_attr_node(c, "through", through)) continue;
+        auto itp = points.find(through);
+        if (itp == points.end()) continue;
+        r = dist(ic->second, itp->second);
+      }
+      const float tol = 10.0f * in.eps;
+      const float d = dist(ip->second, ic->second);
+      if (std::fabs(d - r) > tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "constraint failed: edge " << eid << " relgeo.point_on_circle(p=" << p << ", circle=" << c << "): |d-r|="
+              << std::fabs(d - r) << " > tol=" << tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+    }
+
+    if (er.kind == "relgeo.fixed_radius") {
+      uint32_t c = 0;
+      double r = 0.0;
+      if (!get_u32_attr_edge(eid, "a", c) || !get_f64_attr_edge(eid, "r", r)) continue;
+      auto cn = nodes.find(c);
+      if (cn == nodes.end() || cn->second.kind != "relgeo.circle") continue;
+      uint32_t center_id = 0, through_id = 0;
+      if (!get_u32_attr_node(c, "center", center_id) || !get_u32_attr_node(c, "through", through_id)) continue;
+      auto icp = points.find(center_id);
+      auto itp = points.find(through_id);
+      if (icp == points.end() || itp == points.end()) continue;
+      const float tol = 10.0f * in.eps;
+      const float d = dist(icp->second, itp->second);
+      if (std::fabs(d - static_cast<float>(r)) > tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "constraint failed: edge " << eid << " relgeo.fixed_radius(circle=" << c << "): |d-r|="
+              << std::fabs(d - static_cast<float>(r)) << " > tol=" << tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+    }
+
+    if (er.kind == "relgeo.tangent") {
+      uint32_t l = 0, c = 0;
+      if (!get_u32_attr_edge(eid, "a", l) || !get_u32_attr_edge(eid, "b", c)) continue;
+      auto ln = nodes.find(l);
+      auto cn = nodes.find(c);
+      if (ln == nodes.end() || cn == nodes.end()) continue;
+      if (ln->second.kind != "relgeo.line" || cn->second.kind != "relgeo.circle") continue;
+
+      uint32_t a_id = 0, b_id = 0;
+      if (!get_u32_attr_node(l, "a", a_id) || !get_u32_attr_node(l, "b", b_id)) continue;
+      uint32_t center_id = 0;
+      if (!get_u32_attr_node(c, "center", center_id)) continue;
+      auto ia = points.find(a_id);
+      auto ib = points.find(b_id);
+      auto icp = points.find(center_id);
+      if (ia == points.end() || ib == points.end() || icp == points.end()) continue;
+
+      float r = 0.0f;
+      double rconst = 0.0;
+      if (get_f64_attr_node(c, "r", rconst)) {
+        r = static_cast<float>(rconst);
+      } else {
+        uint32_t through = 0;
+        if (!get_u32_attr_node(c, "through", through)) continue;
+        auto itp = points.find(through);
+        if (itp == points.end()) continue;
+        r = dist(icp->second, itp->second);
+      }
+
+      RelVec2 n;
+      const float sd = signed_distance_to_line(icp->second, ia->second, ib->second, in.eps, &n);
+      const float tol = 10.0f * in.eps;
+      if (std::fabs(std::fabs(sd) - r) > tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "constraint failed: edge " << eid << " relgeo.tangent(line=" << l << ", circle=" << c << "): | |sd|-r |="
+              << std::fabs(std::fabs(sd) - r) << " > tol=" << tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+    }
+
+    if (er.kind == "relgeo.arc_angle") {
+      uint32_t arc = 0;
+      double angle = 0.0;
+      if (!get_u32_attr_edge(eid, "a", arc) || !get_f64_attr_edge(eid, "angle", angle)) continue;
+      auto an = nodes.find(arc);
+      if (an == nodes.end() || an->second.kind != "relgeo.arcse") continue;
+      uint32_t circle = 0, start_id = 0, end_id = 0;
+      if (!get_u32_attr_node(arc, "circle", circle) || !get_u32_attr_node(arc, "start", start_id) || !get_u32_attr_node(arc, "end", end_id)) continue;
+      auto cn = nodes.find(circle);
+      if (cn == nodes.end() || cn->second.kind != "relgeo.circle") continue;
+      uint32_t center_id = 0;
+      if (!get_u32_attr_node(circle, "center", center_id)) continue;
+      auto icp = points.find(center_id);
+      auto is = points.find(start_id);
+      auto ie = points.find(end_id);
+      if (icp == points.end() || is == points.end() || ie == points.end()) continue;
+
+      const float a0 = std::atan2(is->second.y - icp->second.y, is->second.x - icp->second.x);
+      const float a1 = std::atan2(ie->second.y - icp->second.y, ie->second.x - icp->second.x);
+      float da = a1 - a0;
+      // Wrap to [-pi,pi] for comparison.
+      while (da > 3.141592653589793f) da -= 2.0f * 3.141592653589793f;
+      while (da < -3.141592653589793f) da += 2.0f * 3.141592653589793f;
+      const float tol = 20.0f * in.eps;
+      if (std::fabs(std::fabs(da) - static_cast<float>(angle)) > tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "constraint failed: edge " << eid << " relgeo.arc_angle(arc=" << arc << "): | |da|-angle |="
+              << std::fabs(std::fabs(da) - static_cast<float>(angle)) << " > tol=" << tol;
+          *out_error = oss.str();
+        }
+        return false;
       }
     }
   }

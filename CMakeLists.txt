@@ -574,6 +574,13 @@ target_link_libraries(test_graph_ir PRIVATE canvas_tables_static)
 target_compile_features(test_graph_ir PRIVATE cxx_std_20)
 add_test(NAME graph_ir_test COMMAND test_graph_ir)
 
+add_executable(test_relgeo_esat_smoke
+  tests/relgeo_esat_smoke_test.cpp
+)
+target_link_libraries(test_relgeo_esat_smoke PRIVATE canvas_tables_static)
+target_compile_features(test_relgeo_esat_smoke PRIVATE cxx_std_20)
+add_test(NAME relgeo_esat_smoke_test COMMAND test_relgeo_esat_smoke)
+
 add_executable(test_graph_sparse_builder
   tests/graph_sparse_builder_test.cpp
 )

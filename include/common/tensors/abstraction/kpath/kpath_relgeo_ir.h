@@ -31,11 +31,22 @@ namespace nodus::tensors::kpath {
 // - param_quad(start: u32, ctrl: u32, end: u32, u: f64[, dir: string|bool]) -> u32
 // - param_cubic(start: u32, ctrl0: u32, ctrl1: u32, end: u32, u: f64[, dir: string|bool]) -> u32
 // - param_sin(start: u32, end: u32, u: f64, amplitude: f64, cycles: f64, phase: f64[, dir: string|bool]) -> u32
+// - circle(center: u32, r: f64|u32) -> u32 circle
+//     - if r is f64: constant radius
+//     - if r is u32: interpreted as a point id "through" (radius is distance(center, through))
+// - arc(circle: u32circle, a0: f64, a1: f64[, dir: string|bool]) -> u32 arc
+// - arcse(circle: u32circle, start: u32, end: u32[, dir: string|bool]) -> u32 arc
+// - arc3(p0: u32, p1: u32, p2: u32) -> u32 arc
+// - bezier(p0: u32, c0: u32, c1: u32, p1: u32) -> u32 bezier
 // - contour(p0: u32, p1: u32, ..., ["open"|"closed"], ["ccw"|"cw"|"outer"|"inner"]) -> void
 // - parallel(l0: u32, l1: u32) -> void edge
 // - perp(l0: u32, l1: u32) -> void edge
 // - incident(p: u32, l: u32) -> void edge
 // - coincident(p0: u32, p1: u32) -> void edge
+// - point_on_circle(p: u32, circle: u32circle) -> void edge
+// - tangent(line: u32line, circle: u32circle) -> void edge
+// - fixed_radius(circle: u32circle, r: f64) -> void edge
+// - arc_angle(arc: u32arc, angle: f64) -> void edge
 GraphIrOperatorSet make_relgeo_ir_ops();
 
 // A "pure" subset of RelGeo IR intended to avoid numeric literals for *derived* geometry.
@@ -47,6 +58,7 @@ GraphIrOperatorSet make_relgeo_ir_ops();
 // - lerp_ratio(a: u32, b: u32, u: u32ratio) -> u32 point
 //
 // The returned operator set intentionally omits float-based operators such as offset()/param_*/ccint().
+// It also omits constraints that require floats (fixed_radius/arc_angle) and the angle-based arc() constructor.
 GraphIrOperatorSet make_relgeo_ir_ops_pure();
 
 // Validates that a source program only uses the pure operator subset.
