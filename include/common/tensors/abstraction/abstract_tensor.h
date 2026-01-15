@@ -1,25 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
 
+#include "common/tensors/abstraction/abstract_tensor_handle.h"
+#include "common/tensors/abstraction/tensor_index.h"
 #include "common/tensors/abstraction/tensor_types.h"
 
 namespace nodus::tensors {
 
-struct AbstractTensorHandle {
-    uint64_t id = 0;
-};
-
-inline bool abstract_tensor_handle_is_valid(AbstractTensorHandle handle) {
-    return handle.id != 0;
-}
-
 class TensorBackend;
+class AbstractTensorPool;
 
 // Move-only handle wrapper with optional ownership semantics.
 class AbstractTensor {
 public:
     AbstractTensor() = default;
+    explicit AbstractTensor(const TensorDesc& desc, TensorBackend* backend = nullptr);
     AbstractTensor(const AbstractTensor&) = delete;
     AbstractTensor& operator=(const AbstractTensor&) = delete;
 
@@ -39,15 +36,28 @@ public:
     AbstractTensorHandle handle() const { return handle_; }
 
     void set_dtype(TensorDType dtype);
+    void set_slice_affine_row_major(const float* affine16);
+    void set_slice_saturate_threshold(float threshold);
     void reset();
     void release();
     bool refresh_desc();
 
+    AbstractTensor slice(const TensorIndexSpec& index) const;
+    bool set_slice(const TensorIndexSpec& index, const AbstractTensor& value);
+    AbstractTensor operator()(const TensorIndexSpec& index) const;
+    AbstractTensor operator()(std::initializer_list<TensorIndex> dims) const;
+    bool set(std::initializer_list<TensorIndex> dims, const AbstractTensor& value);
+
 private:
+    friend class AbstractTensorPool;
+    static AbstractTensor create_raw(const TensorDesc& desc, TensorBackend* backend = nullptr);
+
     AbstractTensorHandle handle_{};
     TensorDesc desc_{};
     TensorBackend* backend_ = nullptr;
     bool owns_handle_ = true;
+    AbstractTensorPool* pool_ = nullptr;
+    TensorDesc pool_desc_{};
 };
 
 } // namespace nodus::tensors

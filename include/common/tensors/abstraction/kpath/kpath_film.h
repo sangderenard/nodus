@@ -4,9 +4,20 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <cstring>
+#include <cstring>
 #include <span>
 #include <string>
 #include <vector>
+
+#include "common/tensors/abstraction/abstract_tensor.h"
+#include "common/tensors/abstraction/tensor_index.h"
+#include "common/tensors/abstraction/tensor_math.h"
+#include "common/tensors/abstraction/tensor_types.h"
+
+#include "common/tensors/abstraction/tensor_index.h"
+#include "common/tensors/abstraction/tensor_math.h"
+#include "common/tensors/abstraction/tensor_types.h"
 
 namespace nodus::tensors::kpath {
 
@@ -178,6 +189,44 @@ inline uint32_t clamp_pixel(float v, uint32_t limit) {
   if (m >= static_cast<float>(limit)) return limit ? limit - 1 : 0;
   return static_cast<uint32_t>(m);
 }
+
+struct FilmHistogramDescriptor final {
+  SpectrumBasis basis;
+  std::vector<float> layer_reactance;
+
+  uint32_t channel_count() const {
+    return static_cast<uint32_t>(layer_reactance.size());
+  }
+};
+
+class FilmTensor {
+ public:
+  FilmTensor() = default;
+  bool configure(uint32_t width,
+                 uint32_t height,
+                 std::vector<FilmHistogramDescriptor> descriptors);
+  bool valid() const { return width_ != 0 && height_ != 0 && total_channels_ != 0 && !histograms_.empty(); }
+  uint32_t width() const { return width_; }
+  uint32_t height() const { return height_; }
+  uint32_t histogram_count() const { return static_cast<uint32_t>(histograms_.size()); }
+  uint32_t total_channels() const { return total_channels_; }
+
+  AbstractTensor histogram_tensor(const AbstractTensor& exposures, uint32_t index) const;
+  bool reduce_histogram(const AbstractTensor& exposures, uint32_t index, AbstractTensor* out) const;
+  bool reduce_all(const AbstractTensor& exposures, AbstractTensor* out) const;
+  void clear() { histograms_.clear(); width_ = height_ = total_channels_ = 0; }
+
+ private:
+  struct HistogramMeta final {
+    FilmHistogramDescriptor desc;
+    uint32_t offset = 0;
+  };
+
+  std::vector<HistogramMeta> histograms_;
+  uint32_t width_ = 0;
+  uint32_t height_ = 0;
+  uint32_t total_channels_ = 0;
+};
 
 // Map wavelength to nearest basis bin.
 inline uint32_t nearest_bin(const SpectrumBasis& basis, float wavelength) {

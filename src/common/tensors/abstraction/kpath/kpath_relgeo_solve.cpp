@@ -2,6 +2,7 @@
 
 #include "common/tensors/abstraction/graph_sparse.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
+#include "common/tensors/abstraction/in_memory_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,48 +45,119 @@ struct EdgeRec final {
   std::unordered_map<std::string, GraphIrValue> attrs;
 };
 
-static RelVec2 sub(RelVec2 a, RelVec2 b) {
-  return RelVec2{a.x - b.x, a.y - b.y};
+struct P2 final {
+  float x = 0.0f;
+  float y = 0.0f;
+};
+
+static std::optional<AbstractTensor> make_point_tensor(P2 p) {
+  TensorDesc desc;
+  desc.dtype = TensorDType::F32;
+  desc.layout = TensorLayout::Dense;
+  desc.shape.dims = {1u, 2u};
+  AbstractTensor t = AbstractTensor::create(desc, &in_memory_backend_singleton());
+  if (!t.valid()) return std::nullopt;
+  auto* backend = dynamic_cast<InMemoryBackend*>(t.backend());
+  if (!backend) return std::nullopt;
+  void* raw = nullptr;
+  size_t bytes = 0;
+  if (!backend->map(t.handle(), &raw, &bytes)) return std::nullopt;
+  if (bytes < 2u * sizeof(float)) {
+    backend->unmap(t.handle());
+    return std::nullopt;
+  }
+  float* dst = static_cast<float*>(raw);
+  dst[0] = p.x;
+  dst[1] = p.y;
+  backend->unmap(t.handle());
+  return t;
 }
 
-static RelVec2 add(RelVec2 a, RelVec2 b) {
-  return RelVec2{a.x + b.x, a.y + b.y};
+static bool read_point_tensor(const AbstractTensor& t, P2& out) {
+  auto* backend = dynamic_cast<InMemoryBackend*>(t.backend());
+  if (!backend) return false;
+  const TensorDesc& desc = t.desc();
+  if (desc.dtype != TensorDType::F32 || desc.layout != TensorLayout::Dense ||
+      desc.shape.dims.size() != 2 || desc.shape.dims[0] == 0 || desc.shape.dims[1] != 2u) {
+    return false;
+  }
+  void* raw = nullptr;
+  size_t bytes = 0;
+  if (!backend->map(t.handle(), &raw, &bytes)) return false;
+  if (bytes < 2u * sizeof(float)) {
+    backend->unmap(t.handle());
+    return false;
+  }
+  float* src = static_cast<float*>(raw);
+  out = P2{src[0], src[1]};
+  backend->unmap(t.handle());
+  return true;
 }
 
-static RelVec2 mul(RelVec2 a, float s) {
-  return RelVec2{a.x * s, a.y * s};
+static bool clone_point_tensor(const RelTensorPoint& src, RelTensorPoint& out) {
+  P2 p{};
+  if (!read_point_tensor(src, p)) return false;
+  auto t = make_point_tensor(p);
+  if (!t) return false;
+  out = std::move(*t);
+  return true;
 }
 
-static float dot(RelVec2 a, RelVec2 b) {
+static bool get_point(const std::unordered_map<uint32_t, RelTensorPoint>& points, uint32_t id, P2& out) {
+  auto it = points.find(id);
+  if (it == points.end()) return false;
+  return read_point_tensor(it->second, out);
+}
+
+static bool set_point(std::unordered_map<uint32_t, RelTensorPoint>& points, uint32_t id, P2 p) {
+  auto t = make_point_tensor(p);
+  if (!t) return false;
+  points[id] = std::move(*t);
+  return true;
+}
+
+static P2 sub(P2 a, P2 b) {
+  return P2{a.x - b.x, a.y - b.y};
+}
+
+static P2 add(P2 a, P2 b) {
+  return P2{a.x + b.x, a.y + b.y};
+}
+
+static P2 mul(P2 a, float s) {
+  return P2{a.x * s, a.y * s};
+}
+
+static float dot(P2 a, P2 b) {
   return a.x * b.x + a.y * b.y;
 }
 
-static float cross(RelVec2 a, RelVec2 b) {
+static float cross(P2 a, P2 b) {
   return a.x * b.y - a.y * b.x;
 }
 
-static float len(RelVec2 a) {
+static float len(P2 a) {
   return std::sqrt(dot(a, a));
 }
 
-static float dist(RelVec2 a, RelVec2 b) {
+static float dist(P2 a, P2 b) {
   return len(sub(a, b));
 }
 
-static bool line_line_intersection(RelVec2 p0, RelVec2 p1, RelVec2 q0, RelVec2 q1, float eps, RelVec2& out) {
-  const RelVec2 r = sub(p1, p0);
-  const RelVec2 s = sub(q1, q0);
+static bool line_line_intersection(P2 p0, P2 p1, P2 q0, P2 q1, float eps, P2& out) {
+  const P2 r = sub(p1, p0);
+  const P2 s = sub(q1, q0);
   const float denom = cross(r, s);
   if (std::fabs(denom) <= eps) return false;
 
-  const RelVec2 qp = sub(q0, p0);
+  const P2 qp = sub(q0, p0);
   const float t = cross(qp, s) / denom;
   out = add(p0, mul(r, t));
   return true;
 }
 
-static bool point_on_line(RelVec2 p, RelVec2 a, RelVec2 b, float eps) {
-  const RelVec2 ab = sub(b, a);
+static bool point_on_line(P2 p, P2 a, P2 b, float eps) {
+  const P2 ab = sub(b, a);
   const float ab_len = len(ab);
   if (ab_len <= eps) return false;
 
@@ -95,40 +167,40 @@ static bool point_on_line(RelVec2 p, RelVec2 a, RelVec2 b, float eps) {
   return dist <= eps;
 }
 
-static RelVec2 perp(RelVec2 a) {
-  return RelVec2{-a.y, a.x};
+static P2 perp(P2 a) {
+  return P2{-a.y, a.x};
 }
 
-static bool normalize(RelVec2 v, float eps, RelVec2& out) {
+static bool normalize(P2 v, float eps, P2& out) {
   const float l = len(v);
   if (l <= eps) return false;
-  out = RelVec2{v.x / l, v.y / l};
+  out = P2{v.x / l, v.y / l};
   return true;
 }
 
-static RelVec2 project_point_to_line(RelVec2 p, RelVec2 a, RelVec2 b, float eps) {
-  const RelVec2 ab = sub(b, a);
+static P2 project_point_to_line(P2 p, P2 a, P2 b, float eps) {
+  const P2 ab = sub(b, a);
   const float dd = dot(ab, ab);
   if (dd <= eps) return a;
   const float t = dot(sub(p, a), ab) / dd;
   return add(a, mul(ab, t));
 }
 
-static RelVec2 project_point_to_circle(RelVec2 p, RelVec2 center, float r, float eps) {
-  RelVec2 dir;
+static P2 project_point_to_circle(P2 p, P2 center, float r, float eps) {
+  P2 dir;
   if (!normalize(sub(p, center), eps, dir)) {
-    dir = RelVec2{1.0f, 0.0f};
+    dir = P2{1.0f, 0.0f};
   }
   return add(center, mul(dir, r));
 }
 
-static float signed_distance_to_line(RelVec2 p, RelVec2 a, RelVec2 b, float eps, RelVec2* out_unit_normal = nullptr) {
-  RelVec2 dir;
+static float signed_distance_to_line(P2 p, P2 a, P2 b, float eps, P2* out_unit_normal = nullptr) {
+  P2 dir;
   if (!normalize(sub(b, a), eps, dir)) {
-    if (out_unit_normal) *out_unit_normal = RelVec2{0.0f, 0.0f};
+    if (out_unit_normal) *out_unit_normal = P2{0.0f, 0.0f};
     return 0.0f;
   }
-  RelVec2 n = perp(dir);
+  P2 n = perp(dir);
   // n is already unit since dir is unit.
   if (out_unit_normal) *out_unit_normal = n;
   return dot(sub(p, a), n);
@@ -143,12 +215,12 @@ static uint64_t mix_u64(uint64_t x) {
   return x;
 }
 
-static RelVec2 default_free_point_seed(uint32_t id) {
+static P2 default_free_point_seed(uint32_t id) {
   // Deterministic non-degenerate seed so projection constraints have something to work with.
   const uint64_t h = mix_u64(static_cast<uint64_t>(id) * 0x1000003dull);
   const double a = (static_cast<double>(h & 0xFFFFFFFFull) / static_cast<double>(0xFFFFFFFFull)) * (2.0 * 3.141592653589793);
   const double r = 1.0 + 0.5 * (static_cast<double>((h >> 32) & 0xFFFFFFFFull) / static_cast<double>(0xFFFFFFFFull));
-  return RelVec2{static_cast<float>(r * std::cos(a)), static_cast<float>(r * std::sin(a))};
+  return P2{static_cast<float>(r * std::cos(a)), static_cast<float>(r * std::sin(a))};
 }
 
 } // namespace
@@ -329,7 +401,13 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
   }
 
   // Seed known points from anchors and from literal points.
-  std::unordered_map<uint32_t, RelVec2> points = in.anchors;
+  std::unordered_map<uint32_t, RelTensorPoint> points;
+  points.reserve(in.anchors.size());
+  for (const auto& [id, t] : in.anchors) {
+    P2 p{};
+    if (!read_point_tensor(t, p)) continue;
+    (void)set_point(points, id, p);
+  }
 
   // Fixed points: explicit anchors and literal pt() nodes are treated as fixed reference.
   std::unordered_set<uint32_t> fixed;
@@ -342,7 +420,10 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
 
     double x = 0.0, y = 0.0;
     if (get_f64_attr_node(nid, "x", x) && get_f64_attr_node(nid, "y", y)) {
-      points[nid] = RelVec2{static_cast<float>(x), static_cast<float>(y)};
+      if (!set_point(points, nid, P2{static_cast<float>(x), static_cast<float>(y)})) {
+        if (out_error) *out_error = "relgeo.solve failed to allocate point tensor for fixed point";
+        return false;
+      }
       fixed.insert(nid);
     }
   }
@@ -363,22 +444,22 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     return true;
   };
 
-  auto set_point_blend = [&](uint32_t pid, RelVec2 target, float alpha) {
-    auto it = points.find(pid);
-    if (it == points.end()) {
-      points[pid] = target;
+  auto set_point_blend = [&](uint32_t pid, P2 target, float alpha) {
+    P2 cur{};
+    if (!get_point(points, pid, cur)) {
+      (void)set_point(points, pid, target);
       return;
     }
-    it->second = add(mul(it->second, 1.0f - alpha), mul(target, alpha));
+    (void)set_point(points, pid, add(mul(cur, 1.0f - alpha), mul(target, alpha)));
   };
 
-  auto translate_point = [&](uint32_t pid, RelVec2 delta, float alpha) {
-    auto it = points.find(pid);
-    if (it == points.end()) {
-      points[pid] = mul(delta, alpha);
+  auto translate_point = [&](uint32_t pid, P2 delta, float alpha) {
+    P2 cur{};
+    if (!get_point(points, pid, cur)) {
+      (void)set_point(points, pid, mul(delta, alpha));
       return;
     }
-    it->second = add(it->second, mul(delta, alpha));
+    (void)set_point(points, pid, add(cur, mul(delta, alpha)));
   };
 
   // Seed free points so constraints can rotate/translate them.
@@ -387,7 +468,7 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     auto itn = nodes.find(p);
     if (itn == nodes.end()) continue;
     if (itn->second.kind == "relgeo.free_point") {
-      points[p] = default_free_point_seed(p);
+      (void)set_point(points, p, default_free_point_seed(p));
     }
   }
 
@@ -408,9 +489,9 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     struct LineDef {
       uint32_t a_id = 0;
       uint32_t b_id = 0;
-      RelVec2 a{};
-      RelVec2 b{};
-      RelVec2 dir{};
+      P2 a{};
+      P2 b{};
+      P2 dir{};
       float length = 0.0f;
       bool ok = false;
     };
@@ -421,7 +502,7 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       uint32_t center_id = 0;
       uint32_t through_id = 0; // 0 if constant radius
       float r = 0.0f;
-      RelVec2 center{};
+      P2 center{};
       bool ok = false;
     };
 
@@ -434,27 +515,26 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         uint32_t a = 0, b = 0;
         double u = 0.0;
         if (!get_u32_attr_node(nid, "a", a) || !get_u32_attr_node(nid, "b", b) || !get_f64_attr_node(nid, "u", u)) continue;
-        auto ia = points.find(a);
-        auto ib = points.find(b);
-        if (ia == points.end() || ib == points.end()) continue;
+        P2 pa{}, pb{};
+        if (!get_point(points, a, pa) || !get_point(points, b, pb)) continue;
         const float uf = static_cast<float>(u);
-        points[nid] = add(mul(ia->second, 1.0f - uf), mul(ib->second, uf));
+        (void)set_point(points, nid, add(mul(pa, 1.0f - uf), mul(pb, uf)));
       } else if (nr.kind == "relgeo.offset") {
         uint32_t base = 0;
         double dx = 0.0, dy = 0.0;
         if (!get_u32_attr_node(nid, "base", base) || !get_f64_attr_node(nid, "dx", dx) || !get_f64_attr_node(nid, "dy", dy)) continue;
-        auto ib = points.find(base);
-        if (ib == points.end()) continue;
-        points[nid] = add(ib->second, RelVec2{static_cast<float>(dx), static_cast<float>(dy)});
+        P2 pb{};
+        if (!get_point(points, base, pb)) continue;
+        (void)set_point(points, nid, add(pb, P2{static_cast<float>(dx), static_cast<float>(dy)}));
       } else if (nr.kind == "relgeo.lerp_ratio") {
         uint32_t a = 0, b = 0, u = 0;
         if (!get_u32_attr_node(nid, "a", a) || !get_u32_attr_node(nid, "b", b) || !get_u32_attr_node(nid, "u", u)) continue;
-        auto ia = points.find(a);
-        auto ib = points.find(b);
         auto iu = ratios.find(u);
-        if (ia == points.end() || ib == points.end() || iu == ratios.end()) continue;
+        if (iu == ratios.end()) continue;
+        P2 pa{}, pb{};
+        if (!get_point(points, a, pa) || !get_point(points, b, pb)) continue;
         const float uf = iu->second;
-        points[nid] = add(mul(ia->second, 1.0f - uf), mul(ib->second, uf));
+        (void)set_point(points, nid, add(mul(pa, 1.0f - uf), mul(pb, uf)));
       }
     }
 
@@ -462,15 +542,14 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (nr.kind != "relgeo.line") continue;
       uint32_t a_id = 0, b_id = 0;
       if (!get_u32_attr_node(nid, "a", a_id) || !get_u32_attr_node(nid, "b", b_id)) continue;
-      auto ia = points.find(a_id);
-      auto ib = points.find(b_id);
-      if (ia == points.end() || ib == points.end()) continue;
+      P2 pa{}, pb{};
+      if (!get_point(points, a_id, pa) || !get_point(points, b_id, pb)) continue;
       LineDef ld;
       ld.a_id = a_id;
       ld.b_id = b_id;
-      ld.a = ia->second;
-      ld.b = ib->second;
-      const RelVec2 d = sub(ld.b, ld.a);
+      ld.a = pa;
+      ld.b = pb;
+      const P2 d = sub(ld.b, ld.a);
       ld.length = len(d);
       ld.ok = normalize(d, in.eps, ld.dir);
       lines[nid] = ld;
@@ -481,11 +560,11 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (nr.kind != "relgeo.circle") continue;
       uint32_t center_id = 0;
       if (!get_u32_attr_node(nid, "center", center_id)) continue;
-      auto ic = points.find(center_id);
-      if (ic == points.end()) continue;
+      P2 center{};
+      if (!get_point(points, center_id, center)) continue;
       CircleDef cd;
       cd.center_id = center_id;
-      cd.center = ic->second;
+      cd.center = center;
 
       // Constant radius.
       double rconst = 0.0;
@@ -499,10 +578,10 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       // Through-point radius.
       uint32_t through_id = 0;
       if (get_u32_attr_node(nid, "through", through_id)) {
-        auto itp = points.find(through_id);
-        if (itp != points.end()) {
+        P2 through{};
+        if (get_point(points, through_id, through)) {
           cd.through_id = through_id;
-          cd.r = dist(cd.center, itp->second);
+          cd.r = dist(cd.center, through);
           cd.ok = cd.r > in.eps;
           circles[nid] = cd;
         }
@@ -517,9 +596,9 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       auto i0 = lines.find(l0);
       auto i1 = lines.find(l1);
       if (i0 == lines.end() || i1 == lines.end()) continue;
-      RelVec2 p;
+      P2 p;
       if (!line_line_intersection(i0->second.a, i0->second.b, i1->second.a, i1->second.b, in.eps, p)) continue;
-      points[nid] = p;
+      (void)set_point(points, nid, p);
     }
 
     float max_delta = 0.0f;
@@ -529,29 +608,28 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (er.kind == "relgeo.coincident") {
         uint32_t a = 0, b = 0;
         if (!get_u32_attr_edge(eid, "a", a) || !get_u32_attr_edge(eid, "b", b)) continue;
-        auto ia = points.find(a);
-        auto ib = points.find(b);
-        if (ia == points.end() || ib == points.end()) continue;
+        P2 pa{}, pb{};
+        if (!get_point(points, a, pa) || !get_point(points, b, pb)) continue;
 
         const bool ma = is_movable(a);
         const bool mb = is_movable(b);
         if (!ma && !mb) continue;
-        const RelVec2 avg = mul(add(ia->second, ib->second), 0.5f);
+        const P2 avg = mul(add(pa, pb), 0.5f);
         if (ma && mb) {
-          const RelVec2 da = sub(avg, ia->second);
-          const RelVec2 db = sub(avg, ib->second);
+          const P2 da = sub(avg, pa);
+          const P2 db = sub(avg, pb);
           max_delta = std::max(max_delta, len(da));
           max_delta = std::max(max_delta, len(db));
           set_point_blend(a, avg, alpha);
           set_point_blend(b, avg, alpha);
         } else if (ma) {
-          const RelVec2 da = sub(ib->second, ia->second);
+          const P2 da = sub(pb, pa);
           max_delta = std::max(max_delta, len(da));
-          set_point_blend(a, ib->second, alpha);
+          set_point_blend(a, pb, alpha);
         } else {
-          const RelVec2 db = sub(ia->second, ib->second);
+          const P2 db = sub(pa, pb);
           max_delta = std::max(max_delta, len(db));
-          set_point_blend(b, ia->second, alpha);
+          set_point_blend(b, pa, alpha);
         }
         continue;
       }
@@ -559,8 +637,8 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (er.kind == "relgeo.incident") {
         uint32_t p = 0, l = 0;
         if (!get_u32_attr_edge(eid, "a", p) || !get_u32_attr_edge(eid, "b", l)) continue;
-        auto ip = points.find(p);
-        if (ip == points.end()) continue;
+        P2 ppos{};
+        if (!get_point(points, p, ppos)) continue;
         auto ln = lines.find(l);
         if (ln == lines.end() || !ln->second.ok) continue;
 
@@ -572,13 +650,13 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
 
         // If the point is movable, project it onto the current line.
         if (mp) {
-          const RelVec2 a0 = ln->second.a;
-          const RelVec2 d = sub(ln->second.b, ln->second.a);
+          const P2 a0 = ln->second.a;
+          const P2 d = sub(ln->second.b, ln->second.a);
           const float dd = dot(d, d);
           if (dd <= in.eps) continue;
-          const float t = dot(sub(ip->second, a0), d) / dd;
-          const RelVec2 proj = add(a0, mul(d, t));
-          const RelVec2 delta = sub(proj, ip->second);
+          const float t = dot(sub(ppos, a0), d) / dd;
+          const P2 proj = add(a0, mul(d, t));
+          const P2 delta = sub(proj, ppos);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(p, proj, alpha);
           continue;
@@ -587,23 +665,28 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         // Otherwise, try to rotate/translate the line to pass through fixed p by moving a movable endpoint.
         // Prefer keeping the other endpoint as pivot.
         if (ma || mb) {
-          const RelVec2 ppos = ip->second;
           if (mb) {
-            const RelVec2 pivot = points[a_id];
-            RelVec2 dir_to_p;
+            P2 pivot{};
+            if (!get_point(points, a_id, pivot)) continue;
+            P2 dir_to_p;
             if (!normalize(sub(ppos, pivot), in.eps, dir_to_p)) continue;
             const float L = std::max(ln->second.length, 1.0f);
-            const RelVec2 target = add(pivot, mul(dir_to_p, L));
-            const RelVec2 delta = sub(target, points[b_id]);
+            const P2 target = add(pivot, mul(dir_to_p, L));
+            P2 cur_b{};
+            if (!get_point(points, b_id, cur_b)) continue;
+            const P2 delta = sub(target, cur_b);
             max_delta = std::max(max_delta, len(delta));
             set_point_blend(b_id, target, alpha);
           } else if (ma) {
-            const RelVec2 pivot = points[b_id];
-            RelVec2 dir_to_p;
+            P2 pivot{};
+            if (!get_point(points, b_id, pivot)) continue;
+            P2 dir_to_p;
             if (!normalize(sub(ppos, pivot), in.eps, dir_to_p)) continue;
             const float L = std::max(ln->second.length, 1.0f);
-            const RelVec2 target = add(pivot, mul(dir_to_p, L));
-            const RelVec2 delta = sub(target, points[a_id]);
+            const P2 target = add(pivot, mul(dir_to_p, L));
+            P2 cur_a{};
+            if (!get_point(points, a_id, cur_a)) continue;
+            const P2 delta = sub(target, cur_a);
             max_delta = std::max(max_delta, len(delta));
             set_point_blend(a_id, target, alpha);
           }
@@ -619,7 +702,7 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         if (i0 == lines.end() || i1 == lines.end()) continue;
         if (!i0->second.ok || !i1->second.ok) continue;
 
-        auto enforce_dir = [&](const LineDef& line, RelVec2 target_dir) {
+        auto enforce_dir = [&](const LineDef& line, P2 target_dir) {
           uint32_t pivot_id = line.a_id;
           uint32_t move_id = line.b_id;
           if (!is_movable(move_id) && is_movable(pivot_id)) {
@@ -627,22 +710,22 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
           }
           if (!is_movable(move_id)) return;
 
-          const RelVec2 pivot = points[pivot_id];
-          const RelVec2 cur_end = points[move_id];
+          P2 pivot{}, cur_end{};
+          if (!get_point(points, pivot_id, pivot) || !get_point(points, move_id, cur_end)) return;
           const float L = std::max(len(sub(cur_end, pivot)), 1.0f);
           // Keep orientation stable.
-          RelVec2 cur_dir;
+          P2 cur_dir;
           if (normalize(sub(cur_end, pivot), in.eps, cur_dir)) {
             if (dot(cur_dir, target_dir) < 0.0f) target_dir = mul(target_dir, -1.0f);
           }
-          const RelVec2 target = add(pivot, mul(target_dir, L));
-          const RelVec2 delta = sub(target, cur_end);
+          const P2 target = add(pivot, mul(target_dir, L));
+          const P2 delta = sub(target, cur_end);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(move_id, target, alpha);
         };
 
-        RelVec2 d0 = i0->second.dir;
-        RelVec2 d1 = i1->second.dir;
+        P2 d0 = i0->second.dir;
+        P2 d1 = i1->second.dir;
         if (er.kind == "relgeo.parallel") {
           enforce_dir(i0->second, d1);
           enforce_dir(i1->second, d0);
@@ -656,24 +739,25 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (er.kind == "relgeo.point_on_circle") {
         uint32_t p = 0, c = 0;
         if (!get_u32_attr_edge(eid, "a", p) || !get_u32_attr_edge(eid, "b", c)) continue;
-        auto ip = points.find(p);
         auto ic = circles.find(c);
-        if (ip == points.end() || ic == circles.end() || !ic->second.ok) continue;
+        if (ic == circles.end() || !ic->second.ok) continue;
+        P2 ppos{};
+        if (!get_point(points, p, ppos)) continue;
 
         const bool mp = is_movable(p);
         const bool mc = is_movable(ic->second.center_id);
 
         if (mp) {
-          const RelVec2 target = project_point_to_circle(ip->second, ic->second.center, ic->second.r, in.eps);
-          const RelVec2 delta = sub(target, ip->second);
+          const P2 target = project_point_to_circle(ppos, ic->second.center, ic->second.r, in.eps);
+          const P2 delta = sub(target, ppos);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(p, target, alpha);
         } else if (mc) {
           // Move center along current direction so that fixed p lies on the circle.
-          RelVec2 dir;
-          if (!normalize(sub(ic->second.center, ip->second), in.eps, dir)) dir = RelVec2{1.0f, 0.0f};
-          const RelVec2 target_center = add(ip->second, mul(dir, ic->second.r));
-          const RelVec2 delta = sub(target_center, ic->second.center);
+          P2 dir;
+          if (!normalize(sub(ic->second.center, ppos), in.eps, dir)) dir = P2{1.0f, 0.0f};
+          const P2 target_center = add(ppos, mul(dir, ic->second.r));
+          const P2 delta = sub(target_center, ic->second.center);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(ic->second.center_id, target_center, alpha);
         }
@@ -693,9 +777,8 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         const uint32_t center_id = ic->second.center_id;
         const uint32_t through_id = ic->second.through_id;
 
-        auto ip_center = points.find(center_id);
-        auto ip_through = points.find(through_id);
-        if (ip_center == points.end() || ip_through == points.end()) continue;
+        P2 pc{}, pt{};
+        if (!get_point(points, center_id, pc) || !get_point(points, through_id, pt)) continue;
 
         const bool mt = is_movable(through_id);
         const bool mc = is_movable(center_id);
@@ -703,16 +786,16 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
 
         const float rf = static_cast<float>(r);
         if (mt) {
-          const RelVec2 target = project_point_to_circle(ip_through->second, ip_center->second, rf, in.eps);
-          const RelVec2 delta = sub(target, ip_through->second);
+          const P2 target = project_point_to_circle(pt, pc, rf, in.eps);
+          const P2 delta = sub(target, pt);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(through_id, target, alpha);
         } else if (mc) {
           // Move center relative to fixed through point.
-          RelVec2 dir;
-          if (!normalize(sub(ip_center->second, ip_through->second), in.eps, dir)) dir = RelVec2{1.0f, 0.0f};
-          const RelVec2 target_center = add(ip_through->second, mul(dir, rf));
-          const RelVec2 delta = sub(target_center, ip_center->second);
+          P2 dir;
+          if (!normalize(sub(pc, pt), in.eps, dir)) dir = P2{1.0f, 0.0f};
+          const P2 target_center = add(pt, mul(dir, rf));
+          const P2 delta = sub(target_center, pc);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(center_id, target_center, alpha);
         }
@@ -735,14 +818,14 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         const bool mc = is_movable(center_id);
         if (!ma && !mb && !mc) continue;
 
-        RelVec2 n;
+        P2 n;
         const float sd = signed_distance_to_line(ic->second.center, il->second.a, il->second.b, in.eps, &n);
         if (len(n) <= in.eps) continue;
 
         // Want |sd| == r. Translate along n.
         const float want = (sd >= 0.0f ? ic->second.r : -ic->second.r);
         const float delta_s = want - sd;
-        const RelVec2 delta = mul(n, delta_s);
+        const P2 delta = mul(n, delta_s);
         max_delta = std::max(max_delta, len(delta));
 
         if (ma || mb) {
@@ -766,9 +849,8 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         if (!get_u32_attr_node(arc, "circle", circle) || !get_u32_attr_node(arc, "start", start_id) || !get_u32_attr_node(arc, "end", end_id)) continue;
         auto ic = circles.find(circle);
         if (ic == circles.end() || !ic->second.ok) continue;
-        auto is = points.find(start_id);
-        auto ie = points.find(end_id);
-        if (is == points.end() || ie == points.end()) continue;
+        P2 ps{}, pe{};
+        if (!get_point(points, start_id, ps) || !get_point(points, end_id, pe)) continue;
 
         bool ccw = true;
         if (auto it = nodes[arc].attrs.find("ccw"); it != nodes[arc].attrs.end()) {
@@ -779,21 +861,21 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
         const bool me = is_movable(end_id);
         if (!ms && !me) continue;
 
-        const float a0 = std::atan2(is->second.y - ic->second.center.y, is->second.x - ic->second.center.x);
+        const float a0 = std::atan2(ps.y - ic->second.center.y, ps.x - ic->second.center.x);
         const float da = static_cast<float>(angle);
         const float a1 = ccw ? (a0 + da) : (a0 - da);
-        const RelVec2 target_end = add(ic->second.center, RelVec2{ic->second.r * std::cos(a1), ic->second.r * std::sin(a1)});
+        const P2 target_end = add(ic->second.center, P2{ic->second.r * std::cos(a1), ic->second.r * std::sin(a1)});
 
         if (me) {
-          const RelVec2 delta = sub(target_end, ie->second);
+          const P2 delta = sub(target_end, pe);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(end_id, target_end, alpha);
         } else if (ms) {
           // Move start instead, keeping end fixed.
-          const float a_end = std::atan2(ie->second.y - ic->second.center.y, ie->second.x - ic->second.center.x);
+          const float a_end = std::atan2(pe.y - ic->second.center.y, pe.x - ic->second.center.x);
           const float a_start = ccw ? (a_end - da) : (a_end + da);
-          const RelVec2 target_start = add(ic->second.center, RelVec2{ic->second.r * std::cos(a_start), ic->second.r * std::sin(a_start)});
-          const RelVec2 delta = sub(target_start, is->second);
+          const P2 target_start = add(ic->second.center, P2{ic->second.r * std::cos(a_start), ic->second.r * std::sin(a_start)});
+          const P2 delta = sub(target_start, ps);
           max_delta = std::max(max_delta, len(delta));
           set_point_blend(start_id, target_start, alpha);
         }
@@ -809,11 +891,10 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     if (er.kind == "relgeo.coincident") {
       uint32_t a = 0, b = 0;
       if (!get_u32_attr_edge(eid, "a", a) || !get_u32_attr_edge(eid, "b", b)) continue;
-      auto ia = points.find(a);
-      auto ib = points.find(b);
-      if (ia == points.end() || ib == points.end()) continue;
-      const float dx = ia->second.x - ib->second.x;
-      const float dy = ia->second.y - ib->second.y;
+      P2 pa{}, pb{};
+      if (!get_point(points, a, pa) || !get_point(points, b, pb)) continue;
+      const float dx = pa.x - pb.x;
+      const float dy = pa.y - pb.y;
       const float d = std::sqrt(dx * dx + dy * dy);
       const float tol = 5.0f * in.eps;
       if (d > tol) {
@@ -829,21 +910,20 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     if (er.kind == "relgeo.incident") {
       uint32_t p = 0, l = 0;
       if (!get_u32_attr_edge(eid, "a", p) || !get_u32_attr_edge(eid, "b", l)) continue;
-      auto ip = points.find(p);
-      if (ip == points.end()) continue;
+      P2 pp{};
+      if (!get_point(points, p, pp)) continue;
       auto ln = nodes.find(l);
       if (ln == nodes.end() || ln->second.kind != "relgeo.line") continue;
       uint32_t a = 0, b = 0;
       if (!get_u32_attr_node(l, "a", a) || !get_u32_attr_node(l, "b", b)) continue;
-      auto ia = points.find(a);
-      auto ib = points.find(b);
-      if (ia == points.end() || ib == points.end()) continue;
+      P2 pa{}, pb{};
+      if (!get_point(points, a, pa) || !get_point(points, b, pb)) continue;
       const float tol = 5.0f * in.eps;
-      if (!point_on_line(ip->second, ia->second, ib->second, tol)) {
+      if (!point_on_line(pp, pa, pb, tol)) {
         if (out_error) {
-          const RelVec2 ab = sub(ib->second, ia->second);
+          const P2 ab = sub(pb, pa);
           const float denom = std::max(len(ab), in.eps);
-          const float area2 = std::fabs(cross(sub(ip->second, ia->second), ab));
+          const float area2 = std::fabs(cross(sub(pp, pa), ab));
           const float dist_line = area2 / denom;
           std::ostringstream oss;
           oss << "constraint failed: edge " << eid << " relgeo.incident(p=" << p << ", line=" << l << "): dist="
@@ -863,13 +943,11 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       uint32_t a0 = 0, b0 = 0, a1 = 0, b1 = 0;
       if (!get_u32_attr_node(l0, "a", a0) || !get_u32_attr_node(l0, "b", b0)) continue;
       if (!get_u32_attr_node(l1, "a", a1) || !get_u32_attr_node(l1, "b", b1)) continue;
-      auto ia0 = points.find(a0);
-      auto ib0 = points.find(b0);
-      auto ia1 = points.find(a1);
-      auto ib1 = points.find(b1);
-      if (ia0 == points.end() || ib0 == points.end() || ia1 == points.end() || ib1 == points.end()) continue;
-      RelVec2 u0, u1;
-      if (!normalize(sub(ib0->second, ia0->second), in.eps, u0) || !normalize(sub(ib1->second, ia1->second), in.eps, u1)) continue;
+      P2 pa0{}, pb0{}, pa1{}, pb1{};
+      if (!get_point(points, a0, pa0) || !get_point(points, b0, pb0) ||
+          !get_point(points, a1, pa1) || !get_point(points, b1, pb1)) continue;
+      P2 u0, u1;
+      if (!normalize(sub(pb0, pa0), in.eps, u0) || !normalize(sub(pb1, pa1), in.eps, u1)) continue;
       const float c = std::fabs(cross(u0, u1));
       const float dp = std::fabs(dot(u0, u1));
       if (er.kind == "relgeo.parallel") {
@@ -900,14 +978,15 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
     if (er.kind == "relgeo.point_on_circle") {
       uint32_t p = 0, c = 0;
       if (!get_u32_attr_edge(eid, "a", p) || !get_u32_attr_edge(eid, "b", c)) continue;
-      auto ip = points.find(p);
       auto cn = nodes.find(c);
-      if (ip == points.end() || cn == nodes.end() || cn->second.kind != "relgeo.circle") continue;
+      if (cn == nodes.end() || cn->second.kind != "relgeo.circle") continue;
+      P2 pp{};
+      if (!get_point(points, p, pp)) continue;
 
       uint32_t center_id = 0;
       if (!get_u32_attr_node(c, "center", center_id)) continue;
-      auto ic = points.find(center_id);
-      if (ic == points.end()) continue;
+      P2 pc{};
+      if (!get_point(points, center_id, pc)) continue;
 
       float r = 0.0f;
       double rconst = 0.0;
@@ -916,12 +995,12 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       } else {
         uint32_t through = 0;
         if (!get_u32_attr_node(c, "through", through)) continue;
-        auto itp = points.find(through);
-        if (itp == points.end()) continue;
-        r = dist(ic->second, itp->second);
+        P2 pt{};
+        if (!get_point(points, through, pt)) continue;
+        r = dist(pc, pt);
       }
       const float tol = 10.0f * in.eps;
-      const float d = dist(ip->second, ic->second);
+      const float d = dist(pp, pc);
       if (std::fabs(d - r) > tol) {
         if (out_error) {
           std::ostringstream oss;
@@ -941,11 +1020,10 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (cn == nodes.end() || cn->second.kind != "relgeo.circle") continue;
       uint32_t center_id = 0, through_id = 0;
       if (!get_u32_attr_node(c, "center", center_id) || !get_u32_attr_node(c, "through", through_id)) continue;
-      auto icp = points.find(center_id);
-      auto itp = points.find(through_id);
-      if (icp == points.end() || itp == points.end()) continue;
+      P2 pc{}, pt{};
+      if (!get_point(points, center_id, pc) || !get_point(points, through_id, pt)) continue;
       const float tol = 10.0f * in.eps;
-      const float d = dist(icp->second, itp->second);
+      const float d = dist(pc, pt);
       if (std::fabs(d - static_cast<float>(r)) > tol) {
         if (out_error) {
           std::ostringstream oss;
@@ -969,10 +1047,8 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (!get_u32_attr_node(l, "a", a_id) || !get_u32_attr_node(l, "b", b_id)) continue;
       uint32_t center_id = 0;
       if (!get_u32_attr_node(c, "center", center_id)) continue;
-      auto ia = points.find(a_id);
-      auto ib = points.find(b_id);
-      auto icp = points.find(center_id);
-      if (ia == points.end() || ib == points.end() || icp == points.end()) continue;
+      P2 pa{}, pb{}, pc{};
+      if (!get_point(points, a_id, pa) || !get_point(points, b_id, pb) || !get_point(points, center_id, pc)) continue;
 
       float r = 0.0f;
       double rconst = 0.0;
@@ -981,13 +1057,13 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       } else {
         uint32_t through = 0;
         if (!get_u32_attr_node(c, "through", through)) continue;
-        auto itp = points.find(through);
-        if (itp == points.end()) continue;
-        r = dist(icp->second, itp->second);
+        P2 pt{};
+        if (!get_point(points, through, pt)) continue;
+        r = dist(pc, pt);
       }
 
-      RelVec2 n;
-      const float sd = signed_distance_to_line(icp->second, ia->second, ib->second, in.eps, &n);
+      P2 n;
+      const float sd = signed_distance_to_line(pc, pa, pb, in.eps, &n);
       const float tol = 10.0f * in.eps;
       if (std::fabs(std::fabs(sd) - r) > tol) {
         if (out_error) {
@@ -1012,13 +1088,11 @@ bool relgeo_solve_points_from_pure_edits(std::span<const nodus::tensors::GraphEd
       if (cn == nodes.end() || cn->second.kind != "relgeo.circle") continue;
       uint32_t center_id = 0;
       if (!get_u32_attr_node(circle, "center", center_id)) continue;
-      auto icp = points.find(center_id);
-      auto is = points.find(start_id);
-      auto ie = points.find(end_id);
-      if (icp == points.end() || is == points.end() || ie == points.end()) continue;
+      P2 pc{}, ps{}, pe{};
+      if (!get_point(points, center_id, pc) || !get_point(points, start_id, ps) || !get_point(points, end_id, pe)) continue;
 
-      const float a0 = std::atan2(is->second.y - icp->second.y, is->second.x - icp->second.x);
-      const float a1 = std::atan2(ie->second.y - icp->second.y, ie->second.x - icp->second.x);
+      const float a0 = std::atan2(ps.y - pc.y, ps.x - pc.x);
+      const float a1 = std::atan2(pe.y - pc.y, pe.x - pc.x);
       float da = a1 - a0;
       // Wrap to [-pi,pi] for comparison.
       while (da > 3.141592653589793f) da -= 2.0f * 3.141592653589793f;
@@ -1095,7 +1169,26 @@ bool relgeo_solve_points_from_pure_ir(std::string_view src,
   }
 
   // Merge anchors-by-name into the anchor map.
-  RelGeoSolveInputs merged = in;
+  RelGeoSolveInputs merged;
+  merged.eps = in.eps;
+  merged.max_passes = in.max_passes;
+  for (const auto& [id, value] : in.anchors) {
+    RelTensorPoint t;
+    if (!clone_point_tensor(value, t)) {
+      if (out_error) *out_error = "failed to clone anchor tensor";
+      return false;
+    }
+    merged.anchors.emplace(id, std::move(t));
+  }
+  for (const auto& [name, value] : in.anchors_by_name) {
+    RelTensorPoint t;
+    if (!clone_point_tensor(value, t)) {
+      if (out_error) *out_error = "failed to clone anchor-by-name tensor";
+      return false;
+    }
+    merged.anchors_by_name.emplace(name, std::move(t));
+  }
+
   for (const auto& [name, value] : in.anchors_by_name) {
     auto it = ctx.symbols.find(name);
     if (it == ctx.symbols.end()) {
@@ -1107,7 +1200,12 @@ bool relgeo_solve_points_from_pure_ir(std::string_view src,
       if (out_error) *out_error = "anchor symbol is not a u32 id: " + name;
       return false;
     }
-    merged.anchors[static_cast<uint32_t>(*id)] = value;
+    RelTensorPoint t;
+    if (!clone_point_tensor(value, t)) {
+      if (out_error) *out_error = "failed to clone anchor-by-name tensor";
+      return false;
+    }
+    merged.anchors[static_cast<uint32_t>(*id)] = std::move(t);
   }
   merged.anchors_by_name.clear();
 
@@ -1150,7 +1248,26 @@ bool relgeo_program_from_pure_ir_solved(std::string_view src,
   std::vector<nodus::tensors::GraphEdit> edits;
   edits.assign(builder.edits().begin(), builder.edits().end());
 
-  RelGeoSolveInputs merged = in;
+  RelGeoSolveInputs merged;
+  merged.eps = in.eps;
+  merged.max_passes = in.max_passes;
+  for (const auto& [id, value] : in.anchors) {
+    RelTensorPoint t;
+    if (!clone_point_tensor(value, t)) {
+      if (out_error) *out_error = "failed to clone anchor tensor";
+      return false;
+    }
+    merged.anchors.emplace(id, std::move(t));
+  }
+  for (const auto& [name, value] : in.anchors_by_name) {
+    RelTensorPoint t;
+    if (!clone_point_tensor(value, t)) {
+      if (out_error) *out_error = "failed to clone anchor-by-name tensor";
+      return false;
+    }
+    merged.anchors_by_name.emplace(name, std::move(t));
+  }
+
   for (const auto& [name, value] : in.anchors_by_name) {
     auto it = ctx.symbols.find(name);
     if (it == ctx.symbols.end()) {
@@ -1162,7 +1279,12 @@ bool relgeo_program_from_pure_ir_solved(std::string_view src,
       if (out_error) *out_error = "anchor symbol is not a u32 id: " + name;
       return false;
     }
-    merged.anchors[static_cast<uint32_t>(*id)] = value;
+    RelTensorPoint t;
+    if (!clone_point_tensor(value, t)) {
+      if (out_error) *out_error = "failed to clone anchor-by-name tensor";
+      return false;
+    }
+    merged.anchors[static_cast<uint32_t>(*id)] = std::move(t);
   }
   merged.anchors_by_name.clear();
 
@@ -1235,7 +1357,12 @@ bool relgeo_program_from_pure_ir_solved(std::string_view src,
       if (out_error) *out_error = "missing solved point for node id " + std::to_string(point_node_id);
       return false;
     }
-    RelPointId rid = out_program.add_point(RelPointFixed{itp->second.x, itp->second.y});
+    P2 p{};
+    if (!read_point_tensor(itp->second, p)) {
+      if (out_error) *out_error = "failed to read solved point tensor for node id " + std::to_string(point_node_id);
+      return false;
+    }
+    RelPointId rid = out_program.add_point(RelPointFixed{p.x, p.y});
     pid[point_node_id] = rid;
     return true;
   };

@@ -82,6 +82,11 @@ class Shaper final {
   Shaper();
   ~Shaper();
 
+  Shaper(const Shaper&) = delete;
+  Shaper& operator=(const Shaper&) = delete;
+  Shaper(Shaper&& other) noexcept;
+  Shaper& operator=(Shaper&& other) noexcept;
+
   bool load_font(const std::string& path, float point_size = 12.0f);
 
   bool shape(const CodepointSequence& seq, std::vector<Cluster>& out_clusters) const;

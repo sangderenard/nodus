@@ -1,4 +1,5 @@
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
+#include "common/tensors/abstraction/in_memory_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -14,22 +15,27 @@ namespace {
 constexpr float kEps = 1e-6f;
 constexpr float kTwoPi = 6.283185307179586f;
 
-static float dot(RelVec2 a, RelVec2 b) { return a.x * b.x + a.y * b.y; }
+struct P2 final {
+  float x = 0.0f;
+  float y = 0.0f;
+};
 
-static float len(RelVec2 v) { return std::sqrt(v.x * v.x + v.y * v.y); }
+static float dot(P2 a, P2 b) { return a.x * b.x + a.y * b.y; }
 
-static bool normalize(RelVec2 v, RelVec2& out) {
+static float len(P2 v) { return std::sqrt(v.x * v.x + v.y * v.y); }
+
+static bool normalize(P2 v, P2& out) {
   const float l = len(v);
   if (l < kEps) return false;
-  out = RelVec2{v.x / l, v.y / l};
+  out = P2{v.x / l, v.y / l};
   return true;
 }
 
-static RelVec2 sub(RelVec2 a, RelVec2 b) { return RelVec2{a.x - b.x, a.y - b.y}; }
+static P2 sub(P2 a, P2 b) { return P2{a.x - b.x, a.y - b.y}; }
 
-static float cross(RelVec2 a, RelVec2 b) { return a.x * b.y - a.y * b.x; }
+static float cross(P2 a, P2 b) { return a.x * b.y - a.y * b.x; }
 
-static float dist(RelVec2 a, RelVec2 b) {
+static float dist(P2 a, P2 b) {
   const float dx = a.x - b.x;
   const float dy = a.y - b.y;
   return std::sqrt(dx * dx + dy * dy);
@@ -54,7 +60,7 @@ static bool angle_is_between_ccw(float a0, float a1, float am) {
   return d0m <= d01 + 1e-5f;
 }
 
-static bool circumcircle(RelVec2 p0, RelVec2 p1, RelVec2 p2, RelVec2& out_center, float& out_r) {
+static bool circumcircle(P2 p0, P2 p1, P2 p2, P2& out_center, float& out_r) {
   // Compute circumcenter using determinant formula.
   // https://mathworld.wolfram.com/Circumcircle.html
   const float ax = p0.x;
@@ -73,12 +79,12 @@ static bool circumcircle(RelVec2 p0, RelVec2 p1, RelVec2 p2, RelVec2& out_center
 
   const float ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d;
   const float uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
-  out_center = RelVec2{ux, uy};
+  out_center = P2{ux, uy};
   out_r = dist(out_center, p0);
   return out_r > kEps;
 }
 
-static bool circle_circle_intersections(RelVec2 c0, float r0, RelVec2 c1, float r1, RelVec2& out_a, RelVec2& out_b) {
+static bool circle_circle_intersections(P2 c0, float r0, P2 c1, float r1, P2& out_a, P2& out_b) {
   const float dx = c1.x - c0.x;
   const float dy = c1.y - c0.y;
   const float d = std::sqrt(dx * dx + dy * dy);
@@ -96,23 +102,23 @@ static bool circle_circle_intersections(RelVec2 c0, float r0, RelVec2 c1, float 
   const float rx = -dy * (h / d);
   const float ry = dx * (h / d);
 
-  out_a = RelVec2{xm + rx, ym + ry};
-  out_b = RelVec2{xm - rx, ym - ry};
+  out_a = P2{xm + rx, ym + ry};
+  out_b = P2{xm - rx, ym - ry};
   return true;
 }
 
-static bool line_line_intersection(RelVec2 p0, RelVec2 p1, RelVec2 p2, RelVec2 p3, RelVec2& out_p) {
+static bool line_line_intersection(P2 p0, P2 p1, P2 p2, P2 p3, P2& out_p) {
   // Solve p0 + t*(p1-p0) = p2 + u*(p3-p2)
-  const RelVec2 r = sub(p1, p0);
-  const RelVec2 s = sub(p3, p2);
+  const P2 r = sub(p1, p0);
+  const P2 s = sub(p3, p2);
   const float denom = cross(r, s);
   if (std::fabs(denom) < kEps) return false;
   const float t = cross(sub(p2, p0), s) / denom;
-  out_p = RelVec2{p0.x + r.x * t, p0.y + r.y * t};
+  out_p = P2{p0.x + r.x * t, p0.y + r.y * t};
   return true;
 }
 
-static RelVec2 pick(RelPick p, RelVec2 a, RelVec2 b) {
+static P2 pick(RelPick p, P2 a, P2 b) {
   switch (p) {
     case RelPick::HigherY:
       return (a.y >= b.y) ? a : b;
@@ -126,7 +132,7 @@ static RelVec2 pick(RelPick p, RelVec2 a, RelVec2 b) {
   return a;
 }
 
-static OutlineSegment seg_move(RelVec2 p) {
+static OutlineSegment seg_move(P2 p) {
   OutlineSegment s;
   s.op = OutlineOp::MoveTo;
   s.x1 = p.x; s.y1 = p.y;
@@ -135,7 +141,7 @@ static OutlineSegment seg_move(RelVec2 p) {
   return s;
 }
 
-static OutlineSegment seg_line(RelVec2 a, RelVec2 b) {
+static OutlineSegment seg_line(P2 a, P2 b) {
   OutlineSegment s;
   s.op = OutlineOp::LineTo;
   s.x1 = a.x; s.y1 = a.y;
@@ -144,7 +150,7 @@ static OutlineSegment seg_line(RelVec2 a, RelVec2 b) {
   return s;
 }
 
-static OutlineSegment seg_close(RelVec2 last) {
+static OutlineSegment seg_close(P2 last) {
   OutlineSegment s;
   s.op = OutlineOp::Close;
   s.x1 = last.x; s.y1 = last.y;
@@ -153,34 +159,34 @@ static OutlineSegment seg_close(RelVec2 last) {
   return s;
 }
 
-static RelVec2 lerp(const RelVec2& a, const RelVec2& b, float t) {
-  return RelVec2{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
+static P2 lerp(const P2& a, const P2& b, float t) {
+  return P2{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
 }
 
-static RelVec2 evaluate_parametric_segment(const RelParametricSegment& seg,
-                                           const RelVec2& start,
-                                           const RelVec2& ctrl1,
-                                           const RelVec2& ctrl2,
-                                           const RelVec2& end,
-                                           float u,
-                                           RelVec2* out_tangent) {
+static P2 evaluate_parametric_segment(const RelParametricSegment& seg,
+                                      const P2& start,
+                                      const P2& ctrl1,
+                                      const P2& ctrl2,
+                                      const P2& end,
+                                      float u,
+                                      P2* out_tangent) {
   const float t = std::clamp(u, 0.0f, 1.0f);
-  RelVec2 tangent{};
-  RelVec2 pos{};
+  P2 tangent{};
+  P2 pos{};
 
   switch (seg.kind) {
     case RelParametricSegment::Kind::Line: {
-      tangent = RelVec2{end.x - start.x, end.y - start.y};
+      tangent = P2{end.x - start.x, end.y - start.y};
       pos = lerp(start, end, t);
       break;
     }
     case RelParametricSegment::Kind::Quadratic: {
       const float it = 1.0f - t;
-      pos = RelVec2{
+      pos = P2{
           it * it * start.x + 2.0f * it * t * ctrl1.x + t * t * end.x,
           it * it * start.y + 2.0f * it * t * ctrl1.y + t * t * end.y,
       };
-      tangent = RelVec2{
+      tangent = P2{
           2.0f * it * (ctrl1.x - start.x) + 2.0f * t * (end.x - ctrl1.x),
           2.0f * it * (ctrl1.y - start.y) + 2.0f * t * (end.y - ctrl1.y),
       };
@@ -190,29 +196,29 @@ static RelVec2 evaluate_parametric_segment(const RelParametricSegment& seg,
       const float it = 1.0f - t;
       const float it2 = it * it;
       const float t2 = t * t;
-      pos = RelVec2{
+      pos = P2{
           it * it2 * start.x + 3.0f * it2 * t * ctrl1.x + 3.0f * it * t2 * ctrl2.x + t * t2 * end.x,
           it * it2 * start.y + 3.0f * it2 * t * ctrl1.y + 3.0f * it * t2 * ctrl2.y + t * t2 * end.y,
       };
-      tangent = RelVec2{
+      tangent = P2{
           3.0f * it2 * (ctrl1.x - start.x) + 6.0f * it * t * (ctrl2.x - ctrl1.x) + 3.0f * t2 * (end.x - ctrl2.x),
           3.0f * it2 * (ctrl1.y - start.y) + 6.0f * it * t * (ctrl2.y - ctrl1.y) + 3.0f * t2 * (end.y - ctrl2.y),
       };
       break;
     }
     case RelParametricSegment::Kind::SinWave: {
-      const RelVec2 base = lerp(start, end, t);
-      const RelVec2 dir = RelVec2{end.x - start.x, end.y - start.y};
+      const P2 base = lerp(start, end, t);
+      const P2 dir = P2{end.x - start.x, end.y - start.y};
       tangent = dir;
       float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
-      RelVec2 perp{0.0f, 0.0f};
+      P2 perp{0.0f, 0.0f};
       if (len > kEps) {
-        perp = RelVec2{-dir.y / len, dir.x / len};
+        perp = P2{-dir.y / len, dir.x / len};
       }
       const float angle = kTwoPi * seg.cycles * t + seg.phase;
       const float sin_offset = seg.amplitude * std::sin(angle);
       const float cos_offset = seg.amplitude * kTwoPi * seg.cycles * std::cos(angle);
-      pos = RelVec2{base.x + perp.x * sin_offset, base.y + perp.y * sin_offset};
+      pos = P2{base.x + perp.x * sin_offset, base.y + perp.y * sin_offset};
       tangent.x += perp.x * cos_offset;
       tangent.y += perp.y * cos_offset;
       break;
@@ -221,21 +227,149 @@ static RelVec2 evaluate_parametric_segment(const RelParametricSegment& seg,
 
   if (out_tangent) {
     if (seg.tangent_forward) *out_tangent = tangent;
-    else *out_tangent = RelVec2{-tangent.x, -tangent.y};
+    else *out_tangent = P2{-tangent.x, -tangent.y};
   }
 
   return pos;
 }
 
-static float signed_area(const std::vector<RelVec2>& pts) {
-  if (pts.size() < 3) return 0.0f;
+static float signed_area(const float* data, size_t count, const std::vector<RelPointId>& verts) {
+  if (!data || verts.size() < 3) return 0.0f;
   double a2 = 0.0;
-  for (size_t i = 0; i < pts.size(); ++i) {
-    const RelVec2 p = pts[i];
-    const RelVec2 q = pts[(i + 1) % pts.size()];
-    a2 += static_cast<double>(p.x) * static_cast<double>(q.y) - static_cast<double>(q.x) * static_cast<double>(p.y);
+  const size_t n = verts.size();
+  for (size_t i = 0; i < n; ++i) {
+    const size_t pi = static_cast<size_t>(verts[i].v ? verts[i].v - 1 : 0);
+    const size_t qi = static_cast<size_t>(verts[(i + 1) % n].v ? verts[(i + 1) % n].v - 1 : 0);
+    if (pi >= count || qi >= count) continue;
+    const float px = data[pi * 2u + 0u];
+    const float py = data[pi * 2u + 1u];
+    const float qx = data[qi * 2u + 0u];
+    const float qy = data[qi * 2u + 1u];
+    a2 += static_cast<double>(px) * static_cast<double>(qy) - static_cast<double>(qx) * static_cast<double>(py);
   }
   return static_cast<float>(0.5 * a2);
+}
+
+static bool read_point(const float* data, size_t count, RelPointId id, P2& out) {
+  if (!data || !id) return false;
+  const size_t idx = static_cast<size_t>(id.v - 1);
+  if (idx >= count) return false;
+  out = P2{data[idx * 2u + 0u], data[idx * 2u + 1u]};
+  return true;
+}
+
+static void write_point(float* data, size_t idx, P2 p) {
+  data[idx * 2u + 0u] = p.x;
+  data[idx * 2u + 1u] = p.y;
+}
+
+struct TensorMapGuard final {
+  AbstractTensor* tensor = nullptr;
+  InMemoryBackend* backend = nullptr;
+  bool mapped = false;
+  ~TensorMapGuard() {
+    if (mapped && tensor && backend) backend->unmap(tensor->handle());
+  }
+};
+
+static TensorMapGuard map_points_guard(AbstractTensor& tensor,
+                                       float*& data,
+                                       size_t& count,
+                                       std::string* out_error) {
+  TensorMapGuard guard;
+  guard.tensor = &tensor;
+  guard.backend = dynamic_cast<InMemoryBackend*>(tensor.backend());
+  if (!guard.backend) {
+    if (out_error) *out_error = "relgeo expects in-memory tensor backend for mapping";
+    return guard;
+  }
+  const TensorDesc& desc = tensor.desc();
+  if (desc.dtype != TensorDType::F32 || desc.layout != TensorLayout::Dense) {
+    if (out_error) *out_error = "relgeo expects dense f32 tensor for positions";
+    return guard;
+  }
+  if (desc.shape.dims.size() != 2 || desc.shape.dims[1] != 2u) {
+    if (out_error) *out_error = "relgeo expects position tensor shape [point_count,2]";
+    return guard;
+  }
+  count = desc.shape.dims[0];
+  void* raw = nullptr;
+  size_t bytes = 0;
+  if (!guard.backend->map(tensor.handle(), &raw, &bytes)) {
+    if (out_error) *out_error = "relgeo failed to map tensor storage";
+    return guard;
+  }
+  const size_t needed = count * 2u * sizeof(float);
+  if (bytes < needed) {
+    guard.backend->unmap(tensor.handle());
+    if (out_error) *out_error = "relgeo tensor storage too small";
+    return guard;
+  }
+  data = static_cast<float*>(raw);
+  guard.mapped = true;
+  return guard;
+}
+
+static std::optional<AbstractTensor> make_point_tensor(P2 p, TensorBackend* backend, std::string* out_error) {
+  TensorDesc desc;
+  desc.dtype = TensorDType::F32;
+  desc.layout = TensorLayout::Dense;
+  desc.shape.dims = {1u, 2u};
+  AbstractTensor t = AbstractTensor::create(desc, backend);
+  if (!t.valid()) {
+    if (out_error) *out_error = "relgeo failed to allocate point tensor";
+    return std::nullopt;
+  }
+  auto* mem_backend = dynamic_cast<InMemoryBackend*>(t.backend());
+  if (!mem_backend) {
+    if (out_error) *out_error = "relgeo expects in-memory tensor backend for point mapping";
+    return std::nullopt;
+  }
+  void* raw = nullptr;
+  size_t bytes = 0;
+  if (!mem_backend->map(t.handle(), &raw, &bytes)) {
+    if (out_error) *out_error = "relgeo failed to map point tensor";
+    return std::nullopt;
+  }
+  if (bytes < 2u * sizeof(float)) {
+    mem_backend->unmap(t.handle());
+    if (out_error) *out_error = "relgeo point tensor storage too small";
+    return std::nullopt;
+  }
+  float* dst = static_cast<float*>(raw);
+  dst[0] = p.x;
+  dst[1] = p.y;
+  mem_backend->unmap(t.handle());
+  return t;
+}
+
+static bool read_point_tensor(const AbstractTensor& t, P2& out, std::string* out_error) {
+  auto* mem_backend = dynamic_cast<InMemoryBackend*>(t.backend());
+  if (!mem_backend) {
+    if (out_error) *out_error = "relgeo expects in-memory tensor backend for point read";
+    return false;
+  }
+  const TensorDesc& desc = t.desc();
+  if (desc.dtype != TensorDType::F32 || desc.layout != TensorLayout::Dense ||
+      desc.shape.dims.size() != 2 || desc.shape.dims[0] == 0 || desc.shape.dims[1] != 2u) {
+    if (out_error) *out_error = "relgeo expects point tensor shape [1,2]";
+    return false;
+  }
+  void* raw = nullptr;
+  size_t bytes = 0;
+  if (!mem_backend->map(t.handle(), &raw, &bytes)) {
+    if (out_error) *out_error = "relgeo failed to map point tensor";
+    return false;
+  }
+  if (bytes < 2u * sizeof(float)) {
+    mem_backend->unmap(t.handle());
+    if (out_error) *out_error = "relgeo point tensor storage too small";
+    return false;
+  }
+  float* dst = static_cast<float*>(raw);
+  out = P2{dst[0], dst[1]};
+  mem_backend->unmap(t.handle());
+  return true;
 }
 
 } // namespace
@@ -302,11 +436,30 @@ RelContourId RelProgram::add_contour(std::vector<RelPointId> vertices, bool clos
   return id;
 }
 
-void RelProgram::add_assertion(RelAssertion a) { assertions_.push_back(std::move(a)); }
+void RelProgram::add_assertion(RelAssertion a, RelRuleScope scope) {
+  assertions_.push_back(RelScopedAssertion{std::move(a), scope});
+}
 
-bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_error) const {
-  out_positions.clear();
-  out_positions.resize(points_.size());
+bool RelProgram::evaluate(RelTensorPoint& out_positions,
+                          TensorBackend* backend_override,
+                          std::string* out_error) const {
+  TensorDesc desc;
+  desc.dtype = TensorDType::F32;
+  desc.layout = TensorLayout::Dense;
+  desc.shape.dims = {static_cast<uint32_t>(points_.size()), 2u};
+
+  TensorBackend* backend = backend_override ? backend_override : &in_memory_backend_singleton();
+  AbstractTensor positions = AbstractTensor::create(desc, backend);
+  if (!positions.valid()) {
+    if (out_error) *out_error = "relgeo failed to allocate positions tensor";
+    return false;
+  }
+
+  float* data = nullptr;
+  size_t count = 0;
+  auto guard = map_points_guard(positions, data, count, out_error);
+  if (!guard.mapped) return false;
+  std::fill_n(data, count * 2u, 0.0f);
 
   // id.v is 1-based index into points_.
   auto idx_of = [&](RelPointId id) -> std::optional<size_t> {
@@ -325,6 +478,12 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
 
   enum class Mark : uint8_t { Unvisited, Visiting, Done };
   std::vector<Mark> marks(points_.size(), Mark::Unvisited);
+
+  auto read_idx = [&](size_t idx, P2& out) -> bool {
+    if (idx >= count) return false;
+    out = P2{data[idx * 2u + 0u], data[idx * 2u + 1u]};
+    return true;
+  };
 
   std::function<bool(RelPointId)> eval_rec;
   eval_rec = [&](RelPointId id) -> bool {
@@ -345,15 +504,15 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
 
     const RelPointDef& def = points_[idx];
 
-    auto setp = [&](RelVec2 p) {
-      out_positions[idx] = p;
+    auto setp = [&](P2 p) {
+      write_point(data, idx, p);
       marks[idx] = Mark::Done;
       return true;
     };
 
     if (std::holds_alternative<RelPointFixed>(def.expr)) {
       const auto& e = std::get<RelPointFixed>(def.expr);
-      return setp(RelVec2{e.x, e.y});
+      return setp(P2{e.x, e.y});
     }
 
     if (std::holds_alternative<RelPointFree>(def.expr)) {
@@ -368,9 +527,9 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
       const auto ib = idx_of(e.b);
       if (!ia || !ib) return false;
       const float u = std::clamp(e.u, 0.0f, 1.0f);
-      RelVec2 a = out_positions[*ia];
-      RelVec2 b = out_positions[*ib];
-      return setp(RelVec2{a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u});
+      P2 a{}, b{};
+      if (!read_idx(*ia, a) || !read_idx(*ib, b)) return false;
+      return setp(P2{a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u});
     }
 
     if (std::holds_alternative<RelPointOffset>(def.expr)) {
@@ -378,25 +537,25 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
       if (!eval_rec(e.base)) return false;
       const auto ib = idx_of(e.base);
       if (!ib) return false;
-      RelVec2 base = out_positions[*ib];
-      return setp(RelVec2{base.x + e.dx, base.y + e.dy});
+      P2 base{};
+      if (!read_idx(*ib, base)) return false;
+      return setp(P2{base.x + e.dx, base.y + e.dy});
     }
 
     if (std::holds_alternative<RelPointParametric>(def.expr)) {
       const auto& e = std::get<RelPointParametric>(def.expr);
-      auto require_anchor = [&](RelPointId id, RelVec2& out, const char* msg) -> bool {
-        if (!id) {
+      auto require_anchor = [&](RelPointId pid, P2& out, const char* msg) -> bool {
+        if (!pid) {
           if (out_error) *out_error = msg;
           return false;
         }
-        if (!eval_rec(id)) return false;
-        const auto ip = idx_of(id);
+        if (!eval_rec(pid)) return false;
+        const auto ip = idx_of(pid);
         if (!ip) return false;
-        out = out_positions[*ip];
-        return true;
+        return read_idx(*ip, out);
       };
 
-      RelVec2 start{}, end{}, ctrl1{}, ctrl2{};
+      P2 start{}, end{}, ctrl1{}, ctrl2{};
       if (!require_anchor(e.segment.start, start, "relgeo.parametric missing start")) return false;
       if (!require_anchor(e.segment.end, end, "relgeo.parametric missing end")) return false;
       if (e.segment.kind == RelParametricSegment::Kind::Quadratic) {
@@ -406,7 +565,7 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
         if (!require_anchor(e.segment.ctrl2, ctrl2, "relgeo.parametric missing ctrl2")) return false;
       }
 
-      RelVec2 pos = evaluate_parametric_segment(e.segment, start, ctrl1, ctrl2, end, e.u, nullptr);
+      P2 pos = evaluate_parametric_segment(e.segment, start, ctrl1, ctrl2, end, e.u, nullptr);
       return setp(pos);
     }
 
@@ -417,8 +576,8 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
       const auto ic0 = idx_of(e.c0.center);
       const auto ic1 = idx_of(e.c1.center);
       if (!ic0 || !ic1) return false;
-      const RelVec2 c0 = out_positions[*ic0];
-      const RelVec2 c1 = out_positions[*ic1];
+      P2 c0{}, c1{};
+      if (!read_idx(*ic0, c0) || !read_idx(*ic1, c1)) return false;
 
       auto eval_radius = [&](const RelRadiusExpr& r, float& out_r) -> bool {
         if (std::holds_alternative<RelRadiusConstant>(r)) {
@@ -430,7 +589,9 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
         const auto ia = idx_of(d.a);
         const auto ib = idx_of(d.b);
         if (!ia || !ib) return false;
-        out_r = dist(out_positions[*ia], out_positions[*ib]);
+        P2 pa{}, pb{};
+        if (!read_idx(*ia, pa) || !read_idx(*ib, pb)) return false;
+        out_r = dist(pa, pb);
         return out_r > 0.0f;
       };
 
@@ -441,7 +602,7 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
         return false;
       }
 
-      RelVec2 a{}, b{};
+      P2 a{}, b{};
       if (!circle_circle_intersections(c0, r0, c1, r1, a, b)) {
         if (out_error) *out_error = "circles do not intersect";
         return false;
@@ -468,8 +629,10 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
       const auto ip2 = idx_of(l1.a);
       const auto ip3 = idx_of(l1.b);
       if (!ip0 || !ip1 || !ip2 || !ip3) return false;
-      RelVec2 p{};
-      if (!line_line_intersection(out_positions[*ip0], out_positions[*ip1], out_positions[*ip2], out_positions[*ip3], p)) {
+      P2 p0{}, p1{}, p2{}, p3{};
+      if (!read_idx(*ip0, p0) || !read_idx(*ip1, p1) || !read_idx(*ip2, p2) || !read_idx(*ip3, p3)) return false;
+      P2 p{};
+      if (!line_line_intersection(p0, p1, p2, p3, p)) {
         if (out_error) *out_error = "lines do not intersect (parallel)";
         return false;
       }
@@ -480,31 +643,58 @@ bool RelProgram::evaluate(std::vector<RelVec2>& out_positions, std::string* out_
     return false;
   };
 
+  bool ok = true;
   for (const auto& def : points_) {
-    if (!eval_rec(def.id)) return false;
+    if (!eval_rec(def.id)) {
+      ok = false;
+      break;
+    }
   }
 
+  if (!ok) return false;
+  out_positions = std::move(positions);
   return true;
 }
 
 bool RelProgram::validate(std::string* out_error) const {
   if (assertions_.empty()) return true;
-  std::vector<RelVec2> pos;
-  if (!evaluate(pos, out_error)) return false;
+  RelTensorPoint pos;
+  if (!evaluate(pos, nullptr, out_error)) return false;
 
-  auto getp = [&](RelPointId id, RelVec2& out) -> bool {
-    if (!id) return false;
-    const size_t idx = static_cast<size_t>(id.v - 1);
-    if (idx >= pos.size()) return false;
-    out = pos[idx];
-    return true;
+  float* data = nullptr;
+  size_t count = 0;
+  auto guard = map_points_guard(pos, data, count, out_error);
+  if (!guard.mapped) return false;
+
+  const RelRuleContext ctx{};
+
+  auto getp = [&](RelPointId id, P2& out) -> bool {
+    return read_point(data, count, id, out);
   };
-  auto getline = [&](RelLineId id, RelVec2& a, RelVec2& b) -> bool {
+  auto getline = [&](RelLineId id, P2& a, P2& b) -> bool {
     if (!id) return false;
     const size_t idx = static_cast<size_t>(id.v - 1);
     if (idx >= lines_.size()) return false;
     const RelLineDef& l = lines_[idx];
     return getp(l.a, a) && getp(l.b, b);
+  };
+  auto line_distance = [&](P2 a, P2 b, P2 p, float& out_dist) -> bool {
+    const P2 ab = sub(b, a);
+    const float denom = len(ab);
+    if (denom < kEps) return false;
+    const float area2 = std::fabs(cross(ab, sub(p, a)));
+    out_dist = area2 / denom;
+    return true;
+  };
+  auto line_angle = [&](P2 a0, P2 a1, P2 b0, P2 b1, float& out_angle) -> bool {
+    const P2 da = sub(a1, a0);
+    const P2 db = sub(b1, b0);
+    const float la = len(da);
+    const float lb = len(db);
+    if (la < kEps || lb < kEps) return false;
+    const float c = std::fabs(dot(da, db)) / (la * lb);
+    out_angle = std::acos(std::clamp(c, 0.0f, 1.0f));
+    return true;
   };
 
   auto has_circle = [&](RelCircleId id) -> bool {
@@ -518,10 +708,12 @@ bool RelProgram::validate(std::string* out_error) const {
     return idx < arcs_.size();
   };
 
-  for (const auto& a : assertions_) {
+  for (const auto& scoped : assertions_) {
+    if (!relgeo_rule_applies(scoped.scope, ctx)) continue;
+    const auto& a = scoped.assertion;
     if (std::holds_alternative<RelAssertCoincident>(a)) {
       const auto& c = std::get<RelAssertCoincident>(a);
-      RelVec2 pa{}, pb{};
+      P2 pa{}, pb{};
       if (!getp(c.a, pa) || !getp(c.b, pb)) {
         if (out_error) {
           *out_error = "assert coincident: invalid point id (a=" + std::to_string(c.a.v) + ", b=" + std::to_string(c.b.v) + ")";
@@ -541,15 +733,15 @@ bool RelProgram::validate(std::string* out_error) const {
     }
     if (std::holds_alternative<RelAssertPointOnLine>(a)) {
       const auto& inc = std::get<RelAssertPointOnLine>(a);
-      RelVec2 p{}, a0{}, b0{};
+      P2 p{}, a0{}, b0{};
       if (!getp(inc.p, p) || !getline(inc.line, a0, b0)) {
         if (out_error) {
           *out_error = "assert point-on-line: invalid ids (p=" + std::to_string(inc.p.v) + ", line=" + std::to_string(inc.line.v) + ")";
         }
         return false;
       }
-      const RelVec2 ab = sub(b0, a0);
-      const RelVec2 ap = sub(p, a0);
+      const P2 ab = sub(b0, a0);
+      const P2 ap = sub(p, a0);
       const float denom = len(ab);
       if (denom < kEps) {
         if (out_error) *out_error = "assert point-on-line: degenerate line";
@@ -570,15 +762,15 @@ bool RelProgram::validate(std::string* out_error) const {
     }
     if (std::holds_alternative<RelAssertParallelLines>(a)) {
       const auto& pl = std::get<RelAssertParallelLines>(a);
-      RelVec2 a0{}, a1{}, b0{}, b1{};
+      P2 a0{}, a1{}, b0{}, b1{};
       if (!getline(pl.a, a0, a1) || !getline(pl.b, b0, b1)) {
         if (out_error) {
           *out_error = "assert parallel: invalid line id (a=" + std::to_string(pl.a.v) + ", b=" + std::to_string(pl.b.v) + ")";
         }
         return false;
       }
-      const RelVec2 da = sub(a1, a0);
-      const RelVec2 db = sub(b1, b0);
+      const P2 da = sub(a1, a0);
+      const P2 db = sub(b1, b0);
       if (len(da) < kEps || len(db) < kEps) {
         if (out_error) *out_error = "assert parallel: degenerate line";
         return false;
@@ -597,15 +789,15 @@ bool RelProgram::validate(std::string* out_error) const {
     }
     if (std::holds_alternative<RelAssertPerpendicularLines>(a)) {
       const auto& pp = std::get<RelAssertPerpendicularLines>(a);
-      RelVec2 a0{}, a1{}, b0{}, b1{};
+      P2 a0{}, a1{}, b0{}, b1{};
       if (!getline(pp.a, a0, a1) || !getline(pp.b, b0, b1)) {
         if (out_error) {
           *out_error = "assert perpendicular: invalid line id (a=" + std::to_string(pp.a.v) + ", b=" + std::to_string(pp.b.v) + ")";
         }
         return false;
       }
-      const RelVec2 da = sub(a1, a0);
-      const RelVec2 db = sub(b1, b0);
+      const P2 da = sub(a1, a0);
+      const P2 db = sub(b1, b0);
       if (len(da) < kEps || len(db) < kEps) {
         if (out_error) *out_error = "assert perpendicular: degenerate line";
         return false;
@@ -625,7 +817,7 @@ bool RelProgram::validate(std::string* out_error) const {
     }
     if (std::holds_alternative<RelAssertPerpAt>(a)) {
       const auto& pp = std::get<RelAssertPerpAt>(a);
-      RelVec2 v{}, a0{}, b0{};
+      P2 v{}, a0{}, b0{};
       if (!getp(pp.v, v) || !getp(pp.a, a0) || !getp(pp.b, b0)) {
         if (out_error) {
           *out_error = "assert perp-at: invalid point id (v=" + std::to_string(pp.v.v) + ", a=" +
@@ -633,8 +825,8 @@ bool RelProgram::validate(std::string* out_error) const {
         }
         return false;
       }
-      const RelVec2 va = sub(a0, v);
-      const RelVec2 vb = sub(b0, v);
+      const P2 va = sub(a0, v);
+      const P2 vb = sub(b0, v);
       if (len(va) < kEps || len(vb) < kEps) {
         if (out_error) *out_error = "assert perp-at: degenerate segment";
         return false;
@@ -700,18 +892,313 @@ bool RelProgram::validate(std::string* out_error) const {
       }
       continue;
     }
+
+    if (std::holds_alternative<RelAssertCollinear>(a)) {
+      const auto& c = std::get<RelAssertCollinear>(a);
+      P2 pa{}, pb{}, pc{};
+      if (!getp(c.a, pa) || !getp(c.b, pb) || !getp(c.c, pc)) {
+        if (out_error) {
+          *out_error = "assert collinear: invalid point id (a=" + std::to_string(c.a.v) + ", b=" +
+                       std::to_string(c.b.v) + ", c=" + std::to_string(c.c.v) + ")";
+        }
+        return false;
+      }
+      float d = 0.0f;
+      if (!line_distance(pa, pb, pc, d)) {
+        if (out_error) *out_error = "assert collinear: degenerate line";
+        return false;
+      }
+      if (d > c.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert collinear failed: a=" << c.a.v << ", b=" << c.b.v << ", c=" << c.c.v
+              << ", dist=" << d << " > tol=" << c.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    if (std::holds_alternative<RelAssertEqualDistance>(a)) {
+      const auto& ed = std::get<RelAssertEqualDistance>(a);
+      P2 a0{}, b0{}, c0{}, d0{};
+      if (!getp(ed.a, a0) || !getp(ed.b, b0) || !getp(ed.c, c0) || !getp(ed.d, d0)) {
+        if (out_error) {
+          *out_error = "assert equal-dist: invalid point id (a=" + std::to_string(ed.a.v) + ", b=" +
+                       std::to_string(ed.b.v) + ", c=" + std::to_string(ed.c.v) + ", d=" + std::to_string(ed.d.v) + ")";
+        }
+        return false;
+      }
+      const float d0ab = dist(a0, b0);
+      const float d0cd = dist(c0, d0);
+      const float diff = std::fabs(d0ab - d0cd);
+      if (diff > ed.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert equal-dist failed: d_ab=" << d0ab << ", d_cd=" << d0cd << ", diff=" << diff
+              << " > tol=" << ed.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    if (std::holds_alternative<RelAssertMidpoint>(a)) {
+      const auto& mp = std::get<RelAssertMidpoint>(a);
+      P2 m{}, a0{}, b0{};
+      if (!getp(mp.m, m) || !getp(mp.a, a0) || !getp(mp.b, b0)) {
+        if (out_error) {
+          *out_error = "assert midpoint: invalid point id (m=" + std::to_string(mp.m.v) + ", a=" +
+                       std::to_string(mp.a.v) + ", b=" + std::to_string(mp.b.v) + ")";
+        }
+        return false;
+      }
+      const P2 mid{(a0.x + b0.x) * 0.5f, (a0.y + b0.y) * 0.5f};
+      const float dmid = dist(m, mid);
+      if (dmid > mp.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert midpoint failed: m=" << mp.m.v << ", d_mid=" << dmid << " > tol=" << mp.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    if (std::holds_alternative<RelAssertPointOnSegment>(a)) {
+      const auto& ps = std::get<RelAssertPointOnSegment>(a);
+      P2 p{}, a0{}, b0{};
+      if (!getp(ps.p, p) || !getp(ps.a, a0) || !getp(ps.b, b0)) {
+        if (out_error) {
+          *out_error = "assert on-segment: invalid point id (p=" + std::to_string(ps.p.v) + ", a=" +
+                       std::to_string(ps.a.v) + ", b=" + std::to_string(ps.b.v) + ")";
+        }
+        return false;
+      }
+      float dline = 0.0f;
+      if (!line_distance(a0, b0, p, dline)) {
+        if (out_error) *out_error = "assert on-segment: degenerate segment";
+        return false;
+      }
+      if (dline > ps.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert on-segment failed: p=" << ps.p.v << ", dist=" << dline << " > tol=" << ps.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      const P2 ab = sub(b0, a0);
+      const float ab2 = dot(ab, ab);
+      if (ab2 < kEps) {
+        if (out_error) *out_error = "assert on-segment: degenerate segment";
+        return false;
+      }
+      const float t = dot(sub(p, a0), ab) / ab2;
+      if (t < -1e-4f || t > 1.0f + 1e-4f) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert on-segment failed: p=" << ps.p.v << ", t=" << t << " outside [0,1]";
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    if (std::holds_alternative<RelAssertPointOnSegmentRatio>(a)) {
+      const auto& ps = std::get<RelAssertPointOnSegmentRatio>(a);
+      P2 p{}, a0{}, b0{};
+      if (!getp(ps.p, p) || !getp(ps.a, a0) || !getp(ps.b, b0)) {
+        if (out_error) {
+          *out_error = "assert on-segment-ratio: invalid point id (p=" + std::to_string(ps.p.v) + ", a=" +
+                       std::to_string(ps.a.v) + ", b=" + std::to_string(ps.b.v) + ")";
+        }
+        return false;
+      }
+      float dline = 0.0f;
+      if (!line_distance(a0, b0, p, dline)) {
+        if (out_error) *out_error = "assert on-segment-ratio: degenerate segment";
+        return false;
+      }
+      if (dline > ps.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert on-segment-ratio failed: p=" << ps.p.v << ", dist=" << dline << " > tol=" << ps.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      const P2 ab = sub(b0, a0);
+      const float ab2 = dot(ab, ab);
+      if (ab2 < kEps) {
+        if (out_error) *out_error = "assert on-segment-ratio: degenerate segment";
+        return false;
+      }
+      const float t = dot(sub(p, a0), ab) / ab2;
+      if (t < -1e-4f || t > 1.0f + 1e-4f) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert on-segment-ratio failed: p=" << ps.p.v << ", t=" << t << " outside [0,1]";
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      const float diff = std::fabs(t - ps.ratio);
+      if (diff > ps.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert on-segment-ratio failed: p=" << ps.p.v << ", ratio=" << ps.ratio << ", t=" << t
+              << ", diff=" << diff << " > tol=" << ps.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    if (std::holds_alternative<RelAssertParallelLinePairs>(a)) {
+      const auto& pp = std::get<RelAssertParallelLinePairs>(a);
+      P2 a0{}, a1{}, b0{}, b1{};
+      if (!getline(pp.a0, a0, a1) || !getline(pp.a1, b0, b1)) {
+        if (out_error) {
+          *out_error = "assert parallel-pairs: invalid line id (a0=" + std::to_string(pp.a0.v) + ", a1=" +
+                       std::to_string(pp.a1.v) + ")";
+        }
+        return false;
+      }
+      float ang0 = 0.0f;
+      if (!line_angle(a0, a1, b0, b1, ang0)) {
+        if (out_error) *out_error = "assert parallel-pairs: degenerate line";
+        return false;
+      }
+      if (ang0 > pp.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert parallel-pairs failed: a0=" << pp.a0.v << ", a1=" << pp.a1.v
+              << ", angle=" << ang0 << " > tol=" << pp.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      if (!getline(pp.b0, a0, a1) || !getline(pp.b1, b0, b1)) {
+        if (out_error) {
+          *out_error = "assert parallel-pairs: invalid line id (b0=" + std::to_string(pp.b0.v) + ", b1=" +
+                       std::to_string(pp.b1.v) + ")";
+        }
+        return false;
+      }
+      float ang1 = 0.0f;
+      if (!line_angle(a0, a1, b0, b1, ang1)) {
+        if (out_error) *out_error = "assert parallel-pairs: degenerate line";
+        return false;
+      }
+      if (ang1 > pp.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert parallel-pairs failed: b0=" << pp.b0.v << ", b1=" << pp.b1.v
+              << ", angle=" << ang1 << " > tol=" << pp.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    if (std::holds_alternative<RelAssertEqualAngleLines>(a)) {
+      const auto& ea = std::get<RelAssertEqualAngleLines>(a);
+      P2 a0{}, a1{}, b0{}, b1{};
+      if (!getline(ea.a0, a0, a1) || !getline(ea.a1, b0, b1)) {
+        if (out_error) {
+          *out_error = "assert equal-angle: invalid line id (a0=" + std::to_string(ea.a0.v) + ", a1=" +
+                       std::to_string(ea.a1.v) + ")";
+        }
+        return false;
+      }
+      float ang0 = 0.0f;
+      if (!line_angle(a0, a1, b0, b1, ang0)) {
+        if (out_error) *out_error = "assert equal-angle: degenerate line";
+        return false;
+      }
+      if (!getline(ea.b0, a0, a1) || !getline(ea.b1, b0, b1)) {
+        if (out_error) {
+          *out_error = "assert equal-angle: invalid line id (b0=" + std::to_string(ea.b0.v) + ", b1=" +
+                       std::to_string(ea.b1.v) + ")";
+        }
+        return false;
+      }
+      float ang1 = 0.0f;
+      if (!line_angle(a0, a1, b0, b1, ang1)) {
+        if (out_error) *out_error = "assert equal-angle: degenerate line";
+        return false;
+      }
+      const float diff = std::fabs(ang0 - ang1);
+      if (diff > ea.tol) {
+        if (out_error) {
+          std::ostringstream oss;
+          oss << "assert equal-angle failed: diff=" << diff << " > tol=" << ea.tol;
+          *out_error = oss.str();
+        }
+        return false;
+      }
+      continue;
+    }
+
+    if (std::holds_alternative<RelAssertTriangle>(a)) {
+      const auto& t = std::get<RelAssertTriangle>(a);
+      if (!t.a || !t.b || !t.c) {
+        if (out_error) {
+          *out_error = "assert triangle: invalid point id (a=" + std::to_string(t.a.v) + ", b=" +
+                       std::to_string(t.b.v) + ", c=" + std::to_string(t.c.v) + ")";
+        }
+        return false;
+      }
+      continue;
+    }
   }
 
   return true;
 }
 
-std::optional<RelVec2> RelProgram::eval_point(RelPointId id) const {
-  std::vector<RelVec2> pos;
-  if (!evaluate(pos, nullptr)) return std::nullopt;
+std::optional<RelTensorPoint> RelProgram::eval_point(RelPointId id,
+                                                     TensorBackend* backend_override,
+                                                     std::string* out_error) const {
+  RelTensorPoint pos;
+  if (!evaluate(pos, backend_override, out_error)) return std::nullopt;
   if (!id) return std::nullopt;
-  const size_t idx = static_cast<size_t>(id.v - 1);
-  if (idx >= pos.size()) return std::nullopt;
-  return pos[idx];
+
+  float* data = nullptr;
+  size_t count = 0;
+  auto guard = map_points_guard(pos, data, count, out_error);
+  if (!guard.mapped) return std::nullopt;
+
+  P2 p{};
+  if (!read_point(data, count, id, p)) return std::nullopt;
+
+  TensorDesc desc;
+  desc.dtype = TensorDType::F32;
+  desc.layout = TensorLayout::Dense;
+  desc.shape.dims = {1u, 2u};
+  TensorBackend* backend = backend_override ? backend_override : &in_memory_backend_singleton();
+  AbstractTensor out = AbstractTensor::create(desc, backend);
+  if (!out.valid()) return std::nullopt;
+  InMemoryBackend* out_backend = dynamic_cast<InMemoryBackend*>(out.backend());
+  if (!out_backend) return std::nullopt;
+  void* raw = nullptr;
+  size_t bytes = 0;
+  if (!out_backend->map(out.handle(), &raw, &bytes)) return std::nullopt;
+  if (bytes < 2u * sizeof(float)) {
+    out_backend->unmap(out.handle());
+    return std::nullopt;
+  }
+  float* dst = static_cast<float*>(raw);
+  dst[0] = p.x;
+  dst[1] = p.y;
+  out_backend->unmap(out.handle());
+  return out;
 }
 
 std::optional<RelCircleEval> RelProgram::eval_circle(RelCircleId id) const {
@@ -719,14 +1206,17 @@ std::optional<RelCircleEval> RelProgram::eval_circle(RelCircleId id) const {
   const size_t idx = static_cast<size_t>(id.v - 1);
   if (idx >= circles_.size()) return std::nullopt;
 
-  std::vector<RelVec2> pos;
-  if (!evaluate(pos, nullptr)) return std::nullopt;
+  RelTensorPoint pos;
+  if (!evaluate(pos, nullptr, nullptr)) return std::nullopt;
+  float* data = nullptr;
+  size_t count = 0;
+  auto guard = map_points_guard(pos, data, count, nullptr);
+  if (!guard.mapped) return std::nullopt;
 
   const RelCircle& c = circles_[idx].circle;
   if (!c.center) return std::nullopt;
-  const size_t ic = static_cast<size_t>(c.center.v - 1);
-  if (ic >= pos.size()) return std::nullopt;
-  const RelVec2 center = pos[ic];
+  P2 center{};
+  if (!read_point(data, count, c.center, center)) return std::nullopt;
 
   auto eval_radius = [&](const RelRadiusExpr& r, float& out_r) -> bool {
     if (std::holds_alternative<RelRadiusConstant>(r)) {
@@ -735,16 +1225,17 @@ std::optional<RelCircleEval> RelProgram::eval_circle(RelCircleId id) const {
     }
     const auto& d = std::get<RelRadiusDistance>(r);
     if (!d.a || !d.b) return false;
-    const size_t ia = static_cast<size_t>(d.a.v - 1);
-    const size_t ib = static_cast<size_t>(d.b.v - 1);
-    if (ia >= pos.size() || ib >= pos.size()) return false;
-    out_r = dist(pos[ia], pos[ib]);
+    P2 pa{}, pb{};
+    if (!read_point(data, count, d.a, pa) || !read_point(data, count, d.b, pb)) return false;
+    out_r = dist(pa, pb);
     return out_r > 0.0f;
   };
 
   float r = 0.0f;
   if (!eval_radius(c.radius, r)) return std::nullopt;
-  return RelCircleEval{center, r};
+  auto center_tensor = make_point_tensor(center, &in_memory_backend_singleton(), nullptr);
+  if (!center_tensor) return std::nullopt;
+  return RelCircleEval{std::move(*center_tensor), r};
 }
 
 std::optional<RelBezierEval> RelProgram::eval_bezier(RelBezierId id) const {
@@ -752,20 +1243,25 @@ std::optional<RelBezierEval> RelProgram::eval_bezier(RelBezierId id) const {
   const size_t idx = static_cast<size_t>(id.v - 1);
   if (idx >= beziers_.size()) return std::nullopt;
 
-  std::vector<RelVec2> pos;
-  if (!evaluate(pos, nullptr)) return std::nullopt;
+  RelTensorPoint pos;
+  if (!evaluate(pos, nullptr, nullptr)) return std::nullopt;
+  float* data = nullptr;
+  size_t count = 0;
+  auto guard = map_points_guard(pos, data, count, nullptr);
+  if (!guard.mapped) return std::nullopt;
 
   const RelBezierDef& b = beziers_[idx];
-  auto getp = [&](RelPointId pid, RelVec2& out) -> bool {
-    if (!pid) return false;
-    const size_t ip = static_cast<size_t>(pid.v - 1);
-    if (ip >= pos.size()) return false;
-    out = pos[ip];
-    return true;
-  };
+  P2 p0{}, c0{}, c1{}, p1{};
+  if (!read_point(data, count, b.p0, p0) || !read_point(data, count, b.c0, c0) ||
+      !read_point(data, count, b.c1, c1) || !read_point(data, count, b.p1, p1)) return std::nullopt;
 
-  RelBezierEval out;
-  if (!getp(b.p0, out.p0) || !getp(b.c0, out.c0) || !getp(b.c1, out.c1) || !getp(b.p1, out.p1)) return std::nullopt;
+  auto tp0 = make_point_tensor(p0, &in_memory_backend_singleton(), nullptr);
+  auto tc0 = make_point_tensor(c0, &in_memory_backend_singleton(), nullptr);
+  auto tc1 = make_point_tensor(c1, &in_memory_backend_singleton(), nullptr);
+  auto tp1 = make_point_tensor(p1, &in_memory_backend_singleton(), nullptr);
+  if (!tp0 || !tc0 || !tc1 || !tp1) return std::nullopt;
+
+  RelBezierEval out{std::move(*tp0), std::move(*tc0), std::move(*tc1), std::move(*tp1)};
   return out;
 }
 
@@ -774,42 +1270,41 @@ std::optional<RelArcEval> RelProgram::eval_arc(RelArcId id) const {
   const size_t idx = static_cast<size_t>(id.v - 1);
   if (idx >= arcs_.size()) return std::nullopt;
 
-  std::vector<RelVec2> pos;
-  if (!evaluate(pos, nullptr)) return std::nullopt;
+  RelTensorPoint pos;
+  if (!evaluate(pos, nullptr, nullptr)) return std::nullopt;
+  float* data = nullptr;
+  size_t count = 0;
+  auto guard = map_points_guard(pos, data, count, nullptr);
+  if (!guard.mapped) return std::nullopt;
 
   const RelArcExpr& e = arcs_[idx].expr;
-
-  auto getp = [&](RelPointId pid, RelVec2& out) -> bool {
-    if (!pid) return false;
-    const size_t ip = static_cast<size_t>(pid.v - 1);
-    if (ip >= pos.size()) return false;
-    out = pos[ip];
-    return true;
-  };
 
   if (std::holds_alternative<RelArcOnCircleAngles>(e)) {
     const auto& a = std::get<RelArcOnCircleAngles>(e);
     auto ce = eval_circle(a.circle);
     if (!ce) return std::nullopt;
-    return RelArcEval{ce->center, ce->r, wrap_0_2pi(a.a0), wrap_0_2pi(a.a1), a.ccw};
+    return RelArcEval{std::move(ce->center), ce->r, wrap_0_2pi(a.a0), wrap_0_2pi(a.a1), a.ccw};
   }
 
   if (std::holds_alternative<RelArcOnCircleEndpoints>(e)) {
     const auto& a = std::get<RelArcOnCircleEndpoints>(e);
     auto ce = eval_circle(a.circle);
     if (!ce) return std::nullopt;
-    RelVec2 p0{}, p1{};
-    if (!getp(a.start, p0) || !getp(a.end, p1)) return std::nullopt;
-    const float a0 = wrap_0_2pi(std::atan2(p0.y - ce->center.y, p0.x - ce->center.x));
-    const float a1 = wrap_0_2pi(std::atan2(p1.y - ce->center.y, p1.x - ce->center.x));
+    P2 p0{}, p1{};
+    if (!read_point(data, count, a.start, p0) || !read_point(data, count, a.end, p1)) return std::nullopt;
+    P2 center{};
+    if (!read_point_tensor(ce->center, center, nullptr)) return std::nullopt;
+    const float a0 = wrap_0_2pi(std::atan2(p0.y - center.y, p0.x - center.x));
+    const float a1 = wrap_0_2pi(std::atan2(p1.y - center.y, p1.x - center.x));
     const bool ccw = a.normal_z >= 0.0f;
-    return RelArcEval{ce->center, ce->r, a0, a1, ccw};
+    return RelArcEval{std::move(ce->center), ce->r, a0, a1, ccw};
   }
 
   const auto& a3 = std::get<RelArc3>(e);
-  RelVec2 p0{}, p1{}, p2{};
-  if (!getp(a3.p0, p0) || !getp(a3.p1, p1) || !getp(a3.p2, p2)) return std::nullopt;
-  RelVec2 center{};
+  P2 p0{}, p1{}, p2{};
+  if (!read_point(data, count, a3.p0, p0) || !read_point(data, count, a3.p1, p1) ||
+      !read_point(data, count, a3.p2, p2)) return std::nullopt;
+  P2 center{};
   float r = 0.0f;
   if (!circumcircle(p0, p1, p2, center, r)) return std::nullopt;
 
@@ -818,7 +1313,9 @@ std::optional<RelArcEval> RelProgram::eval_arc(RelArcId id) const {
   const float am = wrap_0_2pi(std::atan2(p1.y - center.y, p1.x - center.x));
 
   const bool ccw = angle_is_between_ccw(a0, a2, am);
-  return RelArcEval{center, r, a0, a2, ccw};
+  auto center_tensor = make_point_tensor(center, &in_memory_backend_singleton(), nullptr);
+  if (!center_tensor) return std::nullopt;
+  return RelArcEval{std::move(*center_tensor), r, a0, a2, ccw};
 }
 
 bool compile_relglyph_outline(const RelGlyph& glyph,
@@ -827,17 +1324,19 @@ bool compile_relglyph_outline(const RelGlyph& glyph,
                               float ty,
                               float scale,
                               std::string* out_error) {
-  std::vector<RelVec2> pos;
-  if (!glyph.program.evaluate(pos, out_error)) return false;
+  RelTensorPoint pos;
+  if (!glyph.program.evaluate(pos, nullptr, out_error)) return false;
+
+  float* data = nullptr;
+  size_t count = 0;
+  auto guard = map_points_guard(pos, data, count, out_error);
+  if (!guard.mapped) return false;
 
   out_outline = GlyphOutline{};
   out_outline.glyph_id = glyph.glyph_id;
 
-  auto getp = [&](RelPointId id, RelVec2& out) -> bool {
-    if (!id) return false;
-    const size_t idx = static_cast<size_t>(id.v - 1);
-    if (idx >= pos.size()) return false;
-    out = pos[idx];
+  auto getp = [&](RelPointId id, P2& out) -> bool {
+    if (!read_point(data, count, id, out)) return false;
     out.x = out.x * scale + tx;
     out.y = out.y * scale + ty;
     return true;
@@ -854,15 +1353,7 @@ bool compile_relglyph_outline(const RelGlyph& glyph,
     // Optionally normalize vertex order for closed contours with explicit winding.
     std::vector<RelPointId> verts = contour.vertices;
     if (contour.closed && contour.winding != RelContourWinding::Unknown && verts.size() >= 3) {
-      std::vector<RelVec2> poly;
-      poly.reserve(verts.size());
-      for (RelPointId vid : verts) {
-        if (!vid) return false;
-        const size_t idx = static_cast<size_t>(vid.v - 1);
-        if (idx >= pos.size()) return false;
-        poly.push_back(pos[idx]);
-      }
-      const float a = signed_area(poly);
+      const float a = signed_area(data, count, verts);
       const bool is_ccw = a > 0.0f;
       const bool want_ccw = contour.winding == RelContourWinding::CCW;
       if (is_ccw != want_ccw) {
@@ -870,13 +1361,13 @@ bool compile_relglyph_outline(const RelGlyph& glyph,
       }
     }
 
-    RelVec2 p0{};
+    P2 p0{};
     if (!getp(verts.front(), p0)) return false;
     out_outline.segments.push_back(seg_move(p0));
 
-    RelVec2 last = p0;
+    P2 last = p0;
     for (size_t i = 1; i < verts.size(); ++i) {
-      RelVec2 pi{};
+      P2 pi{};
       if (!getp(verts[i], pi)) return false;
       out_outline.segments.push_back(seg_line(last, pi));
       last = pi;

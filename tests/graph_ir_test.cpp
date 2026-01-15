@@ -118,7 +118,7 @@ int main() {
 
     bool found = false;
     for (const auto& a : p.assertions()) {
-      if (std::holds_alternative<RelAssertPointOnCircle>(a)) {
+      if (std::holds_alternative<RelAssertPointOnCircle>(a.assertion)) {
         found = true;
         break;
       }
@@ -159,10 +159,10 @@ int main() {
     bool has_arc_angle = false;
     bool has_poc = false;
     for (const auto& a : p.assertions()) {
-      has_fixed_radius |= std::holds_alternative<RelAssertFixedRadius>(a);
-      has_tangent |= std::holds_alternative<RelAssertTangentLineCircle>(a);
-      has_arc_angle |= std::holds_alternative<RelAssertArcAngle>(a);
-      has_poc |= std::holds_alternative<RelAssertPointOnCircle>(a);
+      has_fixed_radius |= std::holds_alternative<RelAssertFixedRadius>(a.assertion);
+      has_tangent |= std::holds_alternative<RelAssertTangentLineCircle>(a.assertion);
+      has_arc_angle |= std::holds_alternative<RelAssertArcAngle>(a.assertion);
+      has_poc |= std::holds_alternative<RelAssertPointOnCircle>(a.assertion);
     }
 
     if (!require_or_report(has_fixed_radius, "should record RelAssertFixedRadius")) return 1;

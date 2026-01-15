@@ -2,6 +2,7 @@
 
 #include "kpath_ids.h"
 #include "kpath_shaper.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
 
 #include <cstdint>
 #include <optional>
@@ -37,10 +38,7 @@ using RelCircleId = Id<RelCircleTag>;
 using RelArcId = Id<RelArcTag>;
 using RelBezierId = Id<RelBezierTag>;
 
-struct RelVec2 final {
-  float x = 0.0f;
-  float y = 0.0f;
-};
+using RelTensorPoint = AbstractTensor;
 
 enum class RelPick : uint8_t {
   HigherY,
@@ -207,12 +205,12 @@ struct RelAngleDef final {
 };
 
 struct RelCircleEval final {
-  RelVec2 center{};
+  RelTensorPoint center;
   float r = 0.0f;
 };
 
 struct RelArcEval final {
-  RelVec2 center{};
+  RelTensorPoint center;
   float r = 0.0f;
   float a0 = 0.0f;
   float a1 = 0.0f;
@@ -220,10 +218,10 @@ struct RelArcEval final {
 };
 
 struct RelBezierEval final {
-  RelVec2 p0{};
-  RelVec2 c0{};
-  RelVec2 c1{};
-  RelVec2 p1{};
+  RelTensorPoint p0;
+  RelTensorPoint c0;
+  RelTensorPoint c1;
+  RelTensorPoint p1;
 };
 
 enum class RelContourWinding : uint8_t {
@@ -231,6 +229,38 @@ enum class RelContourWinding : uint8_t {
   CCW = 1,
   CW = 2,
 };
+
+enum class RelRuleScopeFlags : uint8_t {
+  None = 0,
+  Coplanar = 1 << 0,
+  TwoCell = 1 << 1,
+};
+
+inline RelRuleScopeFlags operator|(RelRuleScopeFlags a, RelRuleScopeFlags b) {
+  return static_cast<RelRuleScopeFlags>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
+
+inline RelRuleScopeFlags operator&(RelRuleScopeFlags a, RelRuleScopeFlags b) {
+  return static_cast<RelRuleScopeFlags>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
+}
+
+struct RelRuleScope final {
+  uint32_t min_dims = 2;
+  uint32_t max_dims = 2;
+  RelRuleScopeFlags flags = RelRuleScopeFlags::Coplanar;
+};
+
+struct RelRuleContext final {
+  uint32_t dims = 2;
+  RelRuleScopeFlags flags = RelRuleScopeFlags::Coplanar;
+};
+
+inline bool relgeo_rule_applies(const RelRuleScope& scope, const RelRuleContext& ctx) {
+  if (ctx.dims < scope.min_dims || ctx.dims > scope.max_dims) return false;
+  if (scope.flags == RelRuleScopeFlags::None) return true;
+  if (ctx.flags == RelRuleScopeFlags::None) return false;
+  return (scope.flags & ctx.flags) == scope.flags;
+}
 
 struct RelAssertPointOnLine final {
   RelPointId p{};
@@ -287,6 +317,65 @@ struct RelAssertArcAngle final {
   float angle = 0.0f; // radians
 };
 
+struct RelAssertCollinear final {
+  RelPointId a{};
+  RelPointId b{};
+  RelPointId c{};
+  float tol = 1e-3f;
+};
+
+struct RelAssertEqualDistance final {
+  RelPointId a{};
+  RelPointId b{};
+  RelPointId c{};
+  RelPointId d{};
+  float tol = 1e-3f;
+};
+
+struct RelAssertMidpoint final {
+  RelPointId m{};
+  RelPointId a{};
+  RelPointId b{};
+  float tol = 1e-3f;
+};
+
+struct RelAssertPointOnSegment final {
+  RelPointId p{};
+  RelPointId a{};
+  RelPointId b{};
+  float tol = 1e-3f;
+};
+
+struct RelAssertPointOnSegmentRatio final {
+  RelPointId p{};
+  RelPointId a{};
+  RelPointId b{};
+  float ratio = 0.5f; // 0..1 along a->b
+  float tol = 1e-3f;
+};
+
+struct RelAssertParallelLinePairs final {
+  RelLineId a0{};
+  RelLineId a1{};
+  RelLineId b0{};
+  RelLineId b1{};
+  float tol = 1e-3f; // angular tolerance (radians)
+};
+
+struct RelAssertEqualAngleLines final {
+  RelLineId a0{};
+  RelLineId a1{};
+  RelLineId b0{};
+  RelLineId b1{};
+  float tol = 1e-3f; // angular tolerance (radians)
+};
+
+struct RelAssertTriangle final {
+  RelPointId a{};
+  RelPointId b{};
+  RelPointId c{};
+};
+
 using RelAssertion = std::variant<RelAssertPointOnLine,
                                   RelAssertCoincident,
                                   RelAssertParallelLines,
@@ -295,7 +384,20 @@ using RelAssertion = std::variant<RelAssertPointOnLine,
                                   RelAssertPointOnCircle,
                                   RelAssertTangentLineCircle,
                                   RelAssertFixedRadius,
-                                  RelAssertArcAngle>;
+                                  RelAssertArcAngle,
+                                  RelAssertCollinear,
+                                  RelAssertEqualDistance,
+                                  RelAssertMidpoint,
+                                  RelAssertPointOnSegment,
+                                  RelAssertPointOnSegmentRatio,
+                                  RelAssertParallelLinePairs,
+                                  RelAssertEqualAngleLines,
+                                  RelAssertTriangle>;
+
+struct RelScopedAssertion final {
+  RelAssertion assertion;
+  RelRuleScope scope{};
+};
 
 struct RelContourDef final {
   RelContourId id{};
@@ -323,7 +425,7 @@ class RelProgram final {
                            bool closed = true,
                            RelContourWinding winding = RelContourWinding::Unknown);
 
-  void add_assertion(RelAssertion a);
+  void add_assertion(RelAssertion a, RelRuleScope scope = {});
 
   const std::vector<RelPointDef>& points() const { return points_; }
   const std::vector<RelSegmentDef>& segments() const { return segments_; }
@@ -334,13 +436,18 @@ class RelProgram final {
   const std::vector<RelArcDef>& arcs() const { return arcs_; }
   const std::vector<RelBezierDef>& beziers() const { return beziers_; }
   const std::vector<RelContourDef>& contours() const { return contours_; }
-  const std::vector<RelAssertion>& assertions() const { return assertions_; }
+  const std::vector<RelScopedAssertion>& assertions() const { return assertions_; }
 
-  // Evaluate all points. Returns false on failure (cycles, invalid refs, no intersections).
-  bool evaluate(std::vector<RelVec2>& out_positions, std::string* out_error = nullptr) const;
+  // Evaluate all points into a dense [point_count,2] F32 tensor.
+  // Returns false on failure (cycles, invalid refs, no intersections).
+  bool evaluate(RelTensorPoint& out_positions,
+                TensorBackend* backend_override = nullptr,
+                std::string* out_error = nullptr) const;
 
-  // Convenience: evaluate a single point.
-  std::optional<RelVec2> eval_point(RelPointId id) const;
+  // Convenience: evaluate a single point as a 1x2 F32 tensor.
+  std::optional<RelTensorPoint> eval_point(RelPointId id,
+                                           TensorBackend* backend_override = nullptr,
+                                           std::string* out_error = nullptr) const;
 
   // Higher-level noun evaluation.
   std::optional<RelCircleEval> eval_circle(RelCircleId id) const;
@@ -360,7 +467,7 @@ class RelProgram final {
   std::vector<RelArcDef> arcs_;
   std::vector<RelBezierDef> beziers_;
   std::vector<RelContourDef> contours_;
-  std::vector<RelAssertion> assertions_;
+  std::vector<RelScopedAssertion> assertions_;
 };
 
 struct RelGlyph final {

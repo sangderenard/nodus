@@ -104,12 +104,32 @@ Shaper::Shaper() {
   FT_Init_FreeType(&ft_library_);
 }
 
+Shaper::Shaper(Shaper&& other) noexcept
+    : ft_library_(other.ft_library_),
+      font_resource_(std::move(other.font_resource_)),
+      glyph_cache_(std::move(other.glyph_cache_)) {
+  other.ft_library_ = nullptr;
+}
+
 Shaper::~Shaper() {
   font_resource_.reset();
   if (ft_library_) {
     FT_Done_FreeType(ft_library_);
     ft_library_ = nullptr;
   }
+}
+
+Shaper& Shaper::operator=(Shaper&& other) noexcept {
+  if (this == &other) return *this;
+  font_resource_.reset();
+  if (ft_library_) {
+    FT_Done_FreeType(ft_library_);
+  }
+  ft_library_ = other.ft_library_;
+  font_resource_ = std::move(other.font_resource_);
+  glyph_cache_ = std::move(other.glyph_cache_);
+  other.ft_library_ = nullptr;
+  return *this;
 }
 
 bool Shaper::ensure_library() {

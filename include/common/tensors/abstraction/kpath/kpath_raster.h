@@ -2,12 +2,41 @@
 
 #include "kpath_shaper.h"
 
+#include "common/tensors/abstraction/abstract_tensor.h"
+#include "common/tensors/abstraction/abstract_tensor_pool.h"
+#include "common/tensors/abstraction/coo_matrix.h"
+
 #include <cstdint>
 #include <span>
 #include <string>
 #include <vector>
 
 namespace nodus::tensors::kpath {
+
+struct ScatterTimingBreakdown final {
+  double plan_ms = 0.0;
+  double clear_ms = 0.0;
+  double map_ms = 0.0;
+  double deposit_ms = 0.0;
+  double temp_state_accum_ms = 0.0;
+  double diffusion_prep_ms = 0.0;
+  double diffusion_iter_ms = 0.0;
+  double diffusion_copyback_ms = 0.0;
+  double temp_state_writeback_ms = 0.0;
+  double total_ms = 0.0;
+
+  // --- Work/efficiency counters ---
+  // Number of points in the input vector program (including travel points).
+  uint64_t program_points = 0;
+  // Number of resampled engaged visits in image space (sum of per-site visit counts).
+  uint64_t plan_moments = 0;
+  // Number of unique image-space sites after compression.
+  uint64_t unique_sites = 0;
+  // Total per-pixel site activations (kernel footprint visits), counting multiplicity.
+  uint64_t site_activations = 0;
+  // Number of unique pixels touched at least once during deposition.
+  uint64_t pixels_touched = 0;
+};
 
 struct ToolPoint final {
   float x = 0.0f;
@@ -34,6 +63,31 @@ struct BeamPoint final {
 struct BeamProgram final {
   std::vector<BeamPoint> beams;
 };
+
+enum class BeamFalloffKind : uint8_t {
+  Colinear = 0, // linear radial falloff to zero at radius
+  Gaussian = 1,
+  Airy = 2
+};
+
+struct BeamToolParams final {
+  BeamFalloffKind falloff = BeamFalloffKind::Airy;
+  float radius_px = 2.0f; // used for colinear falloff
+  float sigma_px = 1.0f;  // used for Gaussian falloff
+  // Airy: either set airy_alpha directly or provide aperture/focal/wavelength.
+  float airy_alpha = 0.0f; // alpha = pi * D / (lambda * f)
+  float aperture_d = 0.0f; // D
+  float focal_length = 0.0f; // f
+  float wavelength = 0.0f; // lambda
+  float airy_lut_step = 0.0f; // step (px) for LUT sampling
+  std::vector<float> airy_lut; // precomputed I(r) for r = i * airy_lut_step
+  float axial_falloff = 0.0f; // scale by 1 / (1 + axial_falloff * t^2)
+  float energy_per_shot = 1.0f; // overrides machine.energy_per_px when > 0
+  float shot_dt = 0.0f; // optional override; 0 => infer from feed_rate_px_per_s
+};
+
+// Build an Airy LUT for a radius (px) and step. Uses I(r) = [2 J1(alpha r)/(alpha r)]^2.
+std::vector<float> make_airy_lut(float alpha, float radius_px, float step_px);
 
 // Models a simplified motion-control configuration.
 // This is intentionally feed/energy-centric (like real CNC/robot controllers).
@@ -68,6 +122,29 @@ struct MachineControlConfig final {
   float safe_z = -1.0f;
   float cut_z = 0.0f;
 };
+
+enum class ThermalMaterialPreset : uint8_t {
+  SteelThin = 0,
+  SteelThick,
+  AluminumThin,
+  AluminumThick,
+  CopperThin,
+  CopperThick,
+  Custom,
+};
+
+struct ThermalSimConfig final {
+  // Decay applied to the accumulated temperature field each tick (0..1).
+  float decay = 0.95f;
+  // Diffusion time step for the Laplacian stencil.
+  float diffusion_dt = 0.12f;
+  // Number of diffusion iterations per tick.
+  uint32_t diffusion_steps = 1;
+  // Multiplier applied to incoming energy when accumulating heat.
+  float heat_gain = 1.0f;
+};
+
+ThermalSimConfig thermal_sim_from_preset(ThermalMaterialPreset preset);
 
 struct TensorCanvas2D final {
   uint32_t width = 0;
@@ -114,6 +191,16 @@ struct GaussianToolParams final {
   float sigma_px = 0.35f;
 };
 
+struct ProgramRasterTransform;
+
+// Rasterizes using a configurable spatial kernel (Gaussian, Airy, or colinear).
+void rasterize_program_with_kernel_transformed(const ArmatureProgram& program,
+                                               TensorCanvas2D& out_energy,
+                                               TensorCanvas2D& out_temp,
+                                               const MachineControlConfig& machine,
+                                               const BeamToolParams& tool,
+                                               const ProgramRasterTransform& xform);
+
 // A shared mapping from outline space to image space so multiple raster passes
 // (e.g., RGB channels) can be aligned exactly.
 struct ProgramMapping final {
@@ -149,6 +236,23 @@ struct ProgramRasterTransform final {
   float shift_y = 0.0f; // pixels
 };
 
+struct ProgramScatterPlan final {
+  uint32_t width_px = 0;
+  uint32_t height_px = 0;
+  bool compressed = true;
+  float energy_per_visit = 0.0f;
+
+  // Sparse boolean mask of image-space pixel indices (x,y) in COO form.
+  COOMatrix points;
+  bool points_sorted = false;
+  // Flat list of linearized pixel indices (y * width + x).
+  AbstractTensorPool::PooledTensor flat_points;
+  // [N] F32 energy values (counts * energy_per_visit).
+  AbstractTensorPool::PooledTensor values;
+  // [N] F32 counts per site (optional, same length as values).
+  AbstractTensorPool::PooledTensor visit_counts;
+};
+
 // Plans output dimensions by first compiling the program into a resampled toolpath
 // polyline (using machine.step_px in pixel space), tracking min/max during that
 // refinement step, then choosing a tight tensor size with sufficient padding for
@@ -168,6 +272,55 @@ void rasterize_program_gaussian_with_thermal_transformed(const ArmatureProgram& 
                                                         const MachineControlConfig& machine,
                                                         const GaussianToolParams& tool,
                                                         const ProgramRasterTransform& xform);
+
+// Plan scatter-ready indices/values for a program in image space using xform.
+// When compressed, duplicate pixel hits are combined and stored as counts.
+bool plan_program_scatter(const ArmatureProgram& program,
+                          const MachineControlConfig& machine,
+                          const ProgramRasterTransform& xform,
+                          ProgramScatterPlan* out_plan,
+                          bool compress = true,
+                          bool sort_points = true,
+                          TensorBackend* backend_override = nullptr);
+
+// New rasterization entry that consumes a boolean mask and prepares the beam tool.
+bool rasterize_program_from_mask(const AbstractTensor& mask,
+                                 const BeamToolParams& tool,
+                                 TensorBackend* backend_override = nullptr);
+
+// Utility: materialize COO point indices as dense [N,2] F32 tensor (x,y).
+AbstractTensor coo_points_to_dense_f32(const COOMatrix& points, TensorBackend* backend);
+
+// Rasterize via scatter + kernel bank. kernel_bank is [B,K,C], kernel_ids is [N].
+// Optionally apply a diffusion stencil (Laplacian-like) for temp evolution.
+bool rasterize_program_scatter_with_kernels(const ArmatureProgram& program,
+                                            TensorCanvas2D& out_energy,
+                                            TensorCanvas2D& out_temp,
+                                            const MachineControlConfig& machine,
+                                            const ProgramRasterTransform& xform,
+                                            const AbstractTensor& kernel_bank,
+                                            const AbstractTensor& kernel_ids,
+                                            const AbstractTensor* temp_kernel_ids = nullptr,
+                                            const AbstractTensor* diffusion_kernel = nullptr,
+                                            uint32_t diffusion_steps = 0,
+                                            float diffusion_dt = 1.0f,
+                                            float decay = 1.0f,
+                                            AbstractTensor* temp_state = nullptr,
+                                            TensorBackend* backend_override = nullptr,
+                                            ScatterTimingBreakdown* timing = nullptr);
+
+// Scatter mode that splats a spatial kernel for each point (non-histogram kernel).
+bool rasterize_program_scatter_with_spatial_kernel(const ArmatureProgram& program,
+                                                   TensorCanvas2D& out_energy,
+                                                   TensorCanvas2D& out_temp,
+                                                   const MachineControlConfig& machine,
+                                                   const ProgramRasterTransform& xform,
+                                                   const BeamToolParams& tool,
+                                                   const AbstractTensor* diffusion_kernel,
+                                                   const ThermalSimConfig& sim,
+                                                   AbstractTensor* temp_state = nullptr,
+                                                   TensorBackend* backend_override = nullptr,
+                                                   ScatterTimingBreakdown* timing = nullptr);
 
 // Simple calibration summary for a tool kernel.
 // This is currently based on the rasterizer's impulse response (single stamp).
@@ -207,6 +360,16 @@ ProgramMapping compute_program_mapping(const ArmatureProgram& reference_program,
 bool project_beam_program_to_plane(const BeamProgram& beam_prog,
                                    float plane_z,
                                    ArmatureProgram& out_program);
+
+// Rasterize a beam program onto a plane with thermal (optional).
+// Uses a circular tool profile with colinear (linear radial) or Gaussian falloff.
+bool rasterize_beam_program_with_thermal(const BeamProgram& beam_prog,
+                                        float plane_z,
+                                        TensorCanvas2D& out_energy,
+                                        TensorCanvas2D& out_temp,
+                                        const MachineControlConfig& machine,
+                                        const BeamToolParams& tool,
+                                        const ProgramRasterTransform& xform);
 
 // Converts a glyph outline (Move/Line/Quad/Cubic) into a sampled tool-path.
 // The returned points are in the outline coordinate system.

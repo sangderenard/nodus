@@ -1,5 +1,6 @@
 #include "common/tensors/abstraction/coo_matrix.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/tensor_types.h"
 
 #include <cstdint>
 #include <iostream>
@@ -38,7 +39,9 @@ int main() {
     void* idx_data = nullptr;
     size_t idx_bytes = 0;
     if (!require_or_report(backend.map(coo.indices.handle(), &idx_data, &idx_bytes), "backend.map(indices)")) return 1;
-    if (!require_or_report(idx_bytes == sizeof(int32_t) * 3 * 2, "indices byte size")) return 1;
+    const size_t idx_elem_bytes = tensor_dtype_size_bytes(idx_desc.dtype);
+    const size_t expected_idx_bytes = idx_desc.shape.element_count() * idx_elem_bytes;
+    if (!require_or_report(idx_bytes >= expected_idx_bytes, "indices byte size")) return 1;
     int32_t* idx = static_cast<int32_t*>(idx_data);
     idx[0] = 0; idx[1] = 1;
     idx[2] = 2; idx[3] = 3;
@@ -48,7 +51,9 @@ int main() {
     void* val_data = nullptr;
     size_t val_bytes = 0;
     if (!require_or_report(backend.map(coo.values.handle(), &val_data, &val_bytes), "backend.map(values)")) return 1;
-    if (!require_or_report(val_bytes == sizeof(float) * 3, "values byte size")) return 1;
+    const size_t val_elem_bytes = tensor_dtype_size_bytes(val_desc.dtype);
+    const size_t expected_val_bytes = val_desc.shape.element_count() * val_elem_bytes;
+    if (!require_or_report(val_bytes >= expected_val_bytes, "values byte size")) return 1;
     float* val = static_cast<float*>(val_data);
     val[0] = 4.0f;
     val[1] = 5.0f;

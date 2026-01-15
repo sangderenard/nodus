@@ -19,6 +19,11 @@ namespace nodus::tensors::kpath {
 // Operators:
 // - free() -> u32 point
 // - pt(x: f64, y: f64) -> u32 point
+// - pi() -> f64
+// - add(a: f64, b: f64) -> f64
+// - sub(a: f64, b: f64) -> f64
+// - mul(a: f64, b: f64) -> f64
+// - div(a: f64, b: f64) -> f64
 // - lerp(a: u32, b: u32, u: f64) -> u32 point
 // - offset(base: u32, dx: f64, dy: f64) -> u32 point
 // - ccint(c0: u32, r0: f64, c1: u32, r1: f64, pick: string) -> u32 point
@@ -39,6 +44,15 @@ namespace nodus::tensors::kpath {
 // - arc3(p0: u32, p1: u32, p2: u32) -> u32 arc
 // - bezier(p0: u32, c0: u32, c1: u32, p1: u32) -> u32 bezier
 // - contour(p0: u32, p1: u32, ..., ["open"|"closed"], ["ccw"|"cw"|"outer"|"inner"]) -> void
+// - circuit(p0: u32, p1: u32, ..., ["open"|"closed"], ["ccw"|"cw"|"outer"|"inner"]) -> void
+// - ngon(center: u32, r: f64, sides: u32[, phase: f64][, winding: string]) -> void
+// - star(center: u32, r_outer: f64, r_inner: f64, points: u32[, phase: f64][, winding: string]) -> void
+// - spiral(center: u32, r: f64, radians: f64[, samples: u32][, phase: f64][, winding: string]) -> void
+//     - if r < 0: spiral inward from |r| to 0
+// - path_begin() -> u32
+// - path_spiral(path: u32, center: u32, r: f64, radians: f64[, samples: u32][, phase: f64][, winding: string]) -> void
+// - path_arc(path: u32, center: u32, r: f64, radians: f64[, samples: u32][, phase: f64][, winding: string]) -> void
+// - path_end(path: u32[, "open"|"closed"][, "ccw"|"cw"|"outer"|"inner"]) -> void
 // - parallel(l0: u32, l1: u32) -> void edge
 // - perp(l0: u32, l1: u32) -> void edge
 // - perp_at(v: u32, a: u32, b: u32) -> void edge
@@ -48,6 +62,16 @@ namespace nodus::tensors::kpath {
 // - tangent(line: u32line, circle: u32circle) -> void edge
 // - fixed_radius(circle: u32circle, r: f64) -> void edge
 // - arc_angle(arc: u32arc, angle: f64) -> void edge
+// - collinear(a: u32, b: u32, c: u32) -> void edge
+// - equal_dist(a: u32, b: u32, c: u32, d: u32) -> void edge
+// - midpoint(m: u32, a: u32, b: u32) -> void edge
+// - on_segment(p: u32, a: u32, b: u32) -> void edge
+// - on_segment_ratio(p: u32, a: u32, b: u32[, ratio: f64]) -> void edge
+// - inscribed(p: u32, a: u32, b: u32[, ratio: f64]) -> void edge
+// - outscribed(p: u32, a: u32, b: u32[, ratio: f64]) -> void edge
+// - parallel_pairs(a0: u32, a1: u32, b0: u32, b1: u32) -> void edge
+// - equal_angle(a0: u32, a1: u32, b0: u32, b1: u32) -> void edge
+// - triangle(a: u32, b: u32, c: u32) -> void edge
 GraphIrOperatorSet make_relgeo_ir_ops();
 
 // A "pure" subset of RelGeo IR intended to avoid numeric literals for *derived* geometry.

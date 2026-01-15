@@ -29,6 +29,7 @@ struct COOMatrix {
     uint32_t rank() const;
     uint32_t nnz() const;
     bool validate() const;
+    bool sort_indices(bool ascending = true);
 };
 
 } // namespace nodus::tensors

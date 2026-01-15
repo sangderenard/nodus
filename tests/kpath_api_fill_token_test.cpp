@@ -20,6 +20,12 @@
 using namespace nodus::tensors;
 using namespace nodus::tensors::kpath;
 
+static bool require_or_report(bool condition, const char* what) {
+  if (condition) return true;
+  std::cerr << "[KPATH-API] failed: " << what << "\n";
+  return false;
+}
+
 static void rgb_histogram_u8(const std::vector<uint8_t>& r,
                              const std::vector<uint8_t>& g,
                              const std::vector<uint8_t>& b,
@@ -97,7 +103,8 @@ static bool make_fill_from_token(const std::string& token,
                                  const GaussianToolParams& tool,
                                  ArmatureProgram& fill_prog,
                                  TensorCanvas2D& out_energy,
-                                 TensorCanvas2D& out_temp) {
+                                 TensorCanvas2D& out_temp,
+                                 const char* argv0) {
   CodepointSequence seq;
   for (unsigned char ch : token) seq.codepoints.push_back(static_cast<uint32_t>(ch));
 
@@ -290,7 +297,7 @@ int main(int argc, char** argv) {
   ArmatureProgram fill_prog;
   TensorCanvas2D energy;
   TensorCanvas2D temp;
-  if (!make_fill_from_token(token_text, shaper, machine, tool, fill_prog, energy, temp)) {
+  if (!make_fill_from_token(token_text, shaper, machine, tool, fill_prog, energy, temp, argv[0])) {
     std::cerr << "[KPATH-API] failed to build fill from token\n";
     return 1;
   }

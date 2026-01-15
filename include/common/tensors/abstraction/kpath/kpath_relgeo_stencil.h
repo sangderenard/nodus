@@ -9,6 +9,8 @@
 
 namespace nodus::tensors::kpath {
 
+struct RelGeoEsatResult;
+
 // Qualitative (non-numeric) spatial constraints inferred from RelProgram.
 //
 // A stencil captures partial ordering and sign information per axis inside
@@ -73,6 +75,15 @@ struct RelBetweenConstraint final {
   RelPointId b{};
 };
 
+struct RelSegmentRatioConstraint final {
+  uint32_t frame = 0;
+  uint32_t axis = 0;
+  RelPointId a{};
+  RelPointId mid{};
+  RelPointId b{};
+  float ratio = 0.5f; // 0..1 along a->b
+};
+
 struct RelFrameAxisConstraint final {
   uint32_t frame_a = 0;
   uint32_t axis_a = 0;
@@ -86,6 +97,7 @@ struct RelFrameAxisConstraint final {
 struct RelGeoStencilOptions final {
   uint32_t dims = 2;
   bool include_local_frames = true;
+  RelRuleContext rule_context{};
 };
 
 struct RelGeoStencil final {
@@ -94,6 +106,7 @@ struct RelGeoStencil final {
   std::vector<RelAxisOrderConstraint> axis_orders;
   std::vector<RelAxisSignConstraint> axis_signs;
   std::vector<RelBetweenConstraint> betweens;
+  std::vector<RelSegmentRatioConstraint> ratios;
   std::vector<RelFrameAxisConstraint> frame_relations;
   std::vector<RelPointId> points;
   std::vector<RelPointId> free_points;
@@ -101,5 +114,8 @@ struct RelGeoStencil final {
 };
 
 RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStencilOptions& options = {});
+RelGeoStencil relgeo_build_stencil(const RelProgram& program,
+                                   const RelGeoEsatResult& esat,
+                                   const RelGeoStencilOptions& options = {});
 
 } // namespace nodus::tensors::kpath

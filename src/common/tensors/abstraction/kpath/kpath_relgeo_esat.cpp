@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -14,6 +15,17 @@ namespace {
 static int64_t to_microunits(float v) {
   // Quantize to 1e-6 to keep constants stable in hashing/equality.
   return static_cast<int64_t>(std::llround(static_cast<double>(v) * 1'000'000.0));
+}
+
+static bool ratio_to_rational(float ratio, int32_t& out_num, uint32_t& out_den) {
+  if (!std::isfinite(ratio)) return false;
+  const double r = std::clamp(static_cast<double>(ratio), 0.0, 1.0);
+  const int64_t den = 1'000'000;
+  const int64_t num = static_cast<int64_t>(std::llround(r * static_cast<double>(den)));
+  if (num > std::numeric_limits<int32_t>::max()) return false;
+  out_num = static_cast<int32_t>(num);
+  out_den = static_cast<uint32_t>(den);
+  return true;
 }
 
 static uint32_t gcd_u32(uint32_t a, uint32_t b) {
@@ -228,6 +240,31 @@ RelGeoEsatTerm RelGeoEsatTerm::const_angle_pi(int32_t num, uint32_t den) {
   return t;
 }
 
+RelGeoEsatTerm RelGeoEsatTerm::angle_at(RelPointId a, RelPointId v, RelPointId b) {
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::AngleAtPoints;
+  t.a = v.v;
+  const uint32_t lo = std::min(a.v, b.v);
+  const uint32_t hi = std::max(a.v, b.v);
+  t.b = lo;
+  t.c = static_cast<int64_t>(hi);
+  return t;
+}
+
+RelGeoEsatTerm RelGeoEsatTerm::sin(uint32_t angle_term) {
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::SinAngle;
+  t.a = angle_term;
+  return t;
+}
+
+RelGeoEsatTerm RelGeoEsatTerm::cos(uint32_t angle_term) {
+  RelGeoEsatTerm t;
+  t.kind = RelGeoEsatTermKind::CosAngle;
+  t.a = angle_term;
+  return t;
+}
+
 struct RelGeoEsatResult::Impl final {
   std::unordered_map<RelGeoEsatTerm, uint32_t, TermHash> term_to_id;
   std::vector<RelGeoEsatTerm> id_to_term;
@@ -297,6 +334,9 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
   std::vector<RelAssertPerpAt> perp_at;
   perp_at.reserve(8);
 
+  std::vector<RelAssertTriangle> triangles;
+  triangles.reserve(8);
+
   const auto mention_point = [&](RelPointId pid) {
     if (!pid) return;
     mentioned_points.push_back(pid.v);
@@ -307,11 +347,75 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
     mentioned_lines.push_back(lid.v);
   };
 
-  for (const auto& a : program.assertions()) {
+  for (const auto& scoped : program.assertions()) {
+    if (!relgeo_rule_applies(scoped.scope, options.rule_context)) continue;
+    const auto& a = scoped.assertion;
     if (const auto* c = std::get_if<RelAssertCoincident>(&a)) {
       result.impl_->equate(RelGeoEsatTerm::point(c->a), RelGeoEsatTerm::point(c->b));
       mention_point(c->a);
       mention_point(c->b);
+      continue;
+    }
+
+    if (const auto* ed = std::get_if<RelAssertEqualDistance>(&a)) {
+      result.impl_->equate(RelGeoEsatTerm::dist(ed->a, ed->b), RelGeoEsatTerm::dist(ed->c, ed->d));
+      mention_point(ed->a);
+      mention_point(ed->b);
+      mention_point(ed->c);
+      mention_point(ed->d);
+      continue;
+    }
+
+    if (const auto* mp = std::get_if<RelAssertMidpoint>(&a)) {
+      result.impl_->equate(RelGeoEsatTerm::dist(mp->a, mp->m), RelGeoEsatTerm::dist(mp->m, mp->b));
+      mention_point(mp->a);
+      mention_point(mp->m);
+      mention_point(mp->b);
+      continue;
+    }
+
+    if (const auto* pp = std::get_if<RelAssertParallelLinePairs>(&a)) {
+      result.impl_->equate(RelGeoEsatTerm::dir(pp->a0), RelGeoEsatTerm::dir(pp->a1));
+      result.impl_->equate(RelGeoEsatTerm::dir(pp->b0), RelGeoEsatTerm::dir(pp->b1));
+      result.impl_->equate(RelGeoEsatTerm::angle_between(pp->a0, pp->b0), RelGeoEsatTerm::angle_between(pp->a1, pp->b1));
+      mention_line(pp->a0);
+      mention_line(pp->a1);
+      mention_line(pp->b0);
+      mention_line(pp->b1);
+      continue;
+    }
+
+    if (const auto* ea = std::get_if<RelAssertEqualAngleLines>(&a)) {
+      result.impl_->equate(RelGeoEsatTerm::angle_between(ea->a0, ea->a1), RelGeoEsatTerm::angle_between(ea->b0, ea->b1));
+      mention_line(ea->a0);
+      mention_line(ea->a1);
+      mention_line(ea->b0);
+      mention_line(ea->b1);
+      continue;
+    }
+
+    if (const auto* ps = std::get_if<RelAssertPointOnSegmentRatio>(&a)) {
+      int32_t num = 0;
+      uint32_t den = 1;
+      if (ratio_to_rational(ps->ratio, num, den)) {
+        const int32_t num_other = static_cast<int32_t>(static_cast<int64_t>(den) - static_cast<int64_t>(num));
+        const uint32_t d_ap = result.impl_->intern(RelGeoEsatTerm::dist(ps->a, ps->p));
+        const uint32_t d_pb = result.impl_->intern(RelGeoEsatTerm::dist(ps->p, ps->b));
+        const uint32_t r_other = result.impl_->intern(RelGeoEsatTerm::const_rational(num_other, den));
+        const uint32_t r_num = result.impl_->intern(RelGeoEsatTerm::const_rational(num, den));
+        result.impl_->equate(RelGeoEsatTerm::mul(d_ap, r_other), RelGeoEsatTerm::mul(d_pb, r_num));
+      }
+      mention_point(ps->a);
+      mention_point(ps->p);
+      mention_point(ps->b);
+      continue;
+    }
+
+    if (const auto* tri = std::get_if<RelAssertTriangle>(&a)) {
+      triangles.push_back(*tri);
+      mention_point(tri->a);
+      mention_point(tri->b);
+      mention_point(tri->c);
       continue;
     }
 
@@ -376,6 +480,43 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
     result.impl_->intern(RelGeoEsatTerm::dir_perp(RelLineId(lv)));
   }
 
+  // Map line definitions by their unordered point pairs.
+  std::unordered_map<uint64_t, RelLineId> line_by_points;
+  line_by_points.reserve(program.lines().size());
+  for (const auto& l : program.lines()) {
+    if (!l.a || !l.b) continue;
+    const uint32_t lo = std::min(l.a.v, l.b.v);
+    const uint32_t hi = std::max(l.a.v, l.b.v);
+    const uint64_t key = (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+    line_by_points.emplace(key, l.id);
+  }
+
+  const auto find_line = [&](RelPointId p, RelPointId q) -> std::optional<RelLineId> {
+    if (!p || !q) return std::nullopt;
+    const uint32_t lo = std::min(p.v, q.v);
+    const uint32_t hi = std::max(p.v, q.v);
+    const uint64_t key = (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+    auto it = line_by_points.find(key);
+    if (it == line_by_points.end()) return std::nullopt;
+    return it->second;
+  };
+
+  // Connect explicit vertex angles to line-pair angles when both lines exist.
+  for (const auto& def : program.angles()) {
+    if (!def.a || !def.v || !def.b) continue;
+    const auto l0 = find_line(def.v, def.a);
+    const auto l1 = find_line(def.v, def.b);
+    if (!l0 || !l1) continue;
+    const RelGeoEsatTerm ang_lines = RelGeoEsatTerm::angle_between(*l0, *l1);
+    const RelGeoEsatTerm ang_pts = RelGeoEsatTerm::angle_at(def.a, def.v, def.b);
+    result.impl_->equate(ang_lines, ang_pts);
+    mention_line(*l0);
+    mention_line(*l1);
+    mention_point(def.a);
+    mention_point(def.v);
+    mention_point(def.b);
+  }
+
   const auto equate_dist_sqrt = [&](RelPointId a, RelPointId b) {
     const uint32_t d2 = result.impl_->intern(RelGeoEsatTerm::dist2(a, b));
     const RelGeoEsatTerm root = RelGeoEsatTerm::sqrt(d2);
@@ -390,6 +531,63 @@ RelGeoEsatResult relgeo_esaturate(const RelProgram& program, const RelGeoEsatOpt
     equate_dist_sqrt(perp.a, perp.b);
     equate_dist_sqrt(perp.a, perp.v);
     equate_dist_sqrt(perp.v, perp.b);
+  }
+
+  // Triangle trigonometric identities (symbolic only).
+  for (const auto& tri : triangles) {
+    if (!tri.a || !tri.b || !tri.c) continue;
+    const RelGeoEsatTerm ang_a = RelGeoEsatTerm::angle_at(tri.b, tri.a, tri.c);
+    const RelGeoEsatTerm ang_b = RelGeoEsatTerm::angle_at(tri.a, tri.b, tri.c);
+    const RelGeoEsatTerm ang_c = RelGeoEsatTerm::angle_at(tri.a, tri.c, tri.b);
+
+    const uint32_t ang_a_id = result.impl_->intern(ang_a);
+    const uint32_t ang_b_id = result.impl_->intern(ang_b);
+    const uint32_t ang_c_id = result.impl_->intern(ang_c);
+
+    const uint32_t sum_ab = result.impl_->intern(RelGeoEsatTerm::add(ang_a_id, ang_b_id));
+    result.impl_->equate(RelGeoEsatTerm::add(sum_ab, ang_c_id), RelGeoEsatTerm::const_angle_pi(1, 1));
+
+    const uint32_t sin_a = result.impl_->intern(RelGeoEsatTerm::sin(ang_a_id));
+    const uint32_t sin_b = result.impl_->intern(RelGeoEsatTerm::sin(ang_b_id));
+    const uint32_t sin_c = result.impl_->intern(RelGeoEsatTerm::sin(ang_c_id));
+
+    const uint32_t len_a = result.impl_->intern(RelGeoEsatTerm::dist(tri.b, tri.c));
+    const uint32_t len_b = result.impl_->intern(RelGeoEsatTerm::dist(tri.a, tri.c));
+    const uint32_t len_c = result.impl_->intern(RelGeoEsatTerm::dist(tri.a, tri.b));
+
+    result.impl_->equate(RelGeoEsatTerm::mul(sin_a, len_b), RelGeoEsatTerm::mul(sin_b, len_a));
+
+    result.impl_->equate(RelGeoEsatTerm::mul(sin_a, len_c), RelGeoEsatTerm::mul(sin_c, len_a));
+
+    const uint32_t cos_a = result.impl_->intern(RelGeoEsatTerm::cos(ang_a_id));
+    const uint32_t cos_b = result.impl_->intern(RelGeoEsatTerm::cos(ang_b_id));
+    const uint32_t cos_c = result.impl_->intern(RelGeoEsatTerm::cos(ang_c_id));
+
+    const uint32_t len_a2 = result.impl_->intern(RelGeoEsatTerm::dist2(tri.b, tri.c));
+    const uint32_t len_b2 = result.impl_->intern(RelGeoEsatTerm::dist2(tri.a, tri.c));
+    const uint32_t len_c2 = result.impl_->intern(RelGeoEsatTerm::dist2(tri.a, tri.b));
+
+    const uint32_t two_neg = result.impl_->intern(RelGeoEsatTerm::const_rational(-2, 1));
+
+    const uint32_t ab = result.impl_->intern(RelGeoEsatTerm::mul(len_b, len_c));
+    const uint32_t ac = result.impl_->intern(RelGeoEsatTerm::mul(len_a, len_c));
+    const uint32_t bc = result.impl_->intern(RelGeoEsatTerm::mul(len_a, len_b));
+
+    const uint32_t term_a = result.impl_->intern(RelGeoEsatTerm::mul(cos_a, ab));
+    const uint32_t term_b = result.impl_->intern(RelGeoEsatTerm::mul(cos_b, ac));
+    const uint32_t term_c = result.impl_->intern(RelGeoEsatTerm::mul(cos_c, bc));
+
+    const uint32_t neg_a = result.impl_->intern(RelGeoEsatTerm::mul(two_neg, term_a));
+    const uint32_t neg_b = result.impl_->intern(RelGeoEsatTerm::mul(two_neg, term_b));
+    const uint32_t neg_c = result.impl_->intern(RelGeoEsatTerm::mul(two_neg, term_c));
+
+    const uint32_t sum_ba = result.impl_->intern(RelGeoEsatTerm::add(len_b2, len_c2));
+    const uint32_t sum_ca = result.impl_->intern(RelGeoEsatTerm::add(len_a2, len_c2));
+    const uint32_t sum_ab2 = result.impl_->intern(RelGeoEsatTerm::add(len_a2, len_b2));
+
+    result.impl_->equate(RelGeoEsatTerm::dist2(tri.b, tri.c), RelGeoEsatTerm::add(sum_ba, neg_a));
+    result.impl_->equate(RelGeoEsatTerm::dist2(tri.a, tri.c), RelGeoEsatTerm::add(sum_ca, neg_b));
+    result.impl_->equate(RelGeoEsatTerm::dist2(tri.a, tri.b), RelGeoEsatTerm::add(sum_ab2, neg_c));
   }
 
   const uint32_t sqrt2 = result.impl_->intern(RelGeoEsatTerm::sqrt(

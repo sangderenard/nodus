@@ -64,7 +64,7 @@ if(NOT DEFINED ENV{VCPKG_FEATURE_FLAGS})
   set(ENV{VCPKG_FEATURE_FLAGS} "manifests")
 endif()
 
-project(canvas_tables LANGUAGES CXX)
+project(canvas_tables LANGUAGES C CXX)
 
 ## Dependencies are built in isolation under dev_bundle/deps/*
 ## The main project only consumes already-installed packages.
@@ -375,6 +375,17 @@ target_include_directories(kpath_relgeo_scene_demo PRIVATE ${CMAKE_CURRENT_SOURC
 target_link_libraries(kpath_relgeo_scene_demo PRIVATE canvas_tables_static)
 target_compile_features(kpath_relgeo_scene_demo PUBLIC cxx_std_20)
 
+# Demo: tensor-backed rasterization with live SDL3 output.
+add_executable(kpath_raster_tensor_demo tools/kpath_raster_tensor_demo.cpp)
+target_include_directories(kpath_raster_tensor_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(kpath_raster_tensor_demo PRIVATE canvas_tables_static)
+if(TARGET SDL3::SDL3)
+  target_link_libraries(kpath_raster_tensor_demo PRIVATE SDL3::SDL3)
+else()
+  message(FATAL_ERROR "SDL3 is required for kpath_raster_tensor_demo.")
+endif()
+target_compile_features(kpath_raster_tensor_demo PUBLIC cxx_std_20)
+
 find_package(OpenGL REQUIRED)
 
 if(NODUS_ENABLE_TORCH)
@@ -382,6 +393,7 @@ if(NODUS_ENABLE_TORCH)
   target_include_directories(frontend_shell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(frontend_shell PRIVATE
     canvas_tables
+    canvas_tables_static
     Torch::Torch
     OpenGL::GL
   )
@@ -608,6 +620,13 @@ add_executable(test_kpath_toolpath_facilities
 target_link_libraries(test_kpath_toolpath_facilities PRIVATE canvas_tables_static)
 target_compile_features(test_kpath_toolpath_facilities PRIVATE cxx_std_20)
 add_test(NAME kpath_toolpath_facilities_test COMMAND test_kpath_toolpath_facilities)
+
+add_executable(test_kpath_film
+  tests/kpath_film_test.cpp
+)
+target_link_libraries(test_kpath_film PRIVATE canvas_tables_static)
+target_compile_features(test_kpath_film PRIVATE cxx_std_20)
+add_test(NAME kpath_film_test COMMAND test_kpath_film)
 
 add_executable(test_kpath_api_fill_token
   tests/kpath_api_fill_token_test.cpp

@@ -1,6 +1,8 @@
 #include "common/tensors/abstraction/kpath/kpath_kinematics.h"
+#include "common/tensors/abstraction/kpath/kpath_raster.h"
 
 #include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/tensor_math.h"
 #include "common/tensors/abstraction/tensor_types.h"
 
 #include <algorithm>
@@ -10,100 +12,66 @@ namespace nodus::tensors::kpath {
 
 namespace {
 
-constexpr float kEps = 1e-6f;
-
-struct Mat4 {
-  float m[16]; // row-major
-};
-
-Mat4 mat4_identity() {
-  Mat4 M{};
-  M.m[0] = M.m[5] = M.m[10] = M.m[15] = 1.0f;
-  return M;
+AbstractTensor make_f32_tensor_1d(TensorBackend* backend, const float* data, uint32_t count) {
+  if (!backend || !data || count == 0) return {};
+  TensorDesc desc{};
+  desc.dtype = TensorDType::F32;
+  desc.layout = TensorLayout::Dense;
+  desc.shape.dims = {count};
+  AbstractTensor out = AbstractTensor::create(desc, backend);
+  if (!out.valid()) return {};
+  auto* mem = dynamic_cast<InMemoryBackend*>(backend);
+  if (!mem) return {};
+  void* ptr_v = nullptr;
+  size_t bytes = 0;
+  if (!mem->map(out.handle(), &ptr_v, &bytes)) return {};
+  float* ptr = static_cast<float*>(ptr_v);
+  for (uint32_t i = 0; i < count; ++i) ptr[i] = data[i];
+  mem->unmap(out.handle());
+  return out;
 }
 
-Mat4 mat4_from_pose(const Pose& p) {
-  // Convert quaternion to rotation matrix; quaternion assumed normalized.
-  const float w = p.q.w, x = p.q.x, y = p.q.y, z = p.q.z;
-  Mat4 M{};
-  M.m[0] = 1 - 2 * (y * y + z * z);
-  M.m[1] = 2 * (x * y - z * w);
-  M.m[2] = 2 * (x * z + y * w);
-  M.m[3] = 0.0f;
-
-  M.m[4] = 2 * (x * y + z * w);
-  M.m[5] = 1 - 2 * (x * x + z * z);
-  M.m[6] = 2 * (y * z - x * w);
-  M.m[7] = 0.0f;
-
-  M.m[8] = 2 * (x * z - y * w);
-  M.m[9] = 2 * (y * z + x * w);
-  M.m[10] = 1 - 2 * (x * x + y * y);
-  M.m[11] = 0.0f;
-
-  M.m[12] = p.t.x;
-  M.m[13] = p.t.y;
-  M.m[14] = p.t.z;
-  M.m[15] = 1.0f;
-  return M;
+AbstractTensor make_vec3_tensor(TensorBackend* backend, const Vec3& v) {
+  const float data[3] = {v.x, v.y, v.z};
+  return make_f32_tensor_1d(backend, data, 3u);
 }
 
-Mat4 mat4_translate(const Vec3& t) {
-  Mat4 M = mat4_identity();
-  M.m[12] = t.x;
-  M.m[13] = t.y;
-  M.m[14] = t.z;
-  return M;
+AbstractTensor make_quat_tensor(TensorBackend* backend, const Quat& q) {
+  const float data[4] = {q.w, q.x, q.y, q.z};
+  return make_f32_tensor_1d(backend, data, 4u);
 }
 
-Mat4 mat4_axis_angle(const Vec3& axis, float angle) {
-  float ax = axis.x, ay = axis.y, az = axis.z;
-  float len = std::sqrt(ax * ax + ay * ay + az * az);
-  if (len < kEps) return mat4_identity();
-  float inv = 1.0f / len;
-  ax *= inv; ay *= inv; az *= inv;
-  float c = std::cos(angle);
-  float s = std::sin(angle);
-  float t = 1.0f - c;
-
-  Mat4 M{};
-  M.m[0] = t * ax * ax + c;
-  M.m[1] = t * ax * ay - s * az;
-  M.m[2] = t * ax * az + s * ay;
-  M.m[3] = 0.0f;
-
-  M.m[4] = t * ay * ax + s * az;
-  M.m[5] = t * ay * ay + c;
-  M.m[6] = t * ay * az - s * ax;
-  M.m[7] = 0.0f;
-
-  M.m[8] = t * az * ax - s * ay;
-  M.m[9] = t * az * ay + s * ax;
-  M.m[10] = t * az * az + c;
-  M.m[11] = 0.0f;
-
-  M.m[12] = 0.0f;
-  M.m[13] = 0.0f;
-  M.m[14] = 0.0f;
-  M.m[15] = 1.0f;
-  return M;
+bool copy_mat4_to(InMemoryBackend* mem, const AbstractTensor& mat, float* dst16) {
+  if (!mem || !dst16 || !mat.valid()) return false;
+  const TensorDesc& desc = mat.desc();
+  if (desc.dtype != TensorDType::F32 || desc.layout != TensorLayout::Dense) return false;
+  if (desc.shape.dims.size() != 2 || desc.shape.dims[0] != 4 || desc.shape.dims[1] != 4) return false;
+  void* ptr_v = nullptr;
+  size_t bytes = 0;
+  if (!mem->map(mat.handle(), &ptr_v, &bytes)) return false;
+  const float* src = static_cast<const float*>(ptr_v);
+  for (int i = 0; i < 16; ++i) dst16[i] = src[i];
+  mem->unmap(mat.handle());
+  return true;
 }
 
-Mat4 mat4_mul(const Mat4& A, const Mat4& B) {
-  Mat4 R{};
-  for (int r = 0; r < 4; ++r) {
-    for (int c = 0; c < 4; ++c) {
-      float v = 0.0f;
-      for (int k = 0; k < 4; ++k) v += A.m[4 * r + k] * B.m[4 * k + c];
-      R.m[4 * r + c] = v;
-    }
-  }
-  return R;
+Quat quat_conj(const Quat& q) {
+  return Quat{q.w, -q.x, -q.y, -q.z};
 }
 
-// Writes a Mat4 into a contiguous float buffer at index idx (stride 16).
-inline void store_mat4(float* dst16, const Mat4& M) {
-  for (int i = 0; i < 16; ++i) dst16[i] = M.m[i];
+Quat quat_mul(const Quat& a, const Quat& b) {
+  return Quat{
+      a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+      a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+      a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+      a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w};
+}
+
+Vec3 quat_rotate(const Quat& q, const Vec3& v) {
+  Quat vq{0.0f, v.x, v.y, v.z};
+  Quat qi = quat_conj(q);
+  Quat r = quat_mul(quat_mul(q, vq), qi);
+  return Vec3{r.x, r.y, r.z};
 }
 
 } // namespace
@@ -287,42 +255,90 @@ bool solve_armature_batch_dense(const ArmatureModel& model,
     joint_ptr = static_cast<float*>(joint_ptr_v);
   }
 
-  std::vector<Mat4> world(model.joints.size());
+  std::vector<AbstractTensor> world(model.joints.size());
   for (uint32_t b = 0; b < batch; ++b) {
-    Mat4 base = mat4_identity();
+    AbstractTensor base = tensor_affine_identity_f32(backend);
+    if (!base.valid()) {
+      mem->unmap(q.handle());
+      mem->unmap(out->tool_transforms.handle());
+      if (emit_joint_transforms && joint_ptr) mem->unmap(out->joint_transforms.handle());
+      return false;
+    }
     // Compute per-joint world transforms.
     for (size_t j = 0; j < model.joints.size(); ++j) {
       const Joint& joint = model.joints[j];
       float qval = q_ptr[b * joints + j];
 
-      Mat4 T_parent_joint = mat4_from_pose(joint.T_parent_joint);
-      Mat4 T_motion = mat4_identity();
-      if (joint.kind == JointKind::Prismatic) {
-        Vec3 t{joint.axis_local.x * qval, joint.axis_local.y * qval, joint.axis_local.z * qval};
-        T_motion = mat4_translate(t);
-      } else { // Revolute
-        float angle = (joint.dir == RotDir::Neg) ? -qval : qval;
-        T_motion = mat4_axis_angle(joint.axis_local, angle);
+      AbstractTensor q_parent = make_quat_tensor(backend, joint.T_parent_joint.q);
+      AbstractTensor t_parent = make_vec3_tensor(backend, joint.T_parent_joint.t);
+      AbstractTensor T_parent_joint = tensor_quat_to_mat4_f32(q_parent, t_parent);
+      if (!T_parent_joint.valid()) {
+        mem->unmap(q.handle());
+        mem->unmap(out->tool_transforms.handle());
+        if (emit_joint_transforms && joint_ptr) mem->unmap(out->joint_transforms.handle());
+        return false;
       }
 
-      Mat4 local = mat4_mul(T_parent_joint, T_motion);
+      AbstractTensor T_motion;
+      if (joint.kind == JointKind::Prismatic) {
+        Vec3 t{joint.axis_local.x * qval, joint.axis_local.y * qval, joint.axis_local.z * qval};
+        AbstractTensor t_motion = make_vec3_tensor(backend, t);
+        T_motion = tensor_affine_translation_f32(t_motion);
+      } else { // Revolute
+        float angle = (joint.dir == RotDir::Neg) ? -qval : qval;
+        AbstractTensor axis = make_vec3_tensor(backend, joint.axis_local);
+        AbstractTensor q_motion = tensor_quat_from_axis_angle_f32(axis, angle);
+        T_motion = tensor_quat_to_mat4_f32(q_motion, AbstractTensor{});
+      }
+
+      if (!T_motion.valid()) {
+        mem->unmap(q.handle());
+        mem->unmap(out->tool_transforms.handle());
+        if (emit_joint_transforms && joint_ptr) mem->unmap(out->joint_transforms.handle());
+        return false;
+      }
+
+      AbstractTensor local = tensor_matmul_f32(T_parent_joint, T_motion);
+      if (!local.valid()) {
+        mem->unmap(q.handle());
+        mem->unmap(out->tool_transforms.handle());
+        if (emit_joint_transforms && joint_ptr) mem->unmap(out->joint_transforms.handle());
+        return false;
+      }
       if (joint.parent >= 0) {
-        const Mat4& Pw = world[static_cast<size_t>(joint.parent)];
-        world[j] = mat4_mul(Pw, local);
+        const AbstractTensor& Pw = world[static_cast<size_t>(joint.parent)];
+        world[j] = tensor_matmul_f32(Pw, local);
       } else {
-        world[j] = mat4_mul(base, local);
+        world[j] = tensor_matmul_f32(base, local);
+      }
+
+      if (!world[j].valid()) {
+        mem->unmap(q.handle());
+        mem->unmap(out->tool_transforms.handle());
+        if (emit_joint_transforms && joint_ptr) mem->unmap(out->joint_transforms.handle());
+        return false;
       }
 
       if (emit_joint_transforms && joint_ptr) {
         float* dst = joint_ptr + static_cast<size_t>(b) * joints * 16 + j * 16;
-        store_mat4(dst, world[j]);
+        if (!copy_mat4_to(mem, world[j], dst)) {
+          mem->unmap(q.handle());
+          mem->unmap(out->tool_transforms.handle());
+          mem->unmap(out->joint_transforms.handle());
+          return false;
+        }
       }
     }
 
     // Tool = last joint or tool_frame if provided.
     size_t tool_joint = model.tool_frame ? static_cast<size_t>(model.tool_frame.v) : model.joints.size() - 1;
     tool_joint = std::min(tool_joint, model.joints.size() - 1);
-    store_mat4(tool_ptr + static_cast<size_t>(b) * 16, world[tool_joint]);
+    if (!copy_mat4_to(mem, world[tool_joint], tool_ptr + static_cast<size_t>(b) * 16)) {
+      mem->unmap(q.handle());
+      mem->unmap(out->tool_transforms.handle());
+      if (emit_joint_transforms && joint_ptr) mem->unmap(out->joint_transforms.handle());
+      return false;
+    }
   }
 
   mem->unmap(q.handle());
@@ -331,96 +347,43 @@ bool solve_armature_batch_dense(const ArmatureModel& model,
   return true;
 }
 
+BeamAimSolution solve_beam_aim_from_pose(const Pose& pose, const ToolMount& mount, bool engaged) {
+  BeamAimSolution sol{};
+  sol.beam.engaged = engaged;
+
+  const Vec3 origin = vec3_add(pose.t, quat_rotate(pose.q, mount.offset));
+  const Quat q_world = quat_mul(pose.q, mount.rotation);
+  const Vec3 dir = quat_rotate(q_world, mount.local_axis);
+  const float len_sq = vec3_len_sq(dir);
+  if (len_sq <= 0.0f) {
+    sol.valid = false;
+    return sol;
+  }
+
+  const float inv_len = 1.0f / std::sqrt(len_sq);
+  const Vec3 d{dir.x * inv_len, dir.y * inv_len, dir.z * inv_len};
+
+  sol.beam.ox = origin.x;
+  sol.beam.oy = origin.y;
+  sol.beam.oz = origin.z;
+  sol.beam.dx = d.x;
+  sol.beam.dy = d.y;
+  sol.beam.dz = d.z;
+
+  // Right-handed, Z-up: yaw around +Z, pitch up/down.
+  sol.yaw_rad = std::atan2(d.y, d.x);
+  const float xy = std::sqrt(d.x * d.x + d.y * d.y);
+  sol.pitch_rad = std::atan2(d.z, xy);
+  sol.valid = true;
+  return sol;
+}
+
 bool intersect_beams_with_plane(const AbstractTensor& origins,
                                  const AbstractTensor& dirs,
                                  float plane_z,
                                  AbstractTensor* out_hits,
                                  AbstractTensor* out_mask) {
-  if (!out_hits || !out_mask) return false;
-  out_hits->reset();
-  out_mask->reset();
-
-  if (!origins.valid() || !dirs.valid()) return false;
-  const TensorDesc& od = origins.desc();
-  const TensorDesc& dd = dirs.desc();
-  if (od.dtype != TensorDType::F32 || dd.dtype != TensorDType::F32) return false;
-  if (od.shape.rank() != 2 || dd.shape.rank() != 2) return false;
-  if (od.shape.dims.size() < 2 || dd.shape.dims.size() < 2) return false;
-  const uint32_t batch = od.shape.dims[0];
-  if (dd.shape.dims[0] != batch) return false;
-  if (od.shape.dims[1] != 3 || dd.shape.dims[1] != 3) return false;
-
-  TensorBackend* backend = origins.backend();
-  auto* mem = dynamic_cast<InMemoryBackend*>(backend);
-  if (!mem || mem != dynamic_cast<InMemoryBackend*>(dirs.backend())) return false;
-
-  TensorDesc hit_desc;
-  hit_desc.dtype = TensorDType::F32;
-  hit_desc.shape.dims = {batch, 3u};
-  hit_desc.layout = TensorLayout::Dense;
-  *out_hits = AbstractTensor::create(hit_desc, backend);
-  if (!out_hits->valid()) return false;
-
-  TensorDesc mask_desc;
-  mask_desc.dtype = TensorDType::Bool;
-  mask_desc.shape.dims = {batch};
-  mask_desc.layout = TensorLayout::Dense;
-  *out_mask = AbstractTensor::create(mask_desc, backend);
-  if (!out_mask->valid()) return false;
-
-  void* o_ptr_v = nullptr; size_t o_bytes = 0;
-  void* d_ptr_v = nullptr; size_t d_bytes = 0;
-  if (!mem->map(origins.handle(), &o_ptr_v, &o_bytes)) return false;
-  if (!mem->map(dirs.handle(), &d_ptr_v, &d_bytes)) {
-    mem->unmap(origins.handle());
-    return false;
-  }
-  float* o_ptr = static_cast<float*>(o_ptr_v);
-  float* d_ptr = static_cast<float*>(d_ptr_v);
-
-  void* h_ptr_v = nullptr; size_t h_bytes = 0;
-  void* m_ptr_v = nullptr; size_t m_bytes = 0;
-  if (!mem->map(out_hits->handle(), &h_ptr_v, &h_bytes)) {
-    mem->unmap(origins.handle());
-    mem->unmap(dirs.handle());
-    return false;
-  }
-  if (!mem->map(out_mask->handle(), &m_ptr_v, &m_bytes)) {
-    mem->unmap(origins.handle());
-    mem->unmap(dirs.handle());
-    mem->unmap(out_hits->handle());
-    return false;
-  }
-  float* h_ptr = static_cast<float*>(h_ptr_v);
-  uint8_t* m_ptr = static_cast<uint8_t*>(m_ptr_v);
-
-  for (uint32_t b = 0; b < batch; ++b) {
-    const float ox = o_ptr[3 * b + 0];
-    const float oy = o_ptr[3 * b + 1];
-    const float oz = o_ptr[3 * b + 2];
-
-    const float dx = d_ptr[3 * b + 0];
-    const float dy = d_ptr[3 * b + 1];
-    const float dz = d_ptr[3 * b + 2];
-
-    bool ok = std::fabs(dz) > kEps;
-    float t = ok ? (plane_z - oz) / dz : 0.0f;
-    ok = ok && (t >= 0.0f);
-    m_ptr[b] = ok ? 1 : 0;
-
-    float hx = ok ? (ox + t * dx) : 0.0f;
-    float hy = ok ? (oy + t * dy) : 0.0f;
-    float hz = ok ? plane_z : 0.0f;
-    h_ptr[3 * b + 0] = hx;
-    h_ptr[3 * b + 1] = hy;
-    h_ptr[3 * b + 2] = hz;
-  }
-
-  mem->unmap(origins.handle());
-  mem->unmap(dirs.handle());
-  mem->unmap(out_hits->handle());
-  mem->unmap(out_mask->handle());
-  return true;
+  return tensor_intersect_plane_z_f32(origins, dirs, plane_z, out_hits, out_mask);
 }
 
 } // namespace nodus::tensors::kpath

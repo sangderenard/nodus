@@ -4,6 +4,8 @@
 #include <limits>
 #include <vector>
 
+#include "common/tensors/abstraction/abstract_tensor_handle.h"
+
 namespace nodus::tensors {
 
 enum class TensorDType : uint8_t {
@@ -23,6 +25,25 @@ enum class TensorLayout : uint8_t {
     Dense = 0,
     Strided = 1,
     Opaque = 2,
+};
+
+enum class TensorQuantize : uint8_t {
+    RoundNearest = 0,
+};
+
+struct TensorSliceMeta {
+    bool valid = false;
+    TensorQuantize quantize = TensorQuantize::RoundNearest;
+    std::vector<uint32_t> base_shape;
+    std::vector<int64_t> start;
+    std::vector<int64_t> step;
+    std::vector<uint8_t> is_int;
+    bool indexed = false;
+    AbstractTensorHandle index_handle{};
+    bool saturate = false;
+    float saturate_threshold = 0.0f;
+    bool has_affine = false;
+    float affine[16] = {0};
 };
 
 // Canonical floating constants for diagnostics or kernel lowering.
@@ -70,6 +91,7 @@ struct TensorDesc {
     TensorStrides strides;
     bool is_buffer = true;
     bool is_readonly = false;
+    TensorSliceMeta slice;
 };
 
 } // namespace nodus::tensors

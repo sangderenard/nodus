@@ -130,7 +130,10 @@ int main(int argc, char** argv) {
     const float render_scale = 1.0f;
     const float margin_px = 12.0f;
     ProgramRasterTransform xform = plan_program_raster_transform_refined(program, machine, render_scale, margin_px, tool);
-    rasterize_program_gaussian_with_thermal_transformed(program, energy, temp, machine, tool, xform);
+    BeamToolParams kernel_tool{};
+    kernel_tool.falloff = BeamFalloffKind::Gaussian;
+    kernel_tool.sigma_px = tool.sigma_px;
+    rasterize_program_with_kernel_transformed(program, energy, temp, machine, kernel_tool, xform);
 
     const std::string out_path = make_output_path_next_to_exe((argc > 0) ? argv[0] : "kpath_relgeo_scene_demo",
                                                               "kpath_relgeo_scene.png");

@@ -1,8 +1,11 @@
 #include "common/tensors/abstraction/kpath/kpath_relgeo_stencil.h"
 
+#include "common/tensors/abstraction/kpath/kpath_relgeo_esat.h"
+
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace nodus::tensors::kpath {
@@ -75,15 +78,19 @@ struct FrameState final {
 
 } // namespace
 
-RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStencilOptions& options) {
+static RelGeoStencil relgeo_build_stencil_impl(const RelProgram& program,
+                                               const RelGeoStencilOptions& options,
+                                               const RelGeoEsatResult* esat) {
   RelGeoStencil out;
 
+  RelRuleContext rule_ctx = options.rule_context;
   FrameState global;
   global.def.id = 1;
   global.def.dims = std::max(1u, options.dims);
   global.def.label = "global";
   global.axes.resize(global.def.dims);
   out.global_frame = global.def.id;
+  rule_ctx.dims = global.def.dims;
 
   std::vector<FrameState> frames;
   frames.push_back(global);
@@ -167,6 +174,11 @@ RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStenci
     out.betweens.push_back(RelBetweenConstraint{frame, axis, a, m, b});
   };
 
+  auto add_ratio = [&](uint32_t frame, uint32_t axis, RelPointId a, RelPointId m, RelPointId b, float ratio) {
+    if (!a || !m || !b || frame == 0) return;
+    out.ratios.push_back(RelSegmentRatioConstraint{frame, axis, a, m, b, ratio});
+  };
+
   for (const auto& def : program.points()) {
     if (std::holds_alternative<RelPointFree>(def.expr)) {
       out.free_points.push_back(def.id);
@@ -177,7 +189,32 @@ RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStenci
     ensure_line_frame(def.id, def.a, def.b);
   }
 
-  for (const auto& a : program.assertions()) {
+  auto add_line_parallel_relations = [&](RelLineId a, RelLineId b) {
+    if (!a || !b) return;
+    const auto ia = static_cast<size_t>(a.v - 1);
+    const auto ib = static_cast<size_t>(b.v - 1);
+    if (ia >= program.lines().size() || ib >= program.lines().size()) return;
+    const uint32_t fa = ensure_line_frame(a, program.lines()[ia].a, program.lines()[ia].b);
+    const uint32_t fb = ensure_line_frame(b, program.lines()[ib].a, program.lines()[ib].b);
+    out.frame_relations.push_back(RelFrameAxisConstraint{fa, 0, fb, 0, RelFrameAxisRelation::Parallel, 0});
+    out.frame_relations.push_back(RelFrameAxisConstraint{fa, 1, fb, 1, RelFrameAxisRelation::Parallel, 0});
+  };
+
+  auto add_line_perp_relations = [&](RelLineId a, RelLineId b) {
+    if (!a || !b) return;
+    const auto ia = static_cast<size_t>(a.v - 1);
+    const auto ib = static_cast<size_t>(b.v - 1);
+    if (ia >= program.lines().size() || ib >= program.lines().size()) return;
+    const uint32_t fa = ensure_line_frame(a, program.lines()[ia].a, program.lines()[ia].b);
+    const uint32_t fb = ensure_line_frame(b, program.lines()[ib].a, program.lines()[ib].b);
+    out.frame_relations.push_back(RelFrameAxisConstraint{fa, 0, fb, 0, RelFrameAxisRelation::Perpendicular, 0});
+    out.frame_relations.push_back(RelFrameAxisConstraint{fa, 0, fb, 1, RelFrameAxisRelation::Parallel, 0});
+    out.frame_relations.push_back(RelFrameAxisConstraint{fa, 1, fb, 0, RelFrameAxisRelation::Parallel, 0});
+  };
+
+  for (const auto& scoped : program.assertions()) {
+    if (!relgeo_rule_applies(scoped.scope, rule_ctx)) continue;
+    const auto& a = scoped.assertion;
     if (const auto* c = std::get_if<RelAssertCoincident>(&a)) {
       for (uint32_t axis = 0; axis < options.dims; ++axis) {
         add_axis_order(out.global_frame, axis, c->a, c->b, RelAxisOrder::Equal);
@@ -194,6 +231,47 @@ RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStenci
       add_axis_sign(fid, 1, inc->p, RelAxisSign::Zero);
       add_axis_sign(fid, 1, l.a, RelAxisSign::Zero);
       add_axis_sign(fid, 1, l.b, RelAxisSign::Zero);
+      continue;
+    }
+
+    if (const auto* mp = std::get_if<RelAssertMidpoint>(&a)) {
+      if (!mp->a || !mp->b || !mp->m) continue;
+      const uint32_t fid = ensure_segment_frame(mp->a, mp->b);
+      if (fid != 0) {
+        add_between(fid, 0, mp->a, mp->m, mp->b);
+        add_axis_order(fid, 0, mp->a, mp->m, RelAxisOrder::Less);
+        add_axis_order(fid, 0, mp->m, mp->b, RelAxisOrder::Less);
+      }
+      continue;
+    }
+
+    if (const auto* ps = std::get_if<RelAssertPointOnSegment>(&a)) {
+      if (!ps->a || !ps->b || !ps->p) continue;
+      const uint32_t fid = ensure_segment_frame(ps->a, ps->b);
+      if (fid != 0) {
+        add_between(fid, 0, ps->a, ps->p, ps->b);
+        add_axis_order(fid, 0, ps->a, ps->p, RelAxisOrder::Less);
+        add_axis_order(fid, 0, ps->p, ps->b, RelAxisOrder::Less);
+      }
+      continue;
+    }
+
+    if (const auto* ps = std::get_if<RelAssertPointOnSegmentRatio>(&a)) {
+      if (!ps->a || !ps->b || !ps->p) continue;
+      const uint32_t fid = ensure_segment_frame(ps->a, ps->b);
+      if (fid != 0) {
+        add_between(fid, 0, ps->a, ps->p, ps->b);
+        add_axis_order(fid, 0, ps->a, ps->p, RelAxisOrder::Less);
+        add_axis_order(fid, 0, ps->p, ps->b, RelAxisOrder::Less);
+        add_ratio(fid, 0, ps->a, ps->p, ps->b, ps->ratio);
+      }
+      continue;
+    }
+
+    if (const auto* pp = std::get_if<RelAssertParallelLinePairs>(&a)) {
+      if (!pp->a0 || !pp->a1 || !pp->b0 || !pp->b1) continue;
+      add_line_parallel_relations(pp->a0, pp->a1);
+      add_line_parallel_relations(pp->b0, pp->b1);
       continue;
     }
 
@@ -215,10 +293,7 @@ RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStenci
       const auto ia = static_cast<size_t>(par->a.v - 1);
       const auto ib = static_cast<size_t>(par->b.v - 1);
       if (ia >= program.lines().size() || ib >= program.lines().size()) continue;
-      const uint32_t fa = ensure_line_frame(par->a, program.lines()[ia].a, program.lines()[ia].b);
-      const uint32_t fb = ensure_line_frame(par->b, program.lines()[ib].a, program.lines()[ib].b);
-      out.frame_relations.push_back(RelFrameAxisConstraint{fa, 0, fb, 0, RelFrameAxisRelation::Parallel, 0});
-      out.frame_relations.push_back(RelFrameAxisConstraint{fa, 1, fb, 1, RelFrameAxisRelation::Parallel, 0});
+      add_line_parallel_relations(par->a, par->b);
       continue;
     }
 
@@ -227,12 +302,57 @@ RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStenci
       const auto ia = static_cast<size_t>(perp->a.v - 1);
       const auto ib = static_cast<size_t>(perp->b.v - 1);
       if (ia >= program.lines().size() || ib >= program.lines().size()) continue;
-      const uint32_t fa = ensure_line_frame(perp->a, program.lines()[ia].a, program.lines()[ia].b);
-      const uint32_t fb = ensure_line_frame(perp->b, program.lines()[ib].a, program.lines()[ib].b);
-      out.frame_relations.push_back(RelFrameAxisConstraint{fa, 0, fb, 0, RelFrameAxisRelation::Perpendicular, 0});
-      out.frame_relations.push_back(RelFrameAxisConstraint{fa, 0, fb, 1, RelFrameAxisRelation::Parallel, 0});
-      out.frame_relations.push_back(RelFrameAxisConstraint{fa, 1, fb, 0, RelFrameAxisRelation::Parallel, 0});
+      add_line_perp_relations(perp->a, perp->b);
       continue;
+    }
+  }
+
+  if (esat) {
+    const auto& pts = program.points();
+    for (size_t i = 0; i < pts.size(); ++i) {
+      const RelPointId a = pts[i].id;
+      if (!a) continue;
+      for (size_t j = i + 1; j < pts.size(); ++j) {
+        const RelPointId b = pts[j].id;
+        if (!b) continue;
+        if (!esat->are_equal(RelGeoEsatTerm::point(a), RelGeoEsatTerm::point(b))) continue;
+        for (uint32_t axis = 0; axis < options.dims; ++axis) {
+          add_axis_order(out.global_frame, axis, a, b, RelAxisOrder::Equal);
+        }
+        for (const auto& frame : frames) {
+          for (uint32_t axis = 0; axis < frame.def.dims; ++axis) {
+            add_axis_order(frame.def.id, axis, a, b, RelAxisOrder::Equal);
+          }
+        }
+      }
+    }
+
+    const auto& lines = program.lines();
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(lines.size() * lines.size());
+    auto pair_key = [](uint32_t a, uint32_t b) {
+      const uint32_t lo = std::min(a, b);
+      const uint32_t hi = std::max(a, b);
+      return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+    };
+    for (size_t i = 0; i < lines.size(); ++i) {
+      const RelLineId l0 = lines[i].id;
+      if (!l0) continue;
+      for (size_t j = i + 1; j < lines.size(); ++j) {
+        const RelLineId l1 = lines[j].id;
+        if (!l1) continue;
+        const uint64_t key = pair_key(l0.v, l1.v);
+        if (seen.find(key) != seen.end()) continue;
+        seen.insert(key);
+        if (esat->are_equal(RelGeoEsatTerm::dir(l0), RelGeoEsatTerm::dir(l1))) {
+          add_line_parallel_relations(l0, l1);
+          continue;
+        }
+        if (esat->are_equal(RelGeoEsatTerm::dir(l0), RelGeoEsatTerm::dir_perp(l1)) ||
+            esat->are_equal(RelGeoEsatTerm::dir(l1), RelGeoEsatTerm::dir_perp(l0))) {
+          add_line_perp_relations(l0, l1);
+        }
+      }
     }
   }
 
@@ -289,6 +409,16 @@ RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStenci
   for (const auto& f : frames) out.frames.push_back(f.def);
 
   return out;
+}
+
+RelGeoStencil relgeo_build_stencil(const RelProgram& program, const RelGeoStencilOptions& options) {
+  return relgeo_build_stencil_impl(program, options, nullptr);
+}
+
+RelGeoStencil relgeo_build_stencil(const RelProgram& program,
+                                   const RelGeoEsatResult& esat,
+                                   const RelGeoStencilOptions& options) {
+  return relgeo_build_stencil_impl(program, options, &esat);
 }
 
 } // namespace nodus::tensors::kpath

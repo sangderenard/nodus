@@ -11,6 +11,17 @@ struct DummyBackend final : public TensorBackend {
     AbstractTensorHandle create(const TensorDesc&) override { return {}; }
     void destroy(AbstractTensorHandle) override {}
     bool describe(AbstractTensorHandle, TensorDesc*) const override { return false; }
+    bool get_item(AbstractTensorHandle,
+                  const TensorIndexSpec&,
+                  AbstractTensorHandle*,
+                  TensorDesc*) override {
+        return false;
+    }
+    bool set_item(AbstractTensorHandle,
+                  const TensorIndexSpec&,
+                  AbstractTensorHandle) override {
+        return false;
+    }
 };
 
 int main() {

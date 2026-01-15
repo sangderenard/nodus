@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -21,6 +22,16 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
+#include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/kpath/kpath_atlas.h"
+#include "common/tensors/abstraction/kpath/kpath_film.h"
+#include "common/tensors/abstraction/kpath/kpath_fill.h"
+#include "common/tensors/abstraction/kpath/kpath_pipeline.h"
+#include "common/tensors/abstraction/kpath/kpath_program.h"
+#include "common/tensors/abstraction/kpath/kpath_raster.h"
+#include "common/tensors/abstraction/kpath/kpath_raster_utils.h"
+#include "common/tensors/abstraction/kpath/kpath_relgeo.h"
+#include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
 #if defined(__has_include)
 # if __has_include(<torch/torch.h>)
 #  include <torch/torch.h>
@@ -51,7 +62,24 @@ namespace torch { class Tensor; class Device; }
 
 namespace {
 
-// NOTE: no compatibility macros — use SDL3 API names directly.
+// NOTE: no compatibility macros - use SDL3 API names directly.
+
+namespace nt = nodus::tensors;
+namespace nk = nodus::tensors::kpath;
+
+static std::vector<nk::FilmHistogramDescriptor> default_film_histograms() {
+    std::vector<nk::FilmHistogramDescriptor> descs(4);
+    const std::array<const char*, 4> names = {"film_r", "film_g", "film_b", "film_a"};
+    for (size_t i = 0; i < descs.size(); ++i) {
+        descs[i].basis.name = names[i];
+        if (i == 3) {
+            descs[i].layer_reactance = {0.0f};
+        } else {
+            descs[i].layer_reactance = {1.0f};
+        }
+    }
+    return descs;
+}
 
 struct CanvasHead {
     GP_CanvasContext* context = nullptr;
@@ -79,6 +107,111 @@ static void save_frontend_collection_state(const CanvasCollectionState& state);
 static constexpr int kDefaultCanvasWidth = 1000;
 static constexpr int kDefaultCanvasHeight = 720;
 static constexpr int kCanvasSwitchWindowMs = 3000;
+
+// Kpath raster state used as an alternate render source inside the frontend shell.
+static nt::AbstractTensorPool g_demo_tensor_pool(nt::AbstractTensorPool::Options{
+    .clear_on_release = false,
+    .cache_handles = false,
+    .enable_shape_bucketing = false,
+    .bucket_pow2_max = 0,
+    .bucket_multiple = 0,
+    .max_cached_handles_total = 0,
+    .max_cached_handles_per_key = 0,
+});
+struct KpathDemoState {
+    KpathDemoState() = default;
+    KpathDemoState(const KpathDemoState&) = delete;
+    KpathDemoState& operator=(const KpathDemoState&) = delete;
+    KpathDemoState(KpathDemoState&&) = default;
+    KpathDemoState& operator=(KpathDemoState&&) = default;
+    nk::ArmatureProgram program;
+    nk::ArmatureProgram base_program;
+    nk::ArmatureProgram stats_program;
+    nk::MachineControlConfig machine;
+    nk::GaussianToolParams tool;
+    nk::ProgramRasterTransform xform;
+    nk::TensorCanvas2D energy;
+    nk::TensorCanvas2D heat_energy;
+    nk::TensorCanvas2D temp;
+    nk::TensorCanvas2D stats_energy;
+    nk::TensorCanvas2D stats_temp;
+    nt::AbstractTensorPool::PooledTensor film_rgb;
+    nt::AbstractTensorPool::PooledTensor film_exposures;
+    nt::AbstractTensorPool::PooledTensor film_exposures_scratch;
+    nk::FilmTensor film_tensor;
+    std::vector<nk::FilmHistogramDescriptor> film_histograms;
+    nt::AbstractTensorPool::PooledTensor flip;
+    nt::AbstractTensor temp_state;
+    nt::AbstractTensorPool::PooledTensor kernel_bank;
+    nt::AbstractTensorPool::PooledTensor kernel_ids;
+    nt::AbstractTensorPool::PooledTensor temp_kernel_ids;
+    nt::AbstractTensorPool::PooledTensor diffusion_kernel;
+    nt::TensorBackend* backend = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool ready = false;
+    bool use_scatter = false;
+    double avg_raster_ms = 0.0;
+    uint32_t avg_count = 0;
+    float phase = 0.0f;
+    float phase_step = 0.05f;
+    nk::Shaper shaper;
+    bool shaper_ready = false;
+    float radial_offset = -12.0f;
+    float heat_decay_scale = 1.0f;
+    float energy_scale = 1.0f;
+    float exposure_gain = 2.5f;
+    float film_decay = 0.94f;
+    float heat_intensity = 1.0f;
+    float heat_min_kelvin = 800.0f;
+    float heat_max_kelvin = 6500.0f;
+    bool normalize_energy = true;
+    bool normalize_heat = true;
+    struct CachedGlyphProgram {
+        uint64_t outline_hash = 0;
+        nk::GlyphOutline outline;
+        nk::ArmatureProgram outline_program;
+        nk::ArmatureProgram fill_program;
+    };
+    std::unordered_map<uint32_t, CachedGlyphProgram> glyph_cache;
+    struct TimingProfile {
+        double geom_ms = 0.0;
+        double xform_ms = 0.0;
+        double raster_ms = 0.0;
+        double scatter_ms = 0.0;
+        double scatter_plan_ms = 0.0;
+        double scatter_clear_ms = 0.0;
+        double scatter_map_ms = 0.0;
+        double scatter_deposit_ms = 0.0;
+        double scatter_temp_state_accum_ms = 0.0;
+        double scatter_diffusion_prep_ms = 0.0;
+        double scatter_diffusion_iter_ms = 0.0;
+        double scatter_diffusion_copyback_ms = 0.0;
+        double scatter_temp_state_writeback_ms = 0.0;
+        double scatter_total_ms = 0.0;
+
+        uint64_t scatter_program_points = 0;
+        uint64_t scatter_plan_moments = 0;
+        uint64_t scatter_unique_sites = 0;
+        uint64_t scatter_site_activations = 0;
+        uint64_t scatter_pixels_touched = 0;
+        double stats_build_ms = 0.0;
+        double stats_raster_ms = 0.0;
+        double film_ms = 0.0;
+        double film_map_ms = 0.0;
+        double film_norm_energy_ms = 0.0;
+        double film_norm_heat_ms = 0.0;
+        double film_build_ms = 0.0;
+        double film_scatter_ms = 0.0;
+        double film_reduce_ms = 0.0;
+        double film_pixel_ms = 0.0;
+        double film_unmap_ms = 0.0;
+        double film_total_ms = 0.0;
+        double copy_ms = 0.0;
+        double total_ms = 0.0;
+    } timing;
+};
+
 struct FrontendResources {
     SDL_Window* window = nullptr;
     SDL_GLContext gl_context = nullptr;
@@ -93,6 +226,9 @@ struct FrontendResources {
     CanvasCollectionState collection_state{};
     int canvas_width_hint = kDefaultCanvasWidth;
     int canvas_height_hint = kDefaultCanvasHeight;
+    bool kpath_mode = false;
+    KpathDemoState kpath_demo{};
+    std::vector<uint8_t> kpath_pixels;
     // layout info updated on window resize and used for rendering/input translation
     struct FrontendLayout {
         int window_w = 0;
@@ -130,6 +266,718 @@ struct DisplayState {
     std::atomic<int64_t> ticks_since_display{0};
     std::atomic<double> last_display_time{0.0};
 };
+
+static std::string make_spiral_relgeo_ir(float phase, float radial_offset) {
+    std::ostringstream ss;
+    ss.setf(std::ios::fixed);
+    ss.precision(6);
+    ss << "center = pt(0, 0);\n";
+    ss << "pi_v = pi();\n";
+    ss << "tau_v = mul(pi_v, 2.0);\n";
+    ss << "radians_v = mul(tau_v, 5.0);\n";
+    ss << "phase_v = " << phase << ";\n";
+    ss << "radial_offset_v = " << radial_offset << ";\n";
+    ss << "outer_radius = 220.0;\n";
+    ss << "inner_radius = add(outer_radius, radial_offset_v);\n";
+    ss << "phase_out_end = add(phase_v, radians_v);\n";
+    ss << "path = path_begin();\n";
+    ss << "path_spiral(path, center, outer_radius, radians_v, 720, phase_v, \"ccw\");\n";
+    ss << "path_radial(path, center, outer_radius, inner_radius, phase_out_end, 32);\n";
+    ss << "path_spiral(path, center, mul(inner_radius, -1.0), radians_v, 720, phase_out_end, \"cw\");\n";
+    ss << "path_end(path, \"closed\", \"ccw\");\n";
+    return ss.str();
+}
+
+static uint64_t hash_outline(const nk::GlyphOutline& outline) {
+    uint64_t h = 14695981039346656037ull;
+    auto mix = [&](const void* data, size_t len) {
+        const uint8_t* b = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < len; ++i) {
+            h ^= static_cast<uint64_t>(b[i]);
+            h *= 1099511628211ull;
+        }
+    };
+    mix(&outline.glyph_id, sizeof(outline.glyph_id));
+    for (const auto& seg : outline.segments) {
+        mix(&seg.op, sizeof(seg.op));
+        mix(&seg.x1, sizeof(seg.x1));
+        mix(&seg.y1, sizeof(seg.y1));
+        mix(&seg.x2, sizeof(seg.x2));
+        mix(&seg.y2, sizeof(seg.y2));
+        mix(&seg.x3, sizeof(seg.x3));
+        mix(&seg.y3, sizeof(seg.y3));
+    }
+    return h;
+}
+
+static void append_moveto_after_geometry(nk::ArmatureProgram& program, float safe_z) {
+    if (program.points.empty()) return;
+    const nk::ToolPoint& last = program.points.back();
+    nk::ToolPoint move{};
+    move.x = last.x;
+    move.y = last.y;
+    move.z = safe_z;
+    move.engaged = false;
+    program.points.push_back(move);
+}
+
+static std::string resolve_font_path() {
+    if (const char* env = std::getenv("KPATH_TEST_FONT")) {
+        std::filesystem::path p(env);
+        if (std::filesystem::exists(p)) return p.string();
+    }
+#if defined(_WIN32)
+    const std::vector<std::filesystem::path> candidates = {
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/DejaVuSans.ttf",
+        "C:/Windows/Fonts/seguisb.ttf"
+    };
+    for (const auto& c : candidates) if (std::filesystem::exists(c)) return c.string();
+#endif
+    return {};
+}
+
+static bool build_cached_program_from_outline(uint32_t glyph_id,
+                                              const nk::GlyphOutline& outline,
+                                              const nk::FillPlanConfig& fill_cfg,
+                                              std::unordered_map<uint32_t, KpathDemoState::CachedGlyphProgram>& cache,
+                                              nk::ArmatureProgram& out_program) {
+    const uint64_t h = hash_outline(outline);
+    auto& entry = cache[glyph_id];
+    if (entry.outline_hash != h) {
+        entry.outline_hash = h;
+        entry.outline = outline;
+        entry.outline_program.points.clear();
+        entry.fill_program.points.clear();
+        nk::append_glyph_outline_to_program(entry.outline_program, outline, 0.0f, 0.0f, 0.0f, 24);
+        (void)nk::plan_fill_for_glyph_outline(outline, entry.fill_program, fill_cfg);
+    }
+    out_program.points.clear();
+    out_program.points.reserve(entry.outline_program.points.size() + entry.fill_program.points.size());
+    out_program.points.insert(out_program.points.end(),
+                              entry.outline_program.points.begin(),
+                              entry.outline_program.points.end());
+    out_program.points.insert(out_program.points.end(),
+                              entry.fill_program.points.begin(),
+                              entry.fill_program.points.end());
+    return !out_program.points.empty();
+}
+
+struct Mat4 {
+    // Row-major 4x4 matrix.
+    float m[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+};
+
+struct Quat {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 1.0f;
+};
+
+static Mat4 mat4_identity() {
+    return Mat4{};
+}
+
+static Mat4 mat4_from_quat_translation_scale(const Quat& q, float tx, float ty, float tz, float sx, float sy, float sz) {
+    const float xx = q.x * q.x;
+    const float yy = q.y * q.y;
+    const float zz = q.z * q.z;
+    const float xy = q.x * q.y;
+    const float xz = q.x * q.z;
+    const float yz = q.y * q.z;
+    const float wx = q.w * q.x;
+    const float wy = q.w * q.y;
+    const float wz = q.w * q.z;
+
+    Mat4 out;
+    // Row-major rotation (right-handed).
+    out.m[0] = (1.0f - 2.0f * (yy + zz)) * sx;
+    out.m[1] = (2.0f * (xy + wz)) * sx;
+    out.m[2] = (2.0f * (xz - wy)) * sx;
+    out.m[3] = tx;
+
+    out.m[4] = (2.0f * (xy - wz)) * sy;
+    out.m[5] = (1.0f - 2.0f * (xx + zz)) * sy;
+    out.m[6] = (2.0f * (yz + wx)) * sy;
+    out.m[7] = ty;
+
+    out.m[8] = (2.0f * (xz + wy)) * sz;
+    out.m[9] = (2.0f * (yz - wx)) * sz;
+    out.m[10] = (1.0f - 2.0f * (xx + yy)) * sz;
+    out.m[11] = tz;
+
+    out.m[12] = 0.0f;
+    out.m[13] = 0.0f;
+    out.m[14] = 0.0f;
+    out.m[15] = 1.0f;
+    return out;
+}
+
+static nk::ArmatureProgram transform_program(const nk::ArmatureProgram& src, const Mat4& mat) {
+    nk::ArmatureProgram out;
+    out.points.reserve(src.points.size());
+    for (const auto& p : src.points) {
+        nk::ToolPoint q = p;
+        const float x = p.x;
+        const float y = p.y;
+        const float z = p.z;
+        const float nx = mat.m[0] * x + mat.m[1] * y + mat.m[2] * z + mat.m[3];
+        const float ny = mat.m[4] * x + mat.m[5] * y + mat.m[6] * z + mat.m[7];
+        const float nz = mat.m[8] * x + mat.m[9] * y + mat.m[10] * z + mat.m[11];
+        q.x = nx;
+        q.y = ny;
+        q.z = nz;
+        out.points.push_back(q);
+    }
+    return out;
+}
+
+static void reset_kpath_demo(KpathDemoState& state) {
+    state.program.points.clear();
+    state.base_program.points.clear();
+    state.stats_program.points.clear();
+    state.energy = nk::TensorCanvas2D{};
+    state.heat_energy = nk::TensorCanvas2D{};
+    state.temp = nk::TensorCanvas2D{};
+    state.stats_energy = nk::TensorCanvas2D{};
+    state.stats_temp = nk::TensorCanvas2D{};
+    state.film_rgb = nt::AbstractTensorPool::PooledTensor{};
+    state.film_exposures = nt::AbstractTensorPool::PooledTensor{};
+    state.film_exposures_scratch = nt::AbstractTensorPool::PooledTensor{};
+    state.flip = nt::AbstractTensorPool::PooledTensor{};
+    state.temp_state = nt::AbstractTensor{};
+    state.kernel_bank = nt::AbstractTensorPool::PooledTensor{};
+    state.kernel_ids = nt::AbstractTensorPool::PooledTensor{};
+    state.temp_kernel_ids = nt::AbstractTensorPool::PooledTensor{};
+    state.diffusion_kernel = nt::AbstractTensorPool::PooledTensor{};
+    state.backend = nullptr;
+    state.width = 0;
+    state.height = 0;
+    state.ready = false;
+    state.use_scatter = false;
+    state.avg_raster_ms = 0.0;
+    state.avg_count = 0;
+    state.phase = 0.0f;
+    state.phase_step = 0.05f;
+    state.timing = {};
+    state.glyph_cache.clear();
+}
+
+static bool build_atlas_text_program(nk::Shaper& shaper,
+                                     const std::vector<std::string>& lines,
+                                     float start_x,
+                                     float start_y,
+                                     float line_height,
+                                     nk::ArmatureProgram& out_program) {
+    nk::AtlasBuilder builder;
+    struct LinePlan {
+        nk::TokenLayoutPlan plan;
+        float x = 0.0f;
+        float y = 0.0f;
+    };
+    std::vector<LinePlan> plans;
+    plans.reserve(lines.size());
+
+    float y = start_y;
+    for (const auto& line : lines) {
+        if (line.empty()) {
+            y -= line_height;
+            continue;
+        }
+        nk::CodepointSequence seq = nk::codepoints_from_utf8(line);
+        nk::TokenLayoutPlan plan;
+        if (!nk::build_token_from_sequence(builder, shaper, seq, plan)) {
+            y -= line_height;
+            continue;
+        }
+        plans.push_back(LinePlan{std::move(plan), start_x, y});
+        y -= line_height;
+    }
+
+    if (plans.empty()) return false;
+
+    nk::Atlas atlas = builder.finalize();
+    out_program.points.clear();
+
+    for (const auto& line : plans) {
+        float pen_x = line.x;
+        float pen_y = line.y;
+        for (const auto& edge_id : line.plan.edges) {
+            const nk::AtlasEdge& edge = atlas.edge(edge_id);
+            const nk::NodeMetadata* meta = atlas.node_metadata(edge.dst);
+            if (meta) {
+                nk::append_glyph_outline_to_program(out_program,
+                                                    meta->outline,
+                                                    pen_x + edge.offset_x,
+                                                    pen_y + edge.offset_y,
+                                                    0.0f,
+                                                    12);
+            }
+            pen_x += edge.advance_x;
+            pen_y += edge.advance_y;
+        }
+    }
+
+    return !out_program.points.empty();
+}
+
+static void add_canvas_inplace(nk::TensorCanvas2D& dst, const nk::TensorCanvas2D& src, float scale) {
+    if (dst.width != src.width || dst.height != src.height) return;
+    const size_t count = static_cast<size_t>(dst.width) * dst.height;
+    for (size_t i = 0; i < count; ++i) {
+        dst.values[i] += src.values[i] * scale;
+    }
+}
+
+static bool build_spiral_program_from_relgeo(float phase,
+                                             float radial_offset,
+                                             std::unordered_map<uint32_t, KpathDemoState::CachedGlyphProgram>& cache,
+                                             nk::ArmatureProgram& out_program) {
+    const std::string ir = make_spiral_relgeo_ir(phase, radial_offset);
+    nk::RelProgram rel;
+    std::string err;
+    if (!nk::relgeo_program_from_ir(ir, rel, &err)) {
+        std::cerr << "RelGeo parse failed: " << err << "\n";
+        return false;
+    }
+    nk::RelGlyph glyph;
+    glyph.glyph_id = 1;
+    glyph.program = std::move(rel);
+    nk::GlyphOutline outline;
+    if (!nk::compile_relglyph_outline(glyph, outline, 0.0f, 0.0f, 1.0f, &err)) {
+        std::cerr << "RelGeo compile failed: " << err << "\n";
+        return false;
+    }
+    nk::FillPlanConfig fill_cfg;
+    fill_cfg.tool.tool_width = 6.0f;
+    // Lower overlap to reduce redundant re-writing of the same areas.
+    // High overlap is useful for quality/coverage, but it explodes path length.
+    fill_cfg.tool.overlap = 0.25f;
+    fill_cfg.tool.angle_degrees = 0.0f;
+    return build_cached_program_from_outline(glyph.glyph_id, outline, fill_cfg, cache, out_program);
+}
+
+static bool initialize_kpath_demo(KpathDemoState& state, uint32_t width, uint32_t height) {
+    reset_kpath_demo(state);
+    state.width = std::max<uint32_t>(1, width);
+    state.height = std::max<uint32_t>(1, height);
+
+    nt::register_in_memory_backend(true);
+    auto& backend_singleton = nt::in_memory_backend_singleton();
+    state.backend = backend_singleton.name() ? static_cast<nt::TensorBackend*>(&backend_singleton) : nullptr;
+    if (!state.backend) {
+        std::cerr << "Kpath demo: in-memory backend unavailable\n";
+        return false;
+    }
+
+    if (!build_spiral_program_from_relgeo(0.0f, state.radial_offset, state.glyph_cache, state.base_program)) {
+        std::cerr << "Failed to build initial kpath RelGeo program\n";
+        return false;
+    }
+    state.machine.step_px = 0.75f;
+    state.machine.energy_per_px = 1.0f;
+    state.machine.enable_thermal_guard = false;
+    state.tool.sigma_px = 1.1f;
+
+    state.xform = nk::plan_program_raster_transform_refined(state.base_program,
+                                                            state.machine,
+                                                            1.0f,
+                                                            8.0f,
+                                                            state.tool);
+    state.xform.width_px = state.width;
+    state.xform.height_px = state.height;
+    state.xform.scale = 1.0f;
+    state.xform.shift_x = static_cast<float>(state.width) * 0.5f;
+    state.xform.shift_y = static_cast<float>(state.height) * 0.5f;
+
+    state.energy.resize(state.width, state.height, 0.0f);
+    state.heat_energy.resize(state.width, state.height, 0.0f);
+    state.temp.resize(state.width, state.height, 0.0f);
+    state.stats_energy.resize(state.width, state.height, 0.0f);
+    state.stats_temp.resize(state.width, state.height, 0.0f);
+    {
+        state.film_histograms = default_film_histograms();
+        if (!state.film_tensor.configure(state.width, state.height, state.film_histograms)) {
+            std::cerr << "Kpath demo: failed to configure film histograms\n";
+            return false;
+        }
+
+        nt::TensorDesc exposures_desc{};
+        exposures_desc.dtype = nt::TensorDType::F32;
+        exposures_desc.layout = nt::TensorLayout::Dense;
+        exposures_desc.shape.dims = {state.height,
+                                     state.width,
+                                     state.film_tensor.total_channels()};
+        state.film_exposures = g_demo_tensor_pool.acquire(exposures_desc, state.backend);
+        state.film_exposures_scratch = g_demo_tensor_pool.acquire(exposures_desc, state.backend);
+        if (!state.film_exposures.valid()) {
+            std::cerr << "Kpath demo: failed to allocate film exposure tensor\n";
+            return false;
+        }
+        if (!state.film_exposures_scratch.valid()) {
+            std::cerr << "Kpath demo: failed to allocate film exposure scratch tensor\n";
+            return false;
+        }
+
+        nt::TensorDesc agg_desc{};
+        agg_desc.dtype = nt::TensorDType::F32;
+        agg_desc.layout = nt::TensorLayout::Dense;
+        agg_desc.shape.dims = {state.height,
+                               state.width,
+                               state.film_tensor.histogram_count()};
+        state.film_rgb = g_demo_tensor_pool.acquire(agg_desc, state.backend);
+        if (!state.film_rgb.valid()) {
+            std::cerr << "Kpath demo: failed to allocate film accumulator tensor\n";
+            return false;
+        }
+    }
+
+    nk::ProgramScatterPlan scatter_plan;
+    if (!nk::plan_program_scatter(state.base_program, state.machine, state.xform, &scatter_plan, true, true, state.backend)) {
+        std::cerr << "Kpath demo: failed to plan scatter\n";
+        return false;
+    }
+    nt::AbstractTensor dense_points = nk::coo_points_to_dense_f32(scatter_plan.points, state.backend);
+    if (!dense_points.valid()) {
+        std::cerr << "Kpath demo: failed to materialize scatter points\n";
+        return false;
+    }
+
+    const uint32_t head_count = 4;
+    const std::array<float, 4> kernel_weights = {1.0f, 0.85f, 0.7f, 0.55f};
+    state.kernel_bank = nk::make_kernel_bank(g_demo_tensor_pool, state.backend, kernel_weights);
+    state.kernel_ids = nk::make_kernel_ids_for_heads(g_demo_tensor_pool, dense_points, state.width, state.height, head_count, state.backend);
+    state.temp_kernel_ids = nk::make_kernel_ids_for_heads(g_demo_tensor_pool, dense_points, state.width, state.height, head_count, state.backend);
+    state.diffusion_kernel = nk::make_laplacian_kernel(g_demo_tensor_pool, state.backend);
+    state.flip = nk::make_flip_tensor(g_demo_tensor_pool, state.backend, state.width, state.height);
+
+    if (const std::string font_path = resolve_font_path(); !font_path.empty()) {
+        state.shaper_ready = state.shaper.load_font(font_path, 16.0f);
+        if (!state.shaper_ready) {
+            std::cerr << "Kpath demo: failed to load font at " << font_path << "\n";
+        }
+    } else {
+        std::cerr << "Kpath demo: no font found for stats overlay\n";
+    }
+
+    state.ready = state.kernel_bank.valid() && state.kernel_ids.valid() && state.diffusion_kernel.valid() && state.flip.valid();
+    return state.ready;
+}
+
+static bool render_kpath_demo_frame(KpathDemoState& state, std::vector<uint8_t>& rgba_out) {
+    if (!state.ready || !state.backend) return false;
+
+    const auto frame_start = std::chrono::high_resolution_clock::now();
+    state.phase += state.phase_step;
+    const auto t_geom_start = std::chrono::high_resolution_clock::now();
+    const float ang = state.phase;
+    const float half = 0.5f * ang;
+    Quat qz{};
+    qz.z = std::sin(half);
+    qz.w = std::cos(half);
+    Mat4 transform = mat4_from_quat_translation_scale(qz, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+    state.program = transform_program(state.base_program, transform);
+    append_moveto_after_geometry(state.program, state.machine.safe_z);
+    const auto t_geom_end = std::chrono::high_resolution_clock::now();
+
+    nk::ThermalSimConfig heat_cfg = nk::thermal_sim_from_preset(nk::ThermalMaterialPreset::SteelThin);
+    heat_cfg.decay = std::clamp(heat_cfg.decay * state.heat_decay_scale, 0.0f, 0.999f);
+    nk::MachineControlConfig machine = state.machine;
+    machine.energy_per_px = state.machine.energy_per_px * state.energy_scale;
+    machine.energy_to_temp = heat_cfg.heat_gain;
+    nk::BeamToolParams gaussian_tool{};
+    gaussian_tool.falloff = nk::BeamFalloffKind::Gaussian;
+    gaussian_tool.sigma_px = state.tool.sigma_px;
+    nk::BeamToolParams airy_tool{};
+    airy_tool.falloff = nk::BeamFalloffKind::Airy;
+
+    const auto t_xform_start = std::chrono::high_resolution_clock::now();
+    state.xform = nk::plan_program_raster_transform_refined(state.program,
+                                                            machine,
+                                                            1.0f,
+                                                            8.0f,
+                                                            state.tool);
+    state.xform.width_px = state.width;
+    state.xform.height_px = state.height;
+    state.xform.scale = 1.0f;
+    state.xform.shift_x = static_cast<float>(state.width) * 0.5f;
+    state.xform.shift_y = static_cast<float>(state.height) * 0.5f;
+    const auto t_xform_end = std::chrono::high_resolution_clock::now();
+    state.timing.geom_ms = std::chrono::duration<double, std::milli>(t_geom_end - t_geom_start).count();
+    state.timing.xform_ms = std::chrono::duration<double, std::milli>(t_xform_end - t_xform_start).count();
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    nk::ScatterTimingBreakdown scatter_breakdown;
+    if (!state.use_scatter) {
+        const auto t_raster_start = std::chrono::high_resolution_clock::now();
+        nk::rasterize_program_with_kernel_transformed(state.program,
+                                                      state.energy,
+                                                      state.temp,
+                                                      machine,
+                                                      gaussian_tool,
+                                                      state.xform);
+        const auto t_raster_end = std::chrono::high_resolution_clock::now();
+        const auto t_scatter_start = std::chrono::high_resolution_clock::now();
+        if (!nk::rasterize_program_scatter_with_spatial_kernel(state.program,
+                                                               state.heat_energy,
+                                                               state.temp,
+                                                               machine,
+                                                               state.xform,
+                                                               airy_tool,
+                                                               &state.diffusion_kernel.tensor(),
+                                                               heat_cfg,
+                                                               &state.temp_state,
+                                                               state.backend,
+                                                               &scatter_breakdown)) {
+            std::cerr << "Kpath demo: scatter rasterization failed (scatter-only=0, w="
+                      << state.width << ", h=" << state.height << ")\n";
+            return false;
+        }
+        const auto t_scatter_end = std::chrono::high_resolution_clock::now();
+        state.timing.raster_ms = std::chrono::duration<double, std::milli>(t_raster_end - t_raster_start).count();
+        state.timing.scatter_ms = std::chrono::duration<double, std::milli>(t_scatter_end - t_scatter_start).count();
+    } else {
+        const auto t_scatter_start = std::chrono::high_resolution_clock::now();
+        if (!nk::rasterize_program_scatter_with_spatial_kernel(state.program,
+                                                               state.energy,
+                                                               state.temp,
+                                                               machine,
+                                                               state.xform,
+                                                               airy_tool,
+                                                               &state.diffusion_kernel.tensor(),
+                                                               heat_cfg,
+                                                               &state.temp_state,
+                                                               state.backend,
+                                                               &scatter_breakdown)) {
+            std::cerr << "Kpath demo: scatter rasterization failed (scatter-only=1, w="
+                      << state.width << ", h=" << state.height << ")\n";
+            return false;
+        }
+        const auto t_scatter_end = std::chrono::high_resolution_clock::now();
+        state.timing.raster_ms = 0.0;
+        state.timing.scatter_ms = std::chrono::duration<double, std::milli>(t_scatter_end - t_scatter_start).count();
+    }
+
+    state.timing.scatter_plan_ms = scatter_breakdown.plan_ms;
+    state.timing.scatter_clear_ms = scatter_breakdown.clear_ms;
+    state.timing.scatter_map_ms = scatter_breakdown.map_ms;
+    state.timing.scatter_deposit_ms = scatter_breakdown.deposit_ms;
+    state.timing.scatter_temp_state_accum_ms = scatter_breakdown.temp_state_accum_ms;
+    state.timing.scatter_diffusion_prep_ms = scatter_breakdown.diffusion_prep_ms;
+    state.timing.scatter_diffusion_iter_ms = scatter_breakdown.diffusion_iter_ms;
+    state.timing.scatter_diffusion_copyback_ms = scatter_breakdown.diffusion_copyback_ms;
+    state.timing.scatter_temp_state_writeback_ms = scatter_breakdown.temp_state_writeback_ms;
+    state.timing.scatter_total_ms = scatter_breakdown.total_ms;
+
+    state.timing.scatter_program_points = scatter_breakdown.program_points;
+    state.timing.scatter_plan_moments = scatter_breakdown.plan_moments;
+    state.timing.scatter_unique_sites = scatter_breakdown.unique_sites;
+    state.timing.scatter_site_activations = scatter_breakdown.site_activations;
+    state.timing.scatter_pixels_touched = scatter_breakdown.pixels_touched;
+
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    state.avg_raster_ms = (state.avg_raster_ms * state.avg_count + ms) / static_cast<double>(state.avg_count + 1);
+    state.avg_count = std::min<uint32_t>(state.avg_count + 1, 120u);
+
+    const auto t_stats_build_start = std::chrono::high_resolution_clock::now();
+    if (state.shaper_ready) {
+        const float origin_x = -static_cast<float>(state.width) * 0.5f + 18.0f;
+        const float origin_y = static_cast<float>(state.height) * 0.5f - 24.0f;
+        const float line_height = 18.0f;
+        char line_buf[128];
+        std::vector<std::string> lines;
+        lines.reserve(28);
+        std::snprintf(line_buf, sizeof(line_buf), "kpath bench");
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "geom: %.2f ms", state.timing.geom_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "xform: %.2f ms", state.timing.xform_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "raster: %.2f ms", state.timing.raster_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "scatter: %.2f ms", state.timing.scatter_ms);
+        lines.emplace_back(line_buf);
+          std::snprintf(line_buf, sizeof(line_buf), "  prog points: %llu", static_cast<unsigned long long>(state.timing.scatter_program_points));
+          lines.emplace_back(line_buf);
+          std::snprintf(line_buf, sizeof(line_buf), "  plan moments: %llu", static_cast<unsigned long long>(state.timing.scatter_plan_moments));
+          lines.emplace_back(line_buf);
+          std::snprintf(line_buf, sizeof(line_buf), "  unique sites: %llu", static_cast<unsigned long long>(state.timing.scatter_unique_sites));
+          lines.emplace_back(line_buf);
+          std::snprintf(line_buf, sizeof(line_buf), "  site activations: %llu", static_cast<unsigned long long>(state.timing.scatter_site_activations));
+          lines.emplace_back(line_buf);
+          std::snprintf(line_buf, sizeof(line_buf), "  pixels touched: %llu", static_cast<unsigned long long>(state.timing.scatter_pixels_touched));
+          lines.emplace_back(line_buf);
+          const double eff_kernel = (state.timing.scatter_site_activations > 0)
+                                                  ? (static_cast<double>(state.timing.scatter_pixels_touched) /
+                                                      static_cast<double>(state.timing.scatter_site_activations))
+                                                  : 0.0;
+          const double eff_sites = (state.timing.scatter_plan_moments > 0)
+                                                 ? (static_cast<double>(state.timing.scatter_unique_sites) /
+                                                     static_cast<double>(state.timing.scatter_plan_moments))
+                                                 : 0.0;
+          const double avg_footprint = (state.timing.scatter_plan_moments > 0)
+                                                      ? (static_cast<double>(state.timing.scatter_site_activations) /
+                                                          static_cast<double>(state.timing.scatter_plan_moments))
+                                                      : 0.0;
+          std::snprintf(line_buf, sizeof(line_buf), "  eff(kernel): %.6f", eff_kernel);
+          lines.emplace_back(line_buf);
+          std::snprintf(line_buf, sizeof(line_buf), "  eff(sites): %.6f", eff_sites);
+          lines.emplace_back(line_buf);
+          std::snprintf(line_buf, sizeof(line_buf), "  avg footprint px/moment: %.3f", avg_footprint);
+          lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  plan: %.2f ms", state.timing.scatter_plan_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  clear: %.2f ms", state.timing.scatter_clear_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  map: %.2f ms", state.timing.scatter_map_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  deposit: %.2f ms", state.timing.scatter_deposit_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  decay/state: %.2f ms", state.timing.scatter_temp_state_accum_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  diffusion prep: %.2f ms", state.timing.scatter_diffusion_prep_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  diffusion iters: %.2f ms", state.timing.scatter_diffusion_iter_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  diffusion copy: %.2f ms", state.timing.scatter_diffusion_copyback_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  temp writeback: %.2f ms", state.timing.scatter_temp_state_writeback_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "stats_build: %.2f ms", state.timing.stats_build_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "stats_raster: %.2f ms", state.timing.stats_raster_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "film: %.2f ms", state.timing.film_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  map: %.2f ms", state.timing.film_map_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  norm energy: %.2f ms", state.timing.film_norm_energy_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  norm heat: %.2f ms", state.timing.film_norm_heat_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  build: %.2f ms", state.timing.film_build_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  scatter: %.2f ms", state.timing.film_scatter_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  reduce: %.2f ms", state.timing.film_reduce_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  pixels: %.2f ms", state.timing.film_pixel_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "  unmap: %.2f ms", state.timing.film_unmap_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "copy: %.2f ms", state.timing.copy_ms);
+        lines.emplace_back(line_buf);
+        std::snprintf(line_buf, sizeof(line_buf), "total: %.2f ms", state.timing.total_ms);
+        lines.emplace_back(line_buf);
+        (void)build_atlas_text_program(state.shaper,
+                                       lines,
+                                       origin_x,
+                                       origin_y,
+                                       line_height,
+                                       state.stats_program);
+    }
+    const auto t_stats_build_end = std::chrono::high_resolution_clock::now();
+    const auto t_stats_raster_start = std::chrono::high_resolution_clock::now();
+    if (state.shaper_ready && !state.stats_program.points.empty()) {
+        nk::MachineControlConfig text_machine = state.machine;
+        text_machine.step_px = 1.0f;
+        nk::BeamToolParams text_tool = gaussian_tool;
+        text_tool.sigma_px = 0.9f;
+        nk::rasterize_program_with_kernel_transformed(state.stats_program,
+                                                      state.stats_energy,
+                                                      state.stats_temp,
+                                                      text_machine,
+                                                      text_tool,
+                                                      state.xform);
+        add_canvas_inplace(state.energy, state.stats_energy, 0.65f);
+    }
+    const auto t_stats_raster_end = std::chrono::high_resolution_clock::now();
+
+    const nk::BeamHistogram beam_hist{};
+    nk::BlackbodyResponseConfig heat_response{};
+    heat_response.min_kelvin = state.heat_min_kelvin;
+    heat_response.max_kelvin = state.heat_max_kelvin;
+    heat_response.intensity = state.heat_intensity;
+    const auto t_film_start = std::chrono::high_resolution_clock::now();
+    nk::FilmTimingBreakdown film_breakdown;
+    if (!nk::fill_flip_rgba_dual_tensor(state.energy,
+                                        state.temp,
+                                        state.film_tensor,
+                                        state.film_exposures,
+                                        state.film_exposures_scratch,
+                                        state.film_rgb.tensor(),
+                                        state.flip.tensor(),
+                                        state.exposure_gain,
+                                        state.film_decay,
+                                        beam_hist,
+                                        heat_response,
+                                        state.normalize_energy,
+                                        state.normalize_heat,
+                                        1.0f,
+                                        1.0f,
+                                        &film_breakdown)) {
+        std::cerr << "Kpath demo: film composite failed (w=" << state.width
+                  << ", h=" << state.height << ")\n";
+        return false;
+    }
+    const auto t_film_end = std::chrono::high_resolution_clock::now();
+    state.timing.film_map_ms = film_breakdown.map_ms;
+    state.timing.film_norm_energy_ms = film_breakdown.normalize_energy_ms;
+    state.timing.film_norm_heat_ms = film_breakdown.normalize_heat_ms;
+    state.timing.film_build_ms = film_breakdown.build_ms;
+    state.timing.film_scatter_ms = film_breakdown.scatter_ms;
+    state.timing.film_reduce_ms = film_breakdown.reduce_ms;
+    state.timing.film_pixel_ms = film_breakdown.pixel_loop_ms;
+    state.timing.film_unmap_ms = film_breakdown.unmap_ms;
+    state.timing.film_total_ms = film_breakdown.total_ms;
+
+    auto* mem = dynamic_cast<nt::InMemoryBackend*>(state.backend);
+    if (!mem) {
+        std::cerr << "Kpath demo: backend is not InMemoryBackend\n";
+        return false;
+    }
+    void* src_v = nullptr;
+    size_t src_bytes = 0;
+    if (!mem->map(state.flip->handle(), &src_v, &src_bytes)) {
+        const auto handle = state.flip->handle();
+        std::cerr << "Kpath demo: failed to map flip tensor (handle_id="
+                  << handle.id << ")\n";
+        return false;
+    }
+    const size_t expected = static_cast<size_t>(state.width) * static_cast<size_t>(state.height) * sizeof(uint32_t);
+    rgba_out.resize(expected);
+    const auto t_copy_start = std::chrono::high_resolution_clock::now();
+    std::memcpy(rgba_out.data(), src_v, expected);
+    const auto t_copy_end = std::chrono::high_resolution_clock::now();
+    mem->unmap(state.flip->handle());
+    const auto frame_end = std::chrono::high_resolution_clock::now();
+
+    state.timing.geom_ms = std::chrono::duration<double, std::milli>(t_geom_end - t_geom_start).count();
+    state.timing.xform_ms = std::chrono::duration<double, std::milli>(t_xform_end - t_xform_start).count();
+    state.timing.stats_build_ms = std::chrono::duration<double, std::milli>(t_stats_build_end - t_stats_build_start).count();
+    state.timing.stats_raster_ms = std::chrono::duration<double, std::milli>(t_stats_raster_end - t_stats_raster_start).count();
+    state.timing.film_ms = std::chrono::duration<double, std::milli>(t_film_end - t_film_start).count();
+    state.timing.copy_ms = std::chrono::duration<double, std::milli>(t_copy_end - t_copy_start).count();
+    state.timing.total_ms = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
+    return true;
+}
+
+static bool ensure_kpath_ready(FrontendResources& resources, uint32_t width, uint32_t height) {
+    if (resources.kpath_demo.ready &&
+        resources.kpath_demo.width == width &&
+        resources.kpath_demo.height == height) {
+        return true;
+    }
+    resources.kpath_pixels.clear();
+    return initialize_kpath_demo(resources.kpath_demo, width, height);
+}
 
 class CanvasTickController {
 public:
@@ -676,6 +1524,104 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP: {
             update_modifier_state(event.key, event.type == SDL_EVENT_KEY_DOWN);
+            // Ctrl+Shift+K toggles the kpath raster source.
+            if (event.type == SDL_EVENT_KEY_DOWN &&
+                event.key.scancode == SDL_SCANCODE_K &&
+                ctrl_down_ && shift_down_) {
+                if (!resources_.kpath_mode) {
+                    const uint32_t target_w = static_cast<uint32_t>(std::max(1, resources_.layout.canvas_w > 0 ? resources_.layout.canvas_w : resources_.canvas_width_hint));
+                    const uint32_t target_h = static_cast<uint32_t>(std::max(1, resources_.layout.canvas_h > 0 ? resources_.layout.canvas_h : resources_.canvas_height_hint));
+                    if (ensure_kpath_ready(resources_, target_w, target_h)) {
+                        resources_.kpath_mode = true;
+                        resources_.canvas_texture_width = static_cast<int>(target_w);
+                        resources_.canvas_texture_height = static_cast<int>(target_h);
+                        ensure_canvas_texture(resources_, static_cast<int>(target_w), static_cast<int>(target_h));
+                        refresh_layout_from_window();
+                        std::cout << "Kpath raster mode enabled (Ctrl+Shift+K toggles, Space toggles scatter)\n";
+                    } else {
+                        std::cerr << "Failed to initialize kpath raster mode\n";
+                    }
+                } else {
+                    resources_.kpath_mode = false;
+                    // Restore canvas texture sizing to the active canvas dimensions.
+                    auto& head = resources_.canvas_heads[resources_.active_canvas_index];
+                    resources_.canvas_texture_width = head.width;
+                    resources_.canvas_texture_height = head.height;
+                    refresh_layout_from_window();
+                    std::cout << "Kpath raster mode disabled; returning to canvas rendering\n";
+                }
+                return;
+            }
+            if (resources_.kpath_mode && event.type == SDL_EVENT_KEY_DOWN &&
+                event.key.scancode == SDL_SCANCODE_SPACE) {
+                resources_.kpath_demo.use_scatter = !resources_.kpath_demo.use_scatter;
+                std::cout << "Kpath raster scatter mode "
+                          << (resources_.kpath_demo.use_scatter ? "enabled" : "disabled") << "\n";
+                return;
+            }
+            if (resources_.kpath_mode && event.type == SDL_EVENT_KEY_DOWN) {
+                switch (event.key.scancode) {
+                    case SDL_SCANCODE_LEFTBRACKET:
+                        resources_.kpath_demo.heat_decay_scale = std::max(0.01f, resources_.kpath_demo.heat_decay_scale * 0.9f);
+                        std::cout << "Kpath heat decay scale: " << resources_.kpath_demo.heat_decay_scale << "\n";
+                        return;
+                    case SDL_SCANCODE_RIGHTBRACKET:
+                        resources_.kpath_demo.heat_decay_scale = std::min(10.0f, resources_.kpath_demo.heat_decay_scale * 1.1f);
+                        std::cout << "Kpath heat decay scale: " << resources_.kpath_demo.heat_decay_scale << "\n";
+                        return;
+                    case SDL_SCANCODE_MINUS:
+                        resources_.kpath_demo.energy_scale = std::max(0.01f, resources_.kpath_demo.energy_scale * 0.9f);
+                        std::cout << "Kpath energy scale: " << resources_.kpath_demo.energy_scale << "\n";
+                        return;
+                    case SDL_SCANCODE_EQUALS:
+                        resources_.kpath_demo.energy_scale = std::min(50.0f, resources_.kpath_demo.energy_scale * 1.1f);
+                        std::cout << "Kpath energy scale: " << resources_.kpath_demo.energy_scale << "\n";
+                        return;
+                    case SDL_SCANCODE_O:
+                        resources_.kpath_demo.exposure_gain = std::max(0.01f, resources_.kpath_demo.exposure_gain * 0.9f);
+                        std::cout << "Kpath exposure gain: " << resources_.kpath_demo.exposure_gain << "\n";
+                        return;
+                    case SDL_SCANCODE_P:
+                        resources_.kpath_demo.exposure_gain = std::min(20.0f, resources_.kpath_demo.exposure_gain * 1.1f);
+                        std::cout << "Kpath exposure gain: " << resources_.kpath_demo.exposure_gain << "\n";
+                        return;
+                    case SDL_SCANCODE_K:
+                        resources_.kpath_demo.film_decay = std::max(0.3f, resources_.kpath_demo.film_decay - 0.02f);
+                        std::cout << "Kpath film decay: " << resources_.kpath_demo.film_decay << "\n";
+                        return;
+                    case SDL_SCANCODE_L:
+                        resources_.kpath_demo.film_decay = std::min(0.99f, resources_.kpath_demo.film_decay + 0.02f);
+                        std::cout << "Kpath film decay: " << resources_.kpath_demo.film_decay << "\n";
+                        return;
+                    case SDL_SCANCODE_H:
+                        resources_.kpath_demo.heat_intensity = std::max(0.05f, resources_.kpath_demo.heat_intensity * 0.9f);
+                        std::cout << "Kpath heat intensity: " << resources_.kpath_demo.heat_intensity << "\n";
+                        return;
+                    case SDL_SCANCODE_J:
+                        resources_.kpath_demo.heat_intensity = std::min(10.0f, resources_.kpath_demo.heat_intensity * 1.1f);
+                        std::cout << "Kpath heat intensity: " << resources_.kpath_demo.heat_intensity << "\n";
+                        return;
+                    case SDL_SCANCODE_COMMA:
+                        resources_.kpath_demo.heat_max_kelvin = std::max(1500.0f, resources_.kpath_demo.heat_max_kelvin - 250.0f);
+                        std::cout << "Kpath heat max kelvin: " << resources_.kpath_demo.heat_max_kelvin << "\n";
+                        return;
+                    case SDL_SCANCODE_PERIOD:
+                        resources_.kpath_demo.heat_max_kelvin = std::min(12000.0f, resources_.kpath_demo.heat_max_kelvin + 250.0f);
+                        std::cout << "Kpath heat max kelvin: " << resources_.kpath_demo.heat_max_kelvin << "\n";
+                        return;
+                    case SDL_SCANCODE_N:
+                        resources_.kpath_demo.normalize_energy = !resources_.kpath_demo.normalize_energy;
+                        std::cout << "Kpath normalize energy: " << (resources_.kpath_demo.normalize_energy ? "on" : "off") << "\n";
+                        return;
+                    case SDL_SCANCODE_M:
+                        resources_.kpath_demo.normalize_heat = !resources_.kpath_demo.normalize_heat;
+                        std::cout << "Kpath normalize heat: " << (resources_.kpath_demo.normalize_heat ? "on" : "off") << "\n";
+                        return;
+                    default:
+                        break;
+                }
+            }
+            if (resources_.kpath_mode) break;
             if (handle_combo_key(event.key)) {
                 return;
             }
@@ -698,6 +1644,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
         }
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP: {
+            if (resources_.kpath_mode) break;
             if (!filters_.mouse_enabled) break;
             if (!should_forward_mouse_button(event.button)) break;
             auto* ctx = resources_.canvas_heads[resources_.active_canvas_index].context;
@@ -725,6 +1672,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
             break;
         }
         case SDL_EVENT_MOUSE_MOTION: {
+            if (resources_.kpath_mode) break;
             if (!filters_.mouse_enabled) break;
             auto* ctx = resources_.canvas_heads[resources_.active_canvas_index].context;
             if (!ctx) break;
@@ -752,6 +1700,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
             break;
         }
         case SDL_EVENT_MOUSE_WHEEL: {
+            if (resources_.kpath_mode) break;
             if (!filters_.mouse_enabled) break;
             auto* ctx = resources_.canvas_heads[resources_.active_canvas_index].context;
             if (!ctx) break;
@@ -852,12 +1801,14 @@ void InputDispatcher::on_window_resized(int window_w, int window_h) {
     layout.bottom_space = window_h - (layout.canvas_y + layout.canvas_h);
 
     // Update each canvas head and notify canvas contexts of new logical size
-    for (auto& head : resources_.canvas_heads) {
-        head.width = cw;
-        head.height = ch;
-        head.pixels.assign(static_cast<size_t>(std::max(1, cw)) * std::max(1, ch) * 4, 0u);
-        if (head.context) {
-            gp_canvas_set_size(head.context, cw, ch);
+    if (!resources_.kpath_mode) {
+        for (auto& head : resources_.canvas_heads) {
+            head.width = cw;
+            head.height = ch;
+            head.pixels.assign(static_cast<size_t>(std::max(1, cw)) * std::max(1, ch) * 4, 0u);
+            if (head.context) {
+                gp_canvas_set_size(head.context, cw, ch);
+            }
         }
     }
     // Ensure the SDL texture matches the chosen canvas size
@@ -1409,13 +2360,46 @@ void pump_events(bool& running, InputDispatcher& dispatcher) {
 
 void render_frame(FrontendResources& resources, CanvasTickController& controller) {
     if (!resources.renderer) return;
+    bool rendered_kpath = false;
+    if (resources.kpath_mode) {
+        const uint32_t target_w = static_cast<uint32_t>(std::max(1, resources.canvas_texture_width > 0 ? resources.canvas_texture_width : resources.canvas_width_hint));
+        const uint32_t target_h = static_cast<uint32_t>(std::max(1, resources.canvas_texture_height > 0 ? resources.canvas_texture_height : resources.canvas_height_hint));
+        const bool kpath_ready = ensure_kpath_ready(resources, target_w, target_h);
+        const bool texture_ready = kpath_ready &&
+            ensure_canvas_texture(resources, static_cast<int>(target_w), static_cast<int>(target_h));
+        const bool frame_ready = texture_ready &&
+            render_kpath_demo_frame(resources.kpath_demo, resources.kpath_pixels);
+        if (frame_ready) {
+            int pitch = static_cast<int>(target_w) * 4;
+            SDL_UpdateTexture(resources.canvas_texture, nullptr, resources.kpath_pixels.data(), pitch);
+            rendered_kpath = true;
+        } else {
+            if (!kpath_ready) {
+                std::cerr << "Kpath raster frame failed: ensure_kpath_ready returned false (w="
+                          << target_w << ", h=" << target_h << ")\n";
+            } else if (!texture_ready) {
+                std::cerr << "Kpath raster frame failed: ensure_canvas_texture returned false (w="
+                          << target_w << ", h=" << target_h << ")\n";
+            } else {
+                std::cerr << "Kpath raster frame failed: render_kpath_demo_frame returned false (w="
+                          << target_w << ", h=" << target_h << ")\n";
+            }
+            std::cerr << "Kpath raster frame failed; disabling kpath mode\n";
+            resources.kpath_mode = false;
+            auto& head = resources.canvas_heads[resources.active_canvas_index];
+            resources.canvas_texture_width = head.width;
+            resources.canvas_texture_height = head.height;
+        }
+    }
     auto now = std::chrono::steady_clock::now();
     double now_seconds = std::chrono::duration<double>(now.time_since_epoch()).count();
     size_t active_idx = resources.active_canvas_index;
-    bool should_update = controller.should_display(active_idx, now_seconds);
-    if (should_update) {
-        update_active_canvas_texture(resources);
-        controller.mark_displayed(active_idx, now_seconds);
+    if (!rendered_kpath) {
+        bool should_update = controller.should_display(active_idx, now_seconds);
+        if (should_update) {
+            update_active_canvas_texture(resources);
+            controller.mark_displayed(active_idx, now_seconds);
+        }
     }
 
     // Clear full window background
@@ -1574,12 +2558,16 @@ int main(int argc, char** argv) {
             dispatcher.update();
             tick_controller.record_render(kCanvasStepDt);
             render_frame(resources, tick_controller);
-            double gui_delay = tick_controller.gui_delay_seconds();
-            if (gui_delay > 0.0) {
-                Uint32 delay_ms = static_cast<Uint32>(std::max(0.0, gui_delay * 1000.0));
-                SDL_Delay(delay_ms);
-            } else {
+            if (resources.kpath_mode) {
                 SDL_Delay(0);
+            } else {
+                double gui_delay = tick_controller.gui_delay_seconds();
+                if (gui_delay > 0.0) {
+                    Uint32 delay_ms = static_cast<Uint32>(std::max(0.0, gui_delay * 1000.0));
+                    SDL_Delay(delay_ms);
+                } else {
+                    SDL_Delay(0);
+                }
             }
         }
         tick_controller.stop();

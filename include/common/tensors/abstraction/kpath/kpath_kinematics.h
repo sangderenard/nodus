@@ -3,6 +3,7 @@
 #include "kpath_ids.h"
 
 #include "common/tensors/abstraction/abstract_tensor.h"
+#include "common/tensors/abstraction/kpath/kpath_raster.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,23 @@ struct InertiaTensor {
 struct Pose final {
   Vec3 t{};
   Quat q{};
+};
+
+// Tool-local mount describing where a beam emitter sits relative to the tool frame.
+// The mount rotation orients the local_axis into tool space; local_axis defaults
+// to -Z to match BeamPoint's conventional dz = -1 direction.
+struct ToolMount final {
+  Vec3 offset{};
+  Quat rotation{};
+  Vec3 local_axis{0.0f, 0.0f, -1.0f};
+};
+
+// Beam aiming result: world-space beam plus derived gimbal angles (yaw/pitch).
+struct BeamAimSolution final {
+  BeamPoint beam{};
+  float yaw_rad = 0.0f;
+  float pitch_rad = 0.0f;
+  bool valid = false;
 };
 
 struct BeamTheory {
@@ -103,6 +121,9 @@ bool solve_armature_batch_dense(const ArmatureModel& model,
                                 BatchedArmatureKinematicsOutput* out,
                                 bool emit_joint_transforms = true,
                                 TensorBackend* backend_override = nullptr);
+
+// Computes a beam aim solution from a tool pose and a tool-local mount.
+BeamAimSolution solve_beam_aim_from_pose(const Pose& pose, const ToolMount& mount, bool engaged = true);
 
 // Vectorized beam/plane intersection: origins and dirs are [B, 3] F32; dirs
 // need not be unit length. Outputs: hits [B, 3] F32 and mask [B] Bool where

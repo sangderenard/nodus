@@ -14,12 +14,33 @@ namespace nodus::tensors::kpath {
 struct ToolpathSolveParams final {
   float nominal_z = 0.0f;
   float feed_rate = 1.0f;
+  float base_dt = 1.0f / 120.0f;
+  float max_speed = 250.0f;
+  float max_accel = 1500.0f;
+  float max_force = 2000.0f;
+  float kp = 12.0f;
+  float kd = 4.0f;
+  float hold_error = 1.0f;
+  float lift_z = 1.0f;
 };
 
-// Placeholder output: sequence of armature configurations along the path.
-// This is expected to expand into a richer multi-receiver actuation tape.
+struct ToolpathActuationFrame final {
+  float t = 0.0f;
+  float dt = 0.0f;
+  float dt_scale = 1.0f;
+  ToolMode tool_mode{ToolMode::Travel};
+  bool tool_engaged = false;
+  Vec3 target_pos{};
+  Quat target_rot{};
+  std::vector<float> q;
+  std::vector<float> dq;
+  std::vector<float> u;
+  uint32_t axis_mask = 0;
+};
+
+// Solver output: step-wise actuation frames (second-order) that track a toolpath.
 struct ToolpathSolveOutput final {
-  std::vector<ArmatureConfiguration> configs;
+  std::vector<ToolpathActuationFrame> frames;
 };
 
 // NOTE: currently a stub that returns false.

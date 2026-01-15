@@ -18,11 +18,14 @@ namespace nodus::tensors::kpath {
 // Anchors are expressed as concrete coordinates for selected point node ids.
 struct RelGeoSolveInputs final {
   // Anchor points by node id (the u32 values returned by operators like pt()/free()).
-  std::unordered_map<uint32_t, RelVec2> anchors; // point_node_id -> value
+  // Each value is a 1x2 F32 tensor.
+  std::unordered_map<uint32_t, RelTensorPoint> anchors; // point_node_id -> value
 
   // Convenience: anchor by IR symbol name (e.g. "origin").
   // These are resolved at parse/eval time and merged into `anchors`.
-  std::unordered_map<std::string, RelVec2> anchors_by_name;
+  // Convenience: anchor by IR symbol name (e.g. "origin").
+  // Each value is a 1x2 F32 tensor.
+  std::unordered_map<std::string, RelTensorPoint> anchors_by_name;
   float eps = 1e-4f;
   uint32_t max_passes = 64;
 };
@@ -30,7 +33,8 @@ struct RelGeoSolveInputs final {
 // A numeric value map for the graph.
 // Today this returns only point positions (enough to compile contours).
 struct RelGeoSolveOutput final {
-  std::unordered_map<uint32_t, RelVec2> points; // point_node_id -> value
+  // Each value is a 1x2 F32 tensor.
+  std::unordered_map<uint32_t, RelTensorPoint> points; // point_node_id -> value
 };
 
 // Solve a numeric embedding for a pure RelGeo IR program.
