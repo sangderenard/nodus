@@ -55,7 +55,7 @@ struct DyadicLog {
     uint64_t total = 0;
 };
 
-struct DyadicLeaf16 {
+struct DyadicLeaf256 {
     uint64_t mask[4] = {0, 0, 0, 0};
     DyadicValue values[256];
 };
@@ -146,7 +146,7 @@ struct DyadicNode {
         kDyadicInvalid, kDyadicInvalid, kDyadicInvalid, kDyadicInvalid,
         kDyadicInvalid, kDyadicInvalid, kDyadicInvalid, kDyadicInvalid,
     };
-    DyadicLeaf16 leaf;
+    DyadicLeaf256 leaf;
 };
 
 class DyadicBins {

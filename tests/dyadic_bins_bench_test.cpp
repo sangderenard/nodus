@@ -27,7 +27,7 @@ int main() {
     nodus::tensors::DyadicBinsConfig cfg{};
     cfg.idx_bytes = 4;
     cfg.chunk_cap = 8192;
-    cfg.stage_bits = 4;
+    cfg.stage_bits = 8;
     cfg.max_nodes = 1'200'000;
     cfg.max_chunks = 4096;
     cfg.preallocate_chunks = false;
