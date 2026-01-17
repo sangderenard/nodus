@@ -441,7 +441,7 @@ else()
 endif()
 
 find_package(Eigen3 REQUIRED)
-find_package(PNG REQUIRED)
+find_package(PNG CONFIG REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(HarfBuzz CONFIG REQUIRED)
         # vcpkg provides a lowercase harfbuzz target; alias the canonical HarfBuzz::HarfBuzz name for compatibility.
@@ -661,6 +661,18 @@ add_executable(test_tensor_compare
 target_link_libraries(test_tensor_compare PRIVATE canvas_tables_static)
 add_test(NAME tensor_compare_test COMMAND test_tensor_compare)
 
+add_executable(test_scatter_indices
+  tests/scatter_indices_test.cpp
+)
+target_link_libraries(test_scatter_indices PRIVATE canvas_tables_static)
+add_test(NAME scatter_indices_test COMMAND test_scatter_indices)
+
+add_executable(test_dyadic_bins_bench
+  tests/dyadic_bins_bench_test.cpp
+)
+target_link_libraries(test_dyadic_bins_bench PRIVATE canvas_tables_static)
+add_test(NAME dyadic_bins_bench_test COMMAND test_dyadic_bins_bench)
+
 add_executable(test_edge_fifo_sparse_delta
   tests/edge_fifo_sparse_delta_test.cpp
 )
@@ -672,6 +684,12 @@ add_executable(test_tensor_ops_lowering
 )
 target_link_libraries(test_tensor_ops_lowering PRIVATE canvas_tables_static)
 add_test(NAME tensor_ops_lowering_test COMMAND test_tensor_ops_lowering)
+
+add_executable(test_tensor_tiling_int8_int16_timing
+  tests/tensor_tiling_int8_int16_timing_test.cpp
+)
+target_link_libraries(test_tensor_tiling_int8_int16_timing PRIVATE canvas_tables_static)
+add_test(NAME tensor_tiling_int8_int16_timing_test COMMAND test_tensor_tiling_int8_int16_timing)
 
 add_executable(test_tool_dll
   tests/tool_dll_test.cpp
@@ -703,8 +721,10 @@ set(NODUS_TEST_TARGETS
   test_graph_sparse
   test_thread_pool
   test_tensor_compare
+  test_scatter_indices
   test_edge_fifo_sparse_delta
   test_tensor_ops_lowering
+  test_tensor_tiling_int8_int16_timing
   test_tool_dll
   test_kpath_toolpath_facilities
   test_kpath_functional_intersection

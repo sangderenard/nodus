@@ -2,6 +2,7 @@
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
 #include "common/tensors/abstraction/kpath/kpath_image_export.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
 
 #include <filesystem>
 #include <iostream>
@@ -137,7 +138,8 @@ int main(int argc, char** argv) {
 
     const std::string out_path = make_output_path_next_to_exe((argc > 0) ? argv[0] : "kpath_relgeo_scene_demo",
                                                               "kpath_relgeo_scene.png");
-    if (!export_canvas_to_png(energy, out_path)) {
+    nodus::tensors::AbstractTensor image = make_image_tensor_from_canvas(energy);
+    if (!export_tensor_png(image, out_path, true)) {
       std::cerr << "Failed to write PNG: " << out_path << "\n";
       return 1;
     }

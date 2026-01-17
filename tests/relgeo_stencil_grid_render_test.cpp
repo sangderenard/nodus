@@ -5,6 +5,7 @@
 #include "common/tensors/abstraction/kpath/kpath_path_builder.h"
 #include "common/tensors/abstraction/kpath/kpath_fill.h"
 #include "common/tensors/abstraction/kpath/kpath_raster.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
 
 #include <filesystem>
 #include <iostream>
@@ -13,6 +14,7 @@
 #include <vector>
 
 using namespace nodus::tensors::kpath;
+using nodus::tensors::AbstractTensor;
 
 static bool require_or_report(bool condition, const char* what) {
   if (condition) return true;
@@ -155,16 +157,19 @@ int main(int argc, char** argv) {
 
   const std::string out_path = make_output_path_next_to_exe(argc > 0 ? argv[0] : "relgeo_stencil_grid_render_test",
                                                             "relgeo_stencil_grid.png");
-  if (!require_or_report(export_canvas_rgb(grid_energy, fill_energy, zero_canvas, out_path),
+  AbstractTensor rgb_image = make_image_tensor_from_canvases_rgb(grid_energy, fill_energy, zero_canvas);
+  if (!require_or_report(export_tensor_png(rgb_image, out_path, true),
                          "export_canvas_rgb failed")) {
     return 1;
   }
   const std::string grid_path = make_output_path_next_to_exe(argc > 0 ? argv[0] : "relgeo_stencil_grid_render_test",
                                                              "relgeo_stencil_grid_gray.png");
-  require_or_report(export_canvas_to_png(grid_energy, grid_path), "export_canvas_to_png(grid) failed");
+  AbstractTensor grid_image = make_image_tensor_from_canvas(grid_energy);
+  require_or_report(export_tensor_png(grid_image, grid_path, true), "export_tensor_png(grid) failed");
   const std::string fill_path = make_output_path_next_to_exe(argc > 0 ? argv[0] : "relgeo_stencil_grid_render_test",
                                                              "relgeo_stencil_fill_gray.png");
-  require_or_report(export_canvas_to_png(fill_energy, fill_path), "export_canvas_to_png(fill) failed");
+  AbstractTensor fill_image = make_image_tensor_from_canvas(fill_energy);
+  require_or_report(export_tensor_png(fill_image, fill_path, true), "export_tensor_png(fill) failed");
 
   std::cout << "[REL-GEO-STENCIL-GRID] wrote PNG: " << out_path << "\n";
   return 0;

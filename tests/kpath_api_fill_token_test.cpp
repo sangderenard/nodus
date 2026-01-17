@@ -223,7 +223,8 @@ static bool make_fill_from_token(const std::string& token,
   }
 
   const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_api_fill_rgb.png");
-  if (!require_or_report(export_canvas_rgb(ch_r, ch_g, ch_b, out_path), "export_canvas_rgb failed")) return false;
+  AbstractTensor rgb_image = make_image_tensor_from_canvases_rgb(ch_r, ch_g, ch_b);
+  if (!require_or_report(export_tensor_png(rgb_image, out_path, true), "export_tensor_png failed")) return false;
   std::cout << "[KPATH-API] wrote PNG: " << out_path << "\n";
   auto report_peak = [](const std::array<uint32_t, 256>& h) {
     uint32_t peak_v = 0; uint32_t peak_bin = 0;

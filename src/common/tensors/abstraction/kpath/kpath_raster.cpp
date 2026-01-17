@@ -776,6 +776,119 @@ void rasterize_program_gaussian_with_thermal_transformed(const ArmatureProgram& 
   rasterize_program_with_kernel_transformed(program, out_energy, out_temp, machine, kernel_tool, xform);
 }
 
+static uint32_t count_exec_frames(const std::vector<ToolPoint>& exec_pts) {
+  bool have_last = false;
+  ToolPoint last{};
+  uint32_t count = 0;
+  for (const auto& p : exec_pts) {
+    if (!p.engaged) continue;
+    if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
+    ++count;
+    last = p;
+    have_last = true;
+  }
+  return count;
+}
+
+static void rasterize_program_with_kernel_transformed_keyframes(const ArmatureProgram& program,
+                                                                 TensorCanvas2D& out_energy,
+                                                                 TensorCanvas2D& out_temp,
+                                                                 const MachineControlConfig& machine,
+                                                                 const BeamToolParams& tool,
+                                                                 const ProgramRasterTransform& xform,
+                                                                 const RasterKeyframeCallback& on_keyframe) {
+  if (xform.width_px == 0 || xform.height_px == 0) return;
+
+  if (out_energy.width != xform.width_px || out_energy.height != xform.height_px) {
+    out_energy.resize(xform.width_px, xform.height_px, 0.0f);
+  } else {
+    out_energy.clear(0.0f);
+  }
+  if (out_temp.width != xform.width_px || out_temp.height != xform.height_px) {
+    out_temp.resize(xform.width_px, xform.height_px, 0.0f);
+  } else {
+    out_temp.clear(0.0f);
+  }
+
+  if (program.points.empty()) return;
+
+  SpatialKernel kernel = make_spatial_kernel(tool);
+
+  std::vector<ToolPoint> img_pts;
+  img_pts.reserve(program.points.size());
+  for (const auto& p : program.points) {
+    ToolPoint ip = p;
+    const float x = p.x * xform.scale + xform.shift_x;
+    const float y_unflipped = p.y * xform.scale + xform.shift_y;
+    ip.x = x;
+    ip.y = (static_cast<float>(xform.height_px) - 1.0f) - y_unflipped;
+    img_pts.push_back(ip);
+  }
+
+  std::vector<ToolPoint> exec_pts = resample_polyline_equal_arclen(img_pts, machine.step_px);
+  if (exec_pts.size() < 2) return;
+
+  const uint32_t frame_total = count_exec_frames(exec_pts);
+  if (frame_total == 0) return;
+
+  const float step = std::max(machine.step_px, 0.05f);
+  const float energy_step = machine.energy_per_px * step;
+  const float feed = std::max(machine.feed_rate_px_per_s, 1.0f);
+  const float dt = step / feed;
+
+  if (!machine.enable_thermal_guard) {
+    out_temp.clear(0.0f);
+    bool have_last = false;
+    ToolPoint last{};
+    uint32_t frame_index = 0;
+    for (const auto& p : exec_pts) {
+      if (!p.engaged) continue;
+      if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
+      kernel_stamp_energy(out_energy, kernel, p.x, p.y, energy_step);
+      if (on_keyframe) on_keyframe(frame_index, frame_total, out_energy, out_temp);
+      ++frame_index;
+      last = p;
+      have_last = true;
+    }
+    return;
+  }
+
+  bool have_last = false;
+  ToolPoint last{};
+  uint32_t frame_index = 0;
+  for (const auto& p : exec_pts) {
+    if (!p.engaged) continue;
+    if (have_last && distance2(p.x, p.y, last.x, last.y) < 1e-6f) continue;
+    kernel_stamp_energy_and_temp(out_energy,
+                                 out_temp,
+                                 kernel,
+                                 p.x,
+                                 p.y,
+                                 energy_step,
+                                 dt,
+                                 std::max(machine.cooling_tau_s, 0.0f),
+                                 machine.energy_to_temp,
+                                 std::max(machine.max_temp, 0.0f));
+    if (on_keyframe) on_keyframe(frame_index, frame_total, out_energy, out_temp);
+    ++frame_index;
+    last = p;
+    have_last = true;
+  }
+}
+
+void rasterize_program_gaussian_with_thermal_transformed_keyframes(const ArmatureProgram& program,
+                                                                  TensorCanvas2D& out_energy,
+                                                                  TensorCanvas2D& out_temp,
+                                                                  const MachineControlConfig& machine,
+                                                                  const GaussianToolParams& tool,
+                                                                  const ProgramRasterTransform& xform,
+                                                                  RasterKeyframeCallback on_keyframe) {
+  BeamToolParams kernel_tool{};
+  kernel_tool.falloff = BeamFalloffKind::Gaussian;
+  kernel_tool.sigma_px = tool.sigma_px;
+  rasterize_program_with_kernel_transformed_keyframes(program, out_energy, out_temp, machine, kernel_tool, xform, on_keyframe);
+}
+
 void rasterize_program_with_kernel_transformed(const ArmatureProgram& program,
                                                TensorCanvas2D& out_energy,
                                                TensorCanvas2D& out_temp,
@@ -1276,314 +1389,41 @@ bool rasterize_program_scatter_with_spatial_kernel(const ArmatureProgram& progra
                                                    AbstractTensor* temp_state,
                                                    TensorBackend* backend_override,
                                                    ScatterTimingBreakdown* timing) {
+  (void)program;
+  (void)machine;
+  (void)tool;
+  (void)diffusion_kernel;
+  (void)sim;
+  (void)temp_state;
+  (void)backend_override;
+
   if (timing) *timing = {};
   const auto t_total_start = now_hr();
 
   if (xform.width_px == 0 || xform.height_px == 0) return false;
 
-  ProgramScatterPlan plan;
   {
     const auto t0 = now_hr();
-    if (!plan_program_scatter(program, machine, xform, &plan, true, true, backend_override)) return false;
-    const auto t1 = now_hr();
-    if (timing) timing->plan_ms += elapsed_ms(t0, t1);
-  }
-
-  if (timing) {
-    timing->program_points = static_cast<uint64_t>(program.points.size());
-  }
-
-  {
-    const auto t0 = now_hr();
-  if (out_energy.width != xform.width_px || out_energy.height != xform.height_px) {
-    out_energy.resize(xform.width_px, xform.height_px, 0.0f);
-  } else {
-    out_energy.clear(0.0f);
-  }
-  if (out_temp.width != xform.width_px || out_temp.height != xform.height_px) {
-    out_temp.resize(xform.width_px, xform.height_px, 0.0f);
-  } else {
-    out_temp.clear(0.0f);
-  }
+    if (out_energy.width != xform.width_px || out_energy.height != xform.height_px) {
+      out_energy.resize(xform.width_px, xform.height_px, 0.0f);
+    } else {
+      out_energy.clear(0.0f);
+    }
+    if (out_temp.width != xform.width_px || out_temp.height != xform.height_px) {
+      out_temp.resize(xform.width_px, xform.height_px, 0.0f);
+    } else {
+      out_temp.clear(0.0f);
+    }
     const auto t1 = now_hr();
     if (timing) timing->clear_ms += elapsed_ms(t0, t1);
   }
 
-  TensorBackend* backend = backend_override ? backend_override : &in_memory_backend_singleton();
-  if (!backend) return false;
-  auto* mem = dynamic_cast<InMemoryBackend*>(backend);
-  if (!mem) return false;
-
-  AbstractTensor dense_points = coo_points_to_dense_f32(plan.points, backend);
-  if (!dense_points.valid()) return false;
-
-  const TensorDesc& pts_desc = dense_points.desc();
-  const TensorDesc& val_desc = plan.values->desc();
-  if (pts_desc.dtype != TensorDType::F32 || val_desc.dtype != TensorDType::F32) return false;
-  if (pts_desc.layout != TensorLayout::Dense || val_desc.layout != TensorLayout::Dense) return false;
-  if (pts_desc.shape.dims.size() != 2 || pts_desc.shape.dims[1] != 2) return false;
-  if (val_desc.shape.dims.size() != 1 || val_desc.shape.dims[0] != pts_desc.shape.dims[0]) return false;
-
-  void* pts_ptr_v = nullptr;
-  size_t pts_bytes = 0;
-  const auto t_map_start = now_hr();
-  if (!mem->map(dense_points.handle(), &pts_ptr_v, &pts_bytes)) return false;
-  void* val_ptr_v = nullptr;
-  size_t val_bytes = 0;
-  if (!mem->map(plan.values->handle(), &val_ptr_v, &val_bytes)) {
-    mem->unmap(dense_points.handle());
-    return false;
-  }
-  void* cnt_ptr_v = nullptr;
-  size_t cnt_bytes = 0;
-  if (!mem->map(plan.visit_counts->handle(), &cnt_ptr_v, &cnt_bytes)) {
-    mem->unmap(dense_points.handle());
-    mem->unmap(plan.values->handle());
-    return false;
-  }
-  const auto t_map_end = now_hr();
-  if (timing) timing->map_ms += elapsed_ms(t_map_start, t_map_end);
-
-  const float* pts = static_cast<const float*>(pts_ptr_v);
-  const float* vals = static_cast<const float*>(val_ptr_v);
-  const float* counts = static_cast<const float*>(cnt_ptr_v);
-  const SpatialKernel kernel = make_spatial_kernel(tool);
-  const float energy_to_temp = machine.energy_to_temp * sim.heat_gain;
-
-  const uint32_t n = pts_desc.shape.dims[0];
-
-  uint64_t plan_moments = 0;
-  if (timing) {
-    timing->unique_sites = static_cast<uint64_t>(n);
-  }
-
-  struct KernelOffset {
-    int dx = 0;
-    int dy = 0;
-    float w = 0.0f;
-  };
-  std::vector<KernelOffset> offsets;
-  if (kernel.radius == 0) {
-    offsets.push_back(KernelOffset{0, 0, 1.0f});
-  } else {
-    const int r = kernel.radius;
-    offsets.reserve(static_cast<size_t>((2 * r + 1) * (2 * r + 1)));
-    for (int dy = -r; dy <= r; ++dy) {
-      for (int dx = -r; dx <= r; ++dx) {
-        const float w = kernel.at(dx, dy);
-        if (w == 0.0f) continue;
-        offsets.push_back(KernelOffset{dx, dy, w});
-      }
-    }
-  }
-
-  // Prepare stamp buffer for unique pixel counting.
-  ScatterPlanScratch& scratch = scatter_plan_scratch();
-  const uint32_t w = out_energy.width;
-  const uint32_t h = out_energy.height;
-  const size_t pixel_count = static_cast<size_t>(w) * h;
-  if (scratch.pixel_stamp.size() != pixel_count) {
-    scratch.pixel_stamp.assign(pixel_count, 0u);
-    scratch.pixel_epoch = 1u;
-  } else {
-    ++scratch.pixel_epoch;
-    if (scratch.pixel_epoch == 0u) {
-      std::fill(scratch.pixel_stamp.begin(), scratch.pixel_stamp.end(), 0u);
-      scratch.pixel_epoch = 1u;
-    }
-  }
-  const uint32_t epoch = scratch.pixel_epoch;
-  uint64_t pixels_touched = 0;
-  uint64_t site_activations = 0;
-
-  auto stamp_pixel = [&](uint32_t px, uint32_t py, uint32_t visits) {
-    const size_t idx = static_cast<size_t>(py) * w + px;
-    if (scratch.pixel_stamp[idx] != epoch) {
-      scratch.pixel_stamp[idx] = epoch;
-      ++pixels_touched;
-    }
-    site_activations += static_cast<uint64_t>(visits);
-  };
-
-  uint64_t expanded_count = 0;
-  for (uint32_t i = 0; i < n; ++i) {
-    const uint32_t visits = static_cast<uint32_t>(std::max<int64_t>(1, std::llround(static_cast<double>(counts[i]))));
-    plan_moments += static_cast<uint64_t>(visits);
-    const int cx = static_cast<int>(std::floor(pts[i * 2 + 0]));
-    const int cy = static_cast<int>(std::floor(pts[i * 2 + 1]));
-    for (const auto& off : offsets) {
-      const int px = cx + off.dx;
-      const int py = cy + off.dy;
-      if (px < 0 || py < 0 || px >= static_cast<int>(w) || py >= static_cast<int>(h)) continue;
-      ++expanded_count;
-      stamp_pixel(static_cast<uint32_t>(px), static_cast<uint32_t>(py), visits);
-    }
-  }
-
-  AbstractTensorPool::PooledTensor expanded_points;
-  AbstractTensorPool::PooledTensor expanded_values;
-  const AbstractTensor* scatter_points = &dense_points;
-  const AbstractTensor* scatter_values = &plan.values.tensor();
-  if (offsets.size() != 1 || offsets[0].dx != 0 || offsets[0].dy != 0 || offsets[0].w != 1.0f) {
-    TensorDesc pts_expand{};
-    pts_expand.dtype = TensorDType::F32;
-    pts_expand.layout = TensorLayout::Dense;
-    pts_expand.shape.dims = {static_cast<uint32_t>(expanded_count), 2u};
-    expanded_points = scatter_plan_pool().acquire(pts_expand, backend);
-    if (!expanded_points.valid()) return false;
-
-    TensorDesc vals_expand{};
-    vals_expand.dtype = TensorDType::F32;
-    vals_expand.layout = TensorLayout::Dense;
-    vals_expand.shape.dims = {static_cast<uint32_t>(expanded_count)};
-    expanded_values = scatter_plan_pool().acquire(vals_expand, backend);
-    if (!expanded_values.valid()) return false;
-
-    void* exp_pts_v = nullptr;
-    size_t exp_pts_bytes = 0;
-    void* exp_vals_v = nullptr;
-    size_t exp_vals_bytes = 0;
-    if (!mem->map(expanded_points->handle(), &exp_pts_v, &exp_pts_bytes)) return false;
-    if (!mem->map(expanded_values->handle(), &exp_vals_v, &exp_vals_bytes)) {
-      mem->unmap(expanded_points->handle());
-      return false;
-    }
-    auto* exp_pts = static_cast<float*>(exp_pts_v);
-    auto* exp_vals = static_cast<float*>(exp_vals_v);
-
-    uint64_t write = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-      const int cx = static_cast<int>(std::floor(pts[i * 2 + 0]));
-      const int cy = static_cast<int>(std::floor(pts[i * 2 + 1]));
-      const float energy = vals[i];
-      for (const auto& off : offsets) {
-        const int px = cx + off.dx;
-        const int py = cy + off.dy;
-        if (px < 0 || py < 0 || px >= static_cast<int>(w) || py >= static_cast<int>(h)) continue;
-        exp_pts[write * 2 + 0] = static_cast<float>(px);
-        exp_pts[write * 2 + 1] = static_cast<float>(py);
-        exp_vals[write] = energy * off.w;
-        ++write;
-      }
-    }
-
-    mem->unmap(expanded_points->handle());
-    mem->unmap(expanded_values->handle());
-
-    scatter_points = &expanded_points.tensor();
-    scatter_values = &expanded_values.tensor();
-  }
-
-  mem->unmap(dense_points.handle());
-  mem->unmap(plan.values->handle());
-  mem->unmap(plan.visit_counts->handle());
-
-  if (timing) {
-    timing->plan_moments = plan_moments;
-    timing->site_activations = site_activations;
-    timing->pixels_touched = pixels_touched;
-  }
-
-  TensorDesc base_desc{};
-  base_desc.dtype = TensorDType::F32;
-  base_desc.layout = TensorLayout::Dense;
-  base_desc.shape.dims = {xform.height_px, xform.width_px};
-  auto base = scatter_plan_pool().acquire(base_desc, backend);
-  if (!base.valid()) return false;
-  {
-    const auto t0 = now_hr();
-    void* base_ptr_v = nullptr;
-    size_t base_bytes = 0;
-    if (!mem->map(base->handle(), &base_ptr_v, &base_bytes)) return false;
-    std::memset(base_ptr_v, 0, base_bytes);
-    mem->unmap(base->handle());
-    const auto t1 = now_hr();
-    if (timing) timing->clear_ms += elapsed_ms(t0, t1);
-  }
-
-  AbstractTensor energy_tensor;
-  {
-    const auto t0 = now_hr();
-    if (!tensor_scatter_add_2d_f32(base.tensor(), *scatter_points, *scatter_values, &energy_tensor, true)) return false;
-    const auto t1 = now_hr();
-    if (timing) timing->deposit_ms += elapsed_ms(t0, t1);
-  }
-
-  {
-    const auto t0 = now_hr();
-    if (!copy_tensor_to_canvas_f32(energy_tensor, out_energy)) return false;
-    const auto t1 = now_hr();
-    if (timing) timing->diffusion_copyback_ms += elapsed_ms(t0, t1);
-  }
-
-  AbstractTensor temp_tensor;
-  if (energy_to_temp != 0.0f) {
-    temp_tensor = clone_dense_f32(energy_tensor, backend);
-    if (!temp_tensor.valid()) return false;
-    if (energy_to_temp != 1.0f) {
-      const auto t0 = now_hr();
-      if (!scale_inplace_f32(temp_tensor, energy_to_temp)) return false;
-      const auto t1 = now_hr();
-      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
-    }
-  } else {
-    temp_tensor = clone_dense_f32(base.tensor(), backend);
-    if (!temp_tensor.valid()) return false;
-  }
-
-  const float decay = std::clamp(sim.decay, 0.0f, 1.0f);
-  if (temp_state) {
-    if (!temp_state->valid()) {
-      const auto t0 = now_hr();
-      *temp_state = clone_dense_f32(temp_tensor, backend);
-      if (!temp_state->valid()) return false;
-      const auto t1 = now_hr();
-      if (timing) timing->diffusion_prep_ms += elapsed_ms(t0, t1);
-    }
-    if (decay > 0.0f && decay < 1.0f) {
-      const auto t0 = now_hr();
-      if (!scale_inplace_f32(*temp_state, decay)) return false;
-      const auto t1 = now_hr();
-      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
-    }
-    {
-      const auto t0 = now_hr();
-      if (!add_scaled_inplace_f32(*temp_state, temp_tensor, 1.0f)) return false;
-      const auto t1 = now_hr();
-      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
-    }
-    temp_tensor = AbstractTensor::wrap(temp_state->handle(), temp_state->desc(), temp_state->backend(), false);
-  } else {
-    if (decay > 0.0f && decay < 1.0f) {
-      const auto t0 = now_hr();
-      if (!scale_inplace_f32(temp_tensor, decay)) return false;
-      const auto t1 = now_hr();
-      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
-    }
-  }
-
-  if (diffusion_kernel && sim.diffusion_steps > 0) {
-    TensorDesc lap_desc = temp_tensor.desc();
-    auto lap_tensor = scatter_plan_pool().acquire(lap_desc, backend);
-    if (!lap_tensor.valid()) return false;
-    for (uint32_t i = 0; i < sim.diffusion_steps; ++i) {
-      const auto t0 = now_hr();
-      if (!tensor_apply_stencil_2d_f32_into(temp_tensor, *diffusion_kernel, &lap_tensor.tensor())) return false;
-      if (!add_scaled_inplace_f32(temp_tensor, lap_tensor.tensor(), sim.diffusion_dt)) return false;
-      const auto t1 = now_hr();
-      if (timing) timing->diffusion_iter_ms += elapsed_ms(t0, t1);
-    }
-  }
-
-  {
-    const auto t0 = now_hr();
-    if (!copy_tensor_to_canvas_f32(temp_tensor, out_temp)) return false;
-    const auto t1 = now_hr();
-    if (timing) timing->diffusion_copyback_ms += elapsed_ms(t0, t1);
-  }
+  // TODO: Replace with a single rasterization technique that writes contiguous
+  // row-major outputs using integer indices (GLI), no pre-expansion.
+  // Expected shape: precomposed row-major write list for all targets.
 
   if (timing) timing->total_ms = elapsed_ms(t_total_start, now_hr());
-  return true;
+  return false;
 }
 
 bool project_beam_program_to_plane(const BeamProgram& beam_prog,
@@ -2219,6 +2059,71 @@ bool write_png_rgb_u8(const std::string& path,
   size_t row_bytes = static_cast<size_t>(width) * 3;
   for (uint32_t y = 0; y < height; ++y) {
     auto* row = const_cast<uint8_t*>(pixels_rgb.data() + static_cast<size_t>(y) * row_bytes);
+    row_ptrs[y] = reinterpret_cast<png_bytep>(row);
+  }
+
+  png_write_image(png_ptr, row_ptrs.data());
+  png_write_end(png_ptr, info_ptr);
+
+  png_destroy_write_struct(&png_ptr, &info_ptr);
+  std::fclose(fp);
+  return true;
+}
+
+bool write_png_rgba_u8(const std::string& path,
+                       uint32_t width,
+                       uint32_t height,
+                       std::span<const uint8_t> pixels_rgba) {
+  if (width == 0 || height == 0) return false;
+  if (pixels_rgba.size() < static_cast<size_t>(width) * height * 4) return false;
+
+  FILE* fp = nullptr;
+#if defined(_MSC_VER)
+  if (fopen_s(&fp, path.c_str(), "wb") != 0) fp = nullptr;
+#else
+  fp = std::fopen(path.c_str(), "wb");
+#endif
+  if (!fp) return false;
+
+  png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+  if (!png_ptr) {
+    std::fclose(fp);
+    return false;
+  }
+
+  png_infop info_ptr = png_create_info_struct(png_ptr);
+  if (!info_ptr) {
+    png_destroy_write_struct(&png_ptr, nullptr);
+    std::fclose(fp);
+    return false;
+  }
+
+  if (setjmp(png_jmpbuf(png_ptr))) {
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    std::fclose(fp);
+    return false;
+  }
+
+  png_init_io(png_ptr, fp);
+
+  png_set_IHDR(
+      png_ptr,
+      info_ptr,
+      width,
+      height,
+      8,
+      PNG_COLOR_TYPE_RGBA,
+      PNG_INTERLACE_NONE,
+      PNG_COMPRESSION_TYPE_BASE,
+      PNG_FILTER_TYPE_BASE);
+
+  png_write_info(png_ptr, info_ptr);
+
+  std::vector<png_bytep> row_ptrs;
+  row_ptrs.resize(height);
+  size_t row_bytes = static_cast<size_t>(width) * 4;
+  for (uint32_t y = 0; y < height; ++y) {
+    auto* row = const_cast<uint8_t*>(pixels_rgba.data() + static_cast<size_t>(y) * row_bytes);
     row_ptrs[y] = reinterpret_cast<png_bytep>(row);
   }
 

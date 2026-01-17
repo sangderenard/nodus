@@ -12,8 +12,12 @@ enum class TensorDType : uint8_t {
     Unknown = 0,
     F32,
     F64,
+    I8,
+    I16,
     I32,
     I64,
+    U8,
+    U16,
     U32,
     U64,
     Bool,
@@ -55,8 +59,12 @@ inline constexpr uint32_t tensor_dtype_size_bytes(TensorDType dtype) {
     switch (dtype) {
         case TensorDType::F32: return 4;
         case TensorDType::F64: return 8;
+        case TensorDType::I8: return 1;
+        case TensorDType::I16: return 2;
         case TensorDType::I32: return 4;
         case TensorDType::I64: return 8;
+        case TensorDType::U8: return 1;
+        case TensorDType::U16: return 2;
         case TensorDType::U32: return 4;
         case TensorDType::U64: return 8;
         case TensorDType::Bool: return 1;

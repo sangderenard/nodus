@@ -48,6 +48,10 @@ public:
     bool get_arena_stats(ArenaStats* out) const;
     bool map(AbstractTensorHandle handle, void** out_data, size_t* out_bytes) const;
     void unmap(AbstractTensorHandle handle) const;
+
+    // Ensure the payload for this tensor is zeroed, preferably by swapping in a clean arena lease.
+    // Falls back to clearing the existing lease when swap is not possible.
+    bool ensure_zeroed(AbstractTensorHandle handle, const TensorDesc& desc);
 };
 
 InMemoryBackend& in_memory_backend_singleton();

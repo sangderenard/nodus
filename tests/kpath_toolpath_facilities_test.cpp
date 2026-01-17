@@ -12,11 +12,14 @@
 #include "common/tensors/abstraction/kpath/kpath_pipeline.h"
 #include "common/tensors/abstraction/kpath/kpath_program.h"
 #include "common/tensors/abstraction/kpath/kpath_image_export.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
 
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <span>
 #include <stdexcept>
@@ -24,6 +27,7 @@
 #include <vector>
 
 using namespace nodus::tensors::kpath;
+using nodus::tensors::AbstractTensor;
 
 static bool require_or_report(bool condition, const char* what) {
   if (condition) return true;
@@ -304,16 +308,35 @@ static bool validate_raster_png_facility(const char* argv0) {
   const float render_scale = 4.0f; // pixels per outline unit
   const float margin_px = 12.0f;
   ProgramRasterTransform xform = plan_program_raster_transform_refined(program, machine, render_scale, margin_px, tool);
-  rasterize_program_gaussian_with_thermal_transformed(program, energy, temp, machine, tool, xform);
+  const uint32_t max_keyframes = 100;
+  uint32_t last_bucket = std::numeric_limits<uint32_t>::max();
+  uint32_t saved_frames = 0;
+  rasterize_program_gaussian_with_thermal_transformed_keyframes(
+      program,
+      energy,
+      temp,
+      machine,
+      tool,
+      xform,
+      [&](uint32_t frame_index, uint32_t frame_total, const TensorCanvas2D& frame_energy, const TensorCanvas2D& /*frame_temp*/) {
+        if (frame_total == 0) return;
+        const uint32_t bucket = static_cast<uint32_t>((static_cast<uint64_t>(frame_index) * max_keyframes) / frame_total);
+        if (bucket == last_bucket) return;
+        last_bucket = bucket;
+
+        std::ostringstream name;
+        name << "kpath_glyph_gaussian_frame_" << std::setw(3) << std::setfill('0') << saved_frames << ".png";
+        const std::string name_str = name.str();
+        const std::string frame_path = make_output_path_next_to_exe(argv0, name_str.c_str());
+        AbstractTensor frame_tensor = make_image_tensor_from_canvas(frame_energy);
+        export_tensor_png(frame_tensor, frame_path, true);
+        ++saved_frames;
+      });
   float max_v = energy.max_value();
   if (!require_or_report(max_v > 0.001f, "rasterized canvas should have non-zero energy")) return false;
 
-  const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_glyph_gaussian.png");
-  if (!require_or_report(export_canvas_to_png(energy, out_path), "export_canvas_to_png failed")) return false;
-
-  if (!require_or_report(export_canvas_to_png(temp, make_output_path_next_to_exe(argv0, "kpath_glyph_gaussian_temp.png")),
-                         "export_canvas_to_png(temp) failed")) return false;
-  std::cout << "[KPATH-FACILITIES] wrote PNG: " << out_path << " (max=" << max_v << ", temp_max=" << temp.max_value() << ")" << std::endl;
+  wait_for_pending_image_saves();
+  std::cout << "[KPATH-FACILITIES] wrote " << saved_frames << " keyframes (max=" << max_v << ", temp_max=" << temp.max_value() << ")" << std::endl;
   return true;
 }
 
@@ -607,10 +630,12 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
   if (!require_or_report(energy.max_value() > 0.001f, "pangram atlas raster energy should be non-zero")) return false;
 
   const std::string out_path = make_output_path_next_to_exe(argv0, "kpath_atlas_pangram.png");
-  if (!require_or_report(export_canvas_to_png(energy, out_path), "export_canvas_to_png energy failed")) return false;
+  AbstractTensor energy_image = make_image_tensor_from_canvas(energy);
+  if (!require_or_report(export_tensor_png(energy_image, out_path, true), "export_tensor_png energy failed")) return false;
 
   const std::string temp_path = make_output_path_next_to_exe(argv0, "kpath_atlas_pangram_temp.png");
-  require_or_report(export_canvas_to_png(temp, temp_path), "export_canvas_to_png temp failed");
+  AbstractTensor temp_image = make_image_tensor_from_canvas(temp);
+  require_or_report(export_tensor_png(temp_image, temp_path, true), "export_tensor_png temp failed");
 
   std::cout << "[KPATH-FACILITIES] wrote PNG: " << out_path << " (energy_max=" << energy.max_value() << ")\n";
   std::cout << "[KPATH-FACILITIES] wrote PNG: " << temp_path << " (temp_max=" << temp.max_value() << ")\n";
@@ -662,7 +687,8 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     if (!require_or_report(fill_energy.max_value() > 0.001f, "fill raster energy should be non-zero")) return false;
 
     const std::string fill_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill.png");
-    if (!require_or_report(export_canvas_to_png(fill_energy, fill_path), "export_canvas_to_png fill failed")) return 1;
+    AbstractTensor fill_image = make_image_tensor_from_canvas(fill_energy);
+    if (!require_or_report(export_tensor_png(fill_image, fill_path, true), "export_tensor_png fill failed")) return 1;
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << fill_path << " (energy_max=" << fill_energy.max_value() << ")\n";
 
     struct Pt2 {
@@ -857,8 +883,9 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     rasterize_program_gaussian_with_thermal_transformed(outline_ccw, ch_b, tmp, machine, tool, xform);
 
     const std::string rgb_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill_rgb.png");
-    if (!require_or_report(export_canvas_rgb(ch_r, ch_g, ch_b, rgb_path),
-                           "export_canvas_rgb failed")) return 1;
+    AbstractTensor rgb_image = make_image_tensor_from_canvases_rgb(ch_r, ch_g, ch_b);
+    if (!require_or_report(export_tensor_png(rgb_image, rgb_path, true),
+                 "export_tensor_png failed")) return 1;
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << rgb_path << " (R=CW outline, G=fill, B=CCW outline)\n";
 
     ArmatureProgram fill_inside;
@@ -937,8 +964,9 @@ static bool validate_pangram_atlas_and_png(const char* argv0) {
     rasterize_program_gaussian_with_thermal_transformed(contour_outside, k_b, tmp, machine, tool, xform_kerf);
 
     const std::string kerf_path = make_output_path_next_to_exe(argv0, "kpath_pangram_fill_kerf_rgb.png");
-    if (!require_or_report(export_canvas_rgb(k_r, k_g, k_b, kerf_path),
-                           "export_canvas_rgb kerf failed")) return 1;
+    AbstractTensor kerf_image = make_image_tensor_from_canvases_rgb(k_r, k_g, k_b);
+    if (!require_or_report(export_tensor_png(kerf_image, kerf_path, true),
+                 "export_tensor_png kerf failed")) return 1;
     std::cout << "[KPATH-FACILITIES] wrote PNG: " << kerf_path << " (R=inside-contour, G=fill, B=outside-contour)\n";
   }
 

@@ -4,6 +4,10 @@
   "dependencies": [
     "sdl3",
     "freetype",
-    "harfbuzz"
+    "harfbuzz",
+    {
+      "name": "libpng",
+      "features": ["apng"]
+    }
   ]
 }

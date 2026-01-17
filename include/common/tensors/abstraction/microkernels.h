@@ -22,6 +22,18 @@ void nodus_fused_addmul_f32(float* out,
                             uint32_t b_stride,
                             uint32_t act_id);
 
+// Fused inverse: out += activation^{-1}(M * x + b)
+// - act_id: 0=ReLU (identity on range), 1=Sigmoid, 2=Tanh, else Linear
+void nodus_fused_addmul_inv_f32(float* out,
+                                const float* x,
+                                const float* m,
+                                const float* b,
+                                uint32_t t,
+                                uint32_t k,
+                                uint32_t c,
+                                uint32_t b_stride,
+                                uint32_t act_id);
+
 // Strided variant for tiled updates.
 // - out_row_stride, x_row_stride in elements.
 // - rows, cols describe the tile shape.
@@ -42,6 +54,25 @@ void nodus_fused_addmul_f32_strided(float* out,
                                     uint32_t act_id,
                                     uint32_t saturate,
                                     float threshold);
+
+// Strided inverse variant for tiled updates.
+// - If m is NULL and k == 1, multiplier is treated as 1.0.
+// - If b is NULL, bias is treated as 0.0.
+// - If saturate != 0, out is clamped to threshold after inverse activation.
+void nodus_fused_addmul_inv_f32_strided(float* out,
+                                        uint32_t out_row_stride,
+                                        const float* x,
+                                        uint32_t x_row_stride,
+                                        const float* m,
+                                        const float* b,
+                                        uint32_t rows,
+                                        uint32_t cols,
+                                        uint32_t k,
+                                        uint32_t c,
+                                        uint32_t b_stride,
+                                        uint32_t act_id,
+                                        uint32_t saturate,
+                                        float threshold);
 
 // Strided add for tiled updates: out += x (x is [rows, cols, c]).
 // - out_row_stride, x_row_stride in elements.

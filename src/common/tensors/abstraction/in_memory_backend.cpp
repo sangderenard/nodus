@@ -10,6 +10,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
 
 namespace nodus::tensors {
 
@@ -69,7 +72,11 @@ struct Arena {
     ArenaSpanNode* nodes = nullptr;
     uint32_t node_capacity = 0;
     int32_t free_node_head = -1;
-    int32_t free_list_head = -1; // sorted by offset
+    int32_t clean_list_head = -1; // sorted by offset, zeroed spans
+    int32_t dirty_list_head = -1; // sorted by offset, not yet zeroed
+
+    std::condition_variable cleaner_cv;
+    std::atomic<bool> cleaner_started{false};
 
     // Debug/telemetry counters (guarded by lease_mu).
     uint64_t active_leases = 0;
@@ -82,6 +89,9 @@ struct Arena {
 };
 
 static Arena g_arena;
+
+static int32_t arena_pop_node();
+static void arena_push_node(int32_t idx);
 
 static uint64_t getenv_u64_mb(const char* name, uint64_t default_mb) {
     const char* v = std::getenv(name);
@@ -158,11 +168,73 @@ static bool arena_ensure_initialized() {
     g_arena.nodes[root].offset = 0;
     g_arena.nodes[root].size = reserve;
     g_arena.nodes[root].next = -1;
-    g_arena.free_list_head = root;
+    g_arena.clean_list_head = root;
+    g_arena.dirty_list_head = -1;
+
+    if (!g_arena.cleaner_started.exchange(true)) {
+        std::thread([] {
+            for (;;) {
+                int32_t node = -1;
+                uint64_t offset = 0;
+                uint64_t size = 0;
+                {
+                    std::unique_lock<std::mutex> lock(g_arena.lease_mu);
+                    g_arena.cleaner_cv.wait_for(lock, std::chrono::milliseconds(10), [] {
+                        return g_arena.dirty_list_head >= 0;
+                    });
+                    if (g_arena.dirty_list_head < 0) {
+                        continue;
+                    }
+                    node = g_arena.dirty_list_head;
+                    g_arena.dirty_list_head = g_arena.nodes[node].next;
+                    g_arena.nodes[node].next = -1;
+                    offset = g_arena.nodes[node].offset;
+                    size = g_arena.nodes[node].size;
+                }
+
+                if (size > 0 && g_arena.base) {
+                    std::memset(g_arena.base + offset, 0, static_cast<size_t>(size));
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(g_arena.lease_mu);
+                    int32_t prev = -1;
+                    int32_t cur = g_arena.clean_list_head;
+                    while (cur >= 0 && g_arena.nodes[cur].offset < offset) {
+                        prev = cur;
+                        cur = g_arena.nodes[cur].next;
+                    }
+                    if (prev < 0) {
+                        g_arena.nodes[node].next = g_arena.clean_list_head;
+                        g_arena.clean_list_head = node;
+                    } else {
+                        g_arena.nodes[node].next = g_arena.nodes[prev].next;
+                        g_arena.nodes[prev].next = node;
+                    }
+
+                    int32_t next = g_arena.nodes[node].next;
+                    if (next >= 0 && g_arena.nodes[node].offset + g_arena.nodes[node].size == g_arena.nodes[next].offset) {
+                        g_arena.nodes[node].size += g_arena.nodes[next].size;
+                        g_arena.nodes[node].next = g_arena.nodes[next].next;
+                        arena_push_node(next);
+                    }
+
+                    if (prev >= 0 && g_arena.nodes[prev].offset + g_arena.nodes[prev].size == g_arena.nodes[node].offset) {
+                        g_arena.nodes[prev].size += g_arena.nodes[node].size;
+                        g_arena.nodes[prev].next = g_arena.nodes[node].next;
+                        arena_push_node(node);
+                    }
+                }
+            }
+        }).detach();
+    }
 
     g_arena.initialized = true;
     return true;
 }
+
+static int32_t arena_pop_node();
+static void arena_push_node(int32_t idx);
 
 static bool arena_ensure_committed(uint64_t end_offset) {
     if (!arena_ensure_initialized()) return false;
@@ -219,7 +291,12 @@ static ArenaStatsSnapshot arena_stats_locked() {
     }
     s.span_nodes_free = free_nodes;
 
-    for (int32_t cur = g_arena.free_list_head; cur >= 0; cur = g_arena.nodes[cur].next) {
+    for (int32_t cur = g_arena.clean_list_head; cur >= 0; cur = g_arena.nodes[cur].next) {
+        ++s.free_spans;
+        s.free_bytes += g_arena.nodes[cur].size;
+        s.largest_free_span = std::max<uint64_t>(s.largest_free_span, g_arena.nodes[cur].size);
+    }
+    for (int32_t cur = g_arena.dirty_list_head; cur >= 0; cur = g_arena.nodes[cur].next) {
         ++s.free_spans;
         s.free_bytes += g_arena.nodes[cur].size;
         s.largest_free_span = std::max<uint64_t>(s.largest_free_span, g_arena.nodes[cur].size);
@@ -238,11 +315,119 @@ static bool arena_alloc(uint64_t bytes, uint64_t* out_offset, uint64_t* out_capa
     g_arena.alloc_calls++;
 
     // Best-fit search: scan all free spans and pick the smallest that satisfies need.
+    auto find_best_fit = [&](int32_t head, int32_t& out_best, uint64_t& out_best_size, int32_t& out_prev) {
+        out_best = -1;
+        out_best_size = 0;
+        out_prev = -1;
+        int32_t prev = -1;
+        for (int32_t cur = head; cur >= 0; prev = cur, cur = g_arena.nodes[cur].next) {
+            const uint64_t sz = g_arena.nodes[cur].size;
+            if (sz < need) continue;
+            if (out_best < 0 || sz < out_best_size) {
+                out_best = cur;
+                out_best_size = sz;
+                out_prev = prev;
+                if (sz == need) break;
+            }
+        }
+    };
+
+    int32_t best = -1;
+    uint64_t best_size = 0;
+    int32_t best_prev = -1;
+    bool from_clean = true;
+    find_best_fit(g_arena.clean_list_head, best, best_size, best_prev);
+    if (best < 0) {
+        from_clean = false;
+        find_best_fit(g_arena.dirty_list_head, best, best_size, best_prev);
+    }
+    if (best < 0) {
+        g_arena.alloc_fail_oom++;
+        return false;
+    }
+
+    int32_t& list_head = from_clean ? g_arena.clean_list_head : g_arena.dirty_list_head;
+
+    // Best-fit search: scan all free spans and pick the smallest that satisfies need.
+    // (done above)
+
+    int32_t prev = best_prev;
+    for (int32_t cur = list_head; cur >= 0; prev = cur, cur = g_arena.nodes[cur].next) {
+        if (cur == best) break;
+    }
+    if (best_prev != prev) {
+        // best_prev is already correct, but keep prev consistent for removal.
+        prev = best_prev;
+    }
+
+    const uint64_t span_offset = g_arena.nodes[best].offset;
+    const uint64_t span_size = g_arena.nodes[best].size;
+
+    // Remove chosen node from free list.
+    if (best_prev < 0) {
+        list_head = g_arena.nodes[best].next;
+    } else {
+        g_arena.nodes[best_prev].next = g_arena.nodes[best].next;
+    }
+    g_arena.nodes[best].next = -1;
+
+    const uint64_t alloc_offset = span_offset; // free list always aligned
+    const uint64_t remaining = span_size - need;
+    if (remaining > 0) {
+        // Reuse the existing node for the remainder span.
+        g_arena.nodes[best].offset = alloc_offset + need;
+        g_arena.nodes[best].size = remaining;
+
+        // Insert remainder back into free list at the correct position (offset order).
+        int32_t insert_prev = -1;
+        int32_t insert_cur = list_head;
+        while (insert_cur >= 0 && g_arena.nodes[insert_cur].offset < g_arena.nodes[best].offset) {
+            insert_prev = insert_cur;
+            insert_cur = g_arena.nodes[insert_cur].next;
+        }
+        if (insert_prev < 0) {
+            g_arena.nodes[best].next = list_head;
+            list_head = best;
+        } else {
+            g_arena.nodes[best].next = g_arena.nodes[insert_prev].next;
+            g_arena.nodes[insert_prev].next = best;
+        }
+    } else {
+        // Exact fit: return node to node pool.
+        arena_push_node(best);
+    }
+
+    const uint64_t end = alloc_offset + need;
+    if (end > g_arena.reserve_bytes) {
+        return false;
+    }
+    if (!arena_ensure_committed(end)) {
+        return false;
+    }
+
+    g_arena.active_leases++;
+    g_arena.active_leased_bytes += need;
+    g_arena.peak_active_leased_bytes = std::max<uint64_t>(g_arena.peak_active_leased_bytes, g_arena.active_leased_bytes);
+    *out_offset = alloc_offset;
+    *out_capacity = need;
+    return true;
+}
+
+static bool arena_alloc_clean_only(uint64_t bytes, uint64_t* out_offset, uint64_t* out_capacity) {
+    if (!out_offset || !out_capacity) return false;
+    if (!arena_ensure_initialized()) return false;
+    if (bytes == 0) bytes = 1;
+
+    const uint64_t need = align_up_u64(bytes, kAlignment);
+
+    std::lock_guard<std::mutex> lock(g_arena.lease_mu);
+    g_arena.alloc_calls++;
+
     int32_t best = -1;
     uint64_t best_size = 0;
     int32_t best_prev = -1;
     int32_t prev = -1;
-    for (int32_t cur = g_arena.free_list_head; cur >= 0; prev = cur, cur = g_arena.nodes[cur].next) {
+    for (int32_t cur = g_arena.clean_list_head; cur >= 0; prev = cur, cur = g_arena.nodes[cur].next) {
         const uint64_t sz = g_arena.nodes[cur].size;
         if (sz < need) continue;
         if (best < 0 || sz < best_size) {
@@ -260,47 +445,39 @@ static bool arena_alloc(uint64_t bytes, uint64_t* out_offset, uint64_t* out_capa
     const uint64_t span_offset = g_arena.nodes[best].offset;
     const uint64_t span_size = g_arena.nodes[best].size;
 
-    // Remove chosen node from free list.
     if (best_prev < 0) {
-        g_arena.free_list_head = g_arena.nodes[best].next;
+        g_arena.clean_list_head = g_arena.nodes[best].next;
     } else {
         g_arena.nodes[best_prev].next = g_arena.nodes[best].next;
     }
     g_arena.nodes[best].next = -1;
 
-    const uint64_t alloc_offset = span_offset; // free list always aligned
+    const uint64_t alloc_offset = span_offset;
     const uint64_t remaining = span_size - need;
     if (remaining > 0) {
-        // Reuse the existing node for the remainder span.
         g_arena.nodes[best].offset = alloc_offset + need;
         g_arena.nodes[best].size = remaining;
 
-        // Insert remainder back into free list at the correct position (offset order).
         int32_t insert_prev = -1;
-        int32_t insert_cur = g_arena.free_list_head;
+        int32_t insert_cur = g_arena.clean_list_head;
         while (insert_cur >= 0 && g_arena.nodes[insert_cur].offset < g_arena.nodes[best].offset) {
             insert_prev = insert_cur;
             insert_cur = g_arena.nodes[insert_cur].next;
         }
         if (insert_prev < 0) {
-            g_arena.nodes[best].next = g_arena.free_list_head;
-            g_arena.free_list_head = best;
+            g_arena.nodes[best].next = g_arena.clean_list_head;
+            g_arena.clean_list_head = best;
         } else {
             g_arena.nodes[best].next = g_arena.nodes[insert_prev].next;
             g_arena.nodes[insert_prev].next = best;
         }
     } else {
-        // Exact fit: return node to node pool.
         arena_push_node(best);
     }
 
     const uint64_t end = alloc_offset + need;
-    if (end > g_arena.reserve_bytes) {
-        return false;
-    }
-    if (!arena_ensure_committed(end)) {
-        return false;
-    }
+    if (end > g_arena.reserve_bytes) return false;
+    if (!arena_ensure_committed(end)) return false;
 
     g_arena.active_leases++;
     g_arena.active_leased_bytes += need;
@@ -331,7 +508,7 @@ static void arena_free(uint64_t offset, uint64_t size) {
     g_arena.nodes[node].size = sz;
 
     int32_t prev = -1;
-    int32_t cur = g_arena.free_list_head;
+    int32_t cur = g_arena.dirty_list_head;
     while (cur >= 0 && g_arena.nodes[cur].offset < offset) {
         prev = cur;
         cur = g_arena.nodes[cur].next;
@@ -339,8 +516,8 @@ static void arena_free(uint64_t offset, uint64_t size) {
 
     // Link in.
     if (prev < 0) {
-        g_arena.nodes[node].next = g_arena.free_list_head;
-        g_arena.free_list_head = node;
+        g_arena.nodes[node].next = g_arena.dirty_list_head;
+        g_arena.dirty_list_head = node;
     } else {
         g_arena.nodes[node].next = g_arena.nodes[prev].next;
         g_arena.nodes[prev].next = node;
@@ -360,6 +537,8 @@ static void arena_free(uint64_t offset, uint64_t size) {
         g_arena.nodes[prev].next = g_arena.nodes[node].next;
         arena_push_node(node);
     }
+
+    g_arena.cleaner_cv.notify_one();
 }
 
 static bool compute_dense_strides(const TensorDesc& desc, std::vector<uint64_t>& out) {
@@ -1070,6 +1249,38 @@ bool InMemoryBackend::map(AbstractTensorHandle handle, void** out_data, size_t* 
 
 void InMemoryBackend::unmap(AbstractTensorHandle /*handle*/) const {
     // No-op for in-memory backend; data is always host-accessible.
+}
+
+bool InMemoryBackend::ensure_zeroed(AbstractTensorHandle handle, const TensorDesc& desc) {
+    if (!abstract_tensor_handle_is_valid(handle)) return false;
+    TensorRecord* rec = find_record(handle.id);
+    if (!check_record_alive(rec)) return false;
+
+    TensorRecord* owner = rec->owns_lease ? rec : find_record(rec->lease_owner_id);
+    if (!owner || !owner->owns_lease) return false;
+
+    const size_t expected = static_cast<size_t>(desc.shape.element_count()) * tensor_dtype_size_bytes(desc.dtype);
+    const size_t clear_bytes = std::min(owner->bytes, expected);
+
+    if (owner->lease_refs.load(std::memory_order_acquire) == 1) {
+        uint64_t new_offset = 0;
+        uint64_t new_cap = 0;
+        if (arena_alloc_clean_only(static_cast<uint64_t>(owner->bytes), &new_offset, &new_cap)) {
+            const uint64_t old_offset = owner->offset;
+            const size_t old_bytes = owner->bytes;
+            owner->offset = new_offset;
+            owner->bytes = static_cast<size_t>(new_cap);
+            owner->data = g_arena.base + new_offset;
+            arena_free(old_offset, static_cast<uint64_t>(old_bytes));
+            return true;
+        }
+    }
+
+    if (owner->data && clear_bytes > 0) {
+        std::memset(owner->data, 0, clear_bytes);
+        return true;
+    }
+    return false;
 }
 
 InMemoryBackend& in_memory_backend_singleton() {

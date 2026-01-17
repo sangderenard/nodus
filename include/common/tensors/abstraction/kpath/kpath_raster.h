@@ -7,6 +7,7 @@
 #include "common/tensors/abstraction/coo_matrix.h"
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -273,6 +274,20 @@ void rasterize_program_gaussian_with_thermal_transformed(const ArmatureProgram& 
                                                         const GaussianToolParams& tool,
                                                         const ProgramRasterTransform& xform);
 
+using RasterKeyframeCallback = std::function<void(uint32_t frame_index,
+                                                  uint32_t frame_total,
+                                                  const TensorCanvas2D& energy,
+                                                  const TensorCanvas2D& temp)>;
+
+// Rasterize and emit keyframe callbacks during the process.
+void rasterize_program_gaussian_with_thermal_transformed_keyframes(const ArmatureProgram& program,
+                                                                  TensorCanvas2D& out_energy,
+                                                                  TensorCanvas2D& out_temp,
+                                                                  const MachineControlConfig& machine,
+                                                                  const GaussianToolParams& tool,
+                                                                  const ProgramRasterTransform& xform,
+                                                                  RasterKeyframeCallback on_keyframe);
+
 // Plan scatter-ready indices/values for a program in image space using xform.
 // When compressed, duplicate pixel hits are combined and stored as counts.
 bool plan_program_scatter(const ArmatureProgram& program,
@@ -423,5 +438,11 @@ bool write_png_rgb_u8(const std::string& path,
                       uint32_t width,
                       uint32_t height,
                       std::span<const uint8_t> pixels_rgb);
+
+// Writes an RGBA PNG to disk. pixels is packed RGBA (row-major, top-down).
+bool write_png_rgba_u8(const std::string& path,
+                       uint32_t width,
+                       uint32_t height,
+                       std::span<const uint8_t> pixels_rgba);
 
 } // namespace nodus::tensors::kpath
