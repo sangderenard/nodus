@@ -4,6 +4,7 @@
 #include "common/tensors/abstraction/tensor_backend.h"
 #include "common/tensors/abstraction/tensor_index.h"
 #include "common/tensors/abstraction/tensor_registry.h"
+#include "common/tensors/abstraction/tensor_math.h"
 
 #include <utility>
 #include <cstring>
@@ -175,6 +176,28 @@ bool AbstractTensor::set(std::initializer_list<TensorIndex> dims, const Abstract
     TensorIndexSpec spec;
     spec.dims.assign(dims.begin(), dims.end());
     return set_slice(spec, value);
+}
+
+bool AbstractTensor::gather(const AbstractTensor& input_indices,
+                            AbstractTensor& output,
+                            const AbstractTensor& output_indices,
+                            bool clamp) const {
+    return tensor_gather_dispatch(*this, input_indices, output, output_indices, clamp);
+}
+
+bool AbstractTensor::scatter(const AbstractTensor& input_indices,
+                             AbstractTensor& output,
+                             const AbstractTensor& output_indices,
+                             bool clamp) const {
+    return tensor_scatter_dispatch(*this, input_indices, output, output_indices, clamp);
+}
+
+bool AbstractTensor::transfer(const AbstractTensor& input_indices,
+                              AbstractTensor& output,
+                              const AbstractTensor& output_indices,
+                              bool gather_first,
+                              bool clamp) const {
+    return tensor_transfer_dispatch(*this, input_indices, output, output_indices, gather_first, clamp);
 }
 
 } // namespace nodus::tensors

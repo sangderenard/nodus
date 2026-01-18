@@ -351,6 +351,24 @@ bool tensor_scatter_nd_f64(const AbstractTensor& base,
                            const AbstractTensor& values,
                            AbstractTensor* out,
                            bool clamp = true);
+
+// Unified dispatchers (input + input indices -> output + output indices).
+bool tensor_gather_dispatch(const AbstractTensor& input,
+                            const AbstractTensor& input_indices,
+                            AbstractTensor& output,
+                            const AbstractTensor& output_indices,
+                            bool clamp = true);
+bool tensor_scatter_dispatch(const AbstractTensor& input,
+                             const AbstractTensor& input_indices,
+                             AbstractTensor& output,
+                             const AbstractTensor& output_indices,
+                             bool clamp = true);
+bool tensor_transfer_dispatch(const AbstractTensor& input,
+                              const AbstractTensor& input_indices,
+                              AbstractTensor& output,
+                              const AbstractTensor& output_indices,
+                              bool gather_first = true,
+                              bool clamp = true);
 // General N-D gather: points are [N, D] with D <= input rank.
 // base is [S0..S{D-1}] or [S0..S{D-1}, C]; out is [N] or [N, C].
 bool tensor_gather_nd_i8(const AbstractTensor& base,
@@ -1689,7 +1707,21 @@ bool tensor_apply_stencil_2d_f64_into(const AbstractTensor& field,
                                       AbstractTensor* out);
 
 // Copy src into dst (InMemoryBackend only). Supports dense/strided.
-bool tensor_copy_f32_into(const AbstractTensor& src, AbstractTensor* dst);
+#define NODUS_TENSOR_COPY_INTO_DECL(SUFFIX) \
+    bool tensor_copy_##SUFFIX##_into(const AbstractTensor& src, AbstractTensor* dst)
+
+NODUS_TENSOR_COPY_INTO_DECL(i8);
+NODUS_TENSOR_COPY_INTO_DECL(i16);
+NODUS_TENSOR_COPY_INTO_DECL(i32);
+NODUS_TENSOR_COPY_INTO_DECL(i64);
+NODUS_TENSOR_COPY_INTO_DECL(u8);
+NODUS_TENSOR_COPY_INTO_DECL(u16);
+NODUS_TENSOR_COPY_INTO_DECL(u32);
+NODUS_TENSOR_COPY_INTO_DECL(u64);
+NODUS_TENSOR_COPY_INTO_DECL(f32);
+NODUS_TENSOR_COPY_INTO_DECL(f64);
+
+#undef NODUS_TENSOR_COPY_INTO_DECL
 
 // Dense elementwise out = alpha * a + beta * b (InMemoryBackend only).
 // a, b, out must be dense F32 and have identical shapes.

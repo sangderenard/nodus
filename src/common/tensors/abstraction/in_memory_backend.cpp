@@ -124,7 +124,7 @@ static bool arena_ensure_initialized() {
     std::lock_guard<std::mutex> lock(g_arena.lease_mu);
     if (g_arena.initialized) return g_arena.base != nullptr;
 
-    const uint64_t mb = getenv_u64_mb("NODUS_INMEM_ARENA_MB", 1024);
+    const uint64_t mb = getenv_u64_mb("NODUS_INMEM_ARENA_MB", 10240);
     const uint64_t reserve = mb * 1024ull * 1024ull;
     g_arena.reserve_bytes = reserve;
 

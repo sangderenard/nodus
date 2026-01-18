@@ -48,6 +48,21 @@ public:
     AbstractTensor operator()(std::initializer_list<TensorIndex> dims) const;
     bool set(std::initializer_list<TensorIndex> dims, const AbstractTensor& value);
 
+    // Unified scatter/gather/transfer front-ends.
+    bool gather(const AbstractTensor& input_indices,
+                AbstractTensor& output,
+                const AbstractTensor& output_indices,
+                bool clamp = true) const;
+    bool scatter(const AbstractTensor& input_indices,
+                 AbstractTensor& output,
+                 const AbstractTensor& output_indices,
+                 bool clamp = true) const;
+    bool transfer(const AbstractTensor& input_indices,
+                  AbstractTensor& output,
+                  const AbstractTensor& output_indices,
+                  bool gather_first = true,
+                  bool clamp = true) const;
+
 private:
     friend class AbstractTensorPool;
     static AbstractTensor create_raw(const TensorDesc& desc, TensorBackend* backend = nullptr);

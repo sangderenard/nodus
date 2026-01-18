@@ -513,7 +513,9 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
                                        TensorBackend* backend) {
     if (!backend || !values || !output.valid() || count == 0 || dims == 0) return false;
     const uint64_t spatial_range = compute_index_range_u64(shape, dims);
-    const uint64_t index_range = spatial_range * static_cast<uint64_t>(channels);
+    const uint64_t index_range = spatial_range;
+    const uint32_t value_stride = val_scalar ? 1u : channels;
+    if (val_scalar && channels > 1u) return false;
 
     DYADIC_SCATTER_LOGF("dyadic_scatter: count=%u dims=%u channels=%u val_scalar=%d index_range=%llu\n",
                         count, dims, channels, val_scalar ? 1 : 0, (unsigned long long)index_range);
@@ -544,116 +546,12 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
     IndexT* idx_data = static_cast<IndexT*>(idx_ptr);
     const uint8_t* in_bounds = coord_buf.mask_ptr;
 
-    if (channels == 1) {
-        AbstractTensor masked_values;
-        Scalar* values_ptr = const_cast<Scalar*>(values);
-        void* mv_ptr = nullptr;
-        size_t mv_bytes = 0;
-        if (in_bounds) {
-            TensorDesc desc_values{};
-            desc_values.dtype = dyadic_value_dtype<Scalar>();
-            desc_values.layout = TensorLayout::Dense;
-            desc_values.shape.dims = {count};
-            masked_values = scatter_pool().acquire_tensor(desc_values, backend);
-            if (!masked_values.valid()) {
-                DYADIC_SCATTER_LOGF("dyadic_scatter: masked_values alloc failed\n");
-                mem->unmap(linear_indices.handle());
-                return false;
-            }
-            if (!mem->map(masked_values.handle(), &mv_ptr, &mv_bytes)) {
-                DYADIC_SCATTER_LOGF("dyadic_scatter: map masked_values failed\n");
-                mem->unmap(linear_indices.handle());
-                return false;
-            }
-            auto* mv = static_cast<Scalar*>(mv_ptr);
-            for (uint32_t i = 0; i < count; ++i) {
-                mv[i] = in_bounds[i] ? values[i] : Scalar{};
-            }
-            values_ptr = mv;
-        }
-
-        const bool ok = dyadic_binning_tensor<PremixPol, OutmixPol>(
-            static_cast<IndexT>(index_range),
-            count,
-            idx_data,
-            values_ptr,
-            8u,
-            1u,
-            1u,
-            1u,
-            1u,
-            output,
-            scatter_pool());
-        DYADIC_SCATTER_LOGF("dyadic_scatter: binning (channels=1) ok=%d\n", ok ? 1 : 0);
-        if (masked_values.valid()) {
-            mem->unmap(masked_values.handle());
-        }
-        mem->unmap(linear_indices.handle());
-        return ok;
-    }
-
-    const uint64_t expanded_count = static_cast<uint64_t>(count) * channels;
-    TensorDesc desc_indices{};
-    desc_indices.dtype = unsigned_index_dtype<IndexT>();
-    desc_indices.layout = TensorLayout::Dense;
-    desc_indices.shape.dims = {static_cast<uint32_t>(expanded_count)};
-    TensorDesc desc_values{};
-    desc_values.dtype = dyadic_value_dtype<Scalar>();
-    desc_values.layout = TensorLayout::Dense;
-    desc_values.shape.dims = {static_cast<uint32_t>(expanded_count)};
-
-    AbstractTensor expanded_indices = scatter_pool().acquire_tensor(desc_indices, backend);
-    AbstractTensor expanded_values = scatter_pool().acquire_tensor(desc_values, backend);
-    if (!expanded_indices.valid() || !expanded_values.valid()) {
-        DYADIC_SCATTER_LOGF("dyadic_scatter: expanded buffers alloc failed\n");
-        mem->unmap(linear_indices.handle());
-        return false;
-    }
-
-    void* ex_idx_ptr = nullptr;
-    size_t ex_idx_bytes = 0;
-    if (!mem->map(expanded_indices.handle(), &ex_idx_ptr, &ex_idx_bytes)) {
-        DYADIC_SCATTER_LOGF("dyadic_scatter: map expanded_indices failed\n");
-        mem->unmap(linear_indices.handle());
-        return false;
-    }
-    void* ex_val_ptr = nullptr;
-    size_t ex_val_bytes = 0;
-    if (!mem->map(expanded_values.handle(), &ex_val_ptr, &ex_val_bytes)) {
-        DYADIC_SCATTER_LOGF("dyadic_scatter: map expanded_values failed\n");
-        mem->unmap(expanded_indices.handle());
-        mem->unmap(linear_indices.handle());
-        return false;
-    }
-
-    auto* ex_idx = static_cast<IndexT*>(ex_idx_ptr);
-    auto* ex_val = static_cast<Scalar*>(ex_val_ptr);
-    uint64_t out_i = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        const uint64_t base = static_cast<uint64_t>(idx_data[i]) * channels;
-        const bool inb = !in_bounds || in_bounds[i];
-        if (val_scalar) {
-            const Scalar v = inb ? values[i] : Scalar{};
-            for (uint32_t c = 0; c < channels; ++c) {
-                ex_idx[out_i] = static_cast<IndexT>(base + c);
-                ex_val[out_i] = v;
-                out_i += 1u;
-            }
-        } else {
-            const Scalar* src = values + static_cast<uint64_t>(i) * channels;
-            for (uint32_t c = 0; c < channels; ++c) {
-                ex_idx[out_i] = static_cast<IndexT>(base + c);
-                ex_val[out_i] = inb ? src[c] : Scalar{};
-                out_i += 1u;
-            }
-        }
-    }
-
     const bool ok = dyadic_binning_tensor<PremixPol, OutmixPol>(
         static_cast<IndexT>(index_range),
-        static_cast<uint32_t>(expanded_count),
-        ex_idx,
-        ex_val,
+        count,
+        idx_data,
+        const_cast<Scalar*>(values),
+        value_stride,
         8u,
         1u,
         1u,
@@ -661,9 +559,7 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
         1u,
         output,
         scatter_pool());
-    DYADIC_SCATTER_LOGF("dyadic_scatter: binning (channels>1) ok=%d\n", ok ? 1 : 0);
-    mem->unmap(expanded_values.handle());
-    mem->unmap(expanded_indices.handle());
+    DYADIC_SCATTER_LOGF("dyadic_scatter: binning (stride=%u) ok=%d\n", value_stride, ok ? 1 : 0);
     mem->unmap(linear_indices.handle());
     return ok;
 }
@@ -679,7 +575,7 @@ static bool dyadic_scatter_from_coords_auto(const CoordBuffer& coord_buf,
                                             AbstractTensor& output,
                                             TensorBackend* backend) {
     const uint64_t spatial_range = compute_index_range_u64(shape, dims);
-    const uint64_t index_range = spatial_range * static_cast<uint64_t>(channels);
+    const uint64_t index_range = spatial_range;
     switch (pick_unsigned_index_dtype(index_range)) {
         case TensorDType::U8:
             return dyadic_scatter_from_coords<uint8_t, Scalar, PremixPol, OutmixPol>(
@@ -2060,6 +1956,48 @@ struct TensorMathImpl {
                                      true,
                                      coords,
                                      in_bounds);
+
+        bmap.unmap();
+        omap.unmap();
+
+        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+                coord_buf,
+                count,
+                2u,
+                bd.shape.dims.data(),
+                channels,
+                val_scalar,
+                vmap.data,
+                *out,
+                base.backend())) {
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
+            }
+            return true;
+        }
+
+        std::fprintf(stderr, "[dyadic] scatter_add_2d: dyadic path failed, falling back\n");
+
+        bmap = map_dense(base);
+        omap = map_dense_mut(*out);
+        if (!bmap.ok || !omap.ok) {
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
+            }
+            bmap.unmap();
+            omap.unmap();
+            return false;
+        }
 
         const bool use_span_tiling = span_tiling_enabled_from_env("NODUS_SCATTER_SPAN_TILING");
         if (use_span_tiling) {
@@ -6741,8 +6679,6 @@ static bool gather_2d_typed(const AbstractTensor& base,
                                  true,
                                  coords,
                                  in_bounds);
-
-
     const bool use_span_tiling = span_tiling_enabled_from_env("NODUS_GATHER_SPAN_TILING");
     if (use_span_tiling) {
         SpanOpConfig span_op{};
@@ -7759,8 +7695,10 @@ bool tensor_axpby_f32(const AbstractTensor& a,
     return true;
 }
 
-bool tensor_copy_f32_into(const AbstractTensor& src, AbstractTensor* dst) {
+template <TensorDType DTypeValue>
+static bool tensor_copy_typed_into(const AbstractTensor& src, AbstractTensor* dst) {
     if (!dst || !dst->valid() || !src.valid()) return false;
+    if (src.desc().dtype != DTypeValue || dst->desc().dtype != DTypeValue) return false;
 
     TensorOpPlan plan{};
     if (!build_unary_plan(src, *dst, plan)) return false;
@@ -7774,6 +7712,24 @@ bool tensor_copy_f32_into(const AbstractTensor& src, AbstractTensor* dst) {
     }
     return true;
 }
+
+#define NODUS_TENSOR_COPY_INTO_DEFINE(SUFFIX, DTYPE)                              \
+    bool tensor_copy_##SUFFIX##_into(const AbstractTensor& src, AbstractTensor* dst) { \
+        return tensor_copy_typed_into<DTYPE>(src, dst);                           \
+    }
+
+NODUS_TENSOR_COPY_INTO_DEFINE(i8, TensorDType::I8)
+NODUS_TENSOR_COPY_INTO_DEFINE(i16, TensorDType::I16)
+NODUS_TENSOR_COPY_INTO_DEFINE(i32, TensorDType::I32)
+NODUS_TENSOR_COPY_INTO_DEFINE(i64, TensorDType::I64)
+NODUS_TENSOR_COPY_INTO_DEFINE(u8, TensorDType::U8)
+NODUS_TENSOR_COPY_INTO_DEFINE(u16, TensorDType::U16)
+NODUS_TENSOR_COPY_INTO_DEFINE(u32, TensorDType::U32)
+NODUS_TENSOR_COPY_INTO_DEFINE(u64, TensorDType::U64)
+NODUS_TENSOR_COPY_INTO_DEFINE(f32, TensorDType::F32)
+NODUS_TENSOR_COPY_INTO_DEFINE(f64, TensorDType::F64)
+
+#undef NODUS_TENSOR_COPY_INTO_DEFINE
 
 #define NODUS_TENSOR_MATH_DEFINE(SUFFIX, SCALAR, DTYPE)                              \
     AbstractTensor tensor_matmul_##SUFFIX(const AbstractTensor& a,                  \
@@ -8073,6 +8029,380 @@ NODUS_TENSOR_GATHER_ADD_ND_WRAP(f64,
 #undef NODUS_TENSOR_GATHER_ND_WRAP
 #undef NODUS_TENSOR_GATHER_ADD_ND_WRAP
 #undef NODUS_TENSOR_STUB_FALSE
+
+namespace {
+
+enum class TransferOp { Gather, Scatter };
+enum class TransferPhase { GatherOnly, ScatterOnly, GatherThenScatter, ScatterThenGather };
+enum class MixPolicyKind { Overwrite, Add };
+
+struct TransferMixConfig {
+    MixPolicyKind premix_scatter = MixPolicyKind::Overwrite;
+    MixPolicyKind postmix_scatter = MixPolicyKind::Overwrite;
+    MixPolicyKind postmix_gather = MixPolicyKind::Overwrite;
+};
+
+template <typename PremixPol, typename OutmixPol>
+static bool dispatch_transfer_op(TransferOp op,
+                                 const AbstractTensor& base,
+                                 const AbstractTensor& points,
+                                 const AbstractTensor& values,
+                                 AbstractTensor& out,
+                                 bool clamp) {
+    if (!base.valid() || !points.valid()) return false;
+    const auto& pd = points.desc();
+    if (pd.layout != TensorLayout::Dense || pd.shape.dims.size() != 2) return false;
+    const uint32_t dims = pd.shape.dims[1];
+    const bool use_2d = (dims == 2);
+
+    if (op == TransferOp::Gather) {
+        switch (base.desc().dtype) {
+            case TensorDType::F32:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_f32(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_f32(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_f32(base, points, &out, clamp)
+                                  : tensor_gather_nd_f32(base, points, &out, clamp);
+                }
+            case TensorDType::F64:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_f64(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_f64(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_f64(base, points, &out, clamp)
+                                  : tensor_gather_nd_f64(base, points, &out, clamp);
+                }
+            case TensorDType::I8:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_i8(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_i8(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_i8(base, points, &out, clamp)
+                                  : tensor_gather_nd_i8(base, points, &out, clamp);
+                }
+            case TensorDType::I16:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_i16(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_i16(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_i16(base, points, &out, clamp)
+                                  : tensor_gather_nd_i16(base, points, &out, clamp);
+                }
+            case TensorDType::I32:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_i32(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_i32(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_i32(base, points, &out, clamp)
+                                  : tensor_gather_nd_i32(base, points, &out, clamp);
+                }
+            case TensorDType::I64:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_i64(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_i64(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_i64(base, points, &out, clamp)
+                                  : tensor_gather_nd_i64(base, points, &out, clamp);
+                }
+            case TensorDType::U8:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_u8(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_u8(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_u8(base, points, &out, clamp)
+                                  : tensor_gather_nd_u8(base, points, &out, clamp);
+                }
+            case TensorDType::U16:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_u16(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_u16(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_u16(base, points, &out, clamp)
+                                  : tensor_gather_nd_u16(base, points, &out, clamp);
+                }
+            case TensorDType::U32:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_u32(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_u32(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_u32(base, points, &out, clamp)
+                                  : tensor_gather_nd_u32(base, points, &out, clamp);
+                }
+            case TensorDType::U64:
+                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
+                    return use_2d ? tensor_gather_add_2d_u64(base, points, &out, clamp)
+                                  : tensor_gather_add_nd_u64(base, points, &out, clamp);
+                } else {
+                    return use_2d ? tensor_gather_2d_u64(base, points, &out, clamp)
+                                  : tensor_gather_nd_u64(base, points, &out, clamp);
+                }
+            default:
+                return false;
+        }
+    }
+
+    if constexpr (std::is_same_v<PremixPol, policies::Add> && std::is_same_v<OutmixPol, policies::Add>) {
+        switch (base.desc().dtype) {
+            case TensorDType::F32:
+                return use_2d ? tensor_scatter_add_2d_f32(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_f32(base, points, values, &out, clamp);
+            case TensorDType::F64:
+                return use_2d ? tensor_scatter_add_2d_f64(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_f64(base, points, values, &out, clamp);
+            case TensorDType::I8:
+                return use_2d ? tensor_scatter_add_2d_i8(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_i8(base, points, values, &out, clamp);
+            case TensorDType::I16:
+                return use_2d ? tensor_scatter_add_2d_i16(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_i16(base, points, values, &out, clamp);
+            case TensorDType::I32:
+                return use_2d ? tensor_scatter_add_2d_i32(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_i32(base, points, values, &out, clamp);
+            case TensorDType::I64:
+                return use_2d ? tensor_scatter_add_2d_i64(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_i64(base, points, values, &out, clamp);
+            case TensorDType::U8:
+                return use_2d ? tensor_scatter_add_2d_u8(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_u8(base, points, values, &out, clamp);
+            case TensorDType::U16:
+                return use_2d ? tensor_scatter_add_2d_u16(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_u16(base, points, values, &out, clamp);
+            case TensorDType::U32:
+                return use_2d ? tensor_scatter_add_2d_u32(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_u32(base, points, values, &out, clamp);
+            case TensorDType::U64:
+                return use_2d ? tensor_scatter_add_2d_u64(base, points, values, &out, clamp)
+                              : tensor_scatter_add_nd_u64(base, points, values, &out, clamp);
+            default:
+                return false;
+        }
+    }
+
+    if constexpr (!std::is_same_v<PremixPol, policies::Overwrite> ||
+                  !std::is_same_v<OutmixPol, policies::Overwrite>) {
+        return false;
+    }
+
+    switch (base.desc().dtype) {
+        case TensorDType::F32:
+            return use_2d ? tensor_scatter_2d_f32(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_f32(base, points, values, &out, clamp);
+        case TensorDType::F64:
+            return use_2d ? tensor_scatter_2d_f64(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_f64(base, points, values, &out, clamp);
+        case TensorDType::I8:
+            return use_2d ? tensor_scatter_2d_i8(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_i8(base, points, values, &out, clamp);
+        case TensorDType::I16:
+            return use_2d ? tensor_scatter_2d_i16(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_i16(base, points, values, &out, clamp);
+        case TensorDType::I32:
+            return use_2d ? tensor_scatter_2d_i32(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_i32(base, points, values, &out, clamp);
+        case TensorDType::I64:
+            return use_2d ? tensor_scatter_2d_i64(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_i64(base, points, values, &out, clamp);
+        case TensorDType::U8:
+            return use_2d ? tensor_scatter_2d_u8(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_u8(base, points, values, &out, clamp);
+        case TensorDType::U16:
+            return use_2d ? tensor_scatter_2d_u16(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_u16(base, points, values, &out, clamp);
+        case TensorDType::U32:
+            return use_2d ? tensor_scatter_2d_u32(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_u32(base, points, values, &out, clamp);
+        case TensorDType::U64:
+            return use_2d ? tensor_scatter_2d_u64(base, points, values, &out, clamp)
+                          : tensor_scatter_nd_u64(base, points, values, &out, clamp);
+        default:
+            return false;
+    }
+}
+
+static bool dispatch_transfer_op_config(TransferOp op,
+                                        const AbstractTensor& base,
+                                        const AbstractTensor& points,
+                                        const AbstractTensor& values,
+                                        AbstractTensor& out,
+                                        bool clamp,
+                                        MixPolicyKind premix,
+                                        MixPolicyKind postmix) {
+    if (premix == MixPolicyKind::Add && postmix == MixPolicyKind::Add) {
+        return dispatch_transfer_op<policies::Add, policies::Add>(op, base, points, values, out, clamp);
+    }
+    if (premix == MixPolicyKind::Overwrite && postmix == MixPolicyKind::Overwrite) {
+        return dispatch_transfer_op<policies::Overwrite, policies::Overwrite>(op, base, points, values, out, clamp);
+    }
+    if (premix == MixPolicyKind::Overwrite && postmix == MixPolicyKind::Add) {
+        return dispatch_transfer_op<policies::Overwrite, policies::Add>(op, base, points, values, out, clamp);
+    }
+    if (premix == MixPolicyKind::Add && postmix == MixPolicyKind::Overwrite) {
+        return dispatch_transfer_op<policies::Add, policies::Overwrite>(op, base, points, values, out, clamp);
+    }
+    return false;
+}
+
+static bool tensor_transfer_dispatch_internal(const AbstractTensor& input,
+                                              const AbstractTensor& input_indices,
+                                              AbstractTensor& output,
+                                              const AbstractTensor& output_indices,
+                                              TransferPhase phase,
+                                              bool clamp) {
+    // NOTE: Supported cases currently cover:
+    //  - input_indices -> output_indices (GatherThenScatter / ScatterThenGather)
+    //  - input_indices -> output tensor in-place (GatherOnly) (functionally equivalent to direct copying, forces algorithm choice)
+    //  - output_indices -> output tensor in-place (ScatterOnly) (functionally equivalent to direct copying, forces algorithm choice)
+    // Unimplemented cases (to define and add):
+    //  - input_indices aggregate to a single output index (reduction/broadcast semantics undefined)
+    //  - a single input index aggregates to output_indices (broadcast semantics undefined)
+    //  - sparse naive excution when indices list for gather/scatter in place is small enough directly call apply for each item
+    //  - dense copying with neither input_indices nor output_indices provided or indices list for gather or scatter in place is too large
+    // Meta cases:
+    //  - a pattern routine of individual gathers or scatters or both to achieve
+    //    neighborhood operations (requires use of stencil/footprint/csl/kernel abstractions)
+    if (!input.valid()) return false;
+    const bool has_input_idx = input_indices.valid();
+    const bool has_output_idx = output_indices.valid();
+    if (!has_input_idx && !has_output_idx) {
+        if (!output.valid()) {
+            output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
+            return true;
+        }
+        if (output.handle() == input.handle()) return true;
+        switch (input.desc().dtype) {
+            case TensorDType::I8:  return tensor_copy_i8_into(input, &output);
+            case TensorDType::I16: return tensor_copy_i16_into(input, &output);
+            case TensorDType::I32: return tensor_copy_i32_into(input, &output);
+            case TensorDType::I64: return tensor_copy_i64_into(input, &output);
+            case TensorDType::U8:  return tensor_copy_u8_into(input, &output);
+            case TensorDType::U16: return tensor_copy_u16_into(input, &output);
+            case TensorDType::U32: return tensor_copy_u32_into(input, &output);
+            case TensorDType::U64: return tensor_copy_u64_into(input, &output);
+            case TensorDType::F32: return tensor_copy_f32_into(input, &output);
+            case TensorDType::F64: return tensor_copy_f64_into(input, &output);
+            default:
+                return false;
+        }
+    }
+
+    const AbstractTensor* gather_points = has_input_idx ? &input_indices : &output_indices;
+    const AbstractTensor* scatter_points = has_output_idx ? &output_indices : &input_indices;
+    const TransferMixConfig mix{};
+
+    if (phase == TransferPhase::GatherOnly) {
+        return dispatch_transfer_op_config(TransferOp::Gather,
+                                           input,
+                                           *gather_points,
+                                           input,
+                                           output,
+                                           clamp,
+                                           MixPolicyKind::Overwrite,
+                                           mix.postmix_gather);
+    }
+
+    if (phase == TransferPhase::ScatterOnly) {
+        if (!output.valid()) {
+            output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
+        }
+        return dispatch_transfer_op_config(TransferOp::Scatter,
+                                           output,
+                                           *scatter_points,
+                                           input,
+                                           output,
+                                           clamp,
+                                           mix.premix_scatter,
+                                           mix.postmix_scatter);
+    }
+
+    if (phase == TransferPhase::GatherThenScatter) {
+        AbstractTensor gathered;
+        if (!dispatch_transfer_op_config(TransferOp::Gather,
+                                         input,
+                                         *gather_points,
+                                         input,
+                                         gathered,
+                                         clamp,
+                                         MixPolicyKind::Overwrite,
+                                         mix.postmix_gather)) return false;
+        if (!output.valid()) {
+            output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
+        }
+        return dispatch_transfer_op_config(TransferOp::Scatter,
+                                           output,
+                                           *scatter_points,
+                                           gathered,
+                                           output,
+                                           clamp,
+                                           mix.premix_scatter,
+                                           mix.postmix_scatter);
+    }
+
+    if (!output.valid()) {
+        output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
+    }
+    AbstractTensor scattered;
+    if (!dispatch_transfer_op_config(TransferOp::Scatter,
+                                     output,
+                                     *scatter_points,
+                                     input,
+                                     scattered,
+                                     clamp,
+                                     mix.premix_scatter,
+                                     mix.postmix_scatter)) return false;
+    return dispatch_transfer_op_config(TransferOp::Gather,
+                                       scattered,
+                                       *gather_points,
+                                       input,
+                                       output,
+                                       clamp,
+                                       MixPolicyKind::Overwrite,
+                                       mix.postmix_gather);
+}
+
+} // namespace
+
+bool tensor_gather_dispatch(const AbstractTensor& input,
+                            const AbstractTensor& input_indices,
+                            AbstractTensor& output,
+                            const AbstractTensor& output_indices,
+                            bool clamp) {
+    return tensor_transfer_dispatch_internal(input,
+                                            input_indices,
+                                            output,
+                                            output_indices,
+                                            TransferPhase::GatherOnly,
+                                            clamp);
+}
+
+bool tensor_scatter_dispatch(const AbstractTensor& input,
+                             const AbstractTensor& input_indices,
+                             AbstractTensor& output,
+                             const AbstractTensor& output_indices,
+                             bool clamp) {
+    return tensor_transfer_dispatch_internal(input,
+                                            input_indices,
+                                            output,
+                                            output_indices,
+                                            TransferPhase::ScatterOnly,
+                                            clamp);
+}
+
+bool tensor_transfer_dispatch(const AbstractTensor& input,
+                              const AbstractTensor& input_indices,
+                              AbstractTensor& output,
+                              const AbstractTensor& output_indices,
+                              bool gather_first,
+                              bool clamp) {
+    const auto phase = gather_first ? TransferPhase::GatherThenScatter
+                                    : TransferPhase::ScatterThenGather;
+    return tensor_transfer_dispatch_internal(input,
+                                            input_indices,
+                                            output,
+                                            output_indices,
+                                            phase,
+                                            clamp);
+}
 
 bool tensor_build_stencil_from_footprint_2d_f32(const TensorFootprint2D& footprint,
                                                 StencilOrientation orientation,

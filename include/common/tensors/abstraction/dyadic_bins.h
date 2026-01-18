@@ -3,6 +3,7 @@
 
 #include "common/tensors/abstraction/abstract_tensor_pool.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/stream_add.h"
 
 #include <atomic>
 #include <cstdint>
@@ -10,6 +11,8 @@
 #include <climits>
 #include <limits>
 #include <type_traits>
+#include <cstdio>
+#include <typeinfo>
 
 #include "common/tensors/abstraction/tensor_types.h"
 
@@ -36,12 +39,40 @@ struct Overwrite {
     static inline void apply(T& dest, const T& src) {
         dest = src;
     }
+
+    template <typename T>
+    static inline void apply_span(T* dest, const uint8_t* src_bytes, uint32_t elem_bytes, uint32_t value_stride) {
+        for (uint32_t c = 0; c < value_stride; ++c) {
+            T v{};
+            DYADIC_RAW_WRITE(&v, src_bytes + elem_bytes * c, sizeof(T));
+            dest[c] = v;
+        }
+    }
 };
 
 struct Add {
     template <typename T>
     static inline void apply(T& dest, const T& src) {
         dest = (T)(dest + src);
+    }
+
+    template <typename T>
+    static inline void apply_span(T* dest, const uint8_t* src_bytes, uint32_t elem_bytes, uint32_t value_stride) {
+        if constexpr (std::is_unsigned<T>::value) {
+            if (elem_bytes == sizeof(T)) {
+                const uintptr_t addr = reinterpret_cast<uintptr_t>(src_bytes);
+                if ((addr % alignof(T)) == 0) {
+                    auto* src = reinterpret_cast<const T*>(src_bytes);
+                    (void)nodus::stream_add::add_wrap_inplace<T, false>(dest, src, value_stride);
+                    return;
+                }
+            }
+        }
+        for (uint32_t c = 0; c < value_stride; ++c) {
+            T v{};
+            DYADIC_RAW_WRITE(&v, src_bytes + elem_bytes * c, sizeof(T));
+            dest[c] = (T)(dest[c] + v);
+        }
     }
 };
 
@@ -50,6 +81,15 @@ struct Multiply {
     static inline void apply(T& dest, const T& src) {
         dest = (T)(dest * src);
     }
+
+    template <typename T>
+    static inline void apply_span(T* dest, const uint8_t* src_bytes, uint32_t elem_bytes, uint32_t value_stride) {
+        for (uint32_t c = 0; c < value_stride; ++c) {
+            T v{};
+            DYADIC_RAW_WRITE(&v, src_bytes + elem_bytes * c, sizeof(T));
+            dest[c] = (T)(dest[c] * v);
+        }
+    }
 };
 
 struct Max {
@@ -57,12 +97,30 @@ struct Max {
     static inline void apply(T& dest, const T& src) {
         dest = (src > dest) ? src : dest;
     }
+
+    template <typename T>
+    static inline void apply_span(T* dest, const uint8_t* src_bytes, uint32_t elem_bytes, uint32_t value_stride) {
+        for (uint32_t c = 0; c < value_stride; ++c) {
+            T v{};
+            DYADIC_RAW_WRITE(&v, src_bytes + elem_bytes * c, sizeof(T));
+            dest[c] = (v > dest[c]) ? v : dest[c];
+        }
+    }
 };
 
 struct FusedMulAdd {
     template <typename T>
     static inline void apply(T& dest, const T& src) {
         dest = (T)((dest * src) + src);
+    }
+
+    template <typename T>
+    static inline void apply_span(T* dest, const uint8_t* src_bytes, uint32_t elem_bytes, uint32_t value_stride) {
+        for (uint32_t c = 0; c < value_stride; ++c) {
+            T v{};
+            DYADIC_RAW_WRITE(&v, src_bytes + elem_bytes * c, sizeof(T));
+            dest[c] = (T)((dest[c] * v) + v);
+        }
     }
 };
 
@@ -117,6 +175,74 @@ inline constexpr TensorDType dyadic_value_dtype() {
     } else {
         return TensorDType::Unknown;
     }
+}
+
+inline const char* dyadic_dtype_name(TensorDType dtype) {
+    switch (dtype) {
+        case TensorDType::F32: return "F32";
+        case TensorDType::F64: return "F64";
+        case TensorDType::I8: return "I8";
+        case TensorDType::I16: return "I16";
+        case TensorDType::I32: return "I32";
+        case TensorDType::I64: return "I64";
+        case TensorDType::U8: return "U8";
+        case TensorDType::U16: return "U16";
+        case TensorDType::U32: return "U32";
+        case TensorDType::U64: return "U64";
+        case TensorDType::Bool: return "Bool";
+        case TensorDType::Bytes: return "Bytes";
+        case TensorDType::Bytes2: return "Bytes2";
+        case TensorDType::Bytes4: return "Bytes4";
+        case TensorDType::Bytes8: return "Bytes8";
+        case TensorDType::Ptr: return "Ptr";
+        case TensorDType::Unknown:
+        default:
+            return "Unknown";
+    }
+}
+
+inline const char* dyadic_layout_name(TensorLayout layout) {
+    switch (layout) {
+        case TensorLayout::Dense: return "Dense";
+        case TensorLayout::Strided: return "Strided";
+        case TensorLayout::Opaque: return "Opaque";
+        default:
+            return "Unknown";
+    }
+}
+
+template <typename T>
+inline void dyadic_log_scalar(const char* name, T value) {
+    if constexpr (std::is_same<T, bool>::value) {
+        std::fprintf(stderr, "[dyadic] %s=%d\n", name, value ? 1 : 0);
+    } else if constexpr (std::is_floating_point<T>::value) {
+        std::fprintf(stderr, "[dyadic] %s=%g\n", name, static_cast<double>(value));
+    } else if constexpr (std::is_signed<T>::value) {
+        std::fprintf(stderr, "[dyadic] %s=%lld\n", name, static_cast<long long>(value));
+    } else {
+        std::fprintf(stderr, "[dyadic] %s=%llu\n", name, static_cast<unsigned long long>(value));
+    }
+}
+
+inline void dyadic_log_tensor(const char* name, const AbstractTensor& t) {
+    const TensorDesc& desc = t.desc();
+    std::fprintf(
+        stderr,
+        "[dyadic] %s: valid=%d handle=%llu backend=%p dtype=%s layout=%s rank=%u dims=[",
+        name,
+        t.valid() ? 1 : 0,
+        static_cast<unsigned long long>(t.handle().id),
+        static_cast<void*>(t.backend()),
+        dyadic_dtype_name(desc.dtype),
+        dyadic_layout_name(desc.layout),
+        static_cast<unsigned int>(desc.shape.rank()));
+    for (size_t i = 0; i < desc.shape.dims.size(); ++i) {
+        std::fprintf(stderr, "%u", desc.shape.dims[i]);
+        if (i + 1u < desc.shape.dims.size()) {
+            std::fprintf(stderr, ",");
+        }
+    }
+    std::fprintf(stderr, "]\n");
 }
 
 template <typename T>
@@ -203,6 +329,8 @@ struct DyadicBinIO3 {
     uint32_t  index_count = 0;
     uint32_t  elem_bytes = 0;
     uint32_t  slot_bytes = 0;
+    uint32_t  value_stride = 1;
+    uint32_t  value_bytes = 0;
     uint32_t  total_bins = 0;
 
     inline uint8_t* page_base(uint32_t bin, uint8_t page) const {
@@ -218,19 +346,34 @@ struct DyadicBinIO3 {
         return page_base(bin, page) + (uint64_t)slot * (uint64_t)slot_bytes;
     }
 
-    inline void write_slot_to_page(uint32_t bin, uint8_t page, INDEX_T idx, const VALUE_T& val) {
+    inline void write_slot_to_page(uint32_t bin, uint8_t page, INDEX_T idx, const VALUE_T* vals) {
         uint32_t slot = cnt(bin, page)++;
         uint8_t* p = slot_ptr(bin, page, slot);
         DYADIC_RAW_WRITE(p, &idx, sizeof(INDEX_T));
-        DYADIC_RAW_WRITE(p + elem_bytes, &val, sizeof(VALUE_T));
+        DYADIC_RAW_WRITE(p + elem_bytes, vals, (size_t)value_bytes);
     }
 
-    inline void push_inbox(uint32_t bin, INDEX_T idx, const VALUE_T& val) {
-        write_slot_to_page(bin, page_inbox[bin], idx, val);
+    inline void write_slot_to_page_bytes(uint32_t bin, uint8_t page, INDEX_T idx, const uint8_t* val_bytes) {
+        uint32_t slot = cnt(bin, page)++;
+        uint8_t* p = slot_ptr(bin, page, slot);
+        DYADIC_RAW_WRITE(p, &idx, sizeof(INDEX_T));
+        DYADIC_RAW_WRITE(p + elem_bytes, val_bytes, (size_t)value_bytes);
     }
 
-    inline void push_retain(uint32_t bin, INDEX_T idx, const VALUE_T& val) {
-        write_slot_to_page(bin, page_retain[bin], idx, val);
+    inline void push_inbox(uint32_t bin, INDEX_T idx, const VALUE_T* vals) {
+        write_slot_to_page(bin, page_inbox[bin], idx, vals);
+    }
+
+    inline void push_retain(uint32_t bin, INDEX_T idx, const VALUE_T* vals) {
+        write_slot_to_page(bin, page_retain[bin], idx, vals);
+    }
+
+    inline void push_inbox_bytes(uint32_t bin, INDEX_T idx, const uint8_t* val_bytes) {
+        write_slot_to_page_bytes(bin, page_inbox[bin], idx, val_bytes);
+    }
+
+    inline void push_retain_bytes(uint32_t bin, INDEX_T idx, const uint8_t* val_bytes) {
+        write_slot_to_page_bytes(bin, page_retain[bin], idx, val_bytes);
     }
 
     inline void prepare_for_scan(uint32_t bin) {
@@ -256,7 +399,7 @@ struct DyadicBinIO3 {
         uint8_t I_old = I;
         uint32_t base = cntA;
         uint32_t add = cntI;
-        std::memcpy(
+        DYADIC_RAW_WRITE(
             page_base(bin, A) + (uint64_t)base * slot_bytes,
             page_base(bin, I_old),
             (size_t)add * (size_t)slot_bytes);
@@ -273,7 +416,7 @@ struct DyadicBinIO3 {
         const uint32_t add = cnt(bin, I);
         page_active[bin] = R;
         if (add) {
-            std::memcpy(
+            DYADIC_RAW_WRITE(
                 page_base(bin, R) + (uint64_t)kept * slot_bytes,
                 page_base(bin, I),
                 (size_t)add * (size_t)slot_bytes);
@@ -296,16 +439,36 @@ inline void dyadic_classify_to_stage_or_bin_paged(
     VALUE_T* stage,
     uint32_t stage_bits,
     INDEX_T idx,
-    const VALUE_T& val) {
+    const VALUE_T* vals) {
     const INDEX_T S = (INDEX_T)1u << stage_bits;
     const INDEX_T lo = (INDEX_T)(idx & (S - 1u));
     const INDEX_T hi = (INDEX_T)(idx >> stage_bits);
     if (hi == 0) {
-        PremixPol::apply(stage[(uint32_t)lo], val);
+        VALUE_T* dst = stage + (uint64_t)lo * (uint64_t)io.value_stride;
+        PremixPol::apply_span(dst, reinterpret_cast<const uint8_t*>(vals), io.elem_bytes, io.value_stride);
         return;
     }
     uint32_t b = dyadic_msb_pos_nonzero<INDEX_T>(hi);
-    io.push_inbox(b, idx, val);
+    io.push_inbox(b, idx, vals);
+}
+
+template <typename INDEX_T, typename VALUE_T, typename PremixPol>
+inline void dyadic_classify_to_stage_or_bin_paged_bytes(
+    DyadicBinIO3<INDEX_T, VALUE_T>& io,
+    VALUE_T* stage,
+    uint32_t stage_bits,
+    INDEX_T idx,
+    const uint8_t* val_bytes) {
+    const INDEX_T S = (INDEX_T)1u << stage_bits;
+    const INDEX_T lo = (INDEX_T)(idx & (S - 1u));
+    const INDEX_T hi = (INDEX_T)(idx >> stage_bits);
+    if (hi == 0) {
+        VALUE_T* dst = stage + (uint64_t)lo * (uint64_t)io.value_stride;
+        PremixPol::apply_span(dst, val_bytes, io.elem_bytes, io.value_stride);
+        return;
+    }
+    uint32_t b = dyadic_msb_pos_nonzero<INDEX_T>(hi);
+    io.push_inbox_bytes(b, idx, val_bytes);
 }
 
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
@@ -327,20 +490,19 @@ inline void dyadic_cascade_phase_a_paged(
     while (slot ^ n) {
         uint8_t* p = base + (uint64_t)slot * (uint64_t)io.slot_bytes;
         INDEX_T idx;
-        VALUE_T val;
         DYADIC_RAW_WRITE(&idx, p, sizeof(INDEX_T));
-        DYADIC_RAW_WRITE(&val, p + io.elem_bytes, sizeof(VALUE_T));
+        const uint8_t* val_bytes = p + io.elem_bytes;
         const INDEX_T lo = (INDEX_T)(idx & lo_mask);
         const INDEX_T hi = (INDEX_T)(idx >> stage_bits);
         const bool gate_move = ((hi & msb1_mask) == 0);
         if (!gate_move) {
-            io.push_retain(src_bin, idx, val);
+            io.push_retain_bytes(src_bin, idx, val_bytes);
             slot += 1u;
             continue;
         }
         const INDEX_T hi_move = (INDEX_T)(hi ^ msb0_mask);
         const INDEX_T idx_move = (INDEX_T)((hi_move << stage_bits) | lo);
-        dyadic_classify_to_stage_or_bin_paged<INDEX_T, VALUE_T, PremixPol>(io, stage, stage_bits, idx_move, val);
+        dyadic_classify_to_stage_or_bin_paged_bytes<INDEX_T, VALUE_T, PremixPol>(io, stage, stage_bits, idx_move, val_bytes);
         slot += 1u;
     }
     io.finish_scan(src_bin);
@@ -365,14 +527,13 @@ inline void dyadic_cascade_phase_b_paged(
     while (slot ^ n) {
         uint8_t* p = base + (uint64_t)slot * (uint64_t)io.slot_bytes;
         INDEX_T idx;
-        VALUE_T val;
         DYADIC_RAW_WRITE(&idx, p, sizeof(INDEX_T));
-        DYADIC_RAW_WRITE(&val, p + io.elem_bytes, sizeof(VALUE_T));
+        const uint8_t* val_bytes = p + io.elem_bytes;
         const INDEX_T lo = (INDEX_T)(idx & lo_mask);
         INDEX_T hi = (INDEX_T)(idx >> stage_bits);
         hi = (INDEX_T)(hi ^ (msb0_mask | msb1_mask));
         const INDEX_T idx2 = (INDEX_T)((hi << stage_bits) | lo);
-        dyadic_classify_to_stage_or_bin_paged<INDEX_T, VALUE_T, PremixPol>(io, stage, stage_bits, idx2, val);
+        dyadic_classify_to_stage_or_bin_paged_bytes<INDEX_T, VALUE_T, PremixPol>(io, stage, stage_bits, idx2, val_bytes);
         slot += 1u;
     }
     io.finish_scan(src_bin);
@@ -393,42 +554,44 @@ inline void dyadic_bin0_drain_paged(
     while (slot ^ n) {
         uint8_t* p = base + (uint64_t)slot * (uint64_t)io.slot_bytes;
         INDEX_T idx;
-        VALUE_T val;
         DYADIC_RAW_WRITE(&idx, p, sizeof(INDEX_T));
-        DYADIC_RAW_WRITE(&val, p + io.elem_bytes, sizeof(VALUE_T));
+        const uint8_t* val_bytes = p + io.elem_bytes;
         const INDEX_T lo = (INDEX_T)(idx & lo_mask);
-        PremixPol::apply(stage[(uint32_t)lo], val);
+        VALUE_T* dst = stage + (uint64_t)lo * (uint64_t)io.value_stride;
+        PremixPol::apply_span(dst, val_bytes, io.elem_bytes, io.value_stride);
         slot += 1u;
     }
     io.finish_scan(bin);
 }
 
 template <typename VALUE_T, typename OutmixPol>
-inline void dyadic_emit_stage_linear(VALUE_T* output, uint32_t* output_offset, const VALUE_T* stage, uint32_t stage_bits) {
+inline void dyadic_emit_stage_linear(VALUE_T* output, uint32_t* output_offset, const VALUE_T* stage,
+                                     uint32_t stage_bits, uint32_t value_stride) {
     const uint32_t stage_len = (uint32_t)(1u << stage_bits);
+    const uint64_t total = (uint64_t)stage_len * (uint64_t)value_stride;
     VALUE_T* out = output + *output_offset;
     if constexpr (std::is_same_v<OutmixPol, policies::Overwrite>) {
-        DYADIC_RAW_WRITE(out, stage, stage_len * (uint32_t)sizeof(VALUE_T));
+        DYADIC_RAW_WRITE(out, stage, (uint32_t)(total * (uint64_t)sizeof(VALUE_T)));
     } else {
-        for (uint32_t i = 0; i < stage_len; ++i) {
-            OutmixPol::apply(out[i], stage[i]);
-        }
+        OutmixPol::apply_span(out, reinterpret_cast<const uint8_t*>(stage),
+                              (uint32_t)sizeof(VALUE_T), (uint32_t)total);
     }
-    *output_offset = (uint32_t)(*output_offset + stage_len);
+    *output_offset = (uint32_t)(*output_offset + (uint32_t)total);
 }
 
 template <typename VALUE_T, typename OutmixPol>
 inline bool dyadic_emit_stage_linear(AbstractTensor& output,
                                      uint32_t* output_offset,
                                      const VALUE_T* stage,
-                                     uint32_t stage_bits) {
+                                     uint32_t stage_bits,
+                                     uint32_t value_stride) {
     if (!output.valid()) return false;
     auto* mem = dynamic_cast<InMemoryBackend*>(output.backend());
     if (!mem) return false;
     void* out_ptr = nullptr;
     size_t out_bytes = 0;
     if (!mem->map(output.handle(), &out_ptr, &out_bytes)) return false;
-    dyadic_emit_stage_linear<VALUE_T, OutmixPol>(static_cast<VALUE_T*>(out_ptr), output_offset, stage, stage_bits);
+    dyadic_emit_stage_linear<VALUE_T, OutmixPol>(static_cast<VALUE_T*>(out_ptr), output_offset, stage, stage_bits, value_stride);
     mem->unmap(output.handle());
     return true;
 }
@@ -437,6 +600,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
 #define DYADIC_BINNING_UINT_DEFINE(INDEX_T, VALUE_T) \
     template <typename PremixPol = policies::Add, typename OutmixPol = policies::Overwrite> \
     inline void dyadic_mt_bitmask_algo(INDEX_T index_range, uint32_t index_count, INDEX_T* indices, VALUE_T* values, \
+                                       uint32_t value_stride, \
                                        uint32_t stage_bits, uint32_t thread_count, \
                                        uint32_t phase_a_rounds, uint32_t phase_b_rounds, uint32_t bin0_passes, \
                                        VALUE_T* output, uint32_t* output_offset, \
@@ -478,7 +642,9 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
         io.page_inbox = static_cast<uint8_t*>(page_inbox_data_void); \
         io.index_count = index_count; \
         io.elem_bytes = (uint32_t)(dyadic_uint_max_bits_v<INDEX_T, VALUE_T> >> 3); \
-        io.slot_bytes = io.elem_bytes * 2u; \
+        io.value_stride = value_stride; \
+        io.value_bytes = io.elem_bytes * value_stride; \
+        io.slot_bytes = io.elem_bytes * (1u + value_stride); \
         io.total_bins = dyadic_bin_count(index_range, stage_bits); \
         VALUE_T* stage = reinterpret_cast<VALUE_T*>(stage_data_void); \
         uint32_t b = 0; \
@@ -490,7 +656,8 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
         } \
         uint32_t i = 0; \
         while (i ^ index_count) { \
-            dyadic_classify_to_stage_or_bin_paged<INDEX_T, VALUE_T, PremixPol>(io, stage, stage_bits, indices[i], values[i]); \
+            const VALUE_T* vals = values + (uint64_t)i * (uint64_t)value_stride; \
+            dyadic_classify_to_stage_or_bin_paged<INDEX_T, VALUE_T, PremixPol>(io, stage, stage_bits, indices[i], vals); \
             i += 1u; \
         } \
         uint32_t round_a = 0; \
@@ -512,7 +679,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             dyadic_bin0_drain_paged<INDEX_T, VALUE_T, PremixPol>(io, stage, stage_bits); \
             pass0 += 1u; \
         } \
-        dyadic_emit_stage_linear<VALUE_T, OutmixPol>(output, output_offset, stage, stage_bits); \
+        dyadic_emit_stage_linear<VALUE_T, OutmixPol>(output, output_offset, stage, stage_bits, value_stride); \
         mem->unmap(bins.handle()); \
         mem->unmap(staging.handle()); \
         mem->unmap(counters.handle()); \
@@ -522,6 +689,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
     } \
     template <typename PremixPol = policies::Add, typename OutmixPol = policies::Overwrite> \
     inline bool dyadic_mt_bitmask_algo(INDEX_T index_range, uint32_t index_count, INDEX_T* indices, VALUE_T* values, \
+                                       uint32_t value_stride, \
                                        uint32_t stage_bits, uint32_t thread_count, \
                                        uint32_t phase_a_rounds, uint32_t phase_b_rounds, uint32_t bin0_passes, \
                                        AbstractTensor& output, uint32_t* output_offset, \
@@ -539,6 +707,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             index_count, \
             indices, \
             values, \
+            value_stride, \
             stage_bits, \
             thread_count, \
             phase_a_rounds, \
@@ -557,6 +726,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
     } \
     template <typename PremixPol = policies::Add, typename OutmixPol = policies::Overwrite> \
     inline bool dyadic_binning_tensor(INDEX_T index_range, uint32_t index_count, INDEX_T* indices, VALUE_T* values, \
+                                      uint32_t value_stride, \
                                       uint32_t stage_bits, uint32_t thread_count, \
                                       uint32_t phase_a_rounds, uint32_t phase_b_rounds, uint32_t bin0_passes, \
                                       AbstractTensor& output, AbstractTensorPool& pool) { \
@@ -567,11 +737,11 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
         TensorDesc desc_dyadic_bins{}; \
         desc_dyadic_bins.dtype = dyadic_uint_bytes_dtype<INDEX_T, VALUE_T>(); \
         desc_dyadic_bins.layout = TensorLayout::Dense; \
-        desc_dyadic_bins.shape.dims = { (uint32_t)(total_bins * 3u), index_count, 2u }; \
+        desc_dyadic_bins.shape.dims = { (uint32_t)(total_bins * 3u), index_count, (uint32_t)(1u + value_stride) }; \
         TensorDesc desc_staging{}; \
         desc_staging.dtype = dyadic_value_dtype<VALUE_T>(); \
         desc_staging.layout = TensorLayout::Dense; \
-        desc_staging.shape.dims = { (uint32_t)(1u << stage_bits) }; \
+        desc_staging.shape.dims = { (uint32_t)((1u << stage_bits) * value_stride) }; \
         TensorDesc desc_counters{}; \
         desc_counters.dtype = TensorDType::Bytes4; \
         desc_counters.layout = TensorLayout::Dense; \
@@ -600,6 +770,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             index_count, \
             indices, \
             values, \
+            value_stride, \
             stage_bits, \
             thread_count, \
             phase_a_rounds, \
@@ -614,10 +785,11 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             page_retain_tensor, \
             page_inbox_tensor); \
     } \
-    inline void dyadic_binning(INDEX_T index_range, uint32_t index_count, INDEX_T* indices, VALUE_T* values, \
-                               float_t dense_threshold, float_t* tile_dense_ratios, uint32_t thread_count, \
-                               uint32_t phase_a_rounds, uint32_t phase_b_rounds, uint32_t bin0_passes, \
-                               VALUE_T* output, uint32_t* output_offset) { \
+        inline void dyadic_binning(INDEX_T index_range, uint32_t index_count, INDEX_T* indices, VALUE_T* values, \
+                                   uint32_t value_stride, \
+                       float_t dense_threshold, float_t* tile_dense_ratios, uint32_t thread_count, \
+                       uint32_t phase_a_rounds, uint32_t phase_b_rounds, uint32_t bin0_passes, \
+                       VALUE_T* output, uint32_t* output_offset) { \
         const uint32_t stage_bits = 8; \
         const uint32_t total_bins = dyadic_bin_count(index_range, stage_bits); \
         const uint32_t stage_bins = (uint32_t)(1u << stage_bits); \
@@ -634,11 +806,11 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
         TensorDesc desc_dyadic_bins{}; \
         desc_dyadic_bins.dtype = dyadic_uint_bytes_dtype<INDEX_T, VALUE_T>(); \
         desc_dyadic_bins.layout = TensorLayout::Dense; \
-        desc_dyadic_bins.shape.dims = { (uint32_t)(total_bins * 3u), index_count, 2u }; \
+        desc_dyadic_bins.shape.dims = { (uint32_t)(total_bins * 3u), index_count, (uint32_t)(1u + value_stride) }; \
         TensorDesc desc_staging{}; \
         desc_staging.dtype = dyadic_value_dtype<VALUE_T>(); \
         desc_staging.layout = TensorLayout::Dense; \
-        desc_staging.shape.dims = { (uint32_t)(1u << stage_bits) }; \
+        desc_staging.shape.dims = { (uint32_t)((1u << stage_bits) * value_stride) }; \
         TensorDesc desc_counters{}; \
         desc_counters.dtype = TensorDType::Bytes4; \
         desc_counters.layout = TensorLayout::Dense; \
@@ -666,6 +838,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             index_count, \
             indices, \
             values, \
+            value_stride, \
             stage_bits, \
             thread_count, \
             phase_a_rounds, \
