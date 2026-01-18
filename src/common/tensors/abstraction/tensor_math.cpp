@@ -2,6 +2,7 @@
 
 #include "common/tensors/abstraction/in_memory_backend.h"
 #include "common/tensors/abstraction/abstract_tensor_pool.h"
+#include "common/tensors/abstraction/dyadic_bins.h"
 #include "common/tensors/abstraction/microkernels.h"
 #include "common/tensors/abstraction/tensor_types.h"
 #include "common/tensors/abstraction/tensor_tiling_strategy.h"
@@ -16,6 +17,12 @@
 #include <limits>
 #include <unordered_map>
 #include <type_traits>
+
+#if defined(NODUS_DYADIC_SCATTER_DEBUG)
+#define DYADIC_SCATTER_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
+#else
+#define DYADIC_SCATTER_LOGF(...) ((void)0)
+#endif
 
 namespace nodus::tensors {
 
@@ -341,11 +348,24 @@ static AbstractTensorPool& coord_pool() {
     return pool;
 }
 
+static AbstractTensorPool& scatter_pool() {
+    static thread_local AbstractTensorPool pool(coord_pool_options());
+    return pool;
+}
+
 static bool ensure_tensor_zeroed(AbstractTensor& tensor) {
     if (!tensor.valid()) return false;
     auto* mem = dynamic_cast<InMemoryBackend*>(tensor.backend());
     if (!mem) return false;
     return mem->ensure_zeroed(tensor.handle(), tensor.desc());
+}
+
+static bool scatter_dyadic_enabled_from_env(const char* env) {
+    if (!env) return false;
+    if (const char* v = std::getenv(env)) {
+        return (*v != 0 && std::strcmp(v, "0") != 0);
+    }
+    return false;
 }
 
 struct CoordBuffer {
@@ -354,6 +374,327 @@ struct CoordBuffer {
     int64_t* coords_ptr = nullptr;
     uint8_t* mask_ptr = nullptr;
 };
+
+static inline uint64_t compute_index_range_u64(const uint32_t* shape, uint32_t dims) {
+    uint64_t range = 1u;
+    for (uint32_t d = 0; d < dims; ++d) {
+        range *= static_cast<uint64_t>(shape[d]);
+    }
+    return range;
+}
+
+static inline TensorDType pick_unsigned_index_dtype(uint64_t range) {
+    if (range <= static_cast<uint64_t>(std::numeric_limits<uint8_t>::max())) return TensorDType::U8;
+    if (range <= static_cast<uint64_t>(std::numeric_limits<uint16_t>::max())) return TensorDType::U16;
+    if (range <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) return TensorDType::U32;
+    return TensorDType::U64;
+}
+
+template <typename IndexT>
+constexpr TensorDType unsigned_index_dtype() {
+    if constexpr (std::is_same_v<IndexT, uint8_t>) return TensorDType::U8;
+    if constexpr (std::is_same_v<IndexT, uint16_t>) return TensorDType::U16;
+    if constexpr (std::is_same_v<IndexT, uint32_t>) return TensorDType::U32;
+    return TensorDType::U64;
+}
+
+template <typename IndexT>
+static bool linearize_coords_to_tensor(const CoordBuffer& coord_buf,
+                                       uint32_t count,
+                                       uint32_t dims,
+                                       const uint32_t* shape,
+                                       AbstractTensor& out,
+                                       TensorBackend* backend,
+                                       TensorDType out_dtype = TensorDType::Unknown) {
+    if (!backend || !coord_buf.coords_ptr || !shape || dims == 0) return false;
+    const uint64_t index_range = compute_index_range_u64(shape, dims);
+    if (out_dtype == TensorDType::Unknown) {
+        out_dtype = pick_unsigned_index_dtype(index_range);
+    }
+    if (!out.valid()) {
+        TensorDesc desc{};
+        desc.dtype = out_dtype;
+        desc.layout = TensorLayout::Dense;
+        desc.shape.dims = {count};
+        out = AbstractTensor::create(desc, backend);
+        if (!out.valid()) return false;
+    } else {
+        if (out.desc().dtype != unsigned_index_dtype<IndexT>()) return false;
+    }
+
+    auto* mem = dynamic_cast<InMemoryBackend*>(backend);
+    if (!mem) return false;
+    void* out_ptr = nullptr;
+    size_t out_bytes = 0;
+    if (!mem->map(out.handle(), &out_ptr, &out_bytes)) return false;
+
+    std::vector<uint64_t> strides;
+    if (!compute_dense_strides_u64(std::vector<uint32_t>(shape, shape + dims), strides)) {
+        mem->unmap(out.handle());
+        return false;
+    }
+
+    IndexT* out_idx = static_cast<IndexT*>(out_ptr);
+    const int64_t* coords = coord_buf.coords_ptr;
+    const uint8_t* in_bounds = coord_buf.mask_ptr;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (in_bounds && !in_bounds[i]) {
+            out_idx[i] = static_cast<IndexT>(0);
+            continue;
+        }
+        const int64_t* coord = coords + static_cast<size_t>(i) * dims;
+        uint64_t linear = 0;
+        for (uint32_t d = 0; d < dims; ++d) {
+            linear += static_cast<uint64_t>(coord[d]) * strides[d];
+        }
+        out_idx[i] = static_cast<IndexT>(linear);
+    }
+
+    mem->unmap(out.handle());
+    return true;
+}
+
+template <typename IndexT>
+static bool delinearize_tensor_to_coords(const AbstractTensor& linear,
+                                         CoordBuffer& coord_buf,
+                                         uint32_t count,
+                                         uint32_t dims,
+                                         const uint32_t* shape) {
+    if (!linear.valid() || !coord_buf.coords_ptr || !shape || dims == 0) return false;
+    if (linear.desc().dtype != unsigned_index_dtype<IndexT>()) return false;
+    auto* mem = dynamic_cast<InMemoryBackend*>(linear.backend());
+    if (!mem) return false;
+    void* in_ptr = nullptr;
+    size_t in_bytes = 0;
+    if (!mem->map(linear.handle(), &in_ptr, &in_bytes)) return false;
+
+    const IndexT* in_idx = static_cast<const IndexT*>(in_ptr);
+    const uint64_t index_range = compute_index_range_u64(shape, dims);
+    int64_t* coords = coord_buf.coords_ptr;
+    uint8_t* in_bounds = coord_buf.mask_ptr;
+
+    std::vector<uint64_t> strides;
+    if (!compute_dense_strides_u64(std::vector<uint32_t>(shape, shape + dims), strides)) {
+        mem->unmap(linear.handle());
+        return false;
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t idx = static_cast<uint64_t>(in_idx[i]);
+        if (idx >= index_range) {
+            if (in_bounds) in_bounds[i] = 0;
+            for (uint32_t d = 0; d < dims; ++d) {
+                coords[static_cast<size_t>(i) * dims + d] = 0;
+            }
+            continue;
+        }
+        if (in_bounds) in_bounds[i] = 1;
+        for (uint32_t d = 0; d < dims; ++d) {
+            const uint64_t stride = strides[d];
+            const uint64_t v = idx / stride;
+            idx -= v * stride;
+            coords[static_cast<size_t>(i) * dims + d] = static_cast<int64_t>(v);
+        }
+    }
+
+    mem->unmap(linear.handle());
+    return true;
+}
+
+template <typename IndexT, typename Scalar, typename PremixPol, typename OutmixPol>
+static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
+                                       uint32_t count,
+                                       uint32_t dims,
+                                       const uint32_t* shape,
+                                       uint32_t channels,
+                                       bool val_scalar,
+                                       const Scalar* values,
+                                       AbstractTensor& output,
+                                       TensorBackend* backend) {
+    if (!backend || !values || !output.valid() || count == 0 || dims == 0) return false;
+    const uint64_t spatial_range = compute_index_range_u64(shape, dims);
+    const uint64_t index_range = spatial_range * static_cast<uint64_t>(channels);
+
+    DYADIC_SCATTER_LOGF("dyadic_scatter: count=%u dims=%u channels=%u val_scalar=%d index_range=%llu\n",
+                        count, dims, channels, val_scalar ? 1 : 0, (unsigned long long)index_range);
+
+    AbstractTensor linear_indices;
+    if (!linearize_coords_to_tensor<IndexT>(coord_buf,
+                                            count,
+                                            dims,
+                                            shape,
+                                            linear_indices,
+                                            backend,
+                                            unsigned_index_dtype<IndexT>())) {
+        DYADIC_SCATTER_LOGF("dyadic_scatter: linearize failed\n");
+        return false;
+    }
+
+    auto* mem = dynamic_cast<InMemoryBackend*>(backend);
+    if (!mem) {
+        DYADIC_SCATTER_LOGF("dyadic_scatter: backend not in-memory\n");
+        return false;
+    }
+    void* idx_ptr = nullptr;
+    size_t idx_bytes = 0;
+    if (!mem->map(linear_indices.handle(), &idx_ptr, &idx_bytes)) {
+        DYADIC_SCATTER_LOGF("dyadic_scatter: map linear_indices failed\n");
+        return false;
+    }
+    IndexT* idx_data = static_cast<IndexT*>(idx_ptr);
+    const uint8_t* in_bounds = coord_buf.mask_ptr;
+
+    if (channels == 1) {
+        AbstractTensor masked_values;
+        Scalar* values_ptr = const_cast<Scalar*>(values);
+        void* mv_ptr = nullptr;
+        size_t mv_bytes = 0;
+        if (in_bounds) {
+            TensorDesc desc_values{};
+            desc_values.dtype = dyadic_value_dtype<Scalar>();
+            desc_values.layout = TensorLayout::Dense;
+            desc_values.shape.dims = {count};
+            masked_values = scatter_pool().acquire_tensor(desc_values, backend);
+            if (!masked_values.valid()) {
+                DYADIC_SCATTER_LOGF("dyadic_scatter: masked_values alloc failed\n");
+                mem->unmap(linear_indices.handle());
+                return false;
+            }
+            if (!mem->map(masked_values.handle(), &mv_ptr, &mv_bytes)) {
+                DYADIC_SCATTER_LOGF("dyadic_scatter: map masked_values failed\n");
+                mem->unmap(linear_indices.handle());
+                return false;
+            }
+            auto* mv = static_cast<Scalar*>(mv_ptr);
+            for (uint32_t i = 0; i < count; ++i) {
+                mv[i] = in_bounds[i] ? values[i] : Scalar{};
+            }
+            values_ptr = mv;
+        }
+
+        const bool ok = dyadic_binning_tensor<PremixPol, OutmixPol>(
+            static_cast<IndexT>(index_range),
+            count,
+            idx_data,
+            values_ptr,
+            8u,
+            1u,
+            1u,
+            1u,
+            1u,
+            output,
+            scatter_pool());
+        DYADIC_SCATTER_LOGF("dyadic_scatter: binning (channels=1) ok=%d\n", ok ? 1 : 0);
+        if (masked_values.valid()) {
+            mem->unmap(masked_values.handle());
+        }
+        mem->unmap(linear_indices.handle());
+        return ok;
+    }
+
+    const uint64_t expanded_count = static_cast<uint64_t>(count) * channels;
+    TensorDesc desc_indices{};
+    desc_indices.dtype = unsigned_index_dtype<IndexT>();
+    desc_indices.layout = TensorLayout::Dense;
+    desc_indices.shape.dims = {static_cast<uint32_t>(expanded_count)};
+    TensorDesc desc_values{};
+    desc_values.dtype = dyadic_value_dtype<Scalar>();
+    desc_values.layout = TensorLayout::Dense;
+    desc_values.shape.dims = {static_cast<uint32_t>(expanded_count)};
+
+    AbstractTensor expanded_indices = scatter_pool().acquire_tensor(desc_indices, backend);
+    AbstractTensor expanded_values = scatter_pool().acquire_tensor(desc_values, backend);
+    if (!expanded_indices.valid() || !expanded_values.valid()) {
+        DYADIC_SCATTER_LOGF("dyadic_scatter: expanded buffers alloc failed\n");
+        mem->unmap(linear_indices.handle());
+        return false;
+    }
+
+    void* ex_idx_ptr = nullptr;
+    size_t ex_idx_bytes = 0;
+    if (!mem->map(expanded_indices.handle(), &ex_idx_ptr, &ex_idx_bytes)) {
+        DYADIC_SCATTER_LOGF("dyadic_scatter: map expanded_indices failed\n");
+        mem->unmap(linear_indices.handle());
+        return false;
+    }
+    void* ex_val_ptr = nullptr;
+    size_t ex_val_bytes = 0;
+    if (!mem->map(expanded_values.handle(), &ex_val_ptr, &ex_val_bytes)) {
+        DYADIC_SCATTER_LOGF("dyadic_scatter: map expanded_values failed\n");
+        mem->unmap(expanded_indices.handle());
+        mem->unmap(linear_indices.handle());
+        return false;
+    }
+
+    auto* ex_idx = static_cast<IndexT*>(ex_idx_ptr);
+    auto* ex_val = static_cast<Scalar*>(ex_val_ptr);
+    uint64_t out_i = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t base = static_cast<uint64_t>(idx_data[i]) * channels;
+        const bool inb = !in_bounds || in_bounds[i];
+        if (val_scalar) {
+            const Scalar v = inb ? values[i] : Scalar{};
+            for (uint32_t c = 0; c < channels; ++c) {
+                ex_idx[out_i] = static_cast<IndexT>(base + c);
+                ex_val[out_i] = v;
+                out_i += 1u;
+            }
+        } else {
+            const Scalar* src = values + static_cast<uint64_t>(i) * channels;
+            for (uint32_t c = 0; c < channels; ++c) {
+                ex_idx[out_i] = static_cast<IndexT>(base + c);
+                ex_val[out_i] = inb ? src[c] : Scalar{};
+                out_i += 1u;
+            }
+        }
+    }
+
+    const bool ok = dyadic_binning_tensor<PremixPol, OutmixPol>(
+        static_cast<IndexT>(index_range),
+        static_cast<uint32_t>(expanded_count),
+        ex_idx,
+        ex_val,
+        8u,
+        1u,
+        1u,
+        1u,
+        1u,
+        output,
+        scatter_pool());
+    DYADIC_SCATTER_LOGF("dyadic_scatter: binning (channels>1) ok=%d\n", ok ? 1 : 0);
+    mem->unmap(expanded_values.handle());
+    mem->unmap(expanded_indices.handle());
+    mem->unmap(linear_indices.handle());
+    return ok;
+}
+
+template <typename Scalar, typename PremixPol, typename OutmixPol>
+static bool dyadic_scatter_from_coords_auto(const CoordBuffer& coord_buf,
+                                            uint32_t count,
+                                            uint32_t dims,
+                                            const uint32_t* shape,
+                                            uint32_t channels,
+                                            bool val_scalar,
+                                            const Scalar* values,
+                                            AbstractTensor& output,
+                                            TensorBackend* backend) {
+    const uint64_t spatial_range = compute_index_range_u64(shape, dims);
+    const uint64_t index_range = spatial_range * static_cast<uint64_t>(channels);
+    switch (pick_unsigned_index_dtype(index_range)) {
+        case TensorDType::U8:
+            return dyadic_scatter_from_coords<uint8_t, Scalar, PremixPol, OutmixPol>(
+                coord_buf, count, dims, shape, channels, val_scalar, values, output, backend);
+        case TensorDType::U16:
+            return dyadic_scatter_from_coords<uint16_t, Scalar, PremixPol, OutmixPol>(
+                coord_buf, count, dims, shape, channels, val_scalar, values, output, backend);
+        case TensorDType::U32:
+            return dyadic_scatter_from_coords<uint32_t, Scalar, PremixPol, OutmixPol>(
+                coord_buf, count, dims, shape, channels, val_scalar, values, output, backend);
+        default:
+            return dyadic_scatter_from_coords<uint64_t, Scalar, PremixPol, OutmixPol>(
+                coord_buf, count, dims, shape, channels, val_scalar, values, output, backend);
+    }
+}
 
 static bool acquire_coord_buffer(uint32_t count,
                                  uint32_t dims,
@@ -2422,38 +2763,28 @@ struct TensorMathImpl {
                                      coords,
                                      in_bounds);
 
-        for (uint32_t i = 0; i < count; ++i) {
-            if (!in_bounds[i]) {
-                if (clamp) continue;
-                continue;
-            }
-            const int64_t xi = coords[i];
-            const uint64_t tile_id = static_cast<uint64_t>(xi) / tile_elems;
-            auto tile_lock = acquire_tile_lock(tile_id);
-            const uint64_t base_idx = static_cast<uint64_t>(xi) * stride0;
-            if (channels == 1) {
-                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
-                omap.data[base_idx] += v;
-            } else {
-                if (val_scalar) {
-                    const Scalar v = vmap.data[i];
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += v;
-                    }
-                } else {
-                    const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += src[c];
-                    }
-                }
-            }
-        }
+        bmap.unmap();
+        omap.unmap();
 
+        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+                coord_buf,
+                count,
+                1u,
+                bd.shape.dims.data(),
+                channels,
+                val_scalar,
+                vmap.data,
+                *out,
+                base.backend())) {
+            pmap.unmap();
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            return true;
+        }
         pmap.unmap();
         vmap.unmap();
-        omap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        return true;
+        return false;
     }
 
     static bool scatter_add_nd_3d(const AbstractTensor& base,
@@ -2575,46 +2906,28 @@ struct TensorMathImpl {
                                      true,
                                      coords,
                                      in_bounds);
-        for (uint32_t i = 0; i < count; ++i) {
-            if (!in_bounds[i]) {
-                if (clamp) continue;
-                continue;
-            }
-            const int64_t xi = coords[static_cast<size_t>(i) * 3 + 0];
-            const int64_t yi = coords[static_cast<size_t>(i) * 3 + 1];
-            const int64_t zi = coords[static_cast<size_t>(i) * 3 + 2];
-            const uint64_t gli = static_cast<uint64_t>(xi) * dense_strides[0] +
-                                 static_cast<uint64_t>(yi) * dense_strides[1] +
-                                 static_cast<uint64_t>(zi) * dense_strides[2];
-            const uint64_t tile_id = gli / tile_elems;
-            auto tile_lock = acquire_tile_lock(tile_id);
-            const uint64_t base_idx =
-                static_cast<uint64_t>(xi) * strides[0] +
-                static_cast<uint64_t>(yi) * strides[1] +
-                static_cast<uint64_t>(zi) * strides[2];
-            if (channels == 1) {
-                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
-                omap.data[base_idx] += v;
-            } else {
-                if (val_scalar) {
-                    const Scalar v = vmap.data[i];
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += v;
-                    }
-                } else {
-                    const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += src[c];
-                    }
-                }
-            }
-        }
 
+        bmap.unmap();
+        omap.unmap();
+        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+                coord_buf,
+                count,
+                3u,
+                bd.shape.dims.data(),
+                channels,
+                val_scalar,
+                vmap.data,
+                *out,
+                base.backend())) {
+            pmap.unmap();
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            return true;
+        }
         pmap.unmap();
         vmap.unmap();
-        omap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        return true;
+        return false;
     }
 
     static bool scatter_add_nd_4d(const AbstractTensor& base,
@@ -2735,49 +3048,27 @@ struct TensorMathImpl {
                                      coords,
                                      in_bounds);
 
-        for (uint32_t i = 0; i < count; ++i) {
-            if (!in_bounds[i]) {
-                if (clamp) continue;
-                continue;
-            }
-            const int64_t xi = coords[static_cast<size_t>(i) * 4 + 0];
-            const int64_t yi = coords[static_cast<size_t>(i) * 4 + 1];
-            const int64_t zi = coords[static_cast<size_t>(i) * 4 + 2];
-            const int64_t wi = coords[static_cast<size_t>(i) * 4 + 3];
-            const uint64_t gli = static_cast<uint64_t>(xi) * dense_strides[0] +
-                                 static_cast<uint64_t>(yi) * dense_strides[1] +
-                                 static_cast<uint64_t>(zi) * dense_strides[2] +
-                                 static_cast<uint64_t>(wi) * dense_strides[3];
-            const uint64_t tile_id = gli / tile_elems;
-            auto tile_lock = acquire_tile_lock(tile_id);
-            const uint64_t base_idx =
-                static_cast<uint64_t>(xi) * strides[0] +
-                static_cast<uint64_t>(yi) * strides[1] +
-                static_cast<uint64_t>(zi) * strides[2] +
-                static_cast<uint64_t>(wi) * strides[3];
-            if (channels == 1) {
-                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
-                omap.data[base_idx] += v;
-            } else {
-                if (val_scalar) {
-                    const Scalar v = vmap.data[i];
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += v;
-                    }
-                } else {
-                    const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += src[c];
-                    }
-                }
-            }
+        bmap.unmap();
+        omap.unmap();
+        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+                coord_buf,
+                count,
+                4u,
+                bd.shape.dims.data(),
+                channels,
+                val_scalar,
+                vmap.data,
+                *out,
+                base.backend())) {
+            pmap.unmap();
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            return true;
         }
-
         pmap.unmap();
         vmap.unmap();
-        omap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        return true;
+        return false;
     }
 
     static bool scatter_add_nd(const AbstractTensor& base,
@@ -2925,39 +3216,30 @@ struct TensorMathImpl {
                                      coords,
                                      in_bounds);
 
-        for (uint32_t i = 0; i < count; ++i) {
-            if (!in_bounds[i]) {
-                if (clamp) continue;
-                continue;
-            }
-
-            const int64_t* coord = coords + static_cast<size_t>(i) * dims;
-
-            uint64_t base_idx = 0;
-            for (uint32_t d = 0; d < dims; ++d) {
-                base_idx += static_cast<uint64_t>(coord[d]) * strides[d];
-            }
-
-            if (channels == 1) {
-                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
-                omap.data[base_idx] += v;
-            } else {
-                if (val_scalar) {
-                    const Scalar v = vmap.data[i];
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += v;
-                    }
-                } else {
-                    const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        omap.data[base_idx + c] += src[c];
-                    }
-                }
-            }
-        }
-
-        vmap.unmap();
+        bmap.unmap();
         omap.unmap();
+
+        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+                coord_buf,
+                count,
+                dims,
+                bd.shape.dims.data(),
+                channels,
+                val_scalar,
+                vmap.data,
+                *out,
+                base.backend())) {
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
+            }
+            return true;
+        }
+        vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
         if (points_match) {
             pmap.unmap();
@@ -2965,7 +3247,7 @@ struct TensorMathImpl {
             auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
             if (mem) mem->unmap(points.handle());
         }
-        return true;
+        return false;
     }
 
     static bool gather_nd(const AbstractTensor& base,
@@ -6460,6 +6742,7 @@ static bool gather_2d_typed(const AbstractTensor& base,
                                  coords,
                                  in_bounds);
 
+
     const bool use_span_tiling = span_tiling_enabled_from_env("NODUS_GATHER_SPAN_TILING");
     if (use_span_tiling) {
         SpanOpConfig span_op{};
@@ -6868,224 +7151,30 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
                                  coords,
                                  in_bounds);
 
-    const uint32_t tile_px = default_tile_px_2d(bd);
-
-    const bool use_span_tiling = span_tiling_enabled_from_env("NODUS_SCATTER_SPAN_TILING");
-    if (use_span_tiling) {
-        SpanOpConfig span_op{};
-        span_op.aggregate = SpanAggregateOp::Add;
-        if (span_scatter_add_2d<Scalar>(coords,
-                                        in_bounds,
-                                        count,
-                                        width,
-                                        height,
-                                        channels,
-                                        val_scalar,
-                                        vmap.data,
-                                        omap.data,
-                                        base.backend(),
-                                        tile_px,
-                                        span_op)) {
-            bmap.unmap();
-            omap.unmap();
-            vmap.unmap();
-            release_coord_buffer(base.backend(), coord_buf);
-            if (points_match) {
-                pmap.unmap();
-            } else if (points_ptr) {
-                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                if (mem) mem->unmap(points.handle());
-            }
-            return true;
-        }
-    }
-
-    auto& bins = tile_bins_2d();
-    const TileBinning2D tile = build_tile_bins_2d(bd, coords, in_bounds,
-                                                  count, width, height, pcols, bins);
-
-    struct ScatterCtx {
-        const int64_t* coords = nullptr;
-        const Scalar* values = nullptr;
-        Scalar* out = nullptr;
-        const uint32_t* offsets = nullptr;
-        const uint32_t* indices = nullptr;
-        const uint64_t* tile_mask = nullptr;
-        uint32_t tile_count = 0;
-        uint32_t width = 0;
-        uint32_t height = 0;
-        uint32_t channels = 0;
-        uint32_t pcols = 0;
-        uint32_t tiles_x = 0;
-        uint32_t tile_px = 0;
-        uint32_t tile_len = 0;
-        TensorBackend* backend = nullptr;
-        bool val_scalar = false;
-        bool dense_grid = false;
-        float dense_threshold = 0.0f;
-    };
-
-    auto scatter_rows = [](const void* vctx, uint32_t t0, uint32_t t1) {
-        const auto* ctx = static_cast<const ScatterCtx*>(vctx);
-        const uint32_t width = ctx->width;
-        const uint32_t channels = ctx->channels;
-        auto* mem = dynamic_cast<InMemoryBackend*>(ctx->backend);
-        if (!mem) return;
-        static thread_local AbstractTensorPool tile_pool(tile_pool_options());
-        static thread_local AbstractTensorPool::PooledTensor tile_buf;
-        TensorDesc tile_desc{};
-        tile_desc.dtype = DTypeValue;
-        tile_desc.layout = TensorLayout::Dense;
-        tile_desc.shape.dims = {ctx->tile_len, channels};
-
-        if (!tile_buf.valid() ||
-            tile_buf.tensor().desc().shape.dims != tile_desc.shape.dims) {
-            tile_buf = tile_pool.acquire(tile_desc, ctx->backend);
-        }
-        if (!tile_buf.valid()) return;
-
-        (void)ensure_tensor_zeroed(tile_buf.tensor());
-        void* tile_ptr_v = nullptr;
-        size_t tile_bytes = 0;
-        if (!mem->map(tile_buf.tensor().handle(), &tile_ptr_v, &tile_bytes)) return;
-        auto* tile = static_cast<Scalar*>(tile_ptr_v);
-        const size_t tile_elems = static_cast<size_t>(ctx->tile_len) * channels;
-
-        for (uint32_t ti = t0; ti < t1; ++ti) {
-            const uint32_t tid = ti;
-            const uint32_t word = tid >> 6;
-            const uint32_t bit = tid & 63u;
-            if ((ctx->tile_mask[word] & (1ull << bit)) == 0ull) continue;
-            const uint32_t begin = ctx->offsets[tid];
-            const uint32_t end = ctx->offsets[tid + 1];
-            if (begin == end) continue;
-            auto tile_lock = acquire_tile_lock(tid);
-            const uint32_t ty = tid / ctx->tiles_x;
-            const uint32_t tx = tid - ty * ctx->tiles_x;
-            const uint32_t tile_origin_x = tx * ctx->tile_px;
-            const uint32_t tile_origin_y = ty * ctx->tile_px;
-            const uint32_t y_end = std::min<uint32_t>(ctx->height, tile_origin_y + ctx->tile_px);
-            const uint32_t x_end = std::min<uint32_t>(ctx->width, tile_origin_x + ctx->tile_px);
-            const uint32_t rows = y_end - tile_origin_y;
-            const uint32_t cols = x_end - tile_origin_x;
-
-            const uint32_t hits = end - begin;
-            const uint32_t tile_area = rows * cols;
-            if (ctx->dense_grid && tile_area > 0) {
-                const float density = static_cast<float>(hits) / static_cast<float>(tile_area);
-                if (density >= ctx->dense_threshold) {
-                    const uint32_t out_row_stride = width * channels;
-                    Scalar* out_ptr =
-                        ctx->out + (static_cast<uint64_t>(tile_origin_y) * width + tile_origin_x) * channels;
-                    for (uint32_t ly = 0; ly < rows; ++ly) {
-                        const uint32_t y = tile_origin_y + ly;
-                        Scalar* dst = out_ptr + static_cast<uint64_t>(ly) * out_row_stride;
-                        if (ctx->val_scalar) {
-                            const Scalar* src = ctx->values + static_cast<size_t>(y) * width + tile_origin_x;
-                            for (uint32_t lx = 0; lx < cols; ++lx) {
-                                const Scalar v = src[lx];
-                                for (uint32_t c = 0; c < channels; ++c) {
-                                    dst[lx * channels + c] += v;
-                                }
-                            }
-                        } else {
-                            const Scalar* src = ctx->values +
-                                (static_cast<size_t>(y) * width + tile_origin_x) * channels;
-                            for (uint32_t lx = 0; lx < cols; ++lx) {
-                                const Scalar* src_row = src + static_cast<uint64_t>(lx) * channels;
-                                for (uint32_t c = 0; c < channels; ++c) {
-                                    dst[lx * channels + c] += src_row[c];
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            for (uint32_t idx = begin; idx < end; ++idx) {
-                const uint32_t i = ctx->indices[idx];
-                const int64_t xi = ctx->coords[static_cast<size_t>(i) * 2 + 0];
-                const int64_t yi = ctx->coords[static_cast<size_t>(i) * 2 + 1];
-                if (xi < 0 || yi < 0 || xi >= static_cast<int64_t>(width) ||
-                    yi >= static_cast<int64_t>(ctx->height)) {
-                    continue;
-                }
-                const uint32_t lx = static_cast<uint32_t>(xi) - tile_origin_x;
-                const uint32_t ly = static_cast<uint32_t>(yi) - tile_origin_y;
-                if (lx >= ctx->tile_px || ly >= ctx->tile_px) continue;
-                const uint32_t local = ly * ctx->tile_px + lx;
-                const uint64_t base_idx = static_cast<uint64_t>(local) * channels;
-                if (ctx->val_scalar) {
-                    const Scalar v = ctx->values[i];
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        tile[base_idx + c] += v;
-                    }
-                } else {
-                    const Scalar* src = ctx->values + static_cast<uint64_t>(i) * channels;
-                    for (uint32_t c = 0; c < channels; ++c) {
-                        tile[base_idx + c] += src[c];
-                    }
-                }
-            }
-
-            const uint32_t out_row_stride = width * channels;
-            const uint32_t x_row_stride = ctx->tile_px * channels;
-            if constexpr (std::is_same_v<Scalar, float>) {
-                float* out_ptr =
-                    ctx->out + (static_cast<uint64_t>(tile_origin_y) * width + tile_origin_x) * channels;
-                nodus_fused_add_f32_strided(out_ptr,
-                                            out_row_stride,
-                                            tile,
-                                            x_row_stride,
-                                            rows,
-                                            cols,
-                                            channels,
-                                            0u,
-                                            0.0f);
-            } else {
-                Scalar* out_ptr =
-                    ctx->out + (static_cast<uint64_t>(tile_origin_y) * width + tile_origin_x) * channels;
-                for (uint32_t r = 0; r < rows; ++r) {
-                    Scalar* dst = out_ptr + static_cast<uint64_t>(r) * out_row_stride;
-                    const Scalar* xv = tile + static_cast<uint64_t>(r) * x_row_stride;
-                    for (uint32_t j = 0; j < cols; ++j) {
-                        Scalar* drow = dst + static_cast<uint64_t>(j) * channels;
-                        const Scalar* xrow = xv + static_cast<uint64_t>(j) * channels;
-                        for (uint32_t cc = 0; cc < channels; ++cc) {
-                            drow[cc] += xrow[cc];
-                        }
-                    }
-                }
-            }
-        }
-        mem->unmap(tile_buf.tensor().handle());
-    };
-
-    ScatterCtx ctx{};
-    ctx.coords = coords;
-    ctx.values = vmap.data;
-    ctx.out = omap.data;
-    ctx.offsets = bins.offsets.data();
-    ctx.indices = bins.indices.data();
-    ctx.tile_mask = bins.tile_mask.data();
-    ctx.tile_count = tile.tile_count;
-    ctx.width = width;
-    ctx.height = height;
-    ctx.channels = channels;
-    ctx.pcols = pcols;
-    ctx.tiles_x = tile.tiles_x;
-    ctx.tile_px = tile.tile_px;
-    ctx.tile_len = tile.tile_px * tile.tile_px;
-    ctx.backend = base.backend();
-    ctx.val_scalar = val_scalar;
-    ctx.dense_grid = tile.dense_grid;
-    ctx.dense_threshold = tile.dense_threshold;
-
-    submit_row_jobs(tensor_op_pool(), scatter_rows, &ctx, 0, ctx.tile_count);
-
     bmap.unmap();
     omap.unmap();
+
+    if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+            coord_buf,
+            count,
+            2u,
+            bd.shape.dims.data(),
+            channels,
+            val_scalar,
+            vmap.data,
+            *out,
+            base.backend())) {
+        vmap.unmap();
+        release_coord_buffer(base.backend(), coord_buf);
+        if (points_match) {
+            pmap.unmap();
+        } else if (points_ptr) {
+            auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+            if (mem) mem->unmap(points.handle());
+        }
+        return true;
+    }
+
     vmap.unmap();
     release_coord_buffer(base.backend(), coord_buf);
     if (points_match) {
@@ -7094,7 +7183,8 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
         auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
         if (mem) mem->unmap(points.handle());
     }
-    return true;
+    return false;
+
 }
 
 template <typename Scalar, TensorDType DTypeValue>
@@ -7554,8 +7644,6 @@ static bool scatter_nd_typed(const AbstractTensor& base,
     }
     return true;
 }
-
-
 } // namespace
 
 TileShape2D choose_tile_shape_2d(const TensorDesc& desc,

@@ -673,6 +673,13 @@ add_executable(test_dyadic_bins_bench
 target_link_libraries(test_dyadic_bins_bench PRIVATE canvas_tables_static)
 add_test(NAME dyadic_bins_bench_test COMMAND test_dyadic_bins_bench)
 
+add_executable(test_dyadic_bins_bench_log
+  tests/dyadic_bins_bench_test.cpp
+)
+target_link_libraries(test_dyadic_bins_bench_log PRIVATE canvas_tables_static)
+target_compile_definitions(test_dyadic_bins_bench_log PRIVATE DYADIC_BINS_LOG=1)
+add_test(NAME dyadic_bins_bench_log_test COMMAND test_dyadic_bins_bench_log)
+
 add_executable(test_edge_fifo_sparse_delta
   tests/edge_fifo_sparse_delta_test.cpp
 )
