@@ -60,398 +60,48 @@ bool tensor_intersect_plane_z_f64(const AbstractTensor& origins,
                                   AbstractTensor* out_hits,
                                   AbstractTensor* out_mask);
 
-// Scatter (replace) values into a dense 2D grid. points are [N,2] or [N,3] (x,y[,z]).
-// base/out are [H,W] or [H,W,C], values are [N] or [N,C].
-bool tensor_scatter_2d_i8(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          const AbstractTensor& values,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_scatter_2d_i16(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_2d_i32(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_2d_i64(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_2d_u8(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          const AbstractTensor& values,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_scatter_2d_u16(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_2d_u32(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_2d_u64(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_2d_f32(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_2d_f64(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
+enum class TensorMixPolicy { Overwrite, Add };
+enum class TensorScatterAlgorithm { Auto, Tiling, Dyadic };
 
-// Scatter-add values into a dense 2D grid. points are [N,2] or [N,3] (x,y[,z]).
-// base/out are [H,W] or [H,W,C], values are [N] or [N,C].
-bool tensor_scatter_add_2d_i8(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              const AbstractTensor& values,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_scatter_add_2d_i16(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_2d_i32(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_2d_i64(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_2d_u8(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              const AbstractTensor& values,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_scatter_add_2d_u16(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_2d_u32(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_2d_u64(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_2d_f32(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_2d_f64(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-// Gather values from a dense 2D grid. points are [N,2] or [N,3] (x,y[,z]).
-// base is [H,W] or [H,W,C], out is [N] or [N,C].
-bool tensor_gather_2d_i8(const AbstractTensor& base,
-                         const AbstractTensor& points,
-                         AbstractTensor* out,
-                         bool clamp = true);
-bool tensor_gather_2d_i16(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_2d_i32(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_2d_i64(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_2d_u8(const AbstractTensor& base,
-                         const AbstractTensor& points,
-                         AbstractTensor* out,
-                         bool clamp = true);
-bool tensor_gather_2d_u16(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_2d_u32(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_2d_u64(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_2d_f32(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_2d_f64(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-// Gather-add into an existing output tensor (out must be valid and correctly shaped).
-bool tensor_gather_add_2d_i8(const AbstractTensor& base,
-                             const AbstractTensor& points,
-                             AbstractTensor* out,
-                             bool clamp = true);
-bool tensor_gather_add_2d_i16(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_2d_i32(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_2d_i64(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_2d_u8(const AbstractTensor& base,
-                             const AbstractTensor& points,
-                             AbstractTensor* out,
-                             bool clamp = true);
-bool tensor_gather_add_2d_u16(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_2d_u32(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_2d_u64(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_2d_f32(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_2d_f64(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-// General N-D scatter-add: points are [N, D] with D <= output rank.
-// Output is [S0..S{D-1}] or [S0..S{D-1}, C]; values are [N] or [N, C].
-bool tensor_scatter_add_nd_i8(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              const AbstractTensor& values,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_scatter_add_nd_i16(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_nd_i32(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_nd_i64(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_nd_u8(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              const AbstractTensor& values,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_scatter_add_nd_u16(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_nd_u32(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_nd_u64(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-bool tensor_scatter_add_nd_f32(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                                         AbstractTensor* out,
-                                         bool clamp = true);
-bool tensor_scatter_add_nd_f64(const AbstractTensor& base,
-                               const AbstractTensor& points,
-                               const AbstractTensor& values,
-                               AbstractTensor* out,
-                               bool clamp = true);
-// General N-D scatter (replace): points are [N, D] with D <= output rank.
-bool tensor_scatter_nd_i8(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          const AbstractTensor& values,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_scatter_nd_i16(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_nd_i32(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_nd_i64(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_nd_u8(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          const AbstractTensor& values,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_scatter_nd_u16(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_nd_u32(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_nd_u64(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_nd_f32(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
-bool tensor_scatter_nd_f64(const AbstractTensor& base,
-                           const AbstractTensor& points,
-                           const AbstractTensor& values,
-                           AbstractTensor* out,
-                           bool clamp = true);
+struct TensorTransferConfig {
+    TensorMixPolicy premix_scatter = TensorMixPolicy::Overwrite;
+    TensorMixPolicy postmix_scatter = TensorMixPolicy::Overwrite;
+    TensorMixPolicy postmix_gather = TensorMixPolicy::Overwrite;
+    TensorScatterAlgorithm scatter_algo = TensorScatterAlgorithm::Auto;
+    bool clamp = true;
+    uint32_t thread_count = 0;
+};
 
-// Unified dispatchers (input + input indices -> output + output indices).
-bool tensor_gather_dispatch(const AbstractTensor& input,
-                            const AbstractTensor& input_indices,
-                            AbstractTensor& output,
-                            const AbstractTensor& output_indices,
-                            bool clamp = true);
-bool tensor_scatter_dispatch(const AbstractTensor& input,
-                             const AbstractTensor& input_indices,
-                             AbstractTensor& output,
-                             const AbstractTensor& output_indices,
-                             bool clamp = true);
-bool tensor_transfer_dispatch(const AbstractTensor& input,
-                              const AbstractTensor& input_indices,
-                              AbstractTensor& output,
-                              const AbstractTensor& output_indices,
-                              bool gather_first = true,
-                              bool clamp = true);
+// Canonical gather/scatter (2D and ND). points are [N, D].
+bool tensor_gather_2d(const AbstractTensor& base,
+                      const AbstractTensor& points,
+                      AbstractTensor* out,
+                      const TensorTransferConfig& config = {});
+bool tensor_gather_nd(const AbstractTensor& base,
+                      const AbstractTensor& points,
+                      AbstractTensor* out,
+                      const TensorTransferConfig& config = {});
+bool tensor_scatter_2d(const AbstractTensor& base,
+                       const AbstractTensor& points,
+                       const AbstractTensor& values,
+                       AbstractTensor* out,
+                       const TensorTransferConfig& config = {});
+bool tensor_scatter_nd(const AbstractTensor& base,
+                       const AbstractTensor& points,
+                       const AbstractTensor& values,
+                       AbstractTensor* out,
+                       const TensorTransferConfig& config = {});
+
+// Unified transfer (input + input indices -> output + output indices).
+bool tensor_transfer(const AbstractTensor& input,
+                     const AbstractTensor& input_indices,
+                     AbstractTensor& output,
+                     const AbstractTensor& output_indices,
+                     bool gather_first,
+                     const TensorTransferConfig& config = {});
 // General N-D gather: points are [N, D] with D <= input rank.
 // base is [S0..S{D-1}] or [S0..S{D-1}, C]; out is [N] or [N, C].
-bool tensor_gather_nd_i8(const AbstractTensor& base,
-                         const AbstractTensor& points,
-                         AbstractTensor* out,
-                         bool clamp = true);
-bool tensor_gather_nd_i16(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_nd_i32(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_nd_i64(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_nd_u8(const AbstractTensor& base,
-                         const AbstractTensor& points,
-                         AbstractTensor* out,
-                         bool clamp = true);
-bool tensor_gather_nd_u16(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_nd_u32(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_nd_u64(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_nd_f32(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-bool tensor_gather_nd_f64(const AbstractTensor& base,
-                          const AbstractTensor& points,
-                          AbstractTensor* out,
-                          bool clamp = true);
-// Gather-add for N-D (out must be valid and correctly shaped).
-bool tensor_gather_add_nd_i8(const AbstractTensor& base,
-                             const AbstractTensor& points,
-                             AbstractTensor* out,
-                             bool clamp = true);
-bool tensor_gather_add_nd_i16(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_nd_i32(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_nd_i64(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_nd_u8(const AbstractTensor& base,
-                             const AbstractTensor& points,
-                             AbstractTensor* out,
-                             bool clamp = true);
-bool tensor_gather_add_nd_u16(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_nd_u32(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_nd_u64(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_nd_f32(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
-bool tensor_gather_add_nd_f64(const AbstractTensor& base,
-                              const AbstractTensor& points,
-                              AbstractTensor* out,
-                              bool clamp = true);
+// N-D gather/scatter implementations are driven through TensorMathImpl and the canonical API above.
 
 enum class StencilBoundaryMode : uint32_t {
     Zero = 0,

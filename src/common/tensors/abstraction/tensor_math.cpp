@@ -515,8 +515,6 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
     const uint64_t spatial_range = compute_index_range_u64(shape, dims);
     const uint64_t index_range = spatial_range;
     const uint32_t value_stride = val_scalar ? 1u : channels;
-    if (val_scalar && channels > 1u) return false;
-
     DYADIC_SCATTER_LOGF("dyadic_scatter: count=%u dims=%u channels=%u val_scalar=%d index_range=%llu\n",
                         count, dims, channels, val_scalar ? 1 : 0, (unsigned long long)index_range);
 
@@ -1822,7 +1820,9 @@ struct TensorMathImpl {
                                const AbstractTensor& points,
                                const AbstractTensor& values,
                                AbstractTensor* out,
-                               bool clamp) {
+                               bool clamp,
+                               bool allow_dyadic,
+                               bool require_dyadic) {
         if (!out) return false;
         out->reset();
         if (!base.valid() || !points.valid() || !values.valid()) return false;
@@ -1960,28 +1960,42 @@ struct TensorMathImpl {
         bmap.unmap();
         omap.unmap();
 
-        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
-                coord_buf,
-                count,
-                2u,
-                bd.shape.dims.data(),
-                channels,
-                val_scalar,
-                vmap.data,
-                *out,
-                base.backend())) {
-            vmap.unmap();
-            release_coord_buffer(base.backend(), coord_buf);
-            if (points_match) {
-                pmap.unmap();
-            } else if (points_ptr) {
-                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                if (mem) mem->unmap(points.handle());
+        if (allow_dyadic) {
+            if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+                    coord_buf,
+                    count,
+                    2u,
+                    bd.shape.dims.data(),
+                    channels,
+                    val_scalar,
+                    vmap.data,
+                    *out,
+                    base.backend())) {
+                vmap.unmap();
+                release_coord_buffer(base.backend(), coord_buf);
+                if (points_match) {
+                    pmap.unmap();
+                } else if (points_ptr) {
+                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                    if (mem) mem->unmap(points.handle());
+                }
+                return true;
             }
-            return true;
-        }
 
-        std::fprintf(stderr, "[dyadic] scatter_add_2d: dyadic path failed, falling back\n");
+            if (require_dyadic) {
+                vmap.unmap();
+                release_coord_buffer(base.backend(), coord_buf);
+                if (points_match) {
+                    pmap.unmap();
+                } else if (points_ptr) {
+                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                    if (mem) mem->unmap(points.handle());
+                }
+                return false;
+            }
+
+            std::fprintf(stderr, "[dyadic] scatter_add_2d: dyadic path failed, falling back\n");
+        }
 
         bmap = map_dense(base);
         omap = map_dense_mut(*out);
@@ -3040,7 +3054,7 @@ struct TensorMathImpl {
         if (out_rank < dims || out_rank > dims + 1) return false;
 
         if (dims == 1 && points_match) return scatter_add_nd_1d(base, points, values, out, clamp);
-        if (dims == 2) return scatter_add_2d(base, points, values, out, clamp);
+        if (dims == 2) return scatter_add_2d(base, points, values, out, clamp, true, true);
         if (dims == 3 && points_match) return scatter_add_nd_3d(base, points, values, out, clamp);
         if (dims == 4 && points_match) return scatter_add_nd_4d(base, points, values, out, clamp);
 
@@ -7644,9 +7658,38 @@ void submit_row_jobs(::nodus::ThreadPool* pool,
     if (batch) batch->wait();
 }
 
+static thread_local uint32_t tensor_op_thread_override = 0;
+
+struct TensorOpThreadOverrideGuard {
+    uint32_t prev = 0;
+    explicit TensorOpThreadOverrideGuard(uint32_t desired) {
+        prev = tensor_op_thread_override;
+        tensor_op_thread_override = desired;
+    }
+    ~TensorOpThreadOverrideGuard() {
+        tensor_op_thread_override = prev;
+    }
+};
+
 ::nodus::ThreadPool* tensor_op_pool() {
     static nodus::ThreadPool* pool = nullptr;
     static uint32_t pool_threads = 0;
+
+    if (tensor_op_thread_override >= 2) {
+        const uint32_t desired = tensor_op_thread_override;
+        if (pool && pool_threads == desired) return pool;
+        if (pool) {
+            delete pool;
+            pool = nullptr;
+            pool_threads = 0;
+        }
+        nodus::ThreadPool::Options opt{};
+        opt.thread_count = desired;
+        opt.start_immediately = true;
+        pool = new nodus::ThreadPool(opt);
+        pool_threads = desired;
+        return pool;
+    }
 
     const char* v = std::getenv("NODUS_TENSOR_OP_THREADS");
     if (!v || !*v) {
@@ -7713,9 +7756,9 @@ static bool tensor_copy_typed_into(const AbstractTensor& src, AbstractTensor* ds
     return true;
 }
 
-#define NODUS_TENSOR_COPY_INTO_DEFINE(SUFFIX, DTYPE)                              \
+#define NODUS_TENSOR_COPY_INTO_DEFINE(SUFFIX, DTYPE) \
     bool tensor_copy_##SUFFIX##_into(const AbstractTensor& src, AbstractTensor* dst) { \
-        return tensor_copy_typed_into<DTYPE>(src, dst);                           \
+        return tensor_copy_typed_into<DTYPE>(src, dst); \
     }
 
 NODUS_TENSOR_COPY_INTO_DEFINE(i8, TensorDType::I8)
@@ -7731,45 +7774,45 @@ NODUS_TENSOR_COPY_INTO_DEFINE(f64, TensorDType::F64)
 
 #undef NODUS_TENSOR_COPY_INTO_DEFINE
 
-#define NODUS_TENSOR_MATH_DEFINE(SUFFIX, SCALAR, DTYPE)                              \
-    AbstractTensor tensor_matmul_##SUFFIX(const AbstractTensor& a,                  \
-                                          const AbstractTensor& b) {                \
-        return TensorMathImpl<SCALAR, DTYPE>::matmul(a, b);                          \
-    }                                                                               \
-    AbstractTensor tensor_affine_identity_##SUFFIX(TensorBackend* backend) {        \
-        return TensorMathImpl<SCALAR, DTYPE>::affine_identity(backend);             \
-    }                                                                               \
-    AbstractTensor tensor_affine_translation_##SUFFIX(const AbstractTensor& t) {    \
-        return TensorMathImpl<SCALAR, DTYPE>::affine_translation(t);                \
-    }                                                                               \
-    AbstractTensor tensor_affine_scale_##SUFFIX(const AbstractTensor& s) {          \
-        return TensorMathImpl<SCALAR, DTYPE>::affine_scale(s);                      \
-    }                                                                               \
-    AbstractTensor tensor_affine_from_quat_translation_##SUFFIX(                    \
-        const AbstractTensor& q, const AbstractTensor& t) {                         \
-        return TensorMathImpl<SCALAR, DTYPE>::affine_from_quat_translation(q, t);   \
-    }                                                                               \
-    AbstractTensor tensor_quat_identity_##SUFFIX(TensorBackend* backend) {          \
-        return TensorMathImpl<SCALAR, DTYPE>::quat_identity(backend);               \
-    }                                                                               \
+#define NODUS_TENSOR_MATH_DEFINE(SUFFIX, SCALAR, DTYPE) \
+    AbstractTensor tensor_matmul_##SUFFIX(const AbstractTensor& a, \
+                                          const AbstractTensor& b) { \
+        return TensorMathImpl<SCALAR, DTYPE>::matmul(a, b); \
+    } \
+    AbstractTensor tensor_affine_identity_##SUFFIX(TensorBackend* backend) { \
+        return TensorMathImpl<SCALAR, DTYPE>::affine_identity(backend); \
+    } \
+    AbstractTensor tensor_affine_translation_##SUFFIX(const AbstractTensor& t) { \
+        return TensorMathImpl<SCALAR, DTYPE>::affine_translation(t); \
+    } \
+    AbstractTensor tensor_affine_scale_##SUFFIX(const AbstractTensor& s) { \
+        return TensorMathImpl<SCALAR, DTYPE>::affine_scale(s); \
+    } \
+    AbstractTensor tensor_affine_from_quat_translation_##SUFFIX( \
+        const AbstractTensor& q, const AbstractTensor& t) { \
+        return TensorMathImpl<SCALAR, DTYPE>::affine_from_quat_translation(q, t); \
+    } \
+    AbstractTensor tensor_quat_identity_##SUFFIX(TensorBackend* backend) { \
+        return TensorMathImpl<SCALAR, DTYPE>::quat_identity(backend); \
+    } \
     AbstractTensor tensor_quat_from_axis_angle_##SUFFIX(const AbstractTensor& axis, \
-                                                        SCALAR angle) {             \
-        return TensorMathImpl<SCALAR, DTYPE>::quat_from_axis_angle(axis, angle);    \
-    }                                                                               \
-    AbstractTensor tensor_quat_normalize_##SUFFIX(const AbstractTensor& q) {        \
-        return TensorMathImpl<SCALAR, DTYPE>::quat_normalize(q);                    \
-    }                                                                               \
-    AbstractTensor tensor_quat_mul_##SUFFIX(const AbstractTensor& a,                \
-                                            const AbstractTensor& b) {              \
-        return TensorMathImpl<SCALAR, DTYPE>::quat_mul(a, b);                        \
-    }                                                                               \
-    AbstractTensor tensor_quat_to_mat4_##SUFFIX(const AbstractTensor& q,            \
-                                                const AbstractTensor& t) {          \
-        return TensorMathImpl<SCALAR, DTYPE>::quat_to_mat4(q, t);                    \
-    }                                                                               \
-    AbstractTensor tensor_transform_points_##SUFFIX(const AbstractTensor& points,  \
-                                                     const AbstractTensor& mat4) {  \
-        return TensorMathImpl<SCALAR, DTYPE>::transform_points(points, mat4);       \
+                                                        SCALAR angle) { \
+        return TensorMathImpl<SCALAR, DTYPE>::quat_from_axis_angle(axis, angle); \
+    } \
+    AbstractTensor tensor_quat_normalize_##SUFFIX(const AbstractTensor& q) { \
+        return TensorMathImpl<SCALAR, DTYPE>::quat_normalize(q); \
+    } \
+    AbstractTensor tensor_quat_mul_##SUFFIX(const AbstractTensor& a, \
+                                            const AbstractTensor& b) { \
+        return TensorMathImpl<SCALAR, DTYPE>::quat_mul(a, b); \
+    } \
+    AbstractTensor tensor_quat_to_mat4_##SUFFIX(const AbstractTensor& q, \
+                                                const AbstractTensor& t) { \
+        return TensorMathImpl<SCALAR, DTYPE>::quat_to_mat4(q, t); \
+    } \
+    AbstractTensor tensor_transform_points_##SUFFIX(const AbstractTensor& points, \
+                                                     const AbstractTensor& mat4) { \
+        return TensorMathImpl<SCALAR, DTYPE>::transform_points(points, mat4); \
     }
 
 NODUS_TENSOR_MATH_DEFINE(f32, float, TensorDType::F32)
@@ -7795,613 +7838,211 @@ bool tensor_intersect_plane_z_f64(const AbstractTensor& origins,
         origins, dirs, plane_z, out_hits, out_mask);
 }
 
-#define NODUS_TENSOR_SCATTER_ADD_2D_WRAP(SUFFIX, ...)                              \
-    bool tensor_scatter_add_2d_##SUFFIX(const AbstractTensor& base,                \
-                                        const AbstractTensor& points,             \
-                                        const AbstractTensor& values,             \
-                                        AbstractTensor* out,                       \
-                                        bool clamp) {                              \
-        return (__VA_ARGS__);                                                      \
-    }
-
-#define NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(SUFFIX, TYPE, DTYPE)               \
-    NODUS_TENSOR_SCATTER_ADD_2D_WRAP(                                              \
-        SUFFIX,                                                                    \
-        scatter_add_2d_typed<TYPE, DTYPE>(base, points, values, out, clamp))
-
-#define NODUS_TENSOR_GATHER_2D_WRAP(SUFFIX, ...)                                   \
-    bool tensor_gather_2d_##SUFFIX(const AbstractTensor& base,                     \
-                                   const AbstractTensor& points,                  \
-                                   AbstractTensor* out,                            \
-                                   bool clamp) {                                   \
-        return (__VA_ARGS__);                                                      \
-    }
-
-#define NODUS_TENSOR_GATHER_2D_WRAP_TYPED(SUFFIX, TYPE, DTYPE)                     \
-    NODUS_TENSOR_GATHER_2D_WRAP(                                                   \
-        SUFFIX,                                                                    \
-        gather_2d_typed<TYPE, DTYPE>(base, points, out, clamp))
-
-#define NODUS_TENSOR_GATHER_ADD_2D_WRAP(SUFFIX, ...)                               \
-    bool tensor_gather_add_2d_##SUFFIX(const AbstractTensor& base,                 \
-                                       const AbstractTensor& points,              \
-                                       AbstractTensor* out,                        \
-                                       bool clamp) {                               \
-        return (__VA_ARGS__);                                                      \
-    }
-
-#define NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(SUFFIX, TYPE, DTYPE)                 \
-    NODUS_TENSOR_GATHER_ADD_2D_WRAP(                                               \
-        SUFFIX,                                                                    \
-        gather_add_2d_typed<TYPE, DTYPE>(base, points, out, clamp))
-
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP(f32,
-    TensorMathImpl<float, TensorDType::F32>::scatter_add_2d(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP(f64,
-    TensorMathImpl<double, TensorDType::F64>::scatter_add_2d(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(i8, int8_t, TensorDType::I8)
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(i16, int16_t, TensorDType::I16)
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(i32, int32_t, TensorDType::I32)
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(i64, int64_t, TensorDType::I64)
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(u8, uint8_t, TensorDType::U8)
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(u16, uint16_t, TensorDType::U16)
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(u32, uint32_t, TensorDType::U32)
-NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED(u64, uint64_t, TensorDType::U64)
-
-NODUS_TENSOR_GATHER_2D_WRAP(f32,
-    TensorMathImpl<float, TensorDType::F32>::gather_2d(base, points, out, clamp))
-NODUS_TENSOR_GATHER_2D_WRAP(f64,
-    TensorMathImpl<double, TensorDType::F64>::gather_2d(base, points, out, clamp))
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(i8, int8_t, TensorDType::I8)
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(i16, int16_t, TensorDType::I16)
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(i32, int32_t, TensorDType::I32)
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(i64, int64_t, TensorDType::I64)
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(u8, uint8_t, TensorDType::U8)
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(u16, uint16_t, TensorDType::U16)
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(u32, uint32_t, TensorDType::U32)
-NODUS_TENSOR_GATHER_2D_WRAP_TYPED(u64, uint64_t, TensorDType::U64)
-
-NODUS_TENSOR_GATHER_ADD_2D_WRAP(f32,
-    TensorMathImpl<float, TensorDType::F32>::gather_add_2d(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_2D_WRAP(f64,
-    TensorMathImpl<double, TensorDType::F64>::gather_add_2d(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(i8, int8_t, TensorDType::I8)
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(i16, int16_t, TensorDType::I16)
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(i32, int32_t, TensorDType::I32)
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(i64, int64_t, TensorDType::I64)
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(u8, uint8_t, TensorDType::U8)
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(u16, uint16_t, TensorDType::U16)
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(u32, uint32_t, TensorDType::U32)
-NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED(u64, uint64_t, TensorDType::U64)
-
-#undef NODUS_TENSOR_SCATTER_ADD_2D_WRAP_TYPED
-#undef NODUS_TENSOR_GATHER_2D_WRAP_TYPED
-#undef NODUS_TENSOR_GATHER_ADD_2D_WRAP_TYPED
-#undef NODUS_TENSOR_SCATTER_ADD_2D_WRAP
-#undef NODUS_TENSOR_GATHER_2D_WRAP
-#undef NODUS_TENSOR_GATHER_ADD_2D_WRAP
-
-#define NODUS_TENSOR_STUB_FALSE(...) false
-
-#define NODUS_TENSOR_SCATTER_2D_WRAP(SUFFIX, ...)                                 \
-    bool tensor_scatter_2d_##SUFFIX(const AbstractTensor& base,                    \
-                                    const AbstractTensor& points,                 \
-                                    const AbstractTensor& values,                 \
-                                    AbstractTensor* out,                           \
-                                    bool clamp) {                                  \
-        return (__VA_ARGS__);                                                      \
-    }
-
-#define NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(SUFFIX, TYPE, DTYPE)                    \
-    NODUS_TENSOR_SCATTER_2D_WRAP(                                                  \
-        SUFFIX,                                                                    \
-        scatter_2d_typed<TYPE, DTYPE>(base, points, values, out, clamp))
-
-#define NODUS_TENSOR_SCATTER_ADD_ND_WRAP(SUFFIX, ...)                              \
-    bool tensor_scatter_add_nd_##SUFFIX(const AbstractTensor& base,                \
-                                        const AbstractTensor& points,             \
-                                        const AbstractTensor& values,             \
-                                        AbstractTensor* out,                       \
-                                        bool clamp) {                              \
-        return (__VA_ARGS__);                                                      \
-    }
-
-#define NODUS_TENSOR_SCATTER_ND_WRAP(SUFFIX, ...)                                  \
-    bool tensor_scatter_nd_##SUFFIX(const AbstractTensor& base,                    \
-                                    const AbstractTensor& points,                 \
-                                    const AbstractTensor& values,                 \
-                                    AbstractTensor* out,                           \
-                                    bool clamp) {                                  \
-        return (__VA_ARGS__);                                                      \
-    }
-
-#define NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(SUFFIX, TYPE, DTYPE)                    \
-    NODUS_TENSOR_SCATTER_ND_WRAP(                                                  \
-        SUFFIX,                                                                    \
-        scatter_nd_typed<TYPE, DTYPE>(base, points, values, out, clamp))
-
-#define NODUS_TENSOR_GATHER_ND_WRAP(SUFFIX, ...)                                   \
-    bool tensor_gather_nd_##SUFFIX(const AbstractTensor& base,                     \
-                                   const AbstractTensor& points,                  \
-                                   AbstractTensor* out,                            \
-                                   bool clamp) {                                   \
-        return (__VA_ARGS__);                                                      \
-    }
-
-#define NODUS_TENSOR_GATHER_ADD_ND_WRAP(SUFFIX, ...)                               \
-    bool tensor_gather_add_nd_##SUFFIX(const AbstractTensor& base,                 \
-                                       const AbstractTensor& points,              \
-                                       AbstractTensor* out,                        \
-                                       bool clamp) {                               \
-        return (__VA_ARGS__);                                                      \
-    }
-
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(i8, int8_t, TensorDType::I8)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(i16, int16_t, TensorDType::I16)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(i32, int32_t, TensorDType::I32)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(i64, int64_t, TensorDType::I64)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(u8, uint8_t, TensorDType::U8)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(u16, uint16_t, TensorDType::U16)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(u32, uint32_t, TensorDType::U32)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(u64, uint64_t, TensorDType::U64)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(f32, float, TensorDType::F32)
-NODUS_TENSOR_SCATTER_2D_WRAP_TYPED(f64, double, TensorDType::F64)
-
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(i8,
-    TensorMathImpl<int8_t, TensorDType::I8>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(i16,
-    TensorMathImpl<int16_t, TensorDType::I16>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(i32,
-    TensorMathImpl<int32_t, TensorDType::I32>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(i64,
-    TensorMathImpl<int64_t, TensorDType::I64>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(u8,
-    TensorMathImpl<uint8_t, TensorDType::U8>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(u16,
-    TensorMathImpl<uint16_t, TensorDType::U16>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(u32,
-    TensorMathImpl<uint32_t, TensorDType::U32>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(u64,
-    TensorMathImpl<uint64_t, TensorDType::U64>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(f32,
-    TensorMathImpl<float, TensorDType::F32>::scatter_add_nd(base, points, values, out, clamp))
-NODUS_TENSOR_SCATTER_ADD_ND_WRAP(f64,
-    TensorMathImpl<double, TensorDType::F64>::scatter_add_nd(base, points, values, out, clamp))
-
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(i8, int8_t, TensorDType::I8)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(i16, int16_t, TensorDType::I16)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(i32, int32_t, TensorDType::I32)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(i64, int64_t, TensorDType::I64)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(u8, uint8_t, TensorDType::U8)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(u16, uint16_t, TensorDType::U16)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(u32, uint32_t, TensorDType::U32)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(u64, uint64_t, TensorDType::U64)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(f32, float, TensorDType::F32)
-NODUS_TENSOR_SCATTER_ND_WRAP_TYPED(f64, double, TensorDType::F64)
-
-NODUS_TENSOR_GATHER_ND_WRAP(i8,
-    TensorMathImpl<int8_t, TensorDType::I8>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(i16,
-    TensorMathImpl<int16_t, TensorDType::I16>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(i32,
-    TensorMathImpl<int32_t, TensorDType::I32>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(i64,
-    TensorMathImpl<int64_t, TensorDType::I64>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(u8,
-    TensorMathImpl<uint8_t, TensorDType::U8>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(u16,
-    TensorMathImpl<uint16_t, TensorDType::U16>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(u32,
-    TensorMathImpl<uint32_t, TensorDType::U32>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(u64,
-    TensorMathImpl<uint64_t, TensorDType::U64>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(f32,
-    TensorMathImpl<float, TensorDType::F32>::gather_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ND_WRAP(f64,
-    TensorMathImpl<double, TensorDType::F64>::gather_nd(base, points, out, clamp))
-
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(i8,
-    TensorMathImpl<int8_t, TensorDType::I8>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(i16,
-    TensorMathImpl<int16_t, TensorDType::I16>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(i32,
-    TensorMathImpl<int32_t, TensorDType::I32>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(i64,
-    TensorMathImpl<int64_t, TensorDType::I64>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(u8,
-    TensorMathImpl<uint8_t, TensorDType::U8>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(u16,
-    TensorMathImpl<uint16_t, TensorDType::U16>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(u32,
-    TensorMathImpl<uint32_t, TensorDType::U32>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(u64,
-    TensorMathImpl<uint64_t, TensorDType::U64>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(f32,
-    TensorMathImpl<float, TensorDType::F32>::gather_add_nd(base, points, out, clamp))
-NODUS_TENSOR_GATHER_ADD_ND_WRAP(f64,
-    TensorMathImpl<double, TensorDType::F64>::gather_add_nd(base, points, out, clamp))
-
-#undef NODUS_TENSOR_SCATTER_2D_WRAP_TYPED
-#undef NODUS_TENSOR_SCATTER_2D_WRAP
-#undef NODUS_TENSOR_SCATTER_ADD_ND_WRAP
-#undef NODUS_TENSOR_SCATTER_ND_WRAP_TYPED
-#undef NODUS_TENSOR_SCATTER_ND_WRAP
-#undef NODUS_TENSOR_GATHER_ND_WRAP
-#undef NODUS_TENSOR_GATHER_ADD_ND_WRAP
-#undef NODUS_TENSOR_STUB_FALSE
-
 namespace {
 
-enum class TransferOp { Gather, Scatter };
-enum class TransferPhase { GatherOnly, ScatterOnly, GatherThenScatter, ScatterThenGather };
-enum class MixPolicyKind { Overwrite, Add };
+enum class CoordMode { TwoD, ND };
 
-struct TransferMixConfig {
-    MixPolicyKind premix_scatter = MixPolicyKind::Overwrite;
-    MixPolicyKind postmix_scatter = MixPolicyKind::Overwrite;
-    MixPolicyKind postmix_gather = MixPolicyKind::Overwrite;
-};
+template <typename Scalar, TensorDType DTypeValue>
+static bool coordinate_gather(const AbstractTensor& base,\
+                              const AbstractTensor& points,\
+                              AbstractTensor* out,\
+                              const TensorTransferConfig& config,\
+                              CoordMode mode) {\
+    if (config.postmix_gather == TensorMixPolicy::Add) {\
+        return (mode == CoordMode::TwoD)\
+            ? TensorMathImpl<Scalar, DTypeValue>::gather_add_2d(base, points, out, config.clamp)\
+            : TensorMathImpl<Scalar, DTypeValue>::gather_add_nd(base, points, out, config.clamp);\
+    }\
+    return (mode == CoordMode::TwoD)\
+        ? TensorMathImpl<Scalar, DTypeValue>::gather_2d(base, points, out, config.clamp)\
+        : TensorMathImpl<Scalar, DTypeValue>::gather_nd(base, points, out, config.clamp);\
+}
 
-template <typename PremixPol, typename OutmixPol>
-static bool dispatch_transfer_op(TransferOp op,
-                                 const AbstractTensor& base,
-                                 const AbstractTensor& points,
-                                 const AbstractTensor& values,
-                                 AbstractTensor& out,
-                                 bool clamp) {
-    if (!base.valid() || !points.valid()) return false;
-    const auto& pd = points.desc();
-    if (pd.layout != TensorLayout::Dense || pd.shape.dims.size() != 2) return false;
-    const uint32_t dims = pd.shape.dims[1];
-    const bool use_2d = (dims == 2);
+template <typename Scalar, TensorDType DTypeValue>
+static bool coordinate_scatter(const AbstractTensor& base,
+                               const AbstractTensor& points,
+                               const AbstractTensor& values,
+                               AbstractTensor* out,
+                               const TensorTransferConfig& config,
+                               CoordMode mode) {
+    const bool add_policy = (config.premix_scatter == TensorMixPolicy::Add &&
+                             config.postmix_scatter == TensorMixPolicy::Add);
+    const bool overwrite_policy = (config.premix_scatter == TensorMixPolicy::Overwrite &&
+                                   config.postmix_scatter == TensorMixPolicy::Overwrite);
+    if (!add_policy && !overwrite_policy) return false;
 
-    if (op == TransferOp::Gather) {
-        switch (base.desc().dtype) {
-            case TensorDType::F32:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_f32(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_f32(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_f32(base, points, &out, clamp)
-                                  : tensor_gather_nd_f32(base, points, &out, clamp);
-                }
-            case TensorDType::F64:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_f64(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_f64(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_f64(base, points, &out, clamp)
-                                  : tensor_gather_nd_f64(base, points, &out, clamp);
-                }
-            case TensorDType::I8:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_i8(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_i8(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_i8(base, points, &out, clamp)
-                                  : tensor_gather_nd_i8(base, points, &out, clamp);
-                }
-            case TensorDType::I16:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_i16(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_i16(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_i16(base, points, &out, clamp)
-                                  : tensor_gather_nd_i16(base, points, &out, clamp);
-                }
-            case TensorDType::I32:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_i32(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_i32(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_i32(base, points, &out, clamp)
-                                  : tensor_gather_nd_i32(base, points, &out, clamp);
-                }
-            case TensorDType::I64:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_i64(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_i64(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_i64(base, points, &out, clamp)
-                                  : tensor_gather_nd_i64(base, points, &out, clamp);
-                }
-            case TensorDType::U8:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_u8(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_u8(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_u8(base, points, &out, clamp)
-                                  : tensor_gather_nd_u8(base, points, &out, clamp);
-                }
-            case TensorDType::U16:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_u16(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_u16(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_u16(base, points, &out, clamp)
-                                  : tensor_gather_nd_u16(base, points, &out, clamp);
-                }
-            case TensorDType::U32:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_u32(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_u32(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_u32(base, points, &out, clamp)
-                                  : tensor_gather_nd_u32(base, points, &out, clamp);
-                }
-            case TensorDType::U64:
-                if constexpr (std::is_same_v<OutmixPol, policies::Add>) {
-                    return use_2d ? tensor_gather_add_2d_u64(base, points, &out, clamp)
-                                  : tensor_gather_add_nd_u64(base, points, &out, clamp);
-                } else {
-                    return use_2d ? tensor_gather_2d_u64(base, points, &out, clamp)
-                                  : tensor_gather_nd_u64(base, points, &out, clamp);
-                }
-            default:
-                return false;
+    const bool allow_dyadic = (config.scatter_algo != TensorScatterAlgorithm::Tiling);
+    const bool require_dyadic = (config.scatter_algo == TensorScatterAlgorithm::Dyadic);
+
+    if (mode == CoordMode::TwoD) {
+        if (add_policy) {
+            return TensorMathImpl<Scalar, DTypeValue>::scatter_add_2d(
+                base, points, values, out, config.clamp, allow_dyadic, require_dyadic);
         }
+        if (require_dyadic) return false;
+        return scatter_2d_typed<Scalar, DTypeValue>(base, points, values, out, config.clamp);
     }
 
-    if constexpr (std::is_same_v<PremixPol, policies::Add> && std::is_same_v<OutmixPol, policies::Add>) {
-        switch (base.desc().dtype) {
-            case TensorDType::F32:
-                return use_2d ? tensor_scatter_add_2d_f32(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_f32(base, points, values, &out, clamp);
-            case TensorDType::F64:
-                return use_2d ? tensor_scatter_add_2d_f64(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_f64(base, points, values, &out, clamp);
-            case TensorDType::I8:
-                return use_2d ? tensor_scatter_add_2d_i8(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_i8(base, points, values, &out, clamp);
-            case TensorDType::I16:
-                return use_2d ? tensor_scatter_add_2d_i16(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_i16(base, points, values, &out, clamp);
-            case TensorDType::I32:
-                return use_2d ? tensor_scatter_add_2d_i32(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_i32(base, points, values, &out, clamp);
-            case TensorDType::I64:
-                return use_2d ? tensor_scatter_add_2d_i64(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_i64(base, points, values, &out, clamp);
-            case TensorDType::U8:
-                return use_2d ? tensor_scatter_add_2d_u8(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_u8(base, points, values, &out, clamp);
-            case TensorDType::U16:
-                return use_2d ? tensor_scatter_add_2d_u16(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_u16(base, points, values, &out, clamp);
-            case TensorDType::U32:
-                return use_2d ? tensor_scatter_add_2d_u32(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_u32(base, points, values, &out, clamp);
-            case TensorDType::U64:
-                return use_2d ? tensor_scatter_add_2d_u64(base, points, values, &out, clamp)
-                              : tensor_scatter_add_nd_u64(base, points, values, &out, clamp);
-            default:
-                return false;
-        }
+    if (require_dyadic) return false;
+    if (add_policy) {
+        if (config.scatter_algo == TensorScatterAlgorithm::Tiling) return false;
+        return TensorMathImpl<Scalar, DTypeValue>::scatter_add_nd(base, points, values, out, config.clamp);
     }
+    return scatter_nd_typed<Scalar, DTypeValue>(base, points, values, out, config.clamp);
+}
 
-    if constexpr (!std::is_same_v<PremixPol, policies::Overwrite> ||
-                  !std::is_same_v<OutmixPol, policies::Overwrite>) {
-        return false;
+static bool transfer_copy_if_no_indices(const AbstractTensor& input,
+                                        AbstractTensor& output) {
+    if (!output.valid()) {
+        output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
+        return true;
     }
-
-    switch (base.desc().dtype) {
-        case TensorDType::F32:
-            return use_2d ? tensor_scatter_2d_f32(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_f32(base, points, values, &out, clamp);
-        case TensorDType::F64:
-            return use_2d ? tensor_scatter_2d_f64(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_f64(base, points, values, &out, clamp);
-        case TensorDType::I8:
-            return use_2d ? tensor_scatter_2d_i8(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_i8(base, points, values, &out, clamp);
-        case TensorDType::I16:
-            return use_2d ? tensor_scatter_2d_i16(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_i16(base, points, values, &out, clamp);
-        case TensorDType::I32:
-            return use_2d ? tensor_scatter_2d_i32(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_i32(base, points, values, &out, clamp);
-        case TensorDType::I64:
-            return use_2d ? tensor_scatter_2d_i64(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_i64(base, points, values, &out, clamp);
-        case TensorDType::U8:
-            return use_2d ? tensor_scatter_2d_u8(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_u8(base, points, values, &out, clamp);
-        case TensorDType::U16:
-            return use_2d ? tensor_scatter_2d_u16(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_u16(base, points, values, &out, clamp);
-        case TensorDType::U32:
-            return use_2d ? tensor_scatter_2d_u32(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_u32(base, points, values, &out, clamp);
-        case TensorDType::U64:
-            return use_2d ? tensor_scatter_2d_u64(base, points, values, &out, clamp)
-                          : tensor_scatter_nd_u64(base, points, values, &out, clamp);
+    if (output.handle() == input.handle()) return true;
+    switch (input.desc().dtype) {
+        case TensorDType::I8:  return tensor_copy_i8_into(input, &output);
+        case TensorDType::I16: return tensor_copy_i16_into(input, &output);
+        case TensorDType::I32: return tensor_copy_i32_into(input, &output);
+        case TensorDType::I64: return tensor_copy_i64_into(input, &output);
+        case TensorDType::U8:  return tensor_copy_u8_into(input, &output);
+        case TensorDType::U16: return tensor_copy_u16_into(input, &output);
+        case TensorDType::U32: return tensor_copy_u32_into(input, &output);
+        case TensorDType::U64: return tensor_copy_u64_into(input, &output);
+        case TensorDType::F32: return tensor_copy_f32_into(input, &output);
+        case TensorDType::F64: return tensor_copy_f64_into(input, &output);
         default:
             return false;
     }
 }
 
-static bool dispatch_transfer_op_config(TransferOp op,
-                                        const AbstractTensor& base,
-                                        const AbstractTensor& points,
-                                        const AbstractTensor& values,
-                                        AbstractTensor& out,
-                                        bool clamp,
-                                        MixPolicyKind premix,
-                                        MixPolicyKind postmix) {
-    if (premix == MixPolicyKind::Add && postmix == MixPolicyKind::Add) {
-        return dispatch_transfer_op<policies::Add, policies::Add>(op, base, points, values, out, clamp);
+} // namespace
+
+bool tensor_gather_2d(const AbstractTensor& base,
+                      const AbstractTensor& points,
+                      AbstractTensor* out,
+                      const TensorTransferConfig& config) {
+    TensorOpThreadOverrideGuard guard(config.thread_count);
+    switch (base.desc().dtype) {
+        case TensorDType::I8:  return coordinate_gather<int8_t, TensorDType::I8>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::I16: return coordinate_gather<int16_t, TensorDType::I16>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::I32: return coordinate_gather<int32_t, TensorDType::I32>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::I64: return coordinate_gather<int64_t, TensorDType::I64>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::U8:  return coordinate_gather<uint8_t, TensorDType::U8>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::U16: return coordinate_gather<uint16_t, TensorDType::U16>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::U32: return coordinate_gather<uint32_t, TensorDType::U32>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::U64: return coordinate_gather<uint64_t, TensorDType::U64>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::F32: return coordinate_gather<float, TensorDType::F32>(base, points, out, config, CoordMode::TwoD);
+        case TensorDType::F64: return coordinate_gather<double, TensorDType::F64>(base, points, out, config, CoordMode::TwoD);
+        default:
+            return false;
     }
-    if (premix == MixPolicyKind::Overwrite && postmix == MixPolicyKind::Overwrite) {
-        return dispatch_transfer_op<policies::Overwrite, policies::Overwrite>(op, base, points, values, out, clamp);
-    }
-    if (premix == MixPolicyKind::Overwrite && postmix == MixPolicyKind::Add) {
-        return dispatch_transfer_op<policies::Overwrite, policies::Add>(op, base, points, values, out, clamp);
-    }
-    if (premix == MixPolicyKind::Add && postmix == MixPolicyKind::Overwrite) {
-        return dispatch_transfer_op<policies::Add, policies::Overwrite>(op, base, points, values, out, clamp);
-    }
-    return false;
 }
 
-static bool tensor_transfer_dispatch_internal(const AbstractTensor& input,
-                                              const AbstractTensor& input_indices,
-                                              AbstractTensor& output,
-                                              const AbstractTensor& output_indices,
-                                              TransferPhase phase,
-                                              bool clamp) {
+bool tensor_gather_nd(const AbstractTensor& base,
+                      const AbstractTensor& points,
+                      AbstractTensor* out,
+                      const TensorTransferConfig& config) {
+    TensorOpThreadOverrideGuard guard(config.thread_count);
+    switch (base.desc().dtype) {
+        case TensorDType::I8:  return coordinate_gather<int8_t, TensorDType::I8>(base, points, out, config, CoordMode::ND);
+        case TensorDType::I16: return coordinate_gather<int16_t, TensorDType::I16>(base, points, out, config, CoordMode::ND);
+        case TensorDType::I32: return coordinate_gather<int32_t, TensorDType::I32>(base, points, out, config, CoordMode::ND);
+        case TensorDType::I64: return coordinate_gather<int64_t, TensorDType::I64>(base, points, out, config, CoordMode::ND);
+        case TensorDType::U8:  return coordinate_gather<uint8_t, TensorDType::U8>(base, points, out, config, CoordMode::ND);
+        case TensorDType::U16: return coordinate_gather<uint16_t, TensorDType::U16>(base, points, out, config, CoordMode::ND);
+        case TensorDType::U32: return coordinate_gather<uint32_t, TensorDType::U32>(base, points, out, config, CoordMode::ND);
+        case TensorDType::U64: return coordinate_gather<uint64_t, TensorDType::U64>(base, points, out, config, CoordMode::ND);
+        case TensorDType::F32: return coordinate_gather<float, TensorDType::F32>(base, points, out, config, CoordMode::ND);
+        case TensorDType::F64: return coordinate_gather<double, TensorDType::F64>(base, points, out, config, CoordMode::ND);
+        default:
+            return false;
+    }
+}
+
+bool tensor_scatter_2d(const AbstractTensor& base,
+                       const AbstractTensor& points,
+                       const AbstractTensor& values,
+                       AbstractTensor* out,
+                       const TensorTransferConfig& config) {
+    TensorOpThreadOverrideGuard guard(config.thread_count);
+    switch (base.desc().dtype) {
+        case TensorDType::I8:  return coordinate_scatter<int8_t, TensorDType::I8>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::I16: return coordinate_scatter<int16_t, TensorDType::I16>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::I32: return coordinate_scatter<int32_t, TensorDType::I32>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::I64: return coordinate_scatter<int64_t, TensorDType::I64>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::U8:  return coordinate_scatter<uint8_t, TensorDType::U8>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::U16: return coordinate_scatter<uint16_t, TensorDType::U16>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::U32: return coordinate_scatter<uint32_t, TensorDType::U32>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::U64: return coordinate_scatter<uint64_t, TensorDType::U64>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::F32: return coordinate_scatter<float, TensorDType::F32>(base, points, values, out, config, CoordMode::TwoD);
+        case TensorDType::F64: return coordinate_scatter<double, TensorDType::F64>(base, points, values, out, config, CoordMode::TwoD);
+        default:
+            return false;
+    }
+}
+
+bool tensor_scatter_nd(const AbstractTensor& base,
+                       const AbstractTensor& points,
+                       const AbstractTensor& values,
+                       AbstractTensor* out,
+                       const TensorTransferConfig& config) {
+    TensorOpThreadOverrideGuard guard(config.thread_count);
+    switch (base.desc().dtype) {
+        case TensorDType::I8:  return coordinate_scatter<int8_t, TensorDType::I8>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::I16: return coordinate_scatter<int16_t, TensorDType::I16>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::I32: return coordinate_scatter<int32_t, TensorDType::I32>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::I64: return coordinate_scatter<int64_t, TensorDType::I64>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::U8:  return coordinate_scatter<uint8_t, TensorDType::U8>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::U16: return coordinate_scatter<uint16_t, TensorDType::U16>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::U32: return coordinate_scatter<uint32_t, TensorDType::U32>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::U64: return coordinate_scatter<uint64_t, TensorDType::U64>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::F32: return coordinate_scatter<float, TensorDType::F32>(base, points, values, out, config, CoordMode::ND);
+        case TensorDType::F64: return coordinate_scatter<double, TensorDType::F64>(base, points, values, out, config, CoordMode::ND);
+        default:
+            return false;
+    }
+}
+
+bool tensor_transfer(const AbstractTensor& input,
+                     const AbstractTensor& input_indices,
+                     AbstractTensor& output,
+                     const AbstractTensor& output_indices,
+                     bool gather_first,
+                     const TensorTransferConfig& config) {
+    TensorOpThreadOverrideGuard guard(config.thread_count);
     // NOTE: Supported cases currently cover:
-    //  - input_indices -> output_indices (GatherThenScatter / ScatterThenGather)
-    //  - input_indices -> output tensor in-place (GatherOnly) (functionally equivalent to direct copying, forces algorithm choice)
-    //  - output_indices -> output tensor in-place (ScatterOnly) (functionally equivalent to direct copying, forces algorithm choice)
+    //  - input_indices -> output_indices (gather + scatter order is controlled by gather_first)
+    //  - input_indices -> output tensor in-place (gather only)
+    //  - output_indices -> output tensor in-place (scatter only)
     // Unimplemented cases (to define and add):
     //  - input_indices aggregate to a single output index (reduction/broadcast semantics undefined)
     //  - a single input index aggregates to output_indices (broadcast semantics undefined)
-    //  - sparse naive excution when indices list for gather/scatter in place is small enough directly call apply for each item
-    //  - dense copying with neither input_indices nor output_indices provided or indices list for gather or scatter in place is too large
-    // Meta cases:
-    //  - a pattern routine of individual gathers or scatters or both to achieve
-    //    neighborhood operations (requires use of stencil/footprint/csl/kernel abstractions)
+    //  - sparse naive execution when indices list for gather/scatter in place is small enough to apply directly
+    //  - pattern routines of staged gathers/scatters to achieve neighborhood ops (stencil/kernel orchestration)
     if (!input.valid()) return false;
     const bool has_input_idx = input_indices.valid();
     const bool has_output_idx = output_indices.valid();
     if (!has_input_idx && !has_output_idx) {
-        if (!output.valid()) {
-            output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
-            return true;
-        }
-        if (output.handle() == input.handle()) return true;
-        switch (input.desc().dtype) {
-            case TensorDType::I8:  return tensor_copy_i8_into(input, &output);
-            case TensorDType::I16: return tensor_copy_i16_into(input, &output);
-            case TensorDType::I32: return tensor_copy_i32_into(input, &output);
-            case TensorDType::I64: return tensor_copy_i64_into(input, &output);
-            case TensorDType::U8:  return tensor_copy_u8_into(input, &output);
-            case TensorDType::U16: return tensor_copy_u16_into(input, &output);
-            case TensorDType::U32: return tensor_copy_u32_into(input, &output);
-            case TensorDType::U64: return tensor_copy_u64_into(input, &output);
-            case TensorDType::F32: return tensor_copy_f32_into(input, &output);
-            case TensorDType::F64: return tensor_copy_f64_into(input, &output);
-            default:
-                return false;
-        }
+        return transfer_copy_if_no_indices(input, output);
     }
 
     const AbstractTensor* gather_points = has_input_idx ? &input_indices : &output_indices;
     const AbstractTensor* scatter_points = has_output_idx ? &output_indices : &input_indices;
-    const TransferMixConfig mix{};
 
-    if (phase == TransferPhase::GatherOnly) {
-        return dispatch_transfer_op_config(TransferOp::Gather,
-                                           input,
-                                           *gather_points,
-                                           input,
-                                           output,
-                                           clamp,
-                                           MixPolicyKind::Overwrite,
-                                           mix.postmix_gather);
-    }
-
-    if (phase == TransferPhase::ScatterOnly) {
-        if (!output.valid()) {
-            output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
-        }
-        return dispatch_transfer_op_config(TransferOp::Scatter,
-                                           output,
-                                           *scatter_points,
-                                           input,
-                                           output,
-                                           clamp,
-                                           mix.premix_scatter,
-                                           mix.postmix_scatter);
-    }
-
-    if (phase == TransferPhase::GatherThenScatter) {
+    if (gather_first) {
         AbstractTensor gathered;
-        if (!dispatch_transfer_op_config(TransferOp::Gather,
-                                         input,
-                                         *gather_points,
-                                         input,
-                                         gathered,
-                                         clamp,
-                                         MixPolicyKind::Overwrite,
-                                         mix.postmix_gather)) return false;
+        if (!tensor_gather_nd(input, *gather_points, &gathered, config)) return false;
         if (!output.valid()) {
             output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
         }
-        return dispatch_transfer_op_config(TransferOp::Scatter,
-                                           output,
-                                           *scatter_points,
-                                           gathered,
-                                           output,
-                                           clamp,
-                                           mix.premix_scatter,
-                                           mix.postmix_scatter);
+        return tensor_scatter_nd(output, *scatter_points, gathered, &output, config);
     }
 
     if (!output.valid()) {
         output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
     }
     AbstractTensor scattered;
-    if (!dispatch_transfer_op_config(TransferOp::Scatter,
-                                     output,
-                                     *scatter_points,
-                                     input,
-                                     scattered,
-                                     clamp,
-                                     mix.premix_scatter,
-                                     mix.postmix_scatter)) return false;
-    return dispatch_transfer_op_config(TransferOp::Gather,
-                                       scattered,
-                                       *gather_points,
-                                       input,
-                                       output,
-                                       clamp,
-                                       MixPolicyKind::Overwrite,
-                                       mix.postmix_gather);
-}
-
-} // namespace
-
-bool tensor_gather_dispatch(const AbstractTensor& input,
-                            const AbstractTensor& input_indices,
-                            AbstractTensor& output,
-                            const AbstractTensor& output_indices,
-                            bool clamp) {
-    return tensor_transfer_dispatch_internal(input,
-                                            input_indices,
-                                            output,
-                                            output_indices,
-                                            TransferPhase::GatherOnly,
-                                            clamp);
-}
-
-bool tensor_scatter_dispatch(const AbstractTensor& input,
-                             const AbstractTensor& input_indices,
-                             AbstractTensor& output,
-                             const AbstractTensor& output_indices,
-                             bool clamp) {
-    return tensor_transfer_dispatch_internal(input,
-                                            input_indices,
-                                            output,
-                                            output_indices,
-                                            TransferPhase::ScatterOnly,
-                                            clamp);
-}
-
-bool tensor_transfer_dispatch(const AbstractTensor& input,
-                              const AbstractTensor& input_indices,
-                              AbstractTensor& output,
-                              const AbstractTensor& output_indices,
-                              bool gather_first,
-                              bool clamp) {
-    const auto phase = gather_first ? TransferPhase::GatherThenScatter
-                                    : TransferPhase::ScatterThenGather;
-    return tensor_transfer_dispatch_internal(input,
-                                            input_indices,
-                                            output,
-                                            output_indices,
-                                            phase,
-                                            clamp);
+    if (!tensor_scatter_nd(output, *scatter_points, input, &scattered, config)) return false;
+    return tensor_gather_nd(scattered, *gather_points, &output, config);
 }
 
 bool tensor_build_stencil_from_footprint_2d_f32(const TensorFootprint2D& footprint,

@@ -11,6 +11,7 @@ namespace nodus::tensors {
 
 class TensorBackend;
 class AbstractTensorPool;
+struct TensorTransferConfig;
 
 // Move-only handle wrapper with optional ownership semantics.
 class AbstractTensor {
@@ -52,16 +53,16 @@ public:
     bool gather(const AbstractTensor& input_indices,
                 AbstractTensor& output,
                 const AbstractTensor& output_indices,
-                bool clamp = true) const;
+                const TensorTransferConfig& config) const;
     bool scatter(const AbstractTensor& input_indices,
                  AbstractTensor& output,
                  const AbstractTensor& output_indices,
-                 bool clamp = true) const;
+                 const TensorTransferConfig& config) const;
     bool transfer(const AbstractTensor& input_indices,
                   AbstractTensor& output,
                   const AbstractTensor& output_indices,
-                  bool gather_first = true,
-                  bool clamp = true) const;
+                  bool gather_first,
+                  const TensorTransferConfig& config) const;
 
 private:
     friend class AbstractTensorPool;

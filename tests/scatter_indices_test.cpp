@@ -403,7 +403,7 @@ int main() {
     const uint32_t width = 1024;
     const uint32_t channels = 3;
     const uint32_t count = 1'000'000;
-    const uint32_t rounds = 5;
+    const uint32_t rounds = 10;
     TensorDesc base_desc = make_dense_desc(TensorDType::F32, {height, width, channels});
     TensorDesc base_i32_desc = make_dense_desc(TensorDType::I32, {height, width, channels});
     TensorDesc base_u8_desc = make_dense_desc(TensorDType::U8, {height, width, channels});
@@ -430,16 +430,12 @@ int main() {
                                     const AbstractTensor& points_tensor,
                                     const AbstractTensor& values_tensor,
                                     AbstractTensor* out) -> bool {
-        switch (base_tensor.desc().dtype) {
-            case TensorDType::F32:
-                return tensor_scatter_add_2d_f32(base_tensor, points_tensor, values_tensor, out, true);
-            case TensorDType::I32:
-                return tensor_scatter_add_2d_i32(base_tensor, points_tensor, values_tensor, out, true);
-            case TensorDType::U8:
-                return tensor_scatter_add_2d_u8(base_tensor, points_tensor, values_tensor, out, true);
-            default:
-                return false;
-        }
+        TensorTransferConfig cfg{};
+        cfg.premix_scatter = TensorMixPolicy::Add;
+        cfg.postmix_scatter = TensorMixPolicy::Add;
+        cfg.clamp = true;
+        if (!out || !out->valid()) return false;
+        return values_tensor.scatter(points_tensor, *out, AbstractTensor{}, cfg);
     };
 
     auto benchmark = [&](const char* label,
@@ -453,7 +449,10 @@ int main() {
             const uint32_t base_w = base_tensor.desc().shape.dims[1];
             fill_random_points(const_cast<AbstractTensor&>(points_tensor), count, base_w, base_h, rng);
             fill_random_values(values_tensor, count, rng);
-            AbstractTensor out;
+            AbstractTensor out = AbstractTensor::create(base_tensor.desc(), base_tensor.backend());
+            if (!out.valid()) return;
+            TensorTransferConfig copy_cfg{};
+            if (!base_tensor.transfer(AbstractTensor{}, out, AbstractTensor{}, true, copy_cfg)) return;
             const auto t0 = clock::now();
             bool ok = scatter_add_dispatch(base_tensor, points_tensor, values_tensor, &out);
             const auto t1 = clock::now();
@@ -467,16 +466,10 @@ int main() {
     auto gather_dispatch = [&](const AbstractTensor& base_tensor,
                                const AbstractTensor& points_tensor,
                                AbstractTensor* out) -> bool {
-        switch (base_tensor.desc().dtype) {
-            case TensorDType::F32:
-                return tensor_gather_2d_f32(base_tensor, points_tensor, out, true);
-            case TensorDType::I32:
-                return tensor_gather_2d_i32(base_tensor, points_tensor, out, true);
-            case TensorDType::U8:
-                return tensor_gather_2d_u8(base_tensor, points_tensor, out, true);
-            default:
-                return false;
-        }
+        TensorTransferConfig cfg{};
+        cfg.clamp = true;
+        if (!out) return false;
+        return base_tensor.gather(points_tensor, *out, AbstractTensor{}, cfg);
     };
 
     auto benchmark_gather = [&](const char* label,
@@ -502,16 +495,11 @@ int main() {
     auto gather_add_dispatch = [&](const AbstractTensor& base_tensor,
                                    const AbstractTensor& points_tensor,
                                    AbstractTensor* out) -> bool {
-        switch (base_tensor.desc().dtype) {
-            case TensorDType::F32:
-                return tensor_gather_add_2d_f32(base_tensor, points_tensor, out, true);
-            case TensorDType::I32:
-                return tensor_gather_add_2d_i32(base_tensor, points_tensor, out, true);
-            case TensorDType::U8:
-                return tensor_gather_add_2d_u8(base_tensor, points_tensor, out, true);
-            default:
-                return false;
-        }
+        TensorTransferConfig cfg{};
+        cfg.postmix_gather = TensorMixPolicy::Add;
+        cfg.clamp = true;
+        if (!out) return false;
+        return base_tensor.gather(points_tensor, *out, AbstractTensor{}, cfg);
     };
 
     auto benchmark_gather_add = [&](const char* label,
@@ -1032,19 +1020,42 @@ int main() {
         TensorFootprint2D footprint_f64 = build_unit_footprint(TensorDType::F64, &backend);
 
         AbstractTensor out;
-        report_stub("tensor_scatter_2d_f32", tensor_scatter_2d_f32(smoke_base_f32, smoke_points_f32, smoke_values_f32, &out, true));
-        report_stub("tensor_scatter_2d_i32", tensor_scatter_2d_i32(smoke_base_i32, smoke_points_i32, smoke_values_i32, &out, true));
-        report_stub("tensor_scatter_2d_u8", tensor_scatter_2d_u8(smoke_base_u8, smoke_points_i32, smoke_values_u8, &out, true));
+        TensorTransferConfig cfg_overwrite{};
+        cfg_overwrite.clamp = true;
+        TensorTransferConfig cfg_scatter_add{};
+        cfg_scatter_add.premix_scatter = TensorMixPolicy::Add;
+        cfg_scatter_add.postmix_scatter = TensorMixPolicy::Add;
+        cfg_scatter_add.clamp = true;
+        TensorTransferConfig cfg_gather_add{};
+        cfg_gather_add.postmix_gather = TensorMixPolicy::Add;
+        cfg_gather_add.clamp = true;
 
-        report_stub("tensor_scatter_add_2d_f32", tensor_scatter_add_2d_f32(smoke_base_f32, smoke_points_f32, smoke_values_f32, &out, true));
-        report_stub("tensor_scatter_add_2d_f64", tensor_scatter_add_2d_f64(smoke_base_f64, smoke_points_i32, smoke_values_f64, &out, true));
-        report_stub("tensor_scatter_add_2d_i32", tensor_scatter_add_2d_i32(smoke_base_i32, smoke_points_i32, smoke_values_i32, &out, true));
-        report_stub("tensor_scatter_add_2d_u8", tensor_scatter_add_2d_u8(smoke_base_u8, smoke_points_i32, smoke_values_u8, &out, true));
+        auto scatter_with_base = [&](const AbstractTensor& base_tensor,
+                                     const AbstractTensor& points_tensor,
+                                     const AbstractTensor& values_tensor,
+                                     const TensorTransferConfig& cfg) -> bool {
+            AbstractTensor base_copy = AbstractTensor::create(base_tensor.desc(), base_tensor.backend());
+            if (!base_copy.valid()) return false;
+            TensorTransferConfig copy_cfg{};
+            if (!base_tensor.transfer(AbstractTensor{}, base_copy, AbstractTensor{}, true, copy_cfg)) return false;
+            const bool ok = values_tensor.scatter(points_tensor, base_copy, AbstractTensor{}, cfg);
+            out = std::move(base_copy);
+            return ok;
+        };
 
-        report_stub("tensor_gather_2d_f32", tensor_gather_2d_f32(smoke_base_f32, smoke_points_f32, &out, true));
-        report_stub("tensor_gather_2d_f64", tensor_gather_2d_f64(smoke_base_f64, smoke_points_i32, &out, true));
-        report_stub("tensor_gather_2d_i32", tensor_gather_2d_i32(smoke_base_i32, smoke_points_i32, &out, true));
-        report_stub("tensor_gather_2d_u8", tensor_gather_2d_u8(smoke_base_u8, smoke_points_i32, &out, true));
+        report_stub("tensor_scatter_2d", scatter_with_base(smoke_base_f32, smoke_points_f32, smoke_values_f32, cfg_overwrite));
+        report_stub("tensor_scatter_2d", scatter_with_base(smoke_base_i32, smoke_points_i32, smoke_values_i32, cfg_overwrite));
+        report_stub("tensor_scatter_2d", scatter_with_base(smoke_base_u8, smoke_points_i32, smoke_values_u8, cfg_overwrite));
+
+        report_stub("tensor_scatter_add_2d", scatter_with_base(smoke_base_f32, smoke_points_f32, smoke_values_f32, cfg_scatter_add));
+        report_stub("tensor_scatter_add_2d", scatter_with_base(smoke_base_f64, smoke_points_i32, smoke_values_f64, cfg_scatter_add));
+        report_stub("tensor_scatter_add_2d", scatter_with_base(smoke_base_i32, smoke_points_i32, smoke_values_i32, cfg_scatter_add));
+        report_stub("tensor_scatter_add_2d", scatter_with_base(smoke_base_u8, smoke_points_i32, smoke_values_u8, cfg_scatter_add));
+
+        report_stub("tensor_gather_2d", smoke_base_f32.gather(smoke_points_f32, out, AbstractTensor{}, cfg_overwrite));
+        report_stub("tensor_gather_2d", smoke_base_f64.gather(smoke_points_i32, out, AbstractTensor{}, cfg_overwrite));
+        report_stub("tensor_gather_2d", smoke_base_i32.gather(smoke_points_i32, out, AbstractTensor{}, cfg_overwrite));
+        report_stub("tensor_gather_2d", smoke_base_u8.gather(smoke_points_i32, out, AbstractTensor{}, cfg_overwrite));
 
         TensorDesc gather_out_desc{};
         gather_out_desc.layout = TensorLayout::Dense;
@@ -1052,33 +1063,33 @@ int main() {
 
         gather_out_desc.dtype = TensorDType::F32;
         AbstractTensor gather_add_f32_out = AbstractTensor::create(gather_out_desc, &backend);
-        report_stub("tensor_gather_add_2d_f32", tensor_gather_add_2d_f32(smoke_base_f32, smoke_points_f32, &gather_add_f32_out, true));
+        report_stub("tensor_gather_add_2d", smoke_base_f32.gather(smoke_points_f32, gather_add_f32_out, AbstractTensor{}, cfg_gather_add));
 
         gather_out_desc.dtype = TensorDType::F64;
         AbstractTensor gather_add_f64_out = AbstractTensor::create(gather_out_desc, &backend);
-        report_stub("tensor_gather_add_2d_f64", tensor_gather_add_2d_f64(smoke_base_f64, smoke_points_i32, &gather_add_f64_out, true));
+        report_stub("tensor_gather_add_2d", smoke_base_f64.gather(smoke_points_i32, gather_add_f64_out, AbstractTensor{}, cfg_gather_add));
 
         gather_out_desc.dtype = TensorDType::I32;
         AbstractTensor gather_add_i32_out = AbstractTensor::create(gather_out_desc, &backend);
-        report_stub("tensor_gather_add_2d_i32", tensor_gather_add_2d_i32(smoke_base_i32, smoke_points_i32, &gather_add_i32_out, true));
+        report_stub("tensor_gather_add_2d", smoke_base_i32.gather(smoke_points_i32, gather_add_i32_out, AbstractTensor{}, cfg_gather_add));
 
         gather_out_desc.dtype = TensorDType::U8;
         AbstractTensor gather_add_u8_out = AbstractTensor::create(gather_out_desc, &backend);
-        report_stub("tensor_gather_add_2d_u8", tensor_gather_add_2d_u8(smoke_base_u8, smoke_points_i32, &gather_add_u8_out, true));
+        report_stub("tensor_gather_add_2d", smoke_base_u8.gather(smoke_points_i32, gather_add_u8_out, AbstractTensor{}, cfg_gather_add));
 
-        report_stub("tensor_scatter_nd_f32", tensor_scatter_nd_f32(smoke_base_f32, smoke_points_f32, smoke_values_f32, &out, true));
-        report_stub("tensor_scatter_nd_i32", tensor_scatter_nd_i32(smoke_base_i32, smoke_points_i32, smoke_values_i32, &out, true));
-        report_stub("tensor_scatter_nd_u8", tensor_scatter_nd_u8(smoke_base_u8, smoke_points_i32, smoke_values_u8, &out, true));
+        report_stub("tensor_scatter_nd", scatter_with_base(smoke_base_f32, smoke_points_f32, smoke_values_f32, cfg_overwrite));
+        report_stub("tensor_scatter_nd", scatter_with_base(smoke_base_i32, smoke_points_i32, smoke_values_i32, cfg_overwrite));
+        report_stub("tensor_scatter_nd", scatter_with_base(smoke_base_u8, smoke_points_i32, smoke_values_u8, cfg_overwrite));
 
-        report_stub("tensor_scatter_add_nd_f32", tensor_scatter_add_nd_f32(smoke_base_f32, smoke_points_f32, smoke_values_f32, &out, true));
-        report_stub("tensor_scatter_add_nd_f64", tensor_scatter_add_nd_f64(smoke_base_f64, smoke_points_i32, smoke_values_f64, &out, true));
-        report_stub("tensor_scatter_add_nd_i32", tensor_scatter_add_nd_i32(smoke_base_i32, smoke_points_i32, smoke_values_i32, &out, true));
-        report_stub("tensor_scatter_add_nd_u8", tensor_scatter_add_nd_u8(smoke_base_u8, smoke_points_i32, smoke_values_u8, &out, true));
+        report_stub("tensor_scatter_add_nd", scatter_with_base(smoke_base_f32, smoke_points_f32, smoke_values_f32, cfg_scatter_add));
+        report_stub("tensor_scatter_add_nd", scatter_with_base(smoke_base_f64, smoke_points_i32, smoke_values_f64, cfg_scatter_add));
+        report_stub("tensor_scatter_add_nd", scatter_with_base(smoke_base_i32, smoke_points_i32, smoke_values_i32, cfg_scatter_add));
+        report_stub("tensor_scatter_add_nd", scatter_with_base(smoke_base_u8, smoke_points_i32, smoke_values_u8, cfg_scatter_add));
 
-        report_stub("tensor_gather_nd_f32", tensor_gather_nd_f32(smoke_base_f32, smoke_points_f32, &out, true));
-        report_stub("tensor_gather_nd_f64", tensor_gather_nd_f64(smoke_base_f64, smoke_points_i32, &out, true));
-        report_stub("tensor_gather_nd_i32", tensor_gather_nd_i32(smoke_base_i32, smoke_points_i32, &out, true));
-        report_stub("tensor_gather_nd_u8", tensor_gather_nd_u8(smoke_base_u8, smoke_points_i32, &out, true));
+        report_stub("tensor_gather_nd", smoke_base_f32.gather(smoke_points_f32, out, AbstractTensor{}, cfg_overwrite));
+        report_stub("tensor_gather_nd", smoke_base_f64.gather(smoke_points_i32, out, AbstractTensor{}, cfg_overwrite));
+        report_stub("tensor_gather_nd", smoke_base_i32.gather(smoke_points_i32, out, AbstractTensor{}, cfg_overwrite));
+        report_stub("tensor_gather_nd", smoke_base_u8.gather(smoke_points_i32, out, AbstractTensor{}, cfg_overwrite));
 
         TensorDesc gather_nd_out_desc{};
         gather_nd_out_desc.layout = TensorLayout::Dense;
@@ -1086,19 +1097,19 @@ int main() {
 
         gather_nd_out_desc.dtype = TensorDType::F32;
         AbstractTensor gather_add_nd_f32_out = AbstractTensor::create(gather_nd_out_desc, &backend);
-        report_stub("tensor_gather_add_nd_f32", tensor_gather_add_nd_f32(smoke_base_f32, smoke_points_f32, &gather_add_nd_f32_out, true));
+        report_stub("tensor_gather_add_nd", smoke_base_f32.gather(smoke_points_f32, gather_add_nd_f32_out, AbstractTensor{}, cfg_gather_add));
 
         gather_nd_out_desc.dtype = TensorDType::F64;
         AbstractTensor gather_add_nd_f64_out = AbstractTensor::create(gather_nd_out_desc, &backend);
-        report_stub("tensor_gather_add_nd_f64", tensor_gather_add_nd_f64(smoke_base_f64, smoke_points_i32, &gather_add_nd_f64_out, true));
+        report_stub("tensor_gather_add_nd", smoke_base_f64.gather(smoke_points_i32, gather_add_nd_f64_out, AbstractTensor{}, cfg_gather_add));
 
         gather_nd_out_desc.dtype = TensorDType::I32;
         AbstractTensor gather_add_nd_i32_out = AbstractTensor::create(gather_nd_out_desc, &backend);
-        report_stub("tensor_gather_add_nd_i32", tensor_gather_add_nd_i32(smoke_base_i32, smoke_points_i32, &gather_add_nd_i32_out, true));
+        report_stub("tensor_gather_add_nd", smoke_base_i32.gather(smoke_points_i32, gather_add_nd_i32_out, AbstractTensor{}, cfg_gather_add));
 
         gather_nd_out_desc.dtype = TensorDType::U8;
         AbstractTensor gather_add_nd_u8_out = AbstractTensor::create(gather_nd_out_desc, &backend);
-        report_stub("tensor_gather_add_nd_u8", tensor_gather_add_nd_u8(smoke_base_u8, smoke_points_i32, &gather_add_nd_u8_out, true));
+        report_stub("tensor_gather_add_nd", smoke_base_u8.gather(smoke_points_i32, gather_add_nd_u8_out, AbstractTensor{}, cfg_gather_add));
 
         report_stub("tensor_gather_stencil_2d_f32", tensor_gather_stencil_2d_f32(
             smoke_base_f32, stencil_f32, &out, StencilBoundaryMode::Clamp, nullptr, nullptr, false));

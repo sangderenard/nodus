@@ -181,23 +181,23 @@ bool AbstractTensor::set(std::initializer_list<TensorIndex> dims, const Abstract
 bool AbstractTensor::gather(const AbstractTensor& input_indices,
                             AbstractTensor& output,
                             const AbstractTensor& output_indices,
-                            bool clamp) const {
-    return tensor_gather_dispatch(*this, input_indices, output, output_indices, clamp);
+                            const TensorTransferConfig& config) const {
+    return tensor_transfer(*this, input_indices, output, output_indices, true, config);
 }
 
 bool AbstractTensor::scatter(const AbstractTensor& input_indices,
                              AbstractTensor& output,
                              const AbstractTensor& output_indices,
-                             bool clamp) const {
-    return tensor_scatter_dispatch(*this, input_indices, output, output_indices, clamp);
+                             const TensorTransferConfig& config) const {
+    return tensor_transfer(*this, input_indices, output, output_indices, false, config);
 }
 
 bool AbstractTensor::transfer(const AbstractTensor& input_indices,
                               AbstractTensor& output,
                               const AbstractTensor& output_indices,
                               bool gather_first,
-                              bool clamp) const {
-    return tensor_transfer_dispatch(*this, input_indices, output, output_indices, gather_first, clamp);
+                              const TensorTransferConfig& config) const {
+    return tensor_transfer(*this, input_indices, output, output_indices, gather_first, config);
 }
 
 } // namespace nodus::tensors

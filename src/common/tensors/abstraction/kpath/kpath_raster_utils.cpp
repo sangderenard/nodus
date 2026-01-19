@@ -654,7 +654,11 @@ bool fill_flip_rgba_dual_tensor(const TensorCanvas2D& energy,
     scaled_base->set_slice_saturate_threshold(1.0f);
 
     AbstractTensor scatter_out;
-    if (!tensor_scatter_add_nd_f32(*scaled_base, points, values, &scatter_out, true)) return false;
+    TensorTransferConfig scatter_cfg{};
+    scatter_cfg.premix_scatter = TensorMixPolicy::Add;
+    scatter_cfg.postmix_scatter = TensorMixPolicy::Add;
+    scatter_cfg.clamp = true;
+    if (!tensor_scatter_nd(*scaled_base, points, values, &scatter_out, scatter_cfg)) return false;
     if (!scatter_out.valid()) return false;
     if (!tensor_copy_f32_into(scatter_out, &film_exposures.tensor())) return false;
     const auto t_scatter_end = now_hr();
