@@ -45,7 +45,7 @@ namespace nodus::tensors {
 namespace {
 
 struct DyadicStagePage {
-    AbstractTensorHandle tensor;
+    AbstractTensorHandle * tensor;
     std::atomic<int32_t> write_offset = -1;
 };
 
@@ -72,16 +72,16 @@ inline uint32_t find_earliest_spot(DyadicStagePagePool* pool, uint32_t start, Ab
             }
             else if (offset == EXPIRED_STAGE_OFFSET) {
                 
-                backend->ensure_zeroed(pool->pages[idx].tensor, tensor_description);
+                backend->ensure_zeroed(*(pool->pages[idx].tensor), tensor_description);
                 pool->pages[idx].write_offset.store(UNCLAIMED_STAGE_OFFSET);
                 spot = idx;
                 break;
             }
             else if (offset == UNINITIALIZED_STAGE_OFFSET) {
                 // Allocate new page
-                pool->pages[idx].tensor = tensor_pool->acquire_tensor(
+                pool->pages[idx].tensor = &tensor_pool->acquire_tensor(
                     tensor_description,
-                    backend);
+                    backend).handle();
                 pool->pages[idx].write_offset.store(UNCLAIMED_STAGE_OFFSET);
                 spot = idx;
                 break;
@@ -678,7 +678,7 @@ inline void dyadic_scan_page_phase_a_custom_stage_pages(
     uint32_t src_bin,
     uint8_t src_page,
     uint8_t keep_page,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits) {
     const uint32_t n = io.cnt(src_bin, src_page);
     if (!n) return;
@@ -746,7 +746,7 @@ inline void dyadic_scan_page_phase_b_custom_stage_pages(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
     uint32_t src_bin,
     uint8_t src_page,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits) {
     const uint32_t n = io.cnt(src_bin, src_page);
     if (!n) return;
@@ -803,7 +803,7 @@ inline void dyadic_scan_page_bin0_custom_stage_pages(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
     uint32_t src_bin,
     uint8_t src_page,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits) {
     const uint32_t n = io.cnt(src_bin, src_page);
     if (!n) return;
@@ -851,7 +851,7 @@ inline void dyadic_classify_to_stage_or_bin_paged(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_classify_to_stage_or_bin_paged_stage_pages(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits,
     INDEX_T idx,
     const VALUE_T* vals,
@@ -894,7 +894,7 @@ inline void dyadic_classify_to_stage_or_bin_paged_bytes(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_classify_to_stage_or_bin_paged_bytes_stage_pages(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits,
     INDEX_T idx,
     const uint8_t* val_bytes,
@@ -956,7 +956,7 @@ template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_cascade_phase_a_paged_stage_pages(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
     uint32_t src_bin,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits) {
     io.prepare_for_scan(src_bin);
     const uint8_t A = io.active_page(src_bin);
@@ -1026,7 +1026,7 @@ template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_cascade_phase_b_paged_stage_pages(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
     uint32_t src_bin,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits) {
     io.prepare_for_scan(src_bin);
     const uint8_t A = io.active_page(src_bin);
@@ -1083,7 +1083,7 @@ inline void dyadic_bin0_drain_paged(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_bin0_drain_paged_stage_pages(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits) {
     const uint32_t bin = 0;
     io.prepare_for_scan(bin);
@@ -1113,7 +1113,7 @@ inline void dyadic_bin0_drain_paged_stage_pages(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_bin_worker_step_bin0(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits,
     uint32_t bin_id,
     std::atomic<uint8_t>* duty_state,
@@ -1165,7 +1165,7 @@ inline void dyadic_bin_worker_step_bin0(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_bin_worker_step_bin1(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits,
     uint32_t bin_id,
     std::atomic<uint8_t>* duty_state,
@@ -1236,7 +1236,7 @@ inline void dyadic_bin_worker_step_bin1(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_bin_worker_step_binn(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits,
     uint32_t bin_id,
     std::atomic<uint8_t>* duty_state,
@@ -1306,7 +1306,7 @@ inline void dyadic_bin_worker_step_binn(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_bin_worker_step_last(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits,
     uint32_t bin_id,
     std::atomic<uint8_t>* duty_state,
@@ -1319,7 +1319,7 @@ inline void dyadic_bin_worker_step_last(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 inline void dyadic_bin_worker_step(
     DyadicBinIO3<INDEX_T, VALUE_T>& io,
-    DyadicStagePagePool<VALUE_T>& stage_pages,
+    DyadicStagePagePool& stage_pages,
     uint32_t stage_bits,
     uint32_t bin_id,
     std::atomic<uint8_t>* duty_state,
@@ -1344,7 +1344,7 @@ inline void dyadic_bin_worker_step(
 template <typename INDEX_T, typename VALUE_T, typename PremixPol>
 struct DyadicBinWorkerJobCtx {
     DyadicBinIO3<INDEX_T, VALUE_T>* io = nullptr;
-    DyadicStagePagePool<VALUE_T>* stage_pages = nullptr;
+    DyadicStagePagePool* stage_pages = nullptr;
     uint32_t stage_bits = 0;
     uint32_t bin_id = 0;
     std::atomic<uint8_t>* duty_state = nullptr;
@@ -1414,7 +1414,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
     template <typename PremixPol = policies::Add, typename OutmixPol = policies::Overwrite> \
     inline void dyadic_mt_bitmask_algo_parallel( \
         DyadicBinIO3<INDEX_T, VALUE_T>& io, \
-        DyadicStagePagePool<VALUE_T>& stage_pages, \
+        DyadicStagePagePool& stage_pages, \
         uint32_t stage_bits, \
         uint32_t phase_a_rounds, \
         uint32_t phase_b_rounds, \
@@ -1500,7 +1500,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
         io.slot_bytes = io.elem_bytes * (1u + value_stride); \
         io.total_bins = dyadic_bin_count(index_range, stage_bits); \
         const uint32_t stage_entries = (uint32_t)((1u << stage_bits) * value_stride); \
-        DyadicStagePagePool<VALUE_T> stage_pages; \
+        DyadicStagePagePool stage_pages; \
         stage_pages.init(&pool, bins.backend(), mem, staging.desc(), io.total_bins, stage_entries); \
         const DyadicThreadPolicy policy = dyadic_read_thread_policy(thread_count, io.total_bins); \
         uint32_t b = 0; \
