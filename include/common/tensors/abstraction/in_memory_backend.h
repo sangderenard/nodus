@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #include "common/tensors/abstraction/tensor_backend.h"
 
@@ -51,7 +52,13 @@ public:
 
     // Ensure the payload for this tensor is zeroed, preferably by swapping in a clean arena lease.
     // Falls back to clearing the existing lease when swap is not possible.
-    bool ensure_zeroed(AbstractTensorHandle handle, const TensorDesc& desc);
+    // When keep_in_place is true, never swap the lease and only clear the specified span.
+    // byte_offset/byte_count are interpreted in bytes; byte_count == 0 means "clear full tensor payload".
+    bool ensure_zeroed(AbstractTensorHandle handle,
+                       const TensorDesc& desc,
+                       bool keep_in_place = false,
+                       uint64_t byte_offset = 0,
+                       uint64_t byte_count = 0);
 };
 
 InMemoryBackend& in_memory_backend_singleton();

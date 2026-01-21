@@ -1251,7 +1251,11 @@ void InMemoryBackend::unmap(AbstractTensorHandle /*handle*/) const {
     // No-op for in-memory backend; data is always host-accessible.
 }
 
-bool InMemoryBackend::ensure_zeroed(AbstractTensorHandle handle, const TensorDesc& desc) {
+bool InMemoryBackend::ensure_zeroed(AbstractTensorHandle handle,
+                                    const TensorDesc& desc,
+                                    bool keep_in_place,
+                                    uint64_t byte_offset,
+                                    uint64_t byte_count) {
     if (!abstract_tensor_handle_is_valid(handle)) return false;
     TensorRecord* rec = find_record(handle.id);
     if (!check_record_alive(rec)) return false;
@@ -1260,9 +1264,18 @@ bool InMemoryBackend::ensure_zeroed(AbstractTensorHandle handle, const TensorDes
     if (!owner || !owner->owns_lease) return false;
 
     const size_t expected = static_cast<size_t>(desc.shape.element_count()) * tensor_dtype_size_bytes(desc.dtype);
-    const size_t clear_bytes = std::min(owner->bytes, expected);
+    if (byte_offset > owner->bytes) return false;
+    const size_t remaining = owner->bytes - static_cast<size_t>(byte_offset);
+    size_t clear_bytes = 0;
+    if (byte_count == 0) {
+        clear_bytes = std::min(remaining, expected);
+    } else {
+        clear_bytes = std::min(remaining, static_cast<size_t>(byte_count));
+    }
 
-    if (owner->lease_refs.load(std::memory_order_acquire) == 1) {
+    const bool full_clear = (byte_offset == 0 && (byte_count == 0 || clear_bytes >= expected));
+    if (!keep_in_place && full_clear &&
+        owner->lease_refs.load(std::memory_order_acquire) == 1) {
         uint64_t new_offset = 0;
         uint64_t new_cap = 0;
         if (arena_alloc_clean_only(static_cast<uint64_t>(owner->bytes), &new_offset, &new_cap)) {
@@ -1277,7 +1290,7 @@ bool InMemoryBackend::ensure_zeroed(AbstractTensorHandle handle, const TensorDes
     }
 
     if (owner->data && clear_bytes > 0) {
-        std::memset(owner->data, 0, clear_bytes);
+        std::memset(static_cast<uint8_t*>(owner->data) + byte_offset, 0, clear_bytes);
         return true;
     }
     return false;

@@ -66,6 +66,11 @@ endif()
 
 project(canvas_tables LANGUAGES C CXX)
 
+# Default to modern C++ for all targets unless a specific target overrides it.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 ## Dependencies are built in isolation under dev_bundle/deps/*
 ## The main project only consumes already-installed packages.
 

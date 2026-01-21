@@ -452,7 +452,10 @@ int main() {
             AbstractTensor out = AbstractTensor::create(base_tensor.desc(), base_tensor.backend());
             if (!out.valid()) return;
             TensorTransferConfig copy_cfg{};
-            if (!base_tensor.transfer(AbstractTensor{}, out, AbstractTensor{}, true, copy_cfg)) return;
+            if (!base_tensor.transfer(AbstractTensor{}, out, AbstractTensor{}, true, copy_cfg)){
+                printf("Failed to copy base tensor to out tensor\n");
+                return;
+            }
             const auto t0 = clock::now();
             bool ok = scatter_add_dispatch(base_tensor, points_tensor, values_tensor, &out);
             const auto t1 = clock::now();
@@ -468,7 +471,10 @@ int main() {
                                AbstractTensor* out) -> bool {
         TensorTransferConfig cfg{};
         cfg.clamp = true;
-        if (!out) return false;
+        if (!out) {
+            std::cerr << "gather_dispatch: out is null\n";
+            return false;
+        }
         return base_tensor.gather(points_tensor, *out, AbstractTensor{}, cfg);
     };
 

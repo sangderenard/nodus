@@ -24,6 +24,12 @@
 #define DYADIC_SCATTER_LOGF(...) ((void)0)
 #endif
 
+#if defined(NODUS_TENSOR_GATHER_DEBUG)
+#define TENSOR_GATHER_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
+#else
+#define TENSOR_GATHER_LOGF(...) ((void)0)
+#endif
+
 namespace nodus::tensors {
 
 struct TensorOpTensor;
@@ -104,6 +110,8 @@ bool tensor_byte_offset_from_gli(const TensorDesc& desc,
     *out_byte_offset = elem_off * static_cast<uint64_t>(elem_bytes);
     return true;
 }
+
+static uint32_t dyadic_thread_count_from_overrides();
 
 namespace {
 
@@ -544,6 +552,7 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
     IndexT* idx_data = static_cast<IndexT*>(idx_ptr);
     const uint8_t* in_bounds = coord_buf.mask_ptr;
 
+    const uint32_t thread_count = dyadic_thread_count_from_overrides();
     const bool ok = dyadic_binning_tensor<PremixPol, OutmixPol>(
         static_cast<IndexT>(index_range),
         count,
@@ -551,7 +560,7 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
         const_cast<Scalar*>(values),
         value_stride,
         8u,
-        1u,
+        thread_count,
         1u,
         1u,
         1u,
@@ -664,7 +673,7 @@ static bool build_unary_plan(const AbstractTensor& src,
     if (src.backend() != dst.backend()) return false;
     const TensorDesc& sd = src.desc();
     const TensorDesc& dd = dst.desc();
-    if (sd.dtype != TensorDType::F32 || dd.dtype != TensorDType::F32) return false;
+    if (sd.dtype != dd.dtype) return false;
     if (!((sd.layout == TensorLayout::Dense || sd.layout == TensorLayout::Strided) &&
           (dd.layout == TensorLayout::Dense || dd.layout == TensorLayout::Strided))) {
         return false;
@@ -717,14 +726,13 @@ static void copy_range(const TensorOpPlan& plan, uint64_t outer_begin, uint64_t 
     const uint64_t inner = plan.inner_count;
     const size_t rank = plan.shape.size();
     if (rank == 0) {
-        auto* s = reinterpret_cast<float*>(plan.a.base);
-        auto* d = reinterpret_cast<float*>(plan.out.base);
-        *d = *s;
+        std::memcpy(plan.out.base, plan.a.base, plan.a.elem_bytes);
         return;
     }
 
     auto* s0 = static_cast<uint8_t*>(plan.a.base);
     auto* d0 = static_cast<uint8_t*>(plan.out.base);
+    const uint64_t elem_bytes = plan.a.elem_bytes;
 
     for (uint64_t outer_idx = outer_begin; outer_idx < outer_end; ++outer_idx) {
         uint64_t s_off = 0;
@@ -740,18 +748,18 @@ static void copy_range(const TensorOpPlan& plan, uint64_t outer_begin, uint64_t 
             }
         }
 
-        auto* s_ptr = reinterpret_cast<float*>(s0 + s_off);
-        auto* d_ptr = reinterpret_cast<float*>(d0 + d_off);
-        const uint64_t s_step = plan.a.byte_strides.back() / plan.a.elem_bytes;
-        const uint64_t d_step = plan.out.byte_strides.back() / plan.out.elem_bytes;
+        auto* s_ptr = s0 + s_off;
+        auto* d_ptr = d0 + d_off;
+        const uint64_t s_step = plan.a.byte_strides.back();
+        const uint64_t d_step = plan.out.byte_strides.back();
 
         if (plan.a.contiguous && plan.out.contiguous && s_step == 1 && d_step == 1) {
-            std::memcpy(d_ptr, s_ptr, static_cast<size_t>(inner * sizeof(float)));
+            std::memcpy(d_ptr, s_ptr, static_cast<size_t>(inner * elem_bytes));
         } else {
             uint64_t si = 0;
             uint64_t di = 0;
             for (uint64_t i = 0; i < inner; ++i) {
-                d_ptr[di] = s_ptr[si];
+                std::memcpy(d_ptr + di, s_ptr + si, elem_bytes);
                 si += s_step;
                 di += d_step;
             }
@@ -1994,7 +2002,7 @@ struct TensorMathImpl {
                 return false;
             }
 
-            std::fprintf(stderr, "[dyadic] scatter_add_2d: dyadic path failed, falling back\n");
+            DYADIC_SCATTER_LOGF("[dyadic] scatter_add_2d: dyadic path failed, falling back\n");
         }
 
         bmap = map_dense(base);
@@ -2244,31 +2252,60 @@ struct TensorMathImpl {
                           const AbstractTensor& points,
                           AbstractTensor* out,
                           bool clamp) {
-        if (!out) return false;
+        TENSOR_GATHER_LOGF("gather_2d: enter\n");
+        if (!out) {
+            TENSOR_GATHER_LOGF("gather_2d: null output\n");
+            return false;
+        }
         out->reset();
-        if (!base.valid() || !points.valid()) return false;
-        if (base.backend() != points.backend()) return false;
+        if (!base.valid() || !points.valid()) {
+            TENSOR_GATHER_LOGF("gather_2d: invalid tensors (base=%d points=%d)\n",
+                               base.valid() ? 1 : 0, points.valid() ? 1 : 0);
+            return false;
+        }
+        if (base.backend() != points.backend()) {
+            TENSOR_GATHER_LOGF("gather_2d: backend mismatch\n");
+            return false;
+        }
         const TensorDesc& bd = base.desc();
         const TensorDesc& pd = points.desc();
-        if (bd.dtype != DType) return false;
+        if (bd.dtype != DType) {
+            TENSOR_GATHER_LOGF("gather_2d: base dtype mismatch\n");
+            return false;
+        }
         const bool points_match = (pd.dtype == DType);
         if (!points_match) {
             if (pd.dtype != TensorDType::I32 && pd.dtype != TensorDType::I64 &&
                 pd.dtype != TensorDType::U32 && pd.dtype != TensorDType::U64) {
+                TENSOR_GATHER_LOGF("gather_2d: points dtype unsupported\n");
                 return false;
             }
         }
-        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense) return false;
+        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense) {
+            TENSOR_GATHER_LOGF("gather_2d: layout not dense\n");
+            return false;
+        }
 
-        if (bd.shape.dims.size() != 2 && bd.shape.dims.size() != 3) return false;
+        if (bd.shape.dims.size() != 2 && bd.shape.dims.size() != 3) {
+            TENSOR_GATHER_LOGF("gather_2d: base rank invalid (%zu)\n", bd.shape.dims.size());
+            return false;
+        }
         const uint32_t height = bd.shape.dims[0];
         const uint32_t width = bd.shape.dims[1];
         const uint32_t channels = (bd.shape.dims.size() == 3) ? bd.shape.dims[2] : 1;
 
-        if (pd.shape.dims.size() != 2) return false;
+        if (pd.shape.dims.size() != 2) {
+            TENSOR_GATHER_LOGF("gather_2d: points rank invalid (%zu)\n", pd.shape.dims.size());
+            return false;
+        }
         const uint32_t count = pd.shape.dims[0];
         const uint32_t pcols = pd.shape.dims[1];
-        if (pcols != 2 && pcols != 3) return false;
+        if (pcols != 2 && pcols != 3) {
+            TENSOR_GATHER_LOGF("gather_2d: points cols invalid (%u)\n", pcols);
+            return false;
+        }
+        TENSOR_GATHER_LOGF("gather_2d: params h=%u w=%u c=%u n=%u pcols=%u clamp=%d\n",
+                           height, width, channels, count, pcols, clamp ? 1 : 0);
 
         TensorDesc out_desc{};
         out_desc.dtype = DType;
@@ -2279,7 +2316,11 @@ struct TensorMathImpl {
             out_desc.shape.dims = {count, channels};
         }
         *out = AbstractTensor::create(out_desc, base.backend());
-        if (!out->valid()) return false;
+        if (!out->valid()) {
+            TENSOR_GATHER_LOGF("gather_2d: output allocation failed\n");
+            return false;
+        }
+        TENSOR_GATHER_LOGF("gather_2d: output allocated\n");
 
         MappedDense bmap = map_dense(base);
         MappedDense omap = map_dense_mut(*out);
@@ -2292,12 +2333,14 @@ struct TensorMathImpl {
         } else {
             auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
             if (!mem || !mem->map(points.handle(), &points_ptr, &points_bytes)) {
+                TENSOR_GATHER_LOGF("gather_2d: map points failed\n");
                 bmap.unmap();
                 omap.unmap();
                 return false;
             }
         }
         if (!bmap.ok || !omap.ok || (points_match && !pmap.ok)) {
+            TENSOR_GATHER_LOGF("gather_2d: map dense failed\n");
             bmap.unmap();
             omap.unmap();
             if (points_match) {
@@ -2308,9 +2351,11 @@ struct TensorMathImpl {
             }
             return false;
         }
+        TENSOR_GATHER_LOGF("gather_2d: base/out/points mapped\n");
 
         CoordBuffer coord_buf{};
         if (!acquire_coord_buffer(count, 2u, base.backend(), coord_buf)) {
+            TENSOR_GATHER_LOGF("gather_2d: coord buffer alloc failed\n");
             bmap.unmap();
             omap.unmap();
             if (points_match) {
@@ -2321,6 +2366,7 @@ struct TensorMathImpl {
             }
             return false;
         }
+        TENSOR_GATHER_LOGF("gather_2d: coord buffer acquired\n");
         int64_t* coords = coord_buf.coords_ptr;
         uint8_t* in_bounds = coord_buf.mask_ptr;
         const bool use_affine = bd.slice.valid && bd.slice.has_affine;
@@ -2335,9 +2381,10 @@ struct TensorMathImpl {
                                      true,
                                      coords,
                                      in_bounds);
+        TENSOR_GATHER_LOGF("gather_2d: coords converted (affine=%d)\n", use_affine ? 1 : 0);
 
         const bool use_span_tiling = span_tiling_enabled_from_env("NODUS_GATHER_SPAN_TILING");
-        if (use_span_tiling) {
+        if (false && use_span_tiling) {
             SpanOpConfig span_op{};
             span_op.aggregate = SpanAggregateOp::Replace;
             span_op.clamp = clamp;
@@ -2414,7 +2461,8 @@ struct TensorMathImpl {
         };
 
         submit_row_jobs(tensor_op_pool(), gather_rows, &ctx, 0, count);
-
+        TENSOR_GATHER_LOGF("gather_2d: gather rows done\n");
+        
         bmap.unmap();
         omap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
@@ -2431,38 +2479,105 @@ struct TensorMathImpl {
                               const AbstractTensor& points,
                               AbstractTensor* out,
                               bool clamp) {
-        if (!out || !out->valid()) return false;
-        if (!base.valid() || !points.valid()) return false;
-        if (base.backend() != points.backend() || base.backend() != out->backend()) return false;
+        TENSOR_GATHER_LOGF("gather_add_2d: enter\n");
+        if (!out) {
+            TENSOR_GATHER_LOGF("gather_add_2d: null output\n");
+            return false;
+        }
+        if (!base.valid() || !points.valid()) {
+            TENSOR_GATHER_LOGF("gather_add_2d: invalid tensors (base=%d points=%d)\n",
+                               base.valid() ? 1 : 0, points.valid() ? 1 : 0);
+            return false;
+        }
+        if (base.backend() != points.backend()) {
+            TENSOR_GATHER_LOGF("gather_add_2d: backend mismatch\n");
+            return false;
+        }
+        if (out->valid() && base.backend() != out->backend()) {
+            TENSOR_GATHER_LOGF("gather_add_2d: backend mismatch\n");
+            return false;
+        }
         const TensorDesc& bd = base.desc();
         const TensorDesc& pd = points.desc();
-        const TensorDesc& od = out->desc();
-        if (bd.dtype != DType || od.dtype != DType) return false;
+        if (bd.dtype != DType) return false;
         const bool points_match = (pd.dtype == DType);
         if (!points_match) {
             if (pd.dtype != TensorDType::I32 && pd.dtype != TensorDType::I64 &&
                 pd.dtype != TensorDType::U32 && pd.dtype != TensorDType::U64) {
+                TENSOR_GATHER_LOGF("gather_add_2d: points dtype unsupported\n");
                 return false;
             }
         }
-        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense || od.layout != TensorLayout::Dense)
+        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense) {
+            TENSOR_GATHER_LOGF("gather_add_2d: layout not dense\n");
             return false;
+        }
+        if (out->valid()) {
+            const TensorDesc& od = out->desc();
+            if (od.dtype != DType) {
+                TENSOR_GATHER_LOGF("gather_add_2d: dtype mismatch\n");
+                return false;
+            }
+            if (od.layout != TensorLayout::Dense) {
+                TENSOR_GATHER_LOGF("gather_add_2d: layout not dense\n");
+                return false;
+            }
+        }
 
-        if (bd.shape.dims.size() != 2 && bd.shape.dims.size() != 3) return false;
+        if (bd.shape.dims.size() != 2 && bd.shape.dims.size() != 3) {
+            TENSOR_GATHER_LOGF("gather_add_2d: base rank invalid (%zu)\n", bd.shape.dims.size());
+            return false;
+        }
         const uint32_t height = bd.shape.dims[0];
         const uint32_t width = bd.shape.dims[1];
         const uint32_t channels = (bd.shape.dims.size() == 3) ? bd.shape.dims[2] : 1;
 
-        if (pd.shape.dims.size() != 2) return false;
+        if (pd.shape.dims.size() != 2) {
+            TENSOR_GATHER_LOGF("gather_add_2d: points rank invalid (%zu)\n", pd.shape.dims.size());
+            return false;
+        }
         const uint32_t count = pd.shape.dims[0];
         const uint32_t pcols = pd.shape.dims[1];
-        if (pcols != 2 && pcols != 3) return false;
-
-        if (channels == 1) {
-            if (!shape_is(od, {count})) return false;
-        } else {
-            if (!shape_is(od, {count, channels})) return false;
+        if (pcols != 2 && pcols != 3) {
+            TENSOR_GATHER_LOGF("gather_add_2d: points cols invalid (%u)\n", pcols);
+            return false;
         }
+        TENSOR_GATHER_LOGF("gather_add_2d: params h=%u w=%u c=%u n=%u pcols=%u clamp=%d\n",
+                           height, width, channels, count, pcols, clamp ? 1 : 0);
+
+        if (!out->valid()) {
+            TensorDesc out_desc{};
+            out_desc.dtype = DType;
+            out_desc.layout = TensorLayout::Dense;
+            if (channels == 1) {
+                out_desc.shape.dims = {count};
+            } else {
+                out_desc.shape.dims = {count, channels};
+            }
+            *out = AbstractTensor::create(out_desc, base.backend());
+            if (!out->valid()) {
+                TENSOR_GATHER_LOGF("gather_add_2d: output allocation failed\n");
+                return false;
+            }
+            if (!ensure_tensor_zeroed(*out)) {
+                TENSOR_GATHER_LOGF("gather_add_2d: output zero failed\n");
+                return false;
+            }
+        } else {
+            const TensorDesc& od = out->desc();
+            if (channels == 1) {
+                if (!shape_is(od, {count})) {
+                    TENSOR_GATHER_LOGF("gather_add_2d: output shape mismatch\n");
+                    return false;
+                }
+            } else {
+                if (!shape_is(od, {count, channels})) {
+                    TENSOR_GATHER_LOGF("gather_add_2d: output shape mismatch\n");
+                    return false;
+                }
+            }
+        }
+        TENSOR_GATHER_LOGF("gather_add_2d: output shape ok\n");
 
         MappedDense bmap = map_dense(base);
         MappedDense omap = map_dense_mut(*out);
@@ -2475,12 +2590,14 @@ struct TensorMathImpl {
         } else {
             auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
             if (!mem || !mem->map(points.handle(), &points_ptr, &points_bytes)) {
+                TENSOR_GATHER_LOGF("gather_add_2d: map points failed\n");
                 bmap.unmap();
                 omap.unmap();
                 return false;
             }
         }
         if (!bmap.ok || !omap.ok || (points_match && !pmap.ok)) {
+            TENSOR_GATHER_LOGF("gather_add_2d: map dense failed\n");
             bmap.unmap();
             omap.unmap();
             if (points_match) {
@@ -2491,9 +2608,11 @@ struct TensorMathImpl {
             }
             return false;
         }
+        TENSOR_GATHER_LOGF("gather_add_2d: base/out/points mapped\n");
 
         CoordBuffer coord_buf{};
         if (!acquire_coord_buffer(count, 2u, base.backend(), coord_buf)) {
+            TENSOR_GATHER_LOGF("gather_add_2d: coord buffer alloc failed\n");
             bmap.unmap();
             omap.unmap();
             if (points_match) {
@@ -2504,6 +2623,7 @@ struct TensorMathImpl {
             }
             return false;
         }
+        TENSOR_GATHER_LOGF("gather_add_2d: coord buffer acquired\n");
         int64_t* coords = coord_buf.coords_ptr;
         uint8_t* in_bounds = coord_buf.mask_ptr;
         const bool use_affine = bd.slice.valid && bd.slice.has_affine;
@@ -2518,6 +2638,7 @@ struct TensorMathImpl {
                                      true,
                                      coords,
                                      in_bounds);
+        TENSOR_GATHER_LOGF("gather_add_2d: coords converted (affine=%d)\n", use_affine ? 1 : 0);
 
         const bool use_span_tiling = span_tiling_enabled_from_env("NODUS_GATHER_SPAN_TILING");
         if (use_span_tiling) {
@@ -2597,6 +2718,7 @@ struct TensorMathImpl {
         };
 
         submit_row_jobs(tensor_op_pool(), gather_rows, &ctx, 0, count);
+        TENSOR_GATHER_LOGF("gather_add_2d: gather rows done\n");
 
         bmap.unmap();
         omap.unmap();
@@ -3191,6 +3313,7 @@ struct TensorMathImpl {
             }
             return true;
         }
+        TENSOR_GATHER_LOGF("gather_2d: span gather failed\n");
         vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
         if (points_match) {
@@ -3206,6 +3329,7 @@ struct TensorMathImpl {
                           const AbstractTensor& points,
                           AbstractTensor* out,
                           bool clamp) {
+        TENSOR_GATHER_LOGF("gather_nd: enter\n");
         if (!out) return false;
         out->reset();
         if (!base.valid() || !points.valid()) return false;
@@ -3351,39 +3475,99 @@ struct TensorMathImpl {
                               const AbstractTensor& points,
                               AbstractTensor* out,
                               bool clamp) {
-        if (!out || !out->valid()) return false;
-        if (!base.valid() || !points.valid()) return false;
-        if (base.backend() != points.backend() || base.backend() != out->backend()) return false;
+        TENSOR_GATHER_LOGF("gather_add_nd: enter\n");
+        if (!out) {
+            TENSOR_GATHER_LOGF("gather_add_nd: null output tensor\n");
+            return false;
+        }
+        if (!base.valid() || !points.valid()){
+            TENSOR_GATHER_LOGF("gather_add_nd: invalid input tensors\n");
+            return false;
+        }
+        if (base.backend() != points.backend()){
+            TENSOR_GATHER_LOGF("gather_add_nd: tensor backends do not match\n");
+            return false;
+        }
+        if (out->valid() && base.backend() != out->backend()){
+            TENSOR_GATHER_LOGF("gather_add_nd: tensor backends do not match\n");
+            return false;
+        }
 
         const TensorDesc& bd = base.desc();
         const TensorDesc& pd = points.desc();
-        const TensorDesc& od = out->desc();
-        if (bd.dtype != DType || od.dtype != DType) return false;
+        if (bd.dtype != DType) return false;
         const bool points_match = (pd.dtype == DType);
         if (!points_match) {
             if (pd.dtype != TensorDType::I32 && pd.dtype != TensorDType::I64 &&
                 pd.dtype != TensorDType::U32 && pd.dtype != TensorDType::U64) {
+                TENSOR_GATHER_LOGF("gather_add_nd: invalid points dtype\n");
                 return false;
             }
         }
-        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense || od.layout != TensorLayout::Dense)
+        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense){
+            TENSOR_GATHER_LOGF("gather_add_nd: invalid tensor layout\n");
             return false;
-        if (pd.shape.dims.size() != 2) return false;
+        }
+        if (out->valid()) {
+            const TensorDesc& od = out->desc();
+            if (od.dtype != DType) return false;
+            if (od.layout != TensorLayout::Dense){
+                TENSOR_GATHER_LOGF("gather_add_nd: invalid tensor layout\n");
+                return false;
+            }
+        }
+        if (pd.shape.dims.size() != 2) {
+            TENSOR_GATHER_LOGF("gather_add_nd: invalid points shape\n");
+            return false;
+        }
 
         const uint32_t count = pd.shape.dims[0];
         const uint32_t dims = pd.shape.dims[1];
-        if (dims == 0) return false;
+        if (dims == 0) {
+            TENSOR_GATHER_LOGF("gather_add_nd: invalid point dims\n");
+            return false;
+        }
 
         const size_t in_rank = bd.shape.dims.size();
-        if (in_rank < dims || in_rank > dims + 1) return false;
+        if (in_rank < dims || in_rank > dims + 1) {
+            TENSOR_GATHER_LOGF("gather_add_nd: invalid base rank\n");
+            return false;
+        }
 
         if (dims == 2) return gather_add_2d(base, points, out, clamp);
 
         const uint32_t channels = (in_rank == dims + 1) ? bd.shape.dims.back() : 1u;
-        if (channels == 1) {
-            if (!shape_is(od, {count})) return false;
+        if (!out->valid()) {
+            TensorDesc out_desc{};
+            out_desc.dtype = DType;
+            out_desc.layout = TensorLayout::Dense;
+            if (channels == 1) {
+                out_desc.shape.dims = {count};
+            } else {
+                out_desc.shape.dims = {count, channels};
+            }
+            *out = AbstractTensor::create(out_desc, base.backend());
+            if (!out->valid()) {
+                TENSOR_GATHER_LOGF("gather_add_nd: output allocation failed\n");
+                return false;
+            }
+            if (!ensure_tensor_zeroed(*out)) {
+                TENSOR_GATHER_LOGF("gather_add_nd: output zero failed\n");
+                return false;
+            }
         } else {
-            if (!shape_is(od, {count, channels})) return false;
+            const TensorDesc& od = out->desc();
+            if (channels == 1) {
+                if (!shape_is(od, {count})) { 
+                    TENSOR_GATHER_LOGF("gather_add_nd: output shape mismatch for scalar case\n");
+                    return false; 
+                }
+            } else {
+                if (!shape_is(od, {count, channels})) {
+                    TENSOR_GATHER_LOGF("gather_add_nd: output shape mismatch for vector case\n");
+                    return false;
+                }
+            }
         }
 
         MappedDense bmap = map_dense(base);
@@ -7416,49 +7600,88 @@ static bool scatter_nd_typed(const AbstractTensor& base,
                              const AbstractTensor& values,
                              AbstractTensor* out,
                              bool clamp) {
-    if (!out) return false;
+    if (!out){
+        DYADIC_SCATTER_LOGF("OUT TENSOR INVALID\n");
+        return false;
+    }
     out->reset();
-    if (!base.valid() || !points.valid() || !values.valid()) return false;
-    if (base.backend() != points.backend() || base.backend() != values.backend()) return false;
+    if (!base.valid() || !points.valid() || !values.valid()) {
+        DYADIC_SCATTER_LOGF("INPUT TENSORS INVALID\n");
+        return false;
+    }
+    if (base.backend() != points.backend() || base.backend() != values.backend()) {
+        DYADIC_SCATTER_LOGF("BACKENDS DO NOT MATCH\n");
+        return false;
+    }
 
     const TensorDesc& bd = base.desc();
     const TensorDesc& pd = points.desc();
     const TensorDesc& vd = values.desc();
-    if (bd.dtype != DTypeValue || vd.dtype != DTypeValue) return false;
+    if (bd.dtype != DTypeValue || vd.dtype != DTypeValue) {
+        DYADIC_SCATTER_LOGF("BASE OR VALUES DTYPE MISMATCH\n");
+        return false;
+    }
     const bool points_match = (pd.dtype == DTypeValue);
     if (!points_match) {
         if (pd.dtype != TensorDType::I32 && pd.dtype != TensorDType::I64 &&
             pd.dtype != TensorDType::U32 && pd.dtype != TensorDType::U64) {
+            DYADIC_SCATTER_LOGF("POINTS DTYPE INVALID\n");
             return false;
         }
     }
-    if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense || vd.layout != TensorLayout::Dense)
+    if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense || vd.layout != TensorLayout::Dense) {
+        DYADIC_SCATTER_LOGF("LAYOUT INVALID\n");
         return false;
-    if (pd.shape.dims.size() != 2) return false;
+    }
+    if (pd.shape.dims.size() != 2) {
+        DYADIC_SCATTER_LOGF("POINTS RANK INVALID\n");
+        return false;
+    }
     const uint32_t count = pd.shape.dims[0];
     const uint32_t dims = pd.shape.dims[1];
-    if (dims == 0) return false;
-
+    if (dims == 0) {
+        DYADIC_SCATTER_LOGF("POINTS DIMENSIONS INVALID\n");    
+        return false;
+    }
     const size_t out_rank = bd.shape.dims.size();
-    if (out_rank < dims || out_rank > dims + 1) return false;
+    if (out_rank < dims || out_rank > dims + 1){
+        DYADIC_SCATTER_LOGF("OUTPUT RANK INVALID\n");
+        return false;
+    }
 
-    if (dims == 2) return scatter_2d_typed<Scalar, DTypeValue>(base, points, values, out, clamp);
+    if (dims == 2){
+        DYADIC_SCATTER_LOGF("DELEGATING TO SCATTER 2D\n");
+        return scatter_2d_typed<Scalar, DTypeValue>(base, points, values, out, clamp);
+    }
 
     const uint32_t channels = (out_rank == dims + 1) ? bd.shape.dims.back() : 1u;
     bool val_scalar = false;
     if (vd.shape.dims.size() == 1) {
-        if (vd.shape.dims[0] != count) return false;
+        if (vd.shape.dims[0] != count) {   
+            DYADIC_SCATTER_LOGF("VALUES DIMENSIONS INVALID\n");
+            return false;
+        }
         val_scalar = true;
     } else if (vd.shape.dims.size() == 2) {
-        if (vd.shape.dims[0] != count) return false;
-        if (vd.shape.dims[1] != channels) return false;
+        if (vd.shape.dims[0] != count) {
+            DYADIC_SCATTER_LOGF("VALUES DIMENSIONS INVALID\n");
+            return false;
+        }
+        if (vd.shape.dims[1] != channels) {
+            DYADIC_SCATTER_LOGF("VALUES DIMENSIONS INVALID\n");
+            return false;
+        }
     } else {
+        DYADIC_SCATTER_LOGF("VALUES DIMENSIONS INVALID\n");
         return false;
     }
 
     TensorDesc out_desc = bd;
     *out = AbstractTensor::create(out_desc, base.backend());
-    if (!out->valid()) return false;
+    if (!out->valid()) {
+        DYADIC_SCATTER_LOGF("OUTPUT TENSOR CREATION FAILED\n");    
+        return false;
+    }
 
     auto bmap = map_dense_typed<Scalar, DTypeValue>(base);
     auto omap = map_dense_typed<Scalar, DTypeValue>(*out);
@@ -7475,6 +7698,7 @@ static bool scatter_nd_typed(const AbstractTensor& base,
             bmap.unmap();
             omap.unmap();
             vmap.unmap();
+            DYADIC_SCATTER_LOGF("POINTS MAPPING FAILED\n");
             return false;
         }
     }
@@ -7488,6 +7712,7 @@ static bool scatter_nd_typed(const AbstractTensor& base,
             auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
             if (mem) mem->unmap(points.handle());
         }
+        DYADIC_SCATTER_LOGF("MAPPING FAILED\n");
         return false;
     }
 
@@ -7497,6 +7722,7 @@ static bool scatter_nd_typed(const AbstractTensor& base,
             omap.unmap();
             pmap.unmap();
             vmap.unmap();
+            DYADIC_SCATTER_LOGF("TENSOR COPY FAILED\n");
             return false;
         }
         bmap.unmap();
@@ -7505,6 +7731,7 @@ static bool scatter_nd_typed(const AbstractTensor& base,
         if (!omap2.ok) {
             pmap.unmap();
             vmap.unmap();
+            DYADIC_SCATTER_LOGF("OUTPUT MAPPING FAILED\n");
             return false;
         }
         omap = omap2;
@@ -7523,6 +7750,7 @@ static bool scatter_nd_typed(const AbstractTensor& base,
             auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
             if (mem) mem->unmap(points.handle());
         }
+        DYADIC_SCATTER_LOGF("COMPUTE DENSE STRIDES FAILED\n");
         return false;
     }
 
@@ -7537,6 +7765,7 @@ static bool scatter_nd_typed(const AbstractTensor& base,
             auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
             if (mem) mem->unmap(points.handle());
         }
+        DYADIC_SCATTER_LOGF("ACQUIRE COORD BUFFER FAILED\n");
         return false;
     }
     int64_t* coords = coord_buf.coords_ptr;
@@ -7659,6 +7888,22 @@ void submit_row_jobs(::nodus::ThreadPool* pool,
 }
 
 static thread_local uint32_t tensor_op_thread_override = 0;
+
+static uint32_t dyadic_thread_count_from_overrides() {
+    if (tensor_op_thread_override >= 2u) {
+        return tensor_op_thread_override;
+    }
+    const char* v = std::getenv("NODUS_TENSOR_OP_THREADS");
+    if (!v || !*v) {
+        return 1u;
+    }
+    char* end = nullptr;
+    unsigned long long parsed = std::strtoull(v, &end, 10);
+    if (end == v || parsed < 2u) {
+        return 1u;
+    }
+    return static_cast<uint32_t>(parsed);
+}
 
 struct TensorOpThreadOverrideGuard {
     uint32_t prev = 0;
@@ -7848,6 +8093,9 @@ static bool coordinate_gather(const AbstractTensor& base,\
                               AbstractTensor* out,\
                               const TensorTransferConfig& config,\
                               CoordMode mode) {\
+    TENSOR_GATHER_LOGF("coordinate_gather: enter mode=%s add=%d\n", \
+                       (mode == CoordMode::TwoD) ? "2d" : "nd", \
+                       (config.postmix_gather == TensorMixPolicy::Add) ? 1 : 0); \
     if (config.postmix_gather == TensorMixPolicy::Add) {\
         return (mode == CoordMode::TwoD)\
             ? TensorMathImpl<Scalar, DTypeValue>::gather_add_2d(base, points, out, config.clamp)\
@@ -7869,25 +8117,41 @@ static bool coordinate_scatter(const AbstractTensor& base,
                              config.postmix_scatter == TensorMixPolicy::Add);
     const bool overwrite_policy = (config.premix_scatter == TensorMixPolicy::Overwrite &&
                                    config.postmix_scatter == TensorMixPolicy::Overwrite);
-    if (!add_policy && !overwrite_policy) return false;
+    if (!add_policy && !overwrite_policy) {
+        DYADIC_SCATTER_LOGF("coordinate_scatter: unsupported mix policy premix=%d postmix=%d\n",
+               static_cast<int>(config.premix_scatter),
+               static_cast<int>(config.postmix_scatter));
+        return false;
+    }
 
     const bool allow_dyadic = (config.scatter_algo != TensorScatterAlgorithm::Tiling);
     const bool require_dyadic = (config.scatter_algo == TensorScatterAlgorithm::Dyadic);
 
     if (mode == CoordMode::TwoD) {
         if (add_policy) {
+            DYADIC_SCATTER_LOGF("coordinate_scatter: scatter add 2d with dyadic=%d\n", allow_dyadic ? 1 : 0);
             return TensorMathImpl<Scalar, DTypeValue>::scatter_add_2d(
                 base, points, values, out, config.clamp, allow_dyadic, require_dyadic);
         }
-        if (require_dyadic) return false;
+        if (require_dyadic) {
+            DYADIC_SCATTER_LOGF("coordinate_scatter: scatter overwrite 2d requires dyadic, not supported\n");
+            return false;
+        }
+        DYADIC_SCATTER_LOGF("coordinate_scatter: scatter overwrite 2d\n");
         return scatter_2d_typed<Scalar, DTypeValue>(base, points, values, out, config.clamp);
     }
 
-    if (require_dyadic) return false;
+    if (require_dyadic) {
+        DYADIC_SCATTER_LOGF("coordinate_scatter: scatter nd requires dyadic, not supported\n");
+        return false;
+    }
     if (add_policy) {
+        DYADIC_SCATTER_LOGF("coordinate_scatter: scatter add nd with tiling=%d\n",
+               (config.scatter_algo == TensorScatterAlgorithm::Tiling) ? 1 : 0);
         if (config.scatter_algo == TensorScatterAlgorithm::Tiling) return false;
         return TensorMathImpl<Scalar, DTypeValue>::scatter_add_nd(base, points, values, out, config.clamp);
     }
+    DYADIC_SCATTER_LOGF("coordinate_scatter: scatter overwrite nd\n");
     return scatter_nd_typed<Scalar, DTypeValue>(base, points, values, out, config.clamp);
 }
 
@@ -7920,6 +8184,7 @@ bool tensor_gather_2d(const AbstractTensor& base,
                       const AbstractTensor& points,
                       AbstractTensor* out,
                       const TensorTransferConfig& config) {
+    TENSOR_GATHER_LOGF("tensor_gather_2d: enter\n");
     TensorOpThreadOverrideGuard guard(config.thread_count);
     switch (base.desc().dtype) {
         case TensorDType::I8:  return coordinate_gather<int8_t, TensorDType::I8>(base, points, out, config, CoordMode::TwoD);
@@ -7941,6 +8206,7 @@ bool tensor_gather_nd(const AbstractTensor& base,
                       const AbstractTensor& points,
                       AbstractTensor* out,
                       const TensorTransferConfig& config) {
+    TENSOR_GATHER_LOGF("tensor_gather_nd: enter\n");
     TensorOpThreadOverrideGuard guard(config.thread_count);
     switch (base.desc().dtype) {
         case TensorDType::I8:  return coordinate_gather<int8_t, TensorDType::I8>(base, points, out, config, CoordMode::ND);
@@ -7954,6 +8220,7 @@ bool tensor_gather_nd(const AbstractTensor& base,
         case TensorDType::F32: return coordinate_gather<float, TensorDType::F32>(base, points, out, config, CoordMode::ND);
         case TensorDType::F64: return coordinate_gather<double, TensorDType::F64>(base, points, out, config, CoordMode::ND);
         default:
+            TENSOR_GATHER_LOGF("tensor_gather_nd: unsupported dtype %d\n", static_cast<int>(base.desc().dtype));
             return false;
     }
 }
@@ -7998,6 +8265,7 @@ bool tensor_scatter_nd(const AbstractTensor& base,
         case TensorDType::F32: return coordinate_scatter<float, TensorDType::F32>(base, points, values, out, config, CoordMode::ND);
         case TensorDType::F64: return coordinate_scatter<double, TensorDType::F64>(base, points, values, out, config, CoordMode::ND);
         default:
+            DYADIC_SCATTER_LOGF("tensor_scatter_nd: unsupported dtype %d\n", static_cast<int>(base.desc().dtype));
             return false;
     }
 }
@@ -8018,30 +8286,102 @@ bool tensor_transfer(const AbstractTensor& input,
     //  - a single input index aggregates to output_indices (broadcast semantics undefined)
     //  - sparse naive execution when indices list for gather/scatter in place is small enough to apply directly
     //  - pattern routines of staged gathers/scatters to achieve neighborhood ops (stencil/kernel orchestration)
-    if (!input.valid()) return false;
+    TENSOR_GATHER_LOGF("tensor_transfer: enter gather_first=%d\n", gather_first ? 1 : 0);
+    
+    if (!input.valid()){ 
+        TENSOR_GATHER_LOGF("tensor_transfer: invalid input tensor\n");
+        return false;
+    }
     const bool has_input_idx = input_indices.valid();
     const bool has_output_idx = output_indices.valid();
     if (!has_input_idx && !has_output_idx) {
+        TENSOR_GATHER_LOGF("tensor_transfer: no indices provided, performing copy\n");
         return transfer_copy_if_no_indices(input, output);
     }
-
+    
+    if (has_input_idx && !has_output_idx) {
+        return tensor_gather_nd(input, input_indices, &output, config);
+    }
+    if (!has_input_idx && has_output_idx) {
+        return tensor_scatter_nd(output, output_indices, input, &output, config);
+    }
+    
     const AbstractTensor* gather_points = has_input_idx ? &input_indices : &output_indices;
     const AbstractTensor* scatter_points = has_output_idx ? &output_indices : &input_indices;
 
     if (gather_first) {
         AbstractTensor gathered;
-        if (!tensor_gather_nd(input, *gather_points, &gathered, config)) return false;
-        if (!output.valid()) {
-            output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
+        if (config.postmix_gather == TensorMixPolicy::Add) {
+            if (!input.valid() || !gather_points->valid()) {
+                TENSOR_GATHER_LOGF("tensor_transfer: invalid tensors for gather_add\n");
+                return false;
+            }
+            const TensorDesc& bd = input.desc();
+            const TensorDesc& pd = gather_points->desc();
+            if (pd.layout != TensorLayout::Dense || pd.shape.dims.size() != 2) {
+                TENSOR_GATHER_LOGF("tensor_transfer: invalid gather points shape\n");
+                return false;
+            }
+            const uint32_t count = pd.shape.dims[0];
+            const uint32_t dims = pd.shape.dims[1];
+            if (dims == 0) {
+                TENSOR_GATHER_LOGF("tensor_transfer: invalid gather points dims\n");
+                return false;
+            }
+            const size_t in_rank = bd.shape.dims.size();
+            if (in_rank < dims || in_rank > dims + 1) {
+                TENSOR_GATHER_LOGF("tensor_transfer: invalid base rank for gather\n");
+                return false;
+            }
+            const uint32_t channels = (in_rank == dims + 1) ? bd.shape.dims.back() : 1u;
+            TensorDesc gdesc{};
+            gdesc.dtype = bd.dtype;
+            gdesc.layout = TensorLayout::Dense;
+            if (channels == 1) {
+                gdesc.shape.dims = {count};
+            } else {
+                gdesc.shape.dims = {count, channels};
+            }
+            gathered = AbstractTensor::create(gdesc, input.backend());
+            if (!gathered.valid()) {
+                TENSOR_GATHER_LOGF("tensor_transfer: gather temp allocation failed\n");
+                return false;
+            }
         }
+        if (!tensor_gather_nd(input, *gather_points, &gathered, config)){
+            TENSOR_GATHER_LOGF("tensor_transfer: gather_nd failed\n");
+            return false;
+        }
+        if (!output.valid()) {
+            TENSOR_GATHER_LOGF("tensor_transfer: wrapping output tensor after gather\n");
+            //output = AbstractTensor::create(gather_points->desc(), input.backend());
+            //output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
+            
+        }
+        if (!gathered.valid()) {
+            TENSOR_GATHER_LOGF("tensor_transfer: invalid gathered tensor after gather\n");
+            return false;
+        }
+        TENSOR_GATHER_LOGF("tensor_transfer: performing scatter after gather\n");
+        TENSOR_GATHER_LOGF("the output: %llu\n",
+                static_cast<unsigned long long>(output.handle().id));
+        TENSOR_GATHER_LOGF("the gathered: %llu\n",
+                static_cast<unsigned long long>(gathered.handle().id));
+        TENSOR_GATHER_LOGF("the scatter points: %llu\n",
+                static_cast<unsigned long long>(scatter_points->handle().id));
+        
         return tensor_scatter_nd(output, *scatter_points, gathered, &output, config);
     }
 
     if (!output.valid()) {
         output = AbstractTensor::wrap(input.handle(), input.desc(), input.backend(), false);
     }
-    AbstractTensor scattered;
-    if (!tensor_scatter_nd(output, *scatter_points, input, &scattered, config)) return false;
+    AbstractTensor scattered = AbstractTensor::create(output.desc(), output.backend());
+    if (!tensor_scatter_nd(output, *scatter_points, input, &scattered, config)){
+        TENSOR_GATHER_LOGF("tensor_transfer: scatter_nd failed\n");
+        return false;
+    }
+    TENSOR_GATHER_LOGF("tensor_transfer: performing gather after scatter\n");
     return tensor_gather_nd(scattered, *gather_points, &output, config);
 }
 

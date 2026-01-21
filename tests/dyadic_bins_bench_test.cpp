@@ -37,9 +37,10 @@ struct RefBins {
     std::vector<RefPages> bins;
     std::vector<ValueT> stage;
     uint32_t total_bins = 0;
+    std::vector<uint8_t> phase_counter;
 
     explicit RefBins(uint32_t total)
-        : bins(total), stage(kStageSize, 0), total_bins(total) {}
+        : bins(total), stage(kStageSize, 0), total_bins(total), phase_counter(total, 0u) {}
 
     void push_inbox(uint32_t b, IndexT idx, ValueT val) {
         bins[b].pages[bins[b].inbox].push_back({idx, val});
@@ -84,6 +85,14 @@ struct RefBins {
         bin.retain = (uint8_t)(3u - bin.active - bin.inbox);
         bin.pages[bin.inbox].clear();
         bin.pages[bin.retain].clear();
+    }
+
+    void swap_inbox(uint32_t b) {
+        std::swap(bins[b].active, bins[b].inbox);
+    }
+
+    void swap_retain(uint32_t b) {
+        std::swap(bins[b].active, bins[b].retain);
     }
 
     void finish_scan(uint32_t b) {
@@ -265,13 +274,42 @@ static CaseResult run_case(const char* label,
     for (size_t i = 0; i < indices.size(); ++i) {
         ref.classify(indices[i], values[i]);
     }
-    for (uint32_t b = total_bins; b-- > 1u;) {
-        ref.phase_a(b);
+    const uint32_t sort_base = static_cast<uint32_t>(DyadicScheduleOp::Bin0Sort);
+    const uint32_t inbox_base = static_cast<uint32_t>(DyadicScheduleOp::Bin0SwapInbox);
+    const uint32_t retain_base = static_cast<uint32_t>(DyadicScheduleOp::Bin0SwapRetain);
+    for (const DyadicScheduleOp op : single_threaded_dyadic_schedule) {
+        const uint32_t u = static_cast<uint32_t>(op);
+        if (u >= sort_base && u < sort_base + kBinSortCount) {
+            const uint32_t bin = u - sort_base;
+            if (bin >= ref.total_bins) continue;
+            if (bin == 0u) {
+                ref.bin0_drain();
+            } else if (bin == 1u) {
+                ref.phase_a(bin);
+            } else {
+                const bool do_phase_a = ((ref.phase_counter[bin] & 1u) == 0u);
+                ref.phase_counter[bin] = (uint8_t)(ref.phase_counter[bin] + 1u);
+                if (do_phase_a) {
+                    ref.phase_a(bin);
+                } else {
+                    ref.phase_b(bin);
+                }
+            }
+            continue;
+        }
+        if (u >= inbox_base && u < inbox_base + kBinSortCount) {
+            const uint32_t bin = u - inbox_base;
+            if (bin >= ref.total_bins) continue;
+            ref.swap_inbox(bin);
+            continue;
+        }
+        if (u >= retain_base && u < retain_base + kBinSortCount) {
+            const uint32_t bin = u - retain_base;
+            if (bin >= ref.total_bins) continue;
+            ref.swap_retain(bin);
+            continue;
+        }
     }
-    for (uint32_t b = total_bins; b-- > 1u;) {
-        ref.phase_b(b);
-    }
-    ref.bin0_drain();
     const auto tref1 = std::chrono::high_resolution_clock::now();
 
     const double ms_impl = std::chrono::duration<double, std::milli>(t1 - t0).count();
