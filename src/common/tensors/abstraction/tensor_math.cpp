@@ -553,7 +553,7 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
     const uint8_t* in_bounds = coord_buf.mask_ptr;
 
     const uint32_t thread_count = dyadic_thread_count_from_overrides();
-    const bool ok = dyadic_binning_tensor<PremixPol, OutmixPol>(
+    const bool ok = dyadic_binning_tensor<PremixPol, policies::Overwrite, OutmixPol, policies::Overwrite>(
         static_cast<IndexT>(index_range),
         count,
         idx_data,
@@ -565,7 +565,12 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
         1u,
         1u,
         output,
-        scatter_pool());
+        scatter_pool(),
+        0u,
+        false,
+        true,
+        0u,
+        1u);
     DYADIC_SCATTER_LOGF("dyadic_scatter: binning (stride=%u) ok=%d\n", value_stride, ok ? 1 : 0);
     mem->unmap(linear_indices.handle());
     return ok;
@@ -1911,27 +1916,22 @@ struct TensorMathImpl {
             return false;
         }
 
-        if constexpr (std::is_same_v<Scalar, float>) {
-            if (!tensor_copy_f32_into(base, out)) {
-                bmap.unmap();
-                omap.unmap();
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
-            MappedDense omap2 = map_dense_mut(*out);
-            if (!omap2.ok) {
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
-            omap = omap2;
-        } else {
-            const uint64_t elems = bd.shape.element_count();
-            std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+            pmap.unmap();
+            vmap.unmap();
+            return false;
         }
+        bmap.unmap();
+        omap.unmap();
+        MappedDense omap2 = map_dense_mut(*out);
+        if (!omap2.ok) {
+            pmap.unmap();
+            vmap.unmap();
+            return false;
+        }
+        omap = omap2;
 
         CoordBuffer coord_buf{};
         if (!acquire_coord_buffer(count, 2u, base.backend(), coord_buf)) {
@@ -2788,27 +2788,22 @@ struct TensorMathImpl {
             return false;
         }
 
-        if constexpr (std::is_same_v<Scalar, float>) {
-            if (!tensor_copy_f32_into(base, out)) {
-                bmap.unmap();
-                omap.unmap();
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
-            MappedDense omap2 = map_dense_mut(*out);
-            if (!omap2.ok) {
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
-            omap = omap2;
-        } else {
-            const uint64_t elems = bd.shape.element_count();
-            std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+            pmap.unmap();
+            vmap.unmap();
+            return false;
         }
+        bmap.unmap();
+        omap.unmap();
+        MappedDense omap2 = map_dense_mut(*out);
+        if (!omap2.ok) {
+            pmap.unmap();
+            vmap.unmap();
+            return false;
+        }
+        omap = omap2;
 
         const bool use_affine = bd.slice.valid && bd.slice.has_affine;
         const uint64_t stride0 = channels;
@@ -2855,10 +2850,37 @@ struct TensorMathImpl {
             release_coord_buffer(base.backend(), coord_buf);
             return true;
         }
+
+        omap = map_dense_mut(*out);
+        if (!omap.ok) {
+            pmap.unmap();
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!in_bounds[i]) continue;
+            const uint64_t base_idx = static_cast<uint64_t>(coords[i]) * channels;
+            if (channels == 1) {
+                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
+                omap.data[base_idx] += v;
+            } else if (val_scalar) {
+                const Scalar v = vmap.data[i];
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += v;
+                }
+            } else {
+                const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += src[c];
+                }
+            }
+        }
+        omap.unmap();
         pmap.unmap();
         vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        return false;
+        return true;
     }
 
     static bool scatter_add_nd_3d(const AbstractTensor& base,
@@ -2917,27 +2939,22 @@ struct TensorMathImpl {
             return false;
         }
 
-        if constexpr (std::is_same_v<Scalar, float>) {
-            if (!tensor_copy_f32_into(base, out)) {
-                bmap.unmap();
-                omap.unmap();
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
-            MappedDense omap2 = map_dense_mut(*out);
-            if (!omap2.ok) {
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
-            omap = omap2;
-        } else {
-            const uint64_t elems = bd.shape.element_count();
-            std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+            pmap.unmap();
+            vmap.unmap();
+            return false;
         }
+        bmap.unmap();
+        omap.unmap();
+        MappedDense omap2 = map_dense_mut(*out);
+        if (!omap2.ok) {
+            pmap.unmap();
+            vmap.unmap();
+            return false;
+        }
+        omap = omap2;
 
         std::vector<uint64_t> strides;
         if (!compute_dense_strides_u64(bd.shape.dims, strides)) {
@@ -2998,10 +3015,41 @@ struct TensorMathImpl {
             release_coord_buffer(base.backend(), coord_buf);
             return true;
         }
+
+        omap = map_dense_mut(*out);
+        if (!omap.ok) {
+            pmap.unmap();
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!in_bounds[i]) continue;
+            uint64_t base_idx = 0;
+            const int64_t* coord = coords + static_cast<size_t>(i) * 3u;
+            for (uint32_t d = 0; d < 3u; ++d) {
+                base_idx += static_cast<uint64_t>(coord[d]) * strides[d];
+            }
+            if (channels == 1) {
+                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
+                omap.data[base_idx] += v;
+            } else if (val_scalar) {
+                const Scalar v = vmap.data[i];
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += v;
+                }
+            } else {
+                const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += src[c];
+                }
+            }
+        }
+        omap.unmap();
         pmap.unmap();
         vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        return false;
+        return true;
     }
 
     static bool scatter_add_nd_4d(const AbstractTensor& base,
@@ -3060,27 +3108,22 @@ struct TensorMathImpl {
             return false;
         }
 
-        if constexpr (std::is_same_v<Scalar, float>) {
-            if (!tensor_copy_f32_into(base, out)) {
-                bmap.unmap();
-                omap.unmap();
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
-            MappedDense omap2 = map_dense_mut(*out);
-            if (!omap2.ok) {
-                pmap.unmap();
-                vmap.unmap();
-                return false;
-            }
-            omap = omap2;
-        } else {
-            const uint64_t elems = bd.shape.element_count();
-            std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+            pmap.unmap();
+            vmap.unmap();
+            return false;
         }
+        bmap.unmap();
+        omap.unmap();
+        MappedDense omap2 = map_dense_mut(*out);
+        if (!omap2.ok) {
+            pmap.unmap();
+            vmap.unmap();
+            return false;
+        }
+        omap = omap2;
 
         std::vector<uint64_t> strides;
         if (!compute_dense_strides_u64(bd.shape.dims, strides)) {
@@ -3139,10 +3182,41 @@ struct TensorMathImpl {
             release_coord_buffer(base.backend(), coord_buf);
             return true;
         }
+
+        omap = map_dense_mut(*out);
+        if (!omap.ok) {
+            pmap.unmap();
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!in_bounds[i]) continue;
+            uint64_t base_idx = 0;
+            const int64_t* coord = coords + static_cast<size_t>(i) * 4u;
+            for (uint32_t d = 0; d < 4u; ++d) {
+                base_idx += static_cast<uint64_t>(coord[d]) * strides[d];
+            }
+            if (channels == 1) {
+                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
+                omap.data[base_idx] += v;
+            } else if (val_scalar) {
+                const Scalar v = vmap.data[i];
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += v;
+                }
+            } else {
+                const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += src[c];
+                }
+            }
+        }
+        omap.unmap();
         pmap.unmap();
         vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        return false;
+        return true;
     }
 
     static bool scatter_add_nd(const AbstractTensor& base,
@@ -3227,7 +3301,7 @@ struct TensorMathImpl {
             return false;
         }
 
-        if (!tensor_copy_f32_into(base, out)) {
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
             vmap.unmap();
@@ -3313,7 +3387,42 @@ struct TensorMathImpl {
             }
             return true;
         }
-        TENSOR_GATHER_LOGF("gather_2d: span gather failed\n");
+
+        omap = map_dense_mut(*out);
+        if (!omap.ok) {
+            vmap.unmap();
+            release_coord_buffer(base.backend(), coord_buf);
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
+            }
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!in_bounds[i]) continue;
+            uint64_t base_idx = 0;
+            const int64_t* coord = coords + static_cast<size_t>(i) * dims;
+            for (uint32_t d = 0; d < dims; ++d) {
+                base_idx += static_cast<uint64_t>(coord[d]) * strides[d];
+            }
+            if (channels == 1) {
+                const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
+                omap.data[base_idx] += v;
+            } else if (val_scalar) {
+                const Scalar v = vmap.data[i];
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += v;
+                }
+            } else {
+                const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
+                for (uint32_t c = 0; c < channels; ++c) {
+                    omap.data[base_idx + c] += src[c];
+                }
+            }
+        }
+        omap.unmap();
         vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
         if (points_match) {
@@ -3322,7 +3431,7 @@ struct TensorMathImpl {
             auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
             if (mem) mem->unmap(points.handle());
         }
-        return false;
+        return true;
     }
 
     static bool gather_nd(const AbstractTensor& base,
@@ -4399,41 +4508,36 @@ struct TensorMathImpl {
             return false;
         }
 
-        if constexpr (std::is_same_v<Scalar, float>) {
-            if (!tensor_copy_f32_into(base, out)) {
-                bmap.unmap();
-                omap.unmap();
-                vmap.unmap();
-                omap_off.unmap();
-                wmap.unmap();
-                if (points_match) {
-                    pmap.unmap();
-                } else if (points_ptr) {
-                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                    if (mem) mem->unmap(points.handle());
-                }
-                return false;
-            }
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
-            MappedDense omap2 = map_dense_mut(*out);
-            if (!omap2.ok) {
-                vmap.unmap();
-                omap_off.unmap();
-                wmap.unmap();
-                if (points_match) {
-                    pmap.unmap();
-                } else if (points_ptr) {
-                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                    if (mem) mem->unmap(points.handle());
-                }
-                return false;
+            vmap.unmap();
+            omap_off.unmap();
+            wmap.unmap();
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
             }
-            omap = omap2;
-        } else {
-            const uint64_t elems = bd.shape.element_count();
-            std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+            return false;
         }
+        bmap.unmap();
+        omap.unmap();
+        MappedDense omap2 = map_dense_mut(*out);
+        if (!omap2.ok) {
+            vmap.unmap();
+            omap_off.unmap();
+            wmap.unmap();
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
+            }
+            return false;
+        }
+        omap = omap2;
 
         auto read_index = [&](uint32_t i, uint32_t col) -> int64_t {
             const uint64_t idx = static_cast<uint64_t>(i) * pcols + col;
@@ -4709,41 +4813,36 @@ struct TensorMathImpl {
             return false;
         }
 
-        if constexpr (std::is_same_v<Scalar, float>) {
-            if (!tensor_copy_f32_into(base, out)) {
-                bmap.unmap();
-                omap.unmap();
-                vmap.unmap();
-                omap_off.unmap();
-                wmap.unmap();
-                if (points_match) {
-                    pmap.unmap();
-                } else if (points_ptr) {
-                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                    if (mem) mem->unmap(points.handle());
-                }
-                return false;
-            }
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
-            MappedDense omap2 = map_dense_mut(*out);
-            if (!omap2.ok) {
-                vmap.unmap();
-                omap_off.unmap();
-                wmap.unmap();
-                if (points_match) {
-                    pmap.unmap();
-                } else if (points_ptr) {
-                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                    if (mem) mem->unmap(points.handle());
-                }
-                return false;
+            vmap.unmap();
+            omap_off.unmap();
+            wmap.unmap();
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
             }
-            omap = omap2;
-        } else {
-            const uint64_t elems = bd.shape.element_count();
-            std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+            return false;
         }
+        bmap.unmap();
+        omap.unmap();
+        MappedDense omap2 = map_dense_mut(*out);
+        if (!omap2.ok) {
+            vmap.unmap();
+            omap_off.unmap();
+            wmap.unmap();
+            if (points_match) {
+                pmap.unmap();
+            } else if (points_ptr) {
+                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
+                if (mem) mem->unmap(points.handle());
+            }
+            return false;
+        }
+        omap = omap2;
 
         std::vector<uint64_t> elem_strides;
         if (!compute_strides_for_desc_u64(bd, elem_strides)) {
@@ -5479,7 +5578,7 @@ struct TensorMathImpl {
                          coords,
                          in_bounds);
 
-        if (!tensor_copy_f32_into(base, out)) {
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
             omap.unmap();
             pmap.unmap();
@@ -5857,7 +5956,7 @@ struct TensorMathImpl {
 
         const bool use_affine = bd.slice.valid && bd.slice.has_affine;
 
-        if (!tensor_copy_f32_into(base, out)) {
+        if (!tensor_copy_typed_into<DType>(base, out)) {
             mem->unmap(kernel_ids.handle());
             bmap.unmap();
             omap.unmap();
@@ -7233,27 +7332,22 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
         return false;
     }
 
-    if constexpr (std::is_same_v<Scalar, float>) {
-        if (!tensor_copy_f32_into(base, out)) {
-            bmap.unmap();
-            omap.unmap();
-            pmap.unmap();
-            vmap.unmap();
-            return false;
-        }
+    if (!tensor_copy_typed_into<DTypeValue>(base, out)) {
         bmap.unmap();
         omap.unmap();
-        auto omap2 = map_dense_typed<Scalar, DTypeValue>(*out);
-        if (!omap2.ok) {
-            pmap.unmap();
-            vmap.unmap();
-            return false;
-        }
-        omap = omap2;
-    } else {
-        const uint64_t elems = bd.shape.element_count();
-        std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+        pmap.unmap();
+        vmap.unmap();
+        return false;
     }
+    bmap.unmap();
+    omap.unmap();
+    auto omap2 = map_dense_typed<Scalar, DTypeValue>(*out);
+    if (!omap2.ok) {
+        pmap.unmap();
+        vmap.unmap();
+        return false;
+    }
+    omap = omap2;
 
     CoordBuffer coord_buf{};
     if (!acquire_coord_buffer(count, 2u, base.backend(), coord_buf)) {
@@ -7401,27 +7495,22 @@ static bool scatter_2d_typed(const AbstractTensor& base,
         return false;
     }
 
-    if constexpr (std::is_same_v<Scalar, float>) {
-        if (!tensor_copy_f32_into(base, out)) {
-            bmap.unmap();
-            omap.unmap();
-            pmap.unmap();
-            vmap.unmap();
-            return false;
-        }
+    if (!tensor_copy_typed_into<DTypeValue>(base, out)) {
         bmap.unmap();
         omap.unmap();
-        auto omap2 = map_dense_typed<Scalar, DTypeValue>(*out);
-        if (!omap2.ok) {
-            pmap.unmap();
-            vmap.unmap();
-            return false;
-        }
-        omap = omap2;
-    } else {
-        const uint64_t elems = bd.shape.element_count();
-        std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+        pmap.unmap();
+        vmap.unmap();
+        return false;
     }
+    bmap.unmap();
+    omap.unmap();
+    auto omap2 = map_dense_typed<Scalar, DTypeValue>(*out);
+    if (!omap2.ok) {
+        pmap.unmap();
+        vmap.unmap();
+        return false;
+    }
+    omap = omap2;
 
     CoordBuffer coord_buf{};
     if (!acquire_coord_buffer(count, 2u, base.backend(), coord_buf)) {
@@ -7716,29 +7805,24 @@ static bool scatter_nd_typed(const AbstractTensor& base,
         return false;
     }
 
-    if constexpr (std::is_same_v<Scalar, float>) {
-        if (!tensor_copy_f32_into(base, out)) {
-            bmap.unmap();
-            omap.unmap();
-            pmap.unmap();
-            vmap.unmap();
-            DYADIC_SCATTER_LOGF("TENSOR COPY FAILED\n");
-            return false;
-        }
+    if (!tensor_copy_typed_into<DTypeValue>(base, out)) {
         bmap.unmap();
         omap.unmap();
-        auto omap2 = map_dense_typed<Scalar, DTypeValue>(*out);
-        if (!omap2.ok) {
-            pmap.unmap();
-            vmap.unmap();
-            DYADIC_SCATTER_LOGF("OUTPUT MAPPING FAILED\n");
-            return false;
-        }
-        omap = omap2;
-    } else {
-        const uint64_t elems = bd.shape.element_count();
-        std::memcpy(omap.data, bmap.data, static_cast<size_t>(elems * sizeof(Scalar)));
+        pmap.unmap();
+        vmap.unmap();
+        DYADIC_SCATTER_LOGF("TENSOR COPY FAILED\n");
+        return false;
     }
+    bmap.unmap();
+    omap.unmap();
+    auto omap2 = map_dense_typed<Scalar, DTypeValue>(*out);
+    if (!omap2.ok) {
+        pmap.unmap();
+        vmap.unmap();
+        DYADIC_SCATTER_LOGF("OUTPUT MAPPING FAILED\n");
+        return false;
+    }
+    omap = omap2;
 
     std::vector<uint64_t> strides;
     if (!compute_dense_strides_u64(bd.shape.dims, strides)) {
