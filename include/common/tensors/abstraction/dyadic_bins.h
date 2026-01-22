@@ -1374,9 +1374,12 @@ inline void dyadic_run_single_thread_schedule_stage_pages(
     const uint32_t sort_base = static_cast<uint32_t>(DyadicScheduleOp::Bin0Sort);
     const uint32_t inbox_base = static_cast<uint32_t>(DyadicScheduleOp::Bin0SwapInbox);
     const uint32_t retain_base = static_cast<uint32_t>(DyadicScheduleOp::Bin0SwapRetain);
+    printf("N: %zu\n", N);
     for (size_t i = 0; i < N; ++i) {
+        printf("Step %zu: Op %u\n", i, static_cast<uint32_t>(schedule[i]));
         const uint32_t u = static_cast<uint32_t>(schedule[i]);
         if (u >= sort_base && u < sort_base + kBinSortCount) {
+            printf("  Bin Sort\n");
             const uint32_t bin = u - sort_base;
             if (bin >= io.total_bins) {
                 continue;
@@ -1392,6 +1395,7 @@ inline void dyadic_run_single_thread_schedule_stage_pages(
             continue;
         }
         if (u >= inbox_base && u < inbox_base + kBinSortCount) {
+            printf("  Swap Inbox\n");
             const uint32_t bin = u - inbox_base;
             if (bin >= io.total_bins) {
                 continue;
@@ -1400,6 +1404,7 @@ inline void dyadic_run_single_thread_schedule_stage_pages(
             continue;
         }
         if (u >= retain_base && u < retain_base + kBinSortCount) {
+            printf("  Swap Retain\n");
             const uint32_t bin = u - retain_base;
             if (bin >= io.total_bins) {
                 continue;
@@ -1408,6 +1413,7 @@ inline void dyadic_run_single_thread_schedule_stage_pages(
             continue;
         }
     }
+    printf("Done\n");
 }
 
 
@@ -1550,6 +1556,7 @@ inline bool dyadic_enqueue_job_row_bytes(
     entry.rows = row_tensor.handle();
     entry.row_count = 1u;
     entry.stage_page_index = stage_bin;
+    printf("Enqueueing job row idx %llu to stage bin %u\n", (unsigned long long)idx, stage_bin);
     return dyadic_job_ring_enqueue(job, entry, &stage_pages, blocking);
 }
 
@@ -1660,12 +1667,16 @@ inline bool dyadic_job_ring_enqueue(DyadicJobCtx& job,
     const uint32_t seq = job.enqueued.fetch_add(1u, std::memory_order_acq_rel) + 1u;
     job.pending.fetch_add(1u, std::memory_order_acq_rel);
     tail.store(t + 1u, std::memory_order_release);
+    printf("[dyadic] Enqueued job at index %u\n", idx);
     if (stage_pages) {
+        printf("[dyadic] Signaling sort classifier thread\n");
         stage_pages->signal_sort_classifier_thread();
     }
     if (blocking) {
+        printf("[dyadic] Waiting for job to complete\n");
         std::unique_lock<std::mutex> lock(job.pending_mutex);
         job.pending_cv.wait(lock, [&job, seq]() {
+            printf("[dyadic] Waiting for job completion, seq=%u, completed=%u\n", seq, job.completed.load(std::memory_order_acquire));
             return job.completed.load(std::memory_order_acquire) >= seq;
         });
         return true;
@@ -2433,6 +2444,11 @@ inline void dyadic_bin0_drain_paged(
     bool use_msb_override = false,
     INDEX_T msb_mask = 0,
     uint32_t sort_epoch = 0) {
+    printf("[dyadic] Draining bin 0\n");
+    printf("[dyadic]   use_msb_override=%d msb_mask=0x%llx sort_epoch=%u\n",
+           use_msb_override ? 1 : 0,
+           static_cast<unsigned long long>(msb_mask),
+           sort_epoch);
     const uint32_t bin = 0;
     io.prepare_for_scan(bin);
     const uint8_t A = io.active_page(bin);
@@ -2441,6 +2457,7 @@ inline void dyadic_bin0_drain_paged(
     uint8_t* base = io.page_base(bin, A);
     uint32_t slot = 0;
     while (slot ^ n) {
+        printf("[dyadic]   draining slot %u / %u\r", slot + 1u, n);
         uint8_t* p = base + (uint64_t)slot * (uint64_t)io.slot_bytes;
         INDEX_T idx;
         DYADIC_RAW_WRITE(&idx, p, sizeof(INDEX_T));
@@ -2526,6 +2543,11 @@ inline void dyadic_exec_bin_sort(
     bool use_msb_override = false,
     INDEX_T msb_mask = 0,
     uint32_t sort_epoch = 0) {
+    printf("[dyadic] Sorting bin %u\n", bin_id);
+    printf("[dyadic]   use_msb_override=%d msb_mask=0x%llx sort_epoch=%u\n",
+           use_msb_override ? 1 : 0,
+           static_cast<unsigned long long>(msb_mask),
+           sort_epoch);
     VALUE_T* stage = stage_pages.template stage_ptr<VALUE_T>(bin_id);
     if (!stage) {
         return;
@@ -3269,6 +3291,8 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
                 } \
             } \
         } \
+        printf("Dyadic Binning: index_count=%u, total_bins=%u, value_stride=%u, packed_value_stride=%u\n", \
+               io.index_count, io.total_bins, value_stride, packed_value_stride); \
         const uint32_t stage_entries = (uint32_t)((1u << stage_bits) * packed_value_stride); \
         const uint64_t stage_page_bytes = (uint64_t)stage_entries * (uint64_t)sizeof(VALUE_T); \
         bool use_output_stage_pool = output_as_stage_pool && output && output_offset; \
@@ -3427,7 +3451,9 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             } \
             i += 1u; \
         } \
+        printf("Dyadic Binning: classification complete, draining stage pages...\n"); \
         if (local_job_active) { \
+            printf("Dyadic Binning: finalizing local job ring...\n"); \
             DyadicJobRingEntry terminal{}; \
             terminal.flags = DyadicJobRingTerminal; \
             local_job.done.store(1u, std::memory_order_release); \
@@ -3438,6 +3464,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             mem->unmap(packed_tensor.tensor().handle()); \
         } \
         if (policy.allow_parallel_bins) { \
+            printf("Dyadic Binning: using parallel stage page writers (%u heads)...\n", policy.write_heads); \
             dyadic_mt_bitmask_algo_parallel<PremixValuePol, PremixIndexPol, OutmixValuePol, OutmixIndexPol>( \
                 io, \
                 stage_pages, \
@@ -3446,6 +3473,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
                 phase_b_rounds, \
                 bin0_passes, \
                 policy); \
+            printf("Dyadic Binning: parallel stage page writers complete.\n"); \
             const uint32_t write_heads = std::max<uint32_t>(1u, policy.write_heads); \
             const uint32_t queue_len = std::max<uint32_t>(1u, policy.write_head_queue_len); \
             TensorDesc inbox_desc{}; \
@@ -3505,7 +3533,9 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             sjob.fn = &dyadic_queue_scanner_job_fn<INDEX_T, VALUE_T>; \
             sjob.user = &scan_ctx; \
             auto sbatch = spool.submit_batch(&sjob, 1u); \
+            printf("Dyadic Binning: waiting for stage pages to drain...\n"); \
             if (sbatch) sbatch->wait(); \
+            printf("Dyadic Binning: stage pages drained, finalizing writes...\n"); \
             for (;;) { \
                 bool queues_empty = true; \
                 for (uint32_t bin = 0; bin < stage_pages.total_bins; ++bin) { \
@@ -3527,6 +3557,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             stage_pages.stop_recycler(); \
             if (inbox_ptr_void) mem->unmap(inbox_tensor.handle()); \
         } else { \
+            printf("Dyadic Binning: using single-threaded stage page writer...\n"); \
             std::vector<uint8_t> duty_state(io.total_bins, 0u); \
             std::vector<uint8_t> phase_counter(io.total_bins, 0u); \
             for (uint32_t bin = 0; bin < io.total_bins; ++bin) { \
@@ -3534,6 +3565,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
                 duty_state[bin] = state; \
                 dyadic_sync_pages_from_state(bin, state, io.page_active, io.page_inbox, io.page_retain); \
             } \
+            printf("Dyadic Binning: draining stage pages...\n"); \
             dyadic_run_single_thread_schedule_stage_pages<INDEX_T, VALUE_T, PremixValuePol, PremixIndexPol>( \
                 single_threaded_dyadic_schedule, \
                 io, \
@@ -3543,6 +3575,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
                 phase_counter.data(), \
                 jobs, \
                 true); \
+            printf("Dyadic Binning: stage pages drained.\n"); \
             const uint32_t write_heads = std::max<uint32_t>(1u, policy.write_heads); \
             const uint32_t queue_len = std::max<uint32_t>(1u, policy.write_head_queue_len); \
             TensorDesc inbox_desc{}; \
@@ -3638,6 +3671,7 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
         void* out_ptr = nullptr; \
         size_t out_bytes = 0; \
         if (!mem->map(output.handle(), &out_ptr, &out_bytes)) return false; \
+        printf("Dyadic MT Bitmask Algo Output Mapped: %zu bytes\n", out_bytes); \
         dyadic_mt_bitmask_algo<PremixValuePol, PremixIndexPol, OutmixValuePol, OutmixIndexPol>( \
             index_range, \
             index_count, \

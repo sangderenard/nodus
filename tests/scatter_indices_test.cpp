@@ -1044,7 +1044,7 @@ int main() {
             if (!base_copy.valid()) return false;
             TensorTransferConfig copy_cfg{};
             if (!base_tensor.transfer(AbstractTensor{}, base_copy, AbstractTensor{}, true, copy_cfg)) return false;
-            const bool ok = values_tensor.scatter(points_tensor, base_copy, AbstractTensor{}, cfg);
+            const bool ok = values_tensor.scatter(AbstractTensor{}, base_copy, points_tensor, cfg);
             out = std::move(base_copy);
             return ok;
         };

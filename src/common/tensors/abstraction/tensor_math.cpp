@@ -18,11 +18,11 @@
 #include <unordered_map>
 #include <type_traits>
 
-#if defined(NODUS_DYADIC_SCATTER_DEBUG)
+//#if defined(NODUS_DYADIC_SCATTER_DEBUG)
 #define DYADIC_SCATTER_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
-#else
-#define DYADIC_SCATTER_LOGF(...) ((void)0)
-#endif
+//#else
+//#define DYADIC_SCATTER_LOGF(...) ((void)0)
+//#endif
 
 #if defined(NODUS_TENSOR_GATHER_DEBUG)
 #define TENSOR_GATHER_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
@@ -1837,7 +1837,7 @@ struct TensorMathImpl {
                                bool allow_dyadic,
                                bool require_dyadic) {
         if (!out) return false;
-        out->reset();
+        
         if (!base.valid() || !points.valid() || !values.valid()) return false;
         if (base.backend() != points.backend() || base.backend() != values.backend()) return false;
         const TensorDesc& bd = base.desc();
@@ -1968,7 +1968,7 @@ struct TensorMathImpl {
         bmap.unmap();
         omap.unmap();
 
-        if (allow_dyadic) {
+        if (allow_dyadic || require_dyadic) {
             if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
                     coord_buf,
                     count,
@@ -3224,15 +3224,44 @@ struct TensorMathImpl {
                                const AbstractTensor& values,
                                AbstractTensor* out,
                                bool clamp) {
-        if (!out) return false;
-        out->reset();
-        if (!base.valid() || !points.valid() || !values.valid()) return false;
-        if (base.backend() != points.backend() || base.backend() != values.backend()) return false;
+        if (!out){
+            DYADIC_SCATTER_LOGF("scatter_add_nd: output tensor is null\n");
+            return false;
+        }
+        DYADIC_SCATTER_LOGF("scatter_add_nd: start\n");
+        if (!base.valid() || !points.valid() || !values.valid()){
+            DYADIC_SCATTER_LOGF("scatter_add_nd: invalid base, points, or values\n");
+            return false;
+        }
+        if (base.backend() != points.backend() || base.backend() != values.backend()){
+            DYADIC_SCATTER_LOGF("base, points, values backend disagreement\n");
+            return false;
+        }
 
         const TensorDesc& bd = base.desc();
         const TensorDesc& pd = points.desc();
         const TensorDesc& vd = values.desc();
-        if (bd.dtype != DType || vd.dtype != DType) return false;
+        if (bd.dtype != DType || vd.dtype != DType) {
+            DYADIC_SCATTER_LOGF("base + values dtype mismatch\n");
+            return false;
+        }
+
+        if (pd.shape.dims.size() != 2){
+            DYADIC_SCATTER_LOGF("points tensor is not 2 dims (count and channels) (maybe you are using spatial coords)");
+            return false;
+        }
+        const uint32_t count = pd.shape.dims[0];
+        const uint32_t dims = pd.shape.dims[1];
+        if (dims == 0){
+            DYADIC_SCATTER_LOGF("points tensor has 0 dims\n");
+            return false;
+        }
+        const size_t out_rank = bd.shape.dims.size();
+        if (out_rank < dims || out_rank > dims + 1){
+            DYADIC_SCATTER_LOGF("output rank mismatch\n");
+            return false;
+        }
+
         const bool points_match = (pd.dtype == DType);
         if (!points_match) {
             if (pd.dtype != TensorDType::I32 && pd.dtype != TensorDType::I64 &&
@@ -3240,19 +3269,25 @@ struct TensorMathImpl {
                 return false;
             }
         }
-        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense || vd.layout != TensorLayout::Dense)
-            return false;
-        if (pd.shape.dims.size() != 2) return false;
-        const uint32_t count = pd.shape.dims[0];
-        const uint32_t dims = pd.shape.dims[1];
-        if (dims == 0) return false;
-        const size_t out_rank = bd.shape.dims.size();
-        if (out_rank < dims || out_rank > dims + 1) return false;
 
-        if (dims == 1 && points_match) return scatter_add_nd_1d(base, points, values, out, clamp);
-        if (dims == 2) return scatter_add_2d(base, points, values, out, clamp, true, true);
-        if (dims == 3 && points_match) return scatter_add_nd_3d(base, points, values, out, clamp);
-        if (dims == 4 && points_match) return scatter_add_nd_4d(base, points, values, out, clamp);
+        DYADIC_SCATTER_LOGF("scatter_add_nd: params dims=%u count=%u out_rank=%zu clamp=%d\n",
+                             dims, count, out_rank, clamp ? 1 : 0);
+        //return scatter_add_2d(base, points, values, out, clamp, true, true);
+        if (dims == 1 && points_match){
+            DYADIC_SCATTER_LOGF("scatter_add_nd: dispatching to scatter_add_nd_1d\n");
+            return scatter_add_nd_1d(base, points, values, out, clamp);
+        }
+        if (dims == 2){
+            DYADIC_SCATTER_LOGF("scatter_add_nd: dispatching to scatter_add_2d\n");
+            return scatter_add_2d(base, points, values, out, clamp, true, true);
+        }
+        if (dims == 3 && points_match) {
+            DYADIC_SCATTER_LOGF("scatter_add_nd: dispatching to scatter_add_nd_3d\n");    
+            return scatter_add_nd_3d(base, points, values, out, clamp);
+        }
+        if (dims == 4 && points_match) {
+            return scatter_add_nd_4d(base, points, values, out, clamp);
+        }
 
         const uint32_t channels = (out_rank == dims + 1) ? bd.shape.dims.back() : 1u;
         bool val_scalar = false;
@@ -3288,18 +3323,7 @@ struct TensorMathImpl {
                 return false;
             }
         }
-        if (!bmap.ok || !omap.ok || !vmap.ok || (points_match && !pmap.ok)) {
-            bmap.unmap();
-            omap.unmap();
-            vmap.unmap();
-            if (points_match) {
-                pmap.unmap();
-            } else if (points_ptr) {
-                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                if (mem) mem->unmap(points.handle());
-            }
-            return false;
-        }
+
 
         if (!tensor_copy_typed_into<DType>(base, out)) {
             bmap.unmap();
@@ -3424,13 +3448,9 @@ struct TensorMathImpl {
         }
         omap.unmap();
         vmap.unmap();
+        pmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        if (points_match) {
-            pmap.unmap();
-        } else if (points_ptr) {
-            auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-            if (mem) mem->unmap(points.handle());
-        }
+
         return true;
     }
 
