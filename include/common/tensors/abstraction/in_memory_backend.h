@@ -9,6 +9,11 @@ namespace nodus::tensors {
 
 class InMemoryBackend final : public TensorBackend {
 public:
+    enum class ArenaBackingPolicy : uint8_t {
+        VirtualOnly,
+        AllowNonVirtual
+    };
+
     const char* name() const override;
 
     AbstractTensorHandle create(const TensorDesc& desc) override;
@@ -59,6 +64,19 @@ public:
                        bool keep_in_place = false,
                        uint64_t byte_offset = 0,
                        uint64_t byte_count = 0);
+
+    // Must be set before first arena initialization to select backing strategy.
+    static void set_arena_backing_policy(ArenaBackingPolicy policy);
+    // Must be set before first arena initialization to control maximum arena size.
+    static void set_arena_reserve_bytes(uint64_t bytes);
+    // Must be set before first arena initialization to control initial commit size.
+    static void set_arena_min_commit_bytes(uint64_t bytes);
+    // Must be set before first arena initialization to control span node capacity.
+    static void set_arena_span_nodes(uint64_t nodes);
+    // For test-only use: clear all arenas so a new policy/size can be applied.
+    static void reset_arena_for_testing();
+    // Expose system-available bytes for test sizing.
+    static uint64_t get_system_available_bytes();
 };
 
 InMemoryBackend& in_memory_backend_singleton();

@@ -11,11 +11,11 @@ namespace nodus::tensors {
 class AbstractTensorPool {
 public:
     struct Options {
-        bool clear_on_release = true;
+        bool clear_on_release = false;
         // If false, the pool will NOT cache handles; it will destroy the handle on release.
         // This makes the backend allocator the single source of truth for reuse and enables
         // cross-shape reuse (any large-enough freed region can satisfy any future request).
-        bool cache_handles = true;
+        bool cache_handles = false;
         // If enabled, the pool will round requested shapes up to bucketed "capacity" shapes
         // for caching purposes. The returned tensor will still report the requested logical
         // shape, but its backing allocation will be at least the bucketed size.

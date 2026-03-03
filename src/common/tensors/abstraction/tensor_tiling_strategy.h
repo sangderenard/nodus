@@ -4,6 +4,8 @@
 #include "common/tensors/abstraction/abstract_tensor_pool.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
 #include "common/tensors/abstraction/tensor_math.h"
+#include "common/tensors/abstraction/rounding.h"
+#include "common/tensors/abstraction/affine_xy.h"
 
 #include <algorithm>
 #include <cstring>
@@ -13,6 +15,8 @@
 #include <vector>
 #include <numeric>
 #include <type_traits>
+#include <unordered_map>
+#include <mutex>
 
 namespace nodus::tensors {
 
@@ -77,17 +81,20 @@ inline uint32_t default_tile_px_2d(const TensorDesc& desc) {
 }
 
 inline float scatter_tile_dense_threshold() {
-    float dense_threshold = 0.85f;
-    if (const char* v = std::getenv("NODUS_SCATTER_TILE_DENSE")) {
-        if (*v) {
-            char* end = nullptr;
-            double parsed = std::strtod(v, &end);
-            if (end != v) {
-                dense_threshold = static_cast<float>(std::clamp(parsed, 0.0, 1.0));
+    static const float cached = []() -> float {
+        float dense_threshold = 0.85f;
+        if (const char* v = std::getenv("NODUS_SCATTER_TILE_DENSE")) {
+            if (*v) {
+                char* end = nullptr;
+                double parsed = std::strtod(v, &end);
+                if (end != v) {
+                    dense_threshold = static_cast<float>(std::clamp(parsed, 0.0, 1.0));
+                }
             }
         }
-    }
-    return dense_threshold;
+        return dense_threshold;
+    }();
+    return cached;
 }
 
 inline bool detect_dense_grid_2d(uint32_t pcols,
@@ -497,8 +504,17 @@ struct SpanRecord2D {
 };
 
 inline bool span_tiling_enabled_from_env(const char* env_name) {
+    if (!env_name) return span_tiling_enabled();
+
+    static std::unordered_map<std::string, bool> cache;
+    static std::mutex cache_mutex;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(env_name);
+        if (it != cache.end()) return it->second;
+    }
+
     bool enabled = span_tiling_enabled();
-    if (!env_name) return enabled;
     if (const char* v = std::getenv(env_name)) {
         if (*v) {
             const char c = *v;
@@ -509,21 +525,41 @@ inline bool span_tiling_enabled_from_env(const char* env_name) {
             }
         }
     }
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.emplace(env_name, enabled);
+    }
     return enabled;
 }
 
 inline uint32_t span_tiling_max_from_env(const char* env_name, uint32_t default_value) {
     if (!env_name) return default_value;
+
+    static std::unordered_map<std::string, uint32_t> cache;
+    static std::mutex cache_mutex;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(env_name);
+        if (it != cache.end()) return it->second;
+    }
+
+    uint32_t value = default_value;
     if (const char* v = std::getenv(env_name)) {
         if (*v) {
             char* end = nullptr;
             const long parsed = std::strtol(v, &end, 10);
             if (end != v && parsed > 0) {
-                return static_cast<uint32_t>(parsed);
+                value = static_cast<uint32_t>(parsed);
             }
         }
     }
-    return default_value;
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.emplace(env_name, value);
+    }
+    return value;
 }
 
 inline uint32_t span_tiling_default_max_from_tile_dims(uint32_t tile_x, uint32_t tile_y) {
@@ -785,7 +821,7 @@ inline void build_contiguous_spans_from_sorted_records(const std::vector<RecordT
         ++r;
         for (; r < n; ++r) {
             const uint64_t cur = records[r].linear;
-            if (cur <= prev) continue;
+
             if (cur == prev + 1u) {
                 prev = cur;
                 continue;
@@ -817,15 +853,6 @@ inline void build_contiguous_spans_from_sorted_records(const std::vector<RecordT
             chunk_begin = chunk_end;
         }
     }
-}
-
-inline bool& assume_nonneg_points_flag() {
-    static bool assume_nonneg = true;
-    return assume_nonneg;
-}
-
-inline void set_assume_nonneg_points(bool assume_nonneg) {
-    assume_nonneg_points_flag() = assume_nonneg;
 }
 
 inline void apply_affine_row_major(const float* m,
@@ -873,254 +900,6 @@ inline int64_t quantize_round_fast(float v) {
     const int64_t r = static_cast<int64_t>(intpart + inc);
     return (b >> 31) ? -r : r;
 }
-
-inline int64_t quantize_round_fast_nonneg(float v) {
-    // Bitwise round-to-nearest-even for non-negative float32 values.
-    // Assumes IEEE-754 binary32, finite inputs, and v >= 0 on the hot path.
-    uint32_t b = 0u;
-    std::memcpy(&b, &v, sizeof(b));
-    const uint32_t absb = b & 0x7FFFFFFFu;
-
-    // |v| >= 2^23 -> float already has integer resolution or is extreme.
-    if (absb >= 0x4B000000u) {
-        return static_cast<int64_t>(v);
-    }
-
-    const uint32_t exp_field = (absb >> 23) & 0xFFu;
-    const int32_t exp = static_cast<int32_t>(exp_field) - 127;
-
-    if (exp < 0) {
-        if (absb < 0x3F000000u) return 0; // |v| < 0.5f
-        return 1;
-    }
-
-    const uint32_t mant = (absb & 0x7FFFFFu) | 0x800000u;
-    const uint32_t shift = 23u - static_cast<uint32_t>(exp);
-    const uint32_t intpart = mant >> shift;
-    const uint32_t frac = mant & ((1u << shift) - 1u);
-    const uint32_t half = 1u << (shift - 1u);
-    const uint32_t inc = (frac > half) | ((frac == half) & (intpart & 1u));
-    return static_cast<int64_t>(intpart + inc);
-}
-
-inline int64_t quantize_round_default(float v, bool assume_nonneg) {
-    return assume_nonneg ? quantize_round_fast_nonneg(v) : quantize_round_fast(v);
-}
-
-inline int32_t quantize_round_fast_i32(float v) {
-    uint32_t b = 0u;
-    std::memcpy(&b, &v, sizeof(b));
-    const uint32_t absb = b & 0x7FFFFFFFu;
-
-    if (absb >= 0x4B000000u) {
-        return static_cast<int32_t>(v);
-    }
-
-    const uint32_t exp_field = (absb >> 23) & 0xFFu;
-    const int32_t exp = static_cast<int32_t>(exp_field) - 127;
-
-    if (exp < 0) {
-        if (absb < 0x3F000000u) return 0;
-        return (b >> 31) ? -1 : 1;
-    }
-
-    const uint32_t mant = (absb & 0x7FFFFFu) | 0x800000u;
-    const uint32_t shift = 23u - static_cast<uint32_t>(exp);
-    const uint32_t intpart = mant >> shift;
-    const uint32_t frac = mant & ((1u << shift) - 1u);
-    const uint32_t half = 1u << (shift - 1u);
-    const uint32_t inc = (frac > half) | ((frac == half) & (intpart & 1u));
-    const int32_t r = static_cast<int32_t>(intpart + inc);
-    return (b >> 31) ? -r : r;
-}
-
-inline int32_t quantize_round_fast_nonneg_i32(float v) {
-    uint32_t b = 0u;
-    std::memcpy(&b, &v, sizeof(b));
-    const uint32_t absb = b & 0x7FFFFFFFu;
-
-    if (absb >= 0x4B000000u) {
-        return static_cast<int32_t>(v);
-    }
-
-    const uint32_t exp_field = (absb >> 23) & 0xFFu;
-    const int32_t exp = static_cast<int32_t>(exp_field) - 127;
-
-    if (exp < 0) {
-        if (absb < 0x3F000000u) return 0;
-        return 1;
-    }
-
-    const uint32_t mant = (absb & 0x7FFFFFu) | 0x800000u;
-    const uint32_t shift = 23u - static_cast<uint32_t>(exp);
-    const uint32_t intpart = mant >> shift;
-    const uint32_t frac = mant & ((1u << shift) - 1u);
-    const uint32_t half = 1u << (shift - 1u);
-    const uint32_t inc = (frac > half) | ((frac == half) & (intpart & 1u));
-    return static_cast<int32_t>(intpart + inc);
-}
-
-inline int32_t quantize_round_default_i32(float v, bool assume_nonneg) {
-    return assume_nonneg ? quantize_round_fast_nonneg_i32(v) : quantize_round_fast_i32(v);
-}
-
-template <bool UseBounds, bool Clamp, bool Emit>
-inline void store_xy(int64_t*& dst,
-                     uint8_t*& inb_ptr,
-                     int64_t xi,
-                     int64_t yi,
-                     int64_t bx,
-                     int64_t by) {
-    if constexpr (UseBounds) {
-        const bool inb = (static_cast<uint64_t>(xi) < static_cast<uint64_t>(bx)) &&
-                         (static_cast<uint64_t>(yi) < static_cast<uint64_t>(by));
-        if constexpr (Clamp) {
-            if (bx > 0) {
-                if (xi < 0) xi = 0;
-                else if (xi >= bx) xi = bx - 1;
-            }
-            if (by > 0) {
-                if (yi < 0) yi = 0;
-                else if (yi >= by) yi = by - 1;
-            }
-        }
-        if constexpr (Emit) {
-            *inb_ptr++ = inb ? 1u : 0u;
-        }
-    } else {
-        if constexpr (Emit) {
-            *inb_ptr++ = 1u;
-        }
-    }
-    dst[0] = xi;
-    dst[1] = yi;
-    dst += 2;
-}
-
-template <bool UseBounds, bool Clamp, bool Emit>
-inline void store_xy_i32(int64_t*& dst,
-                         uint8_t*& inb_ptr,
-                         int32_t xi,
-                         int32_t yi,
-                         uint32_t bx,
-                         uint32_t by) {
-    if constexpr (UseBounds) {
-        const bool inb = (static_cast<uint32_t>(xi) < bx) && (static_cast<uint32_t>(yi) < by);
-        if constexpr (Clamp) {
-            if (bx > 0) {
-                if (xi < 0) xi = 0;
-                else if (static_cast<uint32_t>(xi) >= bx) xi = static_cast<int32_t>(bx - 1u);
-            }
-            if (by > 0) {
-                if (yi < 0) yi = 0;
-                else if (static_cast<uint32_t>(yi) >= by) yi = static_cast<int32_t>(by - 1u);
-            }
-        }
-        if constexpr (Emit) {
-            *inb_ptr++ = inb ? 1u : 0u;
-        }
-    } else {
-        if constexpr (Emit) {
-            *inb_ptr++ = 1u;
-        }
-    }
-    dst[0] = static_cast<int64_t>(xi);
-    dst[1] = static_cast<int64_t>(yi);
-    dst += 2;
-}
-
-template <bool UseBounds, bool Clamp, bool Emit, typename SrcT>
-inline void run_xy(const SrcT* src,
-                   uint32_t count,
-                   int64_t* out_coords,
-                   uint8_t* out_in_bounds,
-                   int64_t bx,
-                   int64_t by,
-                   bool assume_nonneg) {
-    int64_t* dst = out_coords;
-    uint8_t* inb_ptr = out_in_bounds;
-    for (uint32_t i = 0; i < count; ++i) {
-        const int64_t xi = quantize_round_default(static_cast<float>(src[0]), assume_nonneg);
-        const int64_t yi = quantize_round_default(static_cast<float>(src[1]), assume_nonneg);
-        store_xy<UseBounds, Clamp, Emit>(dst, inb_ptr, xi, yi, bx, by);
-        src += 2;
-    }
-}
-
-template <bool UseBounds, bool Clamp, bool Emit, typename SrcT>
-inline void run_xy_i32(const SrcT* src,
-                       uint32_t count,
-                       int64_t* out_coords,
-                       uint8_t* out_in_bounds,
-                       uint32_t bx,
-                       uint32_t by,
-                       bool assume_nonneg) {
-    int64_t* dst = out_coords;
-    uint8_t* inb_ptr = out_in_bounds;
-    for (uint32_t i = 0; i < count; ++i) {
-        const int32_t xi = quantize_round_default_i32(static_cast<float>(src[0]), assume_nonneg);
-        const int32_t yi = quantize_round_default_i32(static_cast<float>(src[1]), assume_nonneg);
-        store_xy_i32<UseBounds, Clamp, Emit>(dst, inb_ptr, xi, yi, bx, by);
-        src += 2;
-    }
-}
-
-template <bool UseBounds, bool Clamp, bool Emit, typename SrcT>
-inline void run_xy_affine(const SrcT* src,
-                          uint32_t count,
-                          int64_t* out_coords,
-                          uint8_t* out_in_bounds,
-                          int64_t bx,
-                          int64_t by,
-                          float m0,
-                          float m1,
-                          float m4,
-                          float m5,
-                          float m12,
-                          float m13,
-                          bool assume_nonneg) {
-    int64_t* dst = out_coords;
-    uint8_t* inb_ptr = out_in_bounds;
-    for (uint32_t i = 0; i < count; ++i) {
-        const float x = static_cast<float>(src[0]);
-        const float y = static_cast<float>(src[1]);
-        const float ox = x * m0 + y * m4 + m12;
-        const float oy = x * m1 + y * m5 + m13;
-        const int64_t xi = quantize_round_default(ox, assume_nonneg);
-        const int64_t yi = quantize_round_default(oy, assume_nonneg);
-        store_xy<UseBounds, Clamp, Emit>(dst, inb_ptr, xi, yi, bx, by);
-        src += 2;
-    }
-}
-
-template <bool UseBounds, bool Clamp, bool Emit, typename SrcT>
-inline void run_xy_affine_i32(const SrcT* src,
-                              uint32_t count,
-                              int64_t* out_coords,
-                              uint8_t* out_in_bounds,
-                              uint32_t bx,
-                              uint32_t by,
-                              float m0,
-                              float m1,
-                              float m4,
-                              float m5,
-                              float m12,
-                              float m13,
-                              bool assume_nonneg) {
-    int64_t* dst = out_coords;
-    uint8_t* inb_ptr = out_in_bounds;
-    for (uint32_t i = 0; i < count; ++i) {
-        const float x = static_cast<float>(src[0]);
-        const float y = static_cast<float>(src[1]);
-        const float ox = x * m0 + y * m4 + m12;
-        const float oy = x * m1 + y * m5 + m13;
-        const int32_t xi = quantize_round_default_i32(ox, assume_nonneg);
-        const int32_t yi = quantize_round_default_i32(oy, assume_nonneg);
-        store_xy_i32<UseBounds, Clamp, Emit>(dst, inb_ptr, xi, yi, bx, by);
-        src += 2;
-    }
-}
-
 struct PointIndexReader {
     const TensorDesc* pd = nullptr;
     const void* points_ptr = nullptr;
@@ -1128,7 +907,6 @@ struct PointIndexReader {
     bool points_match = false;
     bool use_affine = false;
     const float* affine = nullptr;
-    bool assume_nonneg = true;
 
     inline float read_point_f(uint64_t idx) const {
         if (!pd || !points_ptr) return 0.0f;
@@ -1201,16 +979,16 @@ struct PointIndexReader {
             float yf = read_point_as_float(static_cast<uint64_t>(i) * dims + 1);
             float xo = 0.0f, yo = 0.0f, zo = 0.0f;
             apply_affine_row_major(affine, xf, yf, 0.0f, xo, yo, zo);
-            xi = quantize_round_default(xo, assume_nonneg);
-            yi = quantize_round_default(yo, assume_nonneg);
+            xi = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(xo));
+            yi = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(yo));
             return;
         }
 
         if (points_match) {
             float xf = read_point_f(static_cast<uint64_t>(i) * dims + 0);
             float yf = read_point_f(static_cast<uint64_t>(i) * dims + 1);
-            xi = quantize_round_default(xf, assume_nonneg);
-            yi = quantize_round_default(yf, assume_nonneg);
+            xi = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(xf));
+            yi = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(yf));
             return;
         }
 
@@ -1226,11 +1004,12 @@ struct PointIndexReader {
             float zf = (dims > 2) ? read_point_as_float(static_cast<uint64_t>(i) * dims + 2) : 0.0f;
             float xo = 0.0f, yo = 0.0f, zo = 0.0f;
             apply_affine_row_major(affine, xf, yf, zf, xo, yo, zo);
-            out[0] = quantize_round_default(xo, assume_nonneg);
-            if (dims > 1) out[1] = quantize_round_default(yo, assume_nonneg);
-            if (dims > 2) out[2] = quantize_round_default(zo, assume_nonneg);
+            out[0] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(xo));
+            if (dims > 1) out[1] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(yo));
+            if (dims > 2) out[2] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(zo));
             for (uint32_t d = 3; d < dims; ++d) {
-                out[d] = quantize_round_default(read_point_as_float(static_cast<uint64_t>(i) * dims + d), assume_nonneg);
+                out[d] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(
+                    read_point_as_float(static_cast<uint64_t>(i) * dims + d)));
             }
             return;
         }
@@ -1239,11 +1018,12 @@ struct PointIndexReader {
             float xf = read_point_f(static_cast<uint64_t>(i) * dims + 0);
             float yf = (dims > 1) ? read_point_f(static_cast<uint64_t>(i) * dims + 1) : 0.0f;
             float zf = (dims > 2) ? read_point_f(static_cast<uint64_t>(i) * dims + 2) : 0.0f;
-            out[0] = quantize_round_default(xf, assume_nonneg);
-            if (dims > 1) out[1] = quantize_round_default(yf, assume_nonneg);
-            if (dims > 2) out[2] = quantize_round_default(zf, assume_nonneg);
+            out[0] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(xf));
+            if (dims > 1) out[1] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(yf));
+            if (dims > 2) out[2] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(zf));
             for (uint32_t d = 3; d < dims; ++d) {
-                out[d] = quantize_round_default(read_point_f(static_cast<uint64_t>(i) * dims + d), assume_nonneg);
+                out[d] = static_cast<int64_t>(rounding::rne_i32_from_f32_unsafe(
+                    read_point_f(static_cast<uint64_t>(i) * dims + d)));
             }
             return;
         }
@@ -1265,119 +1045,154 @@ inline void convert_points_to_int_coords(const TensorDesc& pd,
                                          bool clamp_to_bounds,
                                          int64_t* out_coords,
                                          uint8_t* out_in_bounds) {
-    if (!out_coords || dims == 0) return;
+    const bool use_bounds = bounds != nullptr;
+    const bool emit_in_bounds = out_in_bounds != nullptr;
 
-    const bool need_bounds_work = (bounds != nullptr) && (clamp_to_bounds || out_in_bounds);
-    if (!need_bounds_work) bounds = nullptr;
-
-    const bool assume_nonneg = assume_nonneg_points_flag();
 
     // Aggressive XY fast paths: avoid per-dim loops and runtime dtype switches.
-    if (dims == 2 && points_ptr && points_match &&
-        (pd.dtype == TensorDType::F32 || pd.dtype == TensorDType::F64)) {
-        const bool use_bounds = bounds != nullptr;
-        const bool emit_in_bounds = (out_in_bounds != nullptr);
-        const uint32_t bx = use_bounds ? bounds[0] : 0u;
-        const uint32_t by = use_bounds ? bounds[1] : 0u;
+    if (dims == 2 && points_ptr) {
+        const int64_t bx = use_bounds ? static_cast<int64_t>(bounds[0]) : 0;
+        const int64_t by = use_bounds ? static_cast<int64_t>(bounds[1]) : 0;
+
+        auto run_xy_dispatch = [&](auto* typed_ptr) {
+            using SrcT = std::remove_pointer_t<decltype(typed_ptr)>;
+            if (use_bounds) {
+                if (clamp_to_bounds) {
+                    if (emit_in_bounds) {
+                        run_xy<true, true, true, SrcT>(typed_ptr, count, out_coords, out_in_bounds, bx, by);
+                    } else {
+                        run_xy<true, true, false, SrcT>(typed_ptr, count, out_coords, out_in_bounds, bx, by);
+                    }
+                } else {
+                    if (emit_in_bounds) {
+                        run_xy<true, false, true, SrcT>(typed_ptr, count, out_coords, out_in_bounds, bx, by);
+                    } else {
+                        run_xy<true, false, false, SrcT>(typed_ptr, count, out_coords, out_in_bounds, bx, by);
+                    }
+                }
+            } else {
+                if (emit_in_bounds) {
+                    run_xy<false, false, true, SrcT>(typed_ptr, count, out_coords, out_in_bounds, bx, by);
+                } else {
+                    run_xy<false, false, false, SrcT>(typed_ptr, count, out_coords, out_in_bounds, bx, by);
+                }
+            }
+        };
+
+        auto run_xy_affine_dispatch = [&](auto* typed_ptr, auto m0, auto m1, auto m4, auto m5, auto m12, auto m13) {
+            using SrcT = std::remove_pointer_t<decltype(typed_ptr)>;
+            using AffineT = decltype(m0);
+            if (use_bounds) {
+                if (clamp_to_bounds) {
+                    if (emit_in_bounds) {
+                        run_xy_affine<true, true, true, SrcT, AffineT>(typed_ptr, count, out_coords, out_in_bounds,
+                                                                       bx, by, m0, m1, m4, m5, m12, m13);
+                    } else {
+                        run_xy_affine<true, true, false, SrcT, AffineT>(typed_ptr, count, out_coords, out_in_bounds,
+                                                                        bx, by, m0, m1, m4, m5, m12, m13);
+                    }
+                } else {
+                    if (emit_in_bounds) {
+                        run_xy_affine<true, false, true, SrcT, AffineT>(typed_ptr, count, out_coords, out_in_bounds,
+                                                                        bx, by, m0, m1, m4, m5, m12, m13);
+                    } else {
+                        run_xy_affine<true, false, false, SrcT, AffineT>(typed_ptr, count, out_coords, out_in_bounds,
+                                                                         bx, by, m0, m1, m4, m5, m12, m13);
+                    }
+                }
+            } else {
+                if (emit_in_bounds) {
+                    run_xy_affine<false, false, true, SrcT, AffineT>(typed_ptr, count, out_coords, out_in_bounds,
+                                                                     bx, by, m0, m1, m4, m5, m12, m13);
+                } else {
+                    run_xy_affine<false, false, false, SrcT, AffineT>(typed_ptr, count, out_coords, out_in_bounds,
+                                                                      bx, by, m0, m1, m4, m5, m12, m13);
+                }
+            }
+        };
 
         if (!use_affine) {
-            if (pd.dtype == TensorDType::F32) {
-                if (!use_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_i32<false, false, true>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    } else {
-                        run_xy_i32<false, false, false>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    }
-                } else if (clamp_to_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_i32<true, true, true>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    } else {
-                        run_xy_i32<true, true, false>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    }
-                } else {
-                    if (emit_in_bounds) {
-                        run_xy_i32<true, false, true>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    } else {
-                        run_xy_i32<true, false, false>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    }
-                }
-                return;
-            }
-
-            if (pd.dtype == TensorDType::F64) {
-                if (!use_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_i32<false, false, true>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    } else {
-                        run_xy_i32<false, false, false>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    }
-                } else if (clamp_to_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_i32<true, true, true>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    } else {
-                        run_xy_i32<true, true, false>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    }
-                } else {
-                    if (emit_in_bounds) {
-                        run_xy_i32<true, false, true>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    } else {
-                        run_xy_i32<true, false, false>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, assume_nonneg);
-                    }
-                }
-                return;
+            switch (pd.dtype) {
+                case TensorDType::F32:
+                    run_xy_dispatch(static_cast<const float*>(points_ptr));
+                    return;
+                case TensorDType::F64:
+                    run_xy_dispatch(static_cast<const double*>(points_ptr));
+                    return;
+                case TensorDType::I8:
+                    run_xy_dispatch(static_cast<const int8_t*>(points_ptr));
+                    return;
+                case TensorDType::I16:
+                    run_xy_dispatch(static_cast<const int16_t*>(points_ptr));
+                    return;
+                case TensorDType::I32:
+                    run_xy_dispatch(static_cast<const int32_t*>(points_ptr));
+                    return;
+                case TensorDType::I64:
+                    run_xy_dispatch(static_cast<const int64_t*>(points_ptr));
+                    return;
+                case TensorDType::U8:
+                    run_xy_dispatch(static_cast<const uint8_t*>(points_ptr));
+                    return;
+                case TensorDType::U16:
+                    run_xy_dispatch(static_cast<const uint16_t*>(points_ptr));
+                    return;
+                case TensorDType::U32:
+                    run_xy_dispatch(static_cast<const uint32_t*>(points_ptr));
+                    return;
+                case TensorDType::U64:
+                    run_xy_dispatch(static_cast<const uint64_t*>(points_ptr));
+                    return;
+                default:
+                    break;
             }
         } else if (affine) {
-            const float m0 = affine[0];
-            const float m1 = affine[1];
-            const float m4 = affine[4];
-            const float m5 = affine[5];
-            const float m12 = affine[12];
-            const float m13 = affine[13];
-
-            if (pd.dtype == TensorDType::F32) {
-                if (!use_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_affine_i32<false, false, true>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    } else {
-                        run_xy_affine_i32<false, false, false>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    }
-                } else if (clamp_to_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_affine_i32<true, true, true>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    } else {
-                        run_xy_affine_i32<true, true, false>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    }
-                } else {
-                    if (emit_in_bounds) {
-                        run_xy_affine_i32<true, false, true>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    } else {
-                        run_xy_affine_i32<true, false, false>(static_cast<const float*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    }
+            const float m0f = affine[0];
+            const float m1f = affine[1];
+            const float m4f = affine[4];
+            const float m5f = affine[5];
+            const float m12f = affine[12];
+            const float m13f = affine[13];
+            switch (pd.dtype) {
+                case TensorDType::F64: {
+                    const double m0 = static_cast<double>(m0f);
+                    const double m1 = static_cast<double>(m1f);
+                    const double m4 = static_cast<double>(m4f);
+                    const double m5 = static_cast<double>(m5f);
+                    const double m12 = static_cast<double>(m12f);
+                    const double m13 = static_cast<double>(m13f);
+                    run_xy_affine_dispatch(static_cast<const double*>(points_ptr), m0, m1, m4, m5, m12, m13);
+                    return;
                 }
-                return;
-            }
-
-            if (pd.dtype == TensorDType::F64) {
-                if (!use_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_affine_i32<false, false, true>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    } else {
-                        run_xy_affine_i32<false, false, false>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    }
-                } else if (clamp_to_bounds) {
-                    if (emit_in_bounds) {
-                        run_xy_affine_i32<true, true, true>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    } else {
-                        run_xy_affine_i32<true, true, false>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    }
-                } else {
-                    if (emit_in_bounds) {
-                        run_xy_affine_i32<true, false, true>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    } else {
-                        run_xy_affine_i32<true, false, false>(static_cast<const double*>(points_ptr), count, out_coords, out_in_bounds, bx, by, m0, m1, m4, m5, m12, m13, assume_nonneg);
-                    }
-                }
-                return;
+                case TensorDType::F32:
+                    run_xy_affine_dispatch(static_cast<const float*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::I8:
+                    run_xy_affine_dispatch(static_cast<const int8_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::I16:
+                    run_xy_affine_dispatch(static_cast<const int16_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::I32:
+                    run_xy_affine_dispatch(static_cast<const int32_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::I64:
+                    run_xy_affine_dispatch(static_cast<const int64_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::U8:
+                    run_xy_affine_dispatch(static_cast<const uint8_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::U16:
+                    run_xy_affine_dispatch(static_cast<const uint16_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::U32:
+                    run_xy_affine_dispatch(static_cast<const uint32_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                case TensorDType::U64:
+                    run_xy_affine_dispatch(static_cast<const uint64_t*>(points_ptr), m0f, m1f, m4f, m5f, m12f, m13f);
+                    return;
+                default:
+                    break;
             }
         }
     }
@@ -1448,7 +1263,6 @@ inline void convert_points_to_int_coords(const TensorDesc& pd,
     reader.points_match = points_match;
     reader.use_affine = use_affine;
     reader.affine = affine;
-    reader.assume_nonneg = assume_nonneg;
 
     for (uint32_t i = 0; i < count; ++i) {
         int64_t* dst = out_coords + static_cast<size_t>(i) * dims;

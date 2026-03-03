@@ -3,7 +3,8 @@
 #include "common/tensors/abstraction/in_memory_backend.h"
 #include "common/tensors/abstraction/tensor_math.h"
 #include "common/tensors/abstraction/kpath/kpath_image_export.h"
-
+//#define DYADIC_TEST_LOGGING(...) std::fprintf(stderr, __VA_ARGS__)
+#define DYADIC_TEST_LOGGING(...) ((void)0)
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -63,30 +64,30 @@ static bool validate_png_output(const char* label,
                                 const AbstractTensor& output_tensor,
                                 InMemoryBackend& backend) {
     if (!output_tensor.valid()) {
-        std::fprintf(stderr, "%s: export precheck failed (invalid output tensor)\n", label);
+        DYADIC_TEST_LOGGING(stderr, "%s: export precheck failed (invalid output tensor)\n", label);
         return false;
     }
     const TensorDesc& desc = output_tensor.desc();
     if (desc.shape.rank() != 3) {
-        std::fprintf(stderr, "%s: export precheck failed (rank %u)\n",
+        DYADIC_TEST_LOGGING(stderr, "%s: export precheck failed (rank %u)\n",
                      label, desc.shape.rank());
         return false;
     }
     if (desc.layout != TensorLayout::Dense) {
-        std::fprintf(stderr, "%s: export precheck failed (layout %d)\n",
+        DYADIC_TEST_LOGGING(stderr, "%s: export precheck failed (layout %d)\n",
                      label, static_cast<int>(desc.layout));
         return false;
     }
     const uint32_t channels = desc.shape.dims[2];
     if (!(channels == 1u || channels == 3u || channels == 4u)) {
-        std::fprintf(stderr, "%s: export precheck failed (channels %u)\n",
+        DYADIC_TEST_LOGGING(stderr, "%s: export precheck failed (channels %u)\n",
                      label, channels);
         return false;
     }
     void* output_ptr = nullptr;
     size_t output_bytes = 0;
     if (!backend.map(output_tensor.handle(), &output_ptr, &output_bytes)) {
-        std::fprintf(stderr, "%s: export precheck failed (map output)\n", label);
+        DYADIC_TEST_LOGGING(stderr, "%s: export precheck failed (map output)\n", label);
         return false;
     }
     const size_t elem_bytes = tensor_dtype_size_bytes(desc.dtype);
@@ -94,7 +95,7 @@ static bool validate_png_output(const char* label,
     const size_t expected_bytes = elem_count * elem_bytes;
     backend.unmap(output_tensor.handle());
     if (elem_bytes == 0 || output_bytes < expected_bytes) {
-        std::fprintf(stderr, "%s: export precheck failed (bytes %zu < %zu)\n",
+        DYADIC_TEST_LOGGING(stderr, "%s: export precheck failed (bytes %zu < %zu)\n",
                      label, output_bytes, expected_bytes);
         return false;
     }
@@ -201,14 +202,14 @@ static CaseResult run_case(const char* label,
         auto values_tensor = pool.acquire_tensor(desc_values, &backend);
         nodus::tensors::AbstractTensor output_tensor = nodus::tensors::AbstractTensor::create(desc_output, &backend);
         if (!output_tensor.valid()) {
-            std::fprintf(stderr, "%s: output tensor create failed\n", label);
+            DYADIC_TEST_LOGGING(stderr, "%s: output tensor create failed\n", label);
             return {1u};
         }
 
         void* points_ptr = nullptr;
         size_t points_bytes = 0;
         if (!backend.map(points_tensor.handle(), &points_ptr, &points_bytes)) {
-            std::fprintf(stderr, "%s: points map failed\n", label);
+            DYADIC_TEST_LOGGING(stderr, "%s: points map failed\n", label);
             return {1u};
         }
         auto* points_out = static_cast<int32_t*>(points_ptr);
@@ -221,7 +222,7 @@ static CaseResult run_case(const char* label,
         void* values_ptr = nullptr;
         size_t values_bytes = 0;
         if (!backend.map(values_tensor.handle(), &values_ptr, &values_bytes)) {
-            std::fprintf(stderr, "%s: values map failed\n", label);
+            DYADIC_TEST_LOGGING(stderr, "%s: values map failed\n", label);
             return {1u};
         }
         std::memcpy(values_ptr, values_shuf.data(), values_shuf.size() * sizeof(ValueT));
@@ -235,7 +236,7 @@ static CaseResult run_case(const char* label,
         cfg.clamp = true;
 
         if (!values_tensor.scatter(nodus::tensors::AbstractTensor{}, output_tensor, points_tensor, cfg)) {
-            std::fprintf(stderr, "%s: scatter failed\n", label);
+            DYADIC_TEST_LOGGING(stderr, "%s: scatter failed\n", label);
             return {1u};
         }
         const auto t1 = std::chrono::high_resolution_clock::now();
@@ -247,7 +248,7 @@ static CaseResult run_case(const char* label,
                 return {1u};
             }
             if (!export_tensor_png(output_tensor, path, true)) {
-                std::fprintf(stderr, "%s: export_tensor_png failed (%s)\n", label, path.c_str());
+                DYADIC_TEST_LOGGING(stderr, "%s: export_tensor_png failed (%s)\n", label, path.c_str());
                 return {1u};
             }
         }
@@ -264,7 +265,7 @@ static CaseResult run_case(const char* label,
         void* output_ptr = nullptr;
         size_t output_bytes = 0;
         if (!backend.map(output_tensor.handle(), &output_ptr, &output_bytes)) {
-            std::fprintf(stderr, "%s: output map failed\n", label);
+            DYADIC_TEST_LOGGING(stderr, "%s: output map failed\n", label);
             return {1u};
         }
         const auto* output = static_cast<const ValueT*>(output_ptr);
@@ -288,7 +289,7 @@ static CaseResult run_case(const char* label,
         return {0u};
     }
 
-    std::fprintf(stderr, "%s: %u mismatches\n", label, mismatch_count);
+    std::printf("%s: %u mismatches\n", label, mismatch_count);
     return {mismatch_count};
 }
 

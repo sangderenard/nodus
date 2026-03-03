@@ -414,33 +414,31 @@ static bool linearize_coords_to_tensor(const CoordBuffer& coord_buf,
                                        AbstractTensor& out,
                                        TensorBackend* backend,
                                        TensorDType out_dtype = TensorDType::Unknown) {
-    if (!backend || !coord_buf.coords_ptr || !shape || dims == 0) return false;
-    const uint64_t index_range = compute_index_range_u64(shape, dims);
-    if (out_dtype == TensorDType::Unknown) {
-        out_dtype = pick_unsigned_index_dtype(index_range);
-    }
-    if (!out.valid()) {
-        TensorDesc desc{};
-        desc.dtype = out_dtype;
-        desc.layout = TensorLayout::Dense;
-        desc.shape.dims = {count};
-        out = AbstractTensor::create(desc, backend);
-        if (!out.valid()) return false;
-    } else {
-        if (out.desc().dtype != unsigned_index_dtype<IndexT>()) return false;
-    }
 
+    const uint64_t index_range = compute_index_range_u64(shape, dims);
     auto* mem = dynamic_cast<InMemoryBackend*>(backend);
     if (!mem) return false;
+    if (out_dtype == TensorDType::Unknown) {
+        out_dtype = unsigned_index_dtype<IndexT>();
+    }
+    TensorDesc out_desc{};
+    out_desc.dtype = out_dtype;
+    out_desc.layout = TensorLayout::Dense;
+    out_desc.shape.dims = {count};
+    out = AbstractTensor::create(out_desc, backend);
+    if (!out.valid()) return false;
     void* out_ptr = nullptr;
     size_t out_bytes = 0;
     if (!mem->map(out.handle(), &out_ptr, &out_bytes)) return false;
-
-    std::vector<uint64_t> strides;
-    if (!compute_dense_strides_u64(std::vector<uint32_t>(shape, shape + dims), strides)) {
+    const size_t elem_bytes = tensor_dtype_size_bytes(out_desc.dtype);
+    if (elem_bytes == 0 || out_bytes < static_cast<size_t>(count) * elem_bytes) {
         mem->unmap(out.handle());
         return false;
     }
+
+    std::vector<uint64_t> strides;
+    compute_dense_strides_u64(std::vector<uint32_t>(shape, shape + dims), strides);
+
 
     IndexT* out_idx = static_cast<IndexT*>(out_ptr);
     const int64_t* coords = coord_buf.coords_ptr;
@@ -468,12 +466,10 @@ static bool delinearize_tensor_to_coords(const AbstractTensor& linear,
                                          uint32_t count,
                                          uint32_t dims,
                                          const uint32_t* shape) {
-    if (!linear.valid() || !coord_buf.coords_ptr || !shape || dims == 0) return false;
-    if (linear.desc().dtype != unsigned_index_dtype<IndexT>()) return false;
     auto* mem = dynamic_cast<InMemoryBackend*>(linear.backend());
-    if (!mem) return false;
     void* in_ptr = nullptr;
     size_t in_bytes = 0;
+    if (!mem) return false;
     if (!mem->map(linear.handle(), &in_ptr, &in_bytes)) return false;
 
     const IndexT* in_idx = static_cast<const IndexT*>(in_ptr);
@@ -482,10 +478,7 @@ static bool delinearize_tensor_to_coords(const AbstractTensor& linear,
     uint8_t* in_bounds = coord_buf.mask_ptr;
 
     std::vector<uint64_t> strides;
-    if (!compute_dense_strides_u64(std::vector<uint32_t>(shape, shape + dims), strides)) {
-        mem->unmap(linear.handle());
-        return false;
-    }
+    compute_dense_strides_u64(std::vector<uint32_t>(shape, shape + dims), strides);
 
     for (uint32_t i = 0; i < count; ++i) {
         uint64_t idx = static_cast<uint64_t>(in_idx[i]);
@@ -519,7 +512,6 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
                                        const Scalar* values,
                                        AbstractTensor& output,
                                        TensorBackend* backend) {
-    if (!backend || !values || !output.valid() || count == 0 || dims == 0) return false;
     const uint64_t spatial_range = compute_index_range_u64(shape, dims);
     const uint64_t index_range = spatial_range;
     const uint32_t value_stride = val_scalar ? 1u : channels;
@@ -534,23 +526,25 @@ static bool dyadic_scatter_from_coords(const CoordBuffer& coord_buf,
                                             linear_indices,
                                             backend,
                                             unsigned_index_dtype<IndexT>())) {
-        DYADIC_SCATTER_LOGF("dyadic_scatter: linearize failed\n");
         return false;
     }
+    DYADIC_SCATTER_LOGF("dyadic_scatter: linear_indices id=%llu\n", (unsigned long long)linear_indices.handle().id);
 
     auto* mem = dynamic_cast<InMemoryBackend*>(backend);
-    if (!mem) {
-        DYADIC_SCATTER_LOGF("dyadic_scatter: backend not in-memory\n");
-        return false;
-    }
+    if (!mem) return false;
     void* idx_ptr = nullptr;
     size_t idx_bytes = 0;
-    if (!mem->map(linear_indices.handle(), &idx_ptr, &idx_bytes)) {
-        DYADIC_SCATTER_LOGF("dyadic_scatter: map linear_indices failed\n");
-        return false;
-    }
+    if (!mem->map(linear_indices.handle(), &idx_ptr, &idx_bytes)) return false;
     IndexT* idx_data = static_cast<IndexT*>(idx_ptr);
     const uint8_t* in_bounds = coord_buf.mask_ptr;
+    const TensorDesc& out_desc = output.desc();
+    const size_t out_rank = out_desc.shape.dims.size();
+    const uint32_t out_d0 = out_rank > 0 ? out_desc.shape.dims[0] : 0u;
+    const uint32_t out_d1 = out_rank > 1 ? out_desc.shape.dims[1] : 0u;
+    const uint32_t out_d2 = out_rank > 2 ? out_desc.shape.dims[2] : 0u;
+    DYADIC_SCATTER_LOGF("dyadic_scatter: idx_ptr=%p idx_bytes=%zu in_bounds=%p values=%p out_id=%llu out_rank=%zu out_dims=%u,%u,%u\n",
+                        idx_ptr, idx_bytes, (const void*)in_bounds, (const void*)values,
+                        (unsigned long long)output.handle().id, out_rank, out_d0, out_d1, out_d2);
 
     const uint32_t thread_count = dyadic_thread_count_from_overrides();
     const bool ok = dyadic_binning_tensor<PremixPol, policies::Overwrite, OutmixPol, policies::Overwrite>(
@@ -608,7 +602,6 @@ static bool acquire_coord_buffer(uint32_t count,
                                  uint32_t dims,
                                  TensorBackend* backend,
                                  CoordBuffer& out) {
-    if (!backend || count == 0 || dims == 0) return false;
     TensorDesc cdesc{};
     cdesc.dtype = TensorDType::I64;
     cdesc.layout = TensorLayout::Dense;
@@ -625,10 +618,10 @@ static bool acquire_coord_buffer(uint32_t count,
 
     out.coords = coord_pool().acquire(cdesc, backend);
     out.mask = coord_pool().acquire(mdesc, backend);
-    if (!out.coords.valid() || !out.mask.valid()) return false;
-
+    
     auto* mem = dynamic_cast<InMemoryBackend*>(backend);
-    if (!mem) return false;
+    if (!mem || !out.coords.valid() || !out.mask.valid()) return false;
+    
     void* cptr = nullptr;
     size_t cbytes = 0;
     if (!mem->map(out.coords.tensor().handle(), &cptr, &cbytes)) return false;
@@ -638,6 +631,7 @@ static bool acquire_coord_buffer(uint32_t count,
         mem->unmap(out.coords.tensor().handle());
         return false;
     }
+    
     out.coords_ptr = static_cast<int64_t*>(cptr);
     out.mask_ptr = static_cast<uint8_t*>(mptr);
     return true;
@@ -645,7 +639,7 @@ static bool acquire_coord_buffer(uint32_t count,
 
 static void release_coord_buffer(TensorBackend* backend, CoordBuffer& buf) {
     auto* mem = dynamic_cast<InMemoryBackend*>(backend);
-    if (!mem) return;
+    
     if (buf.coords.valid()) mem->unmap(buf.coords.tensor().handle());
     if (buf.mask.valid()) mem->unmap(buf.mask.tensor().handle());
     buf.coords_ptr = nullptr;
@@ -674,16 +668,8 @@ struct TensorOpPlan {
 static bool build_unary_plan(const AbstractTensor& src,
                              const AbstractTensor& dst,
                              TensorOpPlan& plan) {
-    if (!src.valid() || !dst.valid()) return false;
-    if (src.backend() != dst.backend()) return false;
     const TensorDesc& sd = src.desc();
     const TensorDesc& dd = dst.desc();
-    if (sd.dtype != dd.dtype) return false;
-    if (!((sd.layout == TensorLayout::Dense || sd.layout == TensorLayout::Strided) &&
-          (dd.layout == TensorLayout::Dense || dd.layout == TensorLayout::Strided))) {
-        return false;
-    }
-    if (sd.shape.dims != dd.shape.dims) return false;
 
     plan.shape.assign(sd.shape.dims.begin(), sd.shape.dims.end());
     plan.rank = static_cast<uint32_t>(plan.shape.size());
@@ -700,13 +686,17 @@ static bool build_unary_plan(const AbstractTensor& src,
         return false;
     }
 
-    if (!build_op_tensor(sd, plan.shape, sp, plan.a) ||
-        !build_op_tensor(dd, plan.shape, dp, plan.out)) {
-        mem->unmap(dst.handle());
+    if (!build_op_tensor(sd, plan.shape, sp, plan.a)) {
         mem->unmap(src.handle());
+        mem->unmap(dst.handle());
         return false;
     }
-
+    if (!build_op_tensor(dd, plan.shape, dp, plan.out)) {
+        mem->unmap(src.handle());
+        mem->unmap(dst.handle());
+        return false;
+    }
+    
     plan.inner_count = plan.shape.empty() ? 1u : plan.shape.back();
     plan.outer_count = 1u;
     plan.outer_shape.clear();
@@ -716,10 +706,7 @@ static bool build_unary_plan(const AbstractTensor& src,
             plan.outer_count *= plan.shape[i];
             plan.outer_shape.push_back(plan.shape[i]);
         }
-        if (!compute_dense_strides_u64(
-                std::vector<uint32_t>(plan.outer_shape.begin(), plan.outer_shape.end()), plan.outer_strides)) {
-            return false;
-        }
+        compute_dense_strides_u64(std::vector<uint32_t>(plan.outer_shape.begin(), plan.outer_shape.end()), plan.outer_strides);
     } else {
         plan.outer_count = 1u;
     }
@@ -775,7 +762,7 @@ static void copy_range(const TensorOpPlan& plan, uint64_t outer_begin, uint64_t 
 static inline bool should_parallelize(nodus::ThreadPool* pool,
                                       uint64_t work_items,
                                       uint32_t min_per_thread = 2) {
-    if (!pool) return false;
+    
     const uint32_t max_jobs = pool->thread_count();
     if (max_jobs < 2) return false;
     return work_items >= static_cast<uint64_t>(max_jobs) * static_cast<uint64_t>(min_per_thread);
@@ -856,11 +843,20 @@ static bool build_op_tensor(const TensorDesc& desc,
                             TensorOpTensor& out) {
     const size_t rank = out_shape.size();
     std::vector<uint64_t> elem_strides;
-    if (!compute_strides_for_desc_u64(desc, elem_strides)) return false;
+    
     out.elem_bytes = tensor_dtype_size_bytes(desc.dtype);
-    if (out.elem_bytes == 0) return false;
+    
     out.byte_strides.assign(rank, 0);
     out.base = base;
+
+    if (!compute_strides_for_desc_u64(desc, elem_strides)) {
+        std::fprintf(stderr,
+                     "[tensor_math] build_op_tensor compute_strides failed layout=%d dims=%zu strides=%zu\n",
+                     static_cast<int>(desc.layout),
+                     desc.shape.dims.size(),
+                     desc.strides.elems.size());
+        return false;
+    }
 
     const size_t dr = desc.shape.dims.size();
     const size_t pad = (rank >= dr) ? (rank - dr) : 0;
@@ -884,30 +880,16 @@ static bool build_axpby_plan(const AbstractTensor& a,
                              const AbstractTensor& b,
                              const AbstractTensor& out,
                              TensorOpPlan& plan) {
-    if (!a.valid() || !b.valid() || !out.valid()) return false;
-    if (a.backend() != b.backend() || a.backend() != out.backend()) return false;
 
     const TensorDesc& ad = a.desc();
     const TensorDesc& bd = b.desc();
     const TensorDesc& od = out.desc();
-    if (ad.dtype != TensorDType::F32 || bd.dtype != TensorDType::F32 || od.dtype != TensorDType::F32) return false;
-    if (!((ad.layout == TensorLayout::Dense || ad.layout == TensorLayout::Strided) &&
-          (bd.layout == TensorLayout::Dense || bd.layout == TensorLayout::Strided) &&
-          (od.layout == TensorLayout::Dense || od.layout == TensorLayout::Strided))) {
-        return false;
-    }
 
-    if (!compute_broadcast_shape(ad, bd, plan.shape)) return false;
     plan.rank = static_cast<uint32_t>(plan.shape.size());
 
     // Out must match broadcast shape (no implicit output broadcast).
-    if (od.shape.dims.size() != plan.shape.size()) return false;
-    for (size_t i = 0; i < plan.shape.size(); ++i) {
-        if (od.shape.dims[i] != plan.shape[i]) return false;
-    }
 
     auto* mem = dynamic_cast<InMemoryBackend*>(a.backend());
-    if (!mem) return false;
 
     void* ap = nullptr;
     void* bp = nullptr;
@@ -915,25 +897,11 @@ static bool build_axpby_plan(const AbstractTensor& a,
     size_t ab = 0;
     size_t bb = 0;
     size_t ob = 0;
-    if (!mem->map(a.handle(), &ap, &ab)) return false;
-    if (!mem->map(b.handle(), &bp, &bb)) {
-        mem->unmap(a.handle());
-        return false;
-    }
-    if (!mem->map(out.handle(), &op, &ob)) {
-        mem->unmap(a.handle());
-        mem->unmap(b.handle());
-        return false;
-    }
 
-    if (!build_op_tensor(ad, plan.shape, ap, plan.a) ||
-        !build_op_tensor(bd, plan.shape, bp, plan.b) ||
-        !build_op_tensor(od, plan.shape, op, plan.out)) {
-        mem->unmap(out.handle());
-        mem->unmap(b.handle());
-        mem->unmap(a.handle());
-        return false;
-    }
+
+    build_op_tensor(ad, plan.shape, ap, plan.a);
+    build_op_tensor(bd, plan.shape, bp, plan.b);
+    build_op_tensor(od, plan.shape, op, plan.out);
 
     plan.inner_count = plan.shape.empty() ? 1u : plan.shape.back();
     plan.outer_count = 1u;
@@ -944,10 +912,7 @@ static bool build_axpby_plan(const AbstractTensor& a,
             plan.outer_count *= plan.shape[i];
             plan.outer_shape.push_back(plan.shape[i]);
         }
-        if (!compute_dense_strides_u64(
-                std::vector<uint32_t>(plan.outer_shape.begin(), plan.outer_shape.end()), plan.outer_strides)) {
-            return false;
-        }
+        compute_dense_strides_u64(std::vector<uint32_t>(plan.outer_shape.begin(), plan.outer_shape.end()), plan.outer_strides);
     } else {
         plan.outer_count = 1u;
     }
@@ -1168,14 +1133,14 @@ struct TensorMathImpl {
 
     static MappedDenseU8 map_dense_u8(const AbstractTensor& t) {
         MappedDenseU8 out{};
-        if (!t.valid()) return out;
+        
         const TensorDesc& d = t.desc();
-        if (d.dtype != TensorDType::Bool || d.layout != TensorLayout::Dense) return out;
+        
         auto* mem = dynamic_cast<InMemoryBackend*>(t.backend());
-        if (!mem) return out;
+        
         void* ptr = nullptr;
         size_t bytes = 0;
-        if (!mem->map(t.handle(), &ptr, &bytes)) return out;
+        mem->map(t.handle(), &ptr, &bytes);
         out.backend = mem;
         out.handle = t.handle();
         out.data = static_cast<uint8_t*>(ptr);
@@ -1196,18 +1161,12 @@ struct TensorMathImpl {
     }
 
     static bool read_vec3(const AbstractTensor& t, Scalar* out3) {
-        if (!out3 || !t.valid()) return false;
+        
         const TensorDesc& d = t.desc();
-        if (d.dtype != DType || d.layout != TensorLayout::Dense) return false;
-        if (!(shape_is(d, {3}) || shape_is(d, {1, 3}) ||
-              (d.shape.dims.size() == 2 && d.shape.dims[1] == 3))) {
-            return false;
-        }
+        
+        
         MappedDense map = map_dense(t);
-        if (!map.ok || map.elems < 3) {
-            map.unmap();
-            return false;
-        }
+        
         out3[0] = map.data[0];
         out3[1] = map.data[1];
         out3[2] = map.data[2];
@@ -1248,37 +1207,23 @@ struct TensorMathImpl {
     }
 
     static AbstractTensor matmul(const AbstractTensor& a, const AbstractTensor& b) {
-        if (!a.valid() || !b.valid()) return {};
-        if (a.backend() != b.backend()) return {};
         const TensorDesc& ad = a.desc();
         const TensorDesc& bd = b.desc();
-        if (ad.dtype != DType || bd.dtype != DType) return {};
-        if (ad.layout != TensorLayout::Dense || bd.layout != TensorLayout::Dense) return {};
-        if (ad.shape.dims.size() != 2 || bd.shape.dims.size() != 2) return {};
         const uint32_t m = ad.shape.dims[0];
         const uint32_t n = ad.shape.dims[1];
         const uint32_t n2 = bd.shape.dims[0];
         const uint32_t k = bd.shape.dims[1];
-        if (n == 0 || n2 == 0 || m == 0 || k == 0) return {};
-        if (n != n2) return {};
-
+        
         TensorDesc out_desc{};
         out_desc.dtype = DType;
         out_desc.layout = TensorLayout::Dense;
         out_desc.shape.dims = {m, k};
         AbstractTensor out = AbstractTensor::create(out_desc, a.backend());
-        if (!out.valid()) return {};
-
+        
         MappedDense amap = map_dense(a);
         MappedDense bmap = map_dense(b);
         MappedDense omap = map_dense_mut(out);
-        if (!amap.ok || !bmap.ok || !omap.ok) {
-            amap.unmap();
-            bmap.unmap();
-            omap.unmap();
-            return {};
-        }
-
+        
         const Scalar* A = amap.data;
         const Scalar* B = bmap.data;
         Scalar* C = omap.data;
@@ -1332,12 +1277,9 @@ struct TensorMathImpl {
         desc.layout = TensorLayout::Dense;
         desc.shape.dims = {4, 4};
         AbstractTensor out = AbstractTensor::create(desc, backend);
-        if (!out.valid()) return {};
+        
         MappedDense map = map_dense_mut(out);
-        if (!map.ok || map.elems < 16) {
-            map.unmap();
-            return {};
-        }
+        
         std::fill(map.data, map.data + 16, static_cast<Scalar>(0));
         map.data[0] = map.data[5] = map.data[10] = map.data[15] = static_cast<Scalar>(1);
         map.unmap();
@@ -1345,77 +1287,49 @@ struct TensorMathImpl {
     }
 
     static AbstractTensor affine_translation(const AbstractTensor& t) {
-        if (!t.valid()) return {};
         const TensorDesc& td = t.desc();
-        if (td.dtype != DType || td.layout != TensorLayout::Dense) return {};
-        const bool t_vec = shape_is(td, {3}) || shape_is(td, {1, 3});
-        const bool t_batch = (td.shape.dims.size() == 2 && td.shape.dims[1] == 3);
-        if (!t_vec && !t_batch) return {};
-        const uint32_t batch = t_batch ? td.shape.dims[0] : 1;
 
         TensorDesc desc{};
         desc.dtype = DType;
         desc.layout = TensorLayout::Dense;
-        desc.shape.dims = (batch > 1) ? std::vector<uint32_t>{batch, 4, 4}
-                                      : std::vector<uint32_t>{4, 4};
+        desc.shape.dims = std::vector<uint32_t>{4, 4};
         AbstractTensor out = AbstractTensor::create(desc, t.backend());
-        if (!out.valid()) return {};
         MappedDense tmap = map_dense(t);
         MappedDense map = map_dense_mut(out);
-        if (!tmap.ok || !map.ok) {
-            tmap.unmap();
-            map.unmap();
-            return {};
-        }
-
-        for (uint32_t i = 0; i < batch; ++i) {
-            const Scalar* v = tmap.data + (t_vec ? 0u : static_cast<uint64_t>(i) * 3u);
-            Scalar* dst = map.data + (static_cast<uint64_t>(i) * 16u);
-            std::fill(dst, dst + 16, static_cast<Scalar>(0));
-            dst[0] = dst[5] = dst[10] = dst[15] = static_cast<Scalar>(1);
-            dst[12] = v[0];
-            dst[13] = v[1];
-            dst[14] = v[2];
-        }
-
+        
+        const Scalar* v = tmap.data;
+        Scalar* dst = map.data;
+        std::fill(dst, dst + 16, static_cast<Scalar>(0));
+        dst[0] = dst[5] = dst[10] = dst[15] = static_cast<Scalar>(1);
+        dst[12] = v[0];
+        dst[13] = v[1];
+        dst[14] = v[2];
+        
         tmap.unmap();
         map.unmap();
         return out;
     }
 
     static AbstractTensor affine_scale(const AbstractTensor& s) {
-        if (!s.valid()) return {};
         const TensorDesc& sd = s.desc();
-        if (sd.dtype != DType || sd.layout != TensorLayout::Dense) return {};
-        const bool s_vec = shape_is(sd, {3}) || shape_is(sd, {1, 3});
-        const bool s_batch = (sd.shape.dims.size() == 2 && sd.shape.dims[1] == 3);
-        if (!s_vec && !s_batch) return {};
-        const uint32_t batch = s_batch ? sd.shape.dims[0] : 1;
 
         TensorDesc desc{};
         desc.dtype = DType;
         desc.layout = TensorLayout::Dense;
-        desc.shape.dims = (batch > 1) ? std::vector<uint32_t>{batch, 4, 4}
-                                      : std::vector<uint32_t>{4, 4};
+        desc.shape.dims = std::vector<uint32_t>{4, 4};
         AbstractTensor out = AbstractTensor::create(desc, s.backend());
-        if (!out.valid()) return {};
         MappedDense smap = map_dense(s);
         MappedDense map = map_dense_mut(out);
-        if (!smap.ok || !map.ok) {
-            smap.unmap();
-            map.unmap();
-            return {};
-        }
-
-        for (uint32_t i = 0; i < batch; ++i) {
-            const Scalar* v = smap.data + (s_vec ? 0u : static_cast<uint64_t>(i) * 3u);
-            Scalar* dst = map.data + (static_cast<uint64_t>(i) * 16u);
-            std::fill(dst, dst + 16, static_cast<Scalar>(0));
-            dst[0] = v[0];
-            dst[5] = v[1];
-            dst[10] = v[2];
-            dst[15] = static_cast<Scalar>(1);
-        }
+        
+        
+        const Scalar* v = smap.data;
+        Scalar* dst = map.data;
+        std::fill(dst, dst + 16, static_cast<Scalar>(0));
+        dst[0] = v[0];
+        dst[5] = v[1];
+        dst[10] = v[2];
+        dst[15] = static_cast<Scalar>(1);
+        
 
         smap.unmap();
         map.unmap();
@@ -1428,12 +1342,7 @@ struct TensorMathImpl {
         desc.layout = TensorLayout::Dense;
         desc.shape.dims = {4};
         AbstractTensor out = AbstractTensor::create(desc, backend);
-        if (!out.valid()) return {};
         MappedDense map = map_dense_mut(out);
-        if (!map.ok || map.elems < 4) {
-            map.unmap();
-            return {};
-        }
         map.data[0] = static_cast<Scalar>(1);
         map.data[1] = static_cast<Scalar>(0);
         map.data[2] = static_cast<Scalar>(0);
@@ -1460,12 +1369,7 @@ struct TensorMathImpl {
         desc.layout = TensorLayout::Dense;
         desc.shape.dims = {4};
         AbstractTensor out = AbstractTensor::create(desc, axis.backend());
-        if (!out.valid()) return {};
         MappedDense map = map_dense_mut(out);
-        if (!map.ok || map.elems < 4) {
-            map.unmap();
-            return {};
-        }
         map.data[0] = c;
         map.data[1] = v[0] * s;
         map.data[2] = v[1] * s;
@@ -1475,21 +1379,12 @@ struct TensorMathImpl {
     }
 
     static AbstractTensor quat_normalize(const AbstractTensor& q) {
-        if (!q.valid()) return {};
         const TensorDesc& d = q.desc();
-        if (d.dtype != DType || d.layout != TensorLayout::Dense) return {};
-        if (!(shape_is(d, {4}) || (d.shape.dims.size() == 2 && d.shape.dims[1] == 4))) return {};
 
         TensorDesc out_desc = d;
         AbstractTensor out = AbstractTensor::create(out_desc, q.backend());
-        if (!out.valid()) return {};
         MappedDense in = map_dense(q);
         MappedDense outm = map_dense_mut(out);
-        if (!in.ok || !outm.ok) {
-            in.unmap();
-            outm.unmap();
-            return {};
-        }
 
         const uint64_t count = (d.shape.dims.size() == 2) ? d.shape.dims[0] : 1;
         for (uint64_t i = 0; i < count; ++i) {
@@ -1515,59 +1410,30 @@ struct TensorMathImpl {
     }
 
     static AbstractTensor quat_mul(const AbstractTensor& a, const AbstractTensor& b) {
-        if (!a.valid() || !b.valid()) return {};
-        if (a.backend() != b.backend()) return {};
         const TensorDesc& ad = a.desc();
         const TensorDesc& bd = b.desc();
-        if (ad.dtype != DType || bd.dtype != DType) return {};
-        if (ad.layout != TensorLayout::Dense || bd.layout != TensorLayout::Dense) return {};
-
-        const bool a_vec = shape_is(ad, {4});
-        const bool b_vec = shape_is(bd, {4});
-        const bool a_batch = (ad.shape.dims.size() == 2 && ad.shape.dims[1] == 4);
-        const bool b_batch = (bd.shape.dims.size() == 2 && bd.shape.dims[1] == 4);
-        if (!(a_vec || a_batch) || !(b_vec || b_batch)) return {};
-
-        uint32_t batch = 1;
-        if (a_batch && b_batch) {
-            if (ad.shape.dims[0] != bd.shape.dims[0]) return {};
-            batch = ad.shape.dims[0];
-        } else if (a_batch) {
-            batch = ad.shape.dims[0];
-        } else if (b_batch) {
-            batch = bd.shape.dims[0];
-        }
 
         TensorDesc out_desc{};
         out_desc.dtype = DType;
         out_desc.layout = TensorLayout::Dense;
-        out_desc.shape.dims = (batch == 1 && a_vec && b_vec) ? std::vector<uint32_t>{4}
-                                                             : std::vector<uint32_t>{batch, 4};
+        out_desc.shape.dims = std::vector<uint32_t>{4};
         AbstractTensor out = AbstractTensor::create(out_desc, a.backend());
-        if (!out.valid()) return {};
 
         MappedDense amap = map_dense(a);
         MappedDense bmap = map_dense(b);
         MappedDense omap = map_dense_mut(out);
-        if (!amap.ok || !bmap.ok || !omap.ok) {
-            amap.unmap();
-            bmap.unmap();
-            omap.unmap();
-            return {};
-        }
 
-        for (uint32_t i = 0; i < batch; ++i) {
-            const Scalar* qa = amap.data + (a_vec ? 0u : static_cast<uint64_t>(i) * 4u);
-            const Scalar* qb = bmap.data + (b_vec ? 0u : static_cast<uint64_t>(i) * 4u);
-            Scalar* qc = omap.data + static_cast<uint64_t>(i) * 4u;
-            const Scalar w1 = qa[0], x1 = qa[1], y1 = qa[2], z1 = qa[3];
-            const Scalar w2 = qb[0], x2 = qb[1], y2 = qb[2], z2 = qb[3];
-            qc[0] = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2;
-            qc[1] = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2;
-            qc[2] = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2;
-            qc[3] = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2;
-        }
-
+        
+        const Scalar* qa = amap.data;
+        const Scalar* qb = bmap.data;
+        Scalar* qc = omap.data;
+        const Scalar w1 = qa[0], x1 = qa[1], y1 = qa[2], z1 = qa[3];
+        const Scalar w2 = qb[0], x2 = qb[1], y2 = qb[2], z2 = qb[3];
+        qc[0] = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2;
+        qc[1] = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2;
+        qc[2] = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2;
+        qc[3] = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2;
+        
         amap.unmap();
         bmap.unmap();
         omap.unmap();
@@ -1577,68 +1443,37 @@ struct TensorMathImpl {
     static AbstractTensor quat_to_mat4(const AbstractTensor& q, const AbstractTensor& t) {
         if (!q.valid()) return {};
         const TensorDesc& qd = q.desc();
-        if (qd.dtype != DType || qd.layout != TensorLayout::Dense) return {};
-        const bool q_vec = shape_is(qd, {4});
-        const bool q_batch = (qd.shape.dims.size() == 2 && qd.shape.dims[1] == 4);
-        if (!q_vec && !q_batch) return {};
-
-        const bool have_t = t.valid();
-        if (have_t && t.backend() != q.backend()) return {};
         const TensorDesc& td = t.desc();
-        const bool t_vec = have_t && shape_is(td, {3});
-        const bool t_batch = have_t && (td.shape.dims.size() == 2 && td.shape.dims[1] == 3);
-        if (have_t && !(t_vec || t_batch)) return {};
-
-        uint32_t batch = q_batch ? qd.shape.dims[0] : 1;
-        if (t_batch) {
-            if (batch != 1 && td.shape.dims[0] != batch) return {};
-            batch = td.shape.dims[0];
-        }
 
         TensorDesc out_desc{};
         out_desc.dtype = DType;
         out_desc.layout = TensorLayout::Dense;
-        if (batch == 1 && q_vec && !t_batch) {
-            out_desc.shape.dims = {4, 4};
-        } else {
-            out_desc.shape.dims = {batch, 4, 4};
-        }
 
         AbstractTensor out = AbstractTensor::create(out_desc, q.backend());
-        if (!out.valid()) return {};
 
         MappedDense qmap = map_dense(q);
-        MappedDense tmap = have_t ? map_dense(t) : MappedDense{};
+        MappedDense tmap = map_dense(t);
         MappedDense omap = map_dense_mut(out);
-        if (!qmap.ok || !omap.ok || (have_t && !tmap.ok)) {
-            qmap.unmap();
-            tmap.unmap();
-            omap.unmap();
-            return {};
+
+        const Scalar* qq = qmap.data;
+        Scalar qw = qq[0], qx = qq[1], qy = qq[2], qz = qq[3];
+        const Scalar len = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+        if (len >= kQuatEps) {
+            const Scalar inv = static_cast<Scalar>(1) / len;
+            qw *= inv;
+            qx *= inv;
+            qy *= inv;
+            qz *= inv;
+        } else {
+            qw = static_cast<Scalar>(1);
+            qx = qy = qz = static_cast<Scalar>(0);
         }
 
-        for (uint32_t i = 0; i < batch; ++i) {
-            const Scalar* qq = qmap.data + (q_vec ? 0u : static_cast<uint64_t>(i) * 4u);
-            Scalar qw = qq[0], qx = qq[1], qy = qq[2], qz = qq[3];
-            const Scalar len = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
-            if (len >= kQuatEps) {
-                const Scalar inv = static_cast<Scalar>(1) / len;
-                qw *= inv;
-                qx *= inv;
-                qy *= inv;
-                qz *= inv;
-            } else {
-                qw = static_cast<Scalar>(1);
-                qx = qy = qz = static_cast<Scalar>(0);
-            }
-
-            const Scalar* tt = nullptr;
-            if (have_t) {
-                tt = tmap.data + (t_vec ? 0u : static_cast<uint64_t>(i) * 3u);
-            }
-            Scalar* dst = omap.data + static_cast<uint64_t>(i) * 16u;
-            quat_to_mat4_row(qw, qx, qy, qz, tt, dst);
-        }
+        const Scalar* tt = nullptr;
+        tt = tmap.data;
+        
+        Scalar* dst = omap.data;
+        quat_to_mat4_row(qw, qx, qy, qz, tt, dst);
 
         qmap.unmap();
         tmap.unmap();
@@ -1651,38 +1486,14 @@ struct TensorMathImpl {
     }
 
     static AbstractTensor transform_points(const AbstractTensor& points, const AbstractTensor& mat4) {
-        if (!points.valid() || !mat4.valid()) return {};
-        if (points.backend() != mat4.backend()) return {};
-
-        const TensorDesc& pd = points.desc();
-        const TensorDesc& md = mat4.desc();
-        if (pd.dtype != DType || md.dtype != DType) return {};
-        if (pd.layout != TensorLayout::Dense || md.layout != TensorLayout::Dense) return {};
-
-        const bool p_vec = shape_is(pd, {3});
-        const bool p_batch = (pd.shape.dims.size() == 2 && pd.shape.dims[1] == 3);
-        if (!p_vec && !p_batch) return {};
-
-        const bool m_single = shape_is(md, {4, 4});
-        const bool m_batch = (md.shape.dims.size() == 3 && md.shape.dims[1] == 4 && md.shape.dims[2] == 4);
-        if (!m_single && !m_batch) return {};
-
-        uint32_t batch = p_vec ? 1 : pd.shape.dims[0];
-        if (m_batch && md.shape.dims[0] != batch) return {};
-
-        TensorDesc out_desc = pd;
+        TensorDesc out_desc{};
+        out_desc.dtype = DType;
+        out_desc.layout = TensorLayout::Dense;
         AbstractTensor out = AbstractTensor::create(out_desc, points.backend());
-        if (!out.valid()) return {};
-
+        
         MappedDense pmap = map_dense(points);
         MappedDense mmap = map_dense(mat4);
         MappedDense omap = map_dense_mut(out);
-        if (!pmap.ok || !mmap.ok || !omap.ok) {
-            pmap.unmap();
-            mmap.unmap();
-            omap.unmap();
-            return {};
-        }
 
         struct TransformCtx {
             const Scalar* p = nullptr;
@@ -1695,9 +1506,9 @@ struct TensorMathImpl {
         auto transform_rows = [](const void* vctx, uint32_t i0, uint32_t i1) {
             const auto* ctx = static_cast<const TransformCtx*>(vctx);
             for (uint32_t i = i0; i < i1; ++i) {
-                const Scalar* p = ctx->p + (ctx->p_vec ? 0u : static_cast<uint64_t>(i) * 3u);
-                const Scalar* m = ctx->m + (ctx->m_single ? 0u : static_cast<uint64_t>(i) * 16u);
-                Scalar* dst = ctx->out + (ctx->p_vec ? 0u : static_cast<uint64_t>(i) * 3u);
+                const Scalar* p = ctx->p;
+                const Scalar* m = ctx->m;
+                Scalar* dst = ctx->out;
                 const Scalar x = p[0];
                 const Scalar y = p[1];
                 const Scalar z = p[2];
@@ -1712,10 +1523,10 @@ struct TensorMathImpl {
         ctx.p = pmap.data;
         ctx.m = mmap.data;
         ctx.out = omap.data;
-        ctx.p_vec = p_vec;
-        ctx.m_single = m_single;
+        //ctx.p_vec = p_vec;
+        //ctx.m_single = m_single;
 
-        submit_row_jobs(tensor_op_pool(), transform_rows, &ctx, 0, batch);
+        submit_row_jobs(tensor_op_pool(), transform_rows, &ctx, 0, 1u);
 
         pmap.unmap();
         mmap.unmap();
@@ -1728,56 +1539,33 @@ struct TensorMathImpl {
                                   Scalar plane_z,
                                   AbstractTensor* out_hits,
                                   AbstractTensor* out_mask) {
-        if (!out_hits || !out_mask) return false;
+        
         out_hits->reset();
         out_mask->reset();
-        if (!origins.valid() || !dirs.valid()) return false;
-        if (origins.backend() != dirs.backend()) return false;
-
-        const TensorDesc& od = origins.desc();
-        const TensorDesc& dd = dirs.desc();
-        if (od.dtype != DType || dd.dtype != DType) return false;
-        if (od.layout != TensorLayout::Dense || dd.layout != TensorLayout::Dense) return false;
-        if (od.shape.dims.size() != 2 || dd.shape.dims.size() != 2) return false;
-        const uint32_t batch = od.shape.dims[0];
-        if (dd.shape.dims[0] != batch) return false;
-        if (od.shape.dims[1] != 3 || dd.shape.dims[1] != 3) return false;
 
         auto* mem = dynamic_cast<InMemoryBackend*>(origins.backend());
-        if (!mem) return false;
-
+        
         TensorDesc hit_desc{};
         hit_desc.dtype = DType;
         hit_desc.layout = TensorLayout::Dense;
-        hit_desc.shape.dims = {batch, 3u};
+        hit_desc.shape.dims = {1u, 3u};
         *out_hits = AbstractTensor::create(hit_desc, origins.backend());
-        if (!out_hits->valid()) return false;
-
+        
         TensorDesc mask_desc{};
         mask_desc.dtype = TensorDType::Bool;
         mask_desc.layout = TensorLayout::Dense;
-        mask_desc.shape.dims = {batch};
+        mask_desc.shape.dims = {1u};
         *out_mask = AbstractTensor::create(mask_desc, origins.backend());
-        if (!out_mask->valid()) return false;
+        
 
         MappedDense omap = map_dense(origins);
         MappedDense dmap = map_dense(dirs);
         MappedDense hmap = map_dense_mut(*out_hits);
-        if (!omap.ok || !dmap.ok || !hmap.ok) {
-            omap.unmap();
-            dmap.unmap();
-            hmap.unmap();
-            return false;
-        }
+        
 
         void* m_ptr_v = nullptr;
         size_t m_bytes = 0;
-        if (!mem->map(out_mask->handle(), &m_ptr_v, &m_bytes)) {
-            omap.unmap();
-            dmap.unmap();
-            hmap.unmap();
-            return false;
-        }
+
         auto* m_ptr = static_cast<uint8_t*>(m_ptr_v);
 
         struct IntersectCtx {
@@ -1820,7 +1608,7 @@ struct TensorMathImpl {
         ctx.m = m_ptr;
         ctx.plane_z = plane_z;
 
-        submit_row_jobs(tensor_op_pool(), intersect_rows, &ctx, 0, batch);
+        submit_row_jobs(tensor_op_pool(), intersect_rows, &ctx, 0, 1u);
 
         omap.unmap();
         dmap.unmap();
@@ -1836,120 +1624,38 @@ struct TensorMathImpl {
                                bool clamp,
                                bool allow_dyadic,
                                bool require_dyadic) {
-        if (!out) return false;
-        
-        if (!base.valid() || !points.valid() || !values.valid()) return false;
-        if (base.backend() != points.backend() || base.backend() != values.backend()) return false;
+
         const TensorDesc& bd = base.desc();
         const TensorDesc& pd = points.desc();
         const TensorDesc& vd = values.desc();
-        if (bd.dtype != DType || vd.dtype != DType) return false;
-        const bool points_match = (pd.dtype == DType);
-        if (!points_match) {
-            if (pd.dtype != TensorDType::I32 && pd.dtype != TensorDType::I64 &&
-                pd.dtype != TensorDType::U32 && pd.dtype != TensorDType::U64) {
-                return false;
-            }
-        }
-        if (bd.layout != TensorLayout::Dense || pd.layout != TensorLayout::Dense || vd.layout != TensorLayout::Dense)
-            return false;
 
-        if (bd.shape.dims.size() != 2 && bd.shape.dims.size() != 3) return false;
         const uint32_t height = bd.shape.dims[0];
         const uint32_t width = bd.shape.dims[1];
         const uint32_t channels = (bd.shape.dims.size() == 3) ? bd.shape.dims[2] : 1;
+        const bool val_scalar = (vd.shape.dims.size() == 1);
 
-        if (pd.shape.dims.size() != 2) return false;
-        const uint32_t count = pd.shape.dims[0];
-        const uint32_t pcols = pd.shape.dims[1];
-        if (pcols != 2 && pcols != 3) return false;
-
-        bool val_scalar = false;
-        if (vd.shape.dims.size() == 1) {
-            if (vd.shape.dims[0] != count) return false;
-            val_scalar = true;
-        } else if (vd.shape.dims.size() == 2) {
-            if (vd.shape.dims[0] != count) return false;
-            if (vd.shape.dims[1] != channels) return false;
-        } else {
-            return false;
-        }
 
         TensorDesc out_desc = bd;
         *out = AbstractTensor::create(out_desc, base.backend());
-        if (!out->valid()) return false;
-
+        
         (void)ensure_tensor_zeroed(*out);
-        (void)ensure_tensor_zeroed(*out);
-        (void)ensure_tensor_zeroed(*out);
-        (void)ensure_tensor_zeroed(*out);
-        (void)ensure_tensor_zeroed(*out);
-        (void)ensure_tensor_zeroed(*out);
-        MappedDense bmap = map_dense(base);
-        MappedDense omap = map_dense_mut(*out);
         MappedDense vmap = map_dense(values);
         MappedDense pmap{};
         void* points_ptr = nullptr;
-        size_t points_bytes = 0;
-        if (points_match) {
-            pmap = map_dense(points);
-            points_ptr = pmap.data; // Store pointer to mapped data
-        } else {
-            auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-            if (!mem || !mem->map(points.handle(), &points_ptr, &points_bytes)) {
-                bmap.unmap();
-                omap.unmap();
-                vmap.unmap();
-                return false;
-            }
-        }
-        if (!bmap.ok || !omap.ok || !vmap.ok || (points_match && !pmap.ok)) {
-            bmap.unmap();
-            omap.unmap();
-            vmap.unmap();
-            if (points_match) {
-                pmap.unmap();
-            } else if (points_ptr) {
-                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                if (mem) mem->unmap(points.handle());
-            }
-            return false;
-        }
-
-        if (!tensor_copy_typed_into<DType>(base, out)) {
-            bmap.unmap();
-            omap.unmap();
-            pmap.unmap();
-            vmap.unmap();
-            return false;
-        }
-        bmap.unmap();
-        omap.unmap();
-        MappedDense omap2 = map_dense_mut(*out);
-        if (!omap2.ok) {
-            pmap.unmap();
-            vmap.unmap();
-            return false;
-        }
-        omap = omap2;
+        pmap = map_dense(points);
+        points_ptr = pmap.data;
+        const uint32_t count = pd.shape.dims[0];
 
         CoordBuffer coord_buf{};
         if (!acquire_coord_buffer(count, 2u, base.backend(), coord_buf)) {
-            bmap.unmap();
-            omap.unmap();
             vmap.unmap();
-            if (points_match) {
-                pmap.unmap();
-            } else if (points_ptr) {
-                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                if (mem) mem->unmap(points.handle());
-            }
+            pmap.unmap();
             return false;
         }
         int64_t* coords = coord_buf.coords_ptr;
         uint8_t* in_bounds = coord_buf.mask_ptr;
 
-        const uint32_t tile_px = default_tile_px_2d(bd);
+        //const uint32_t tile_px = default_tile_px_2d(bd);
 
         const bool use_affine = bd.slice.valid && bd.slice.has_affine;
 
@@ -1957,7 +1663,7 @@ struct TensorMathImpl {
                                      points_ptr,
                                      count,
                                      2u,
-                                     points_match,
+                                     false,
                                      use_affine,
                                      bd.slice.affine,
                                      bd.shape.dims.data(),
@@ -1965,287 +1671,28 @@ struct TensorMathImpl {
                                      coords,
                                      in_bounds);
 
-        bmap.unmap();
-        omap.unmap();
-
+        bool dyadic_ok = false;
         if (allow_dyadic || require_dyadic) {
-            if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
-                    coord_buf,
-                    count,
-                    2u,
-                    bd.shape.dims.data(),
-                    channels,
-                    val_scalar,
-                    vmap.data,
-                    *out,
-                    base.backend())) {
-                vmap.unmap();
-                release_coord_buffer(base.backend(), coord_buf);
-                if (points_match) {
-                    pmap.unmap();
-                } else if (points_ptr) {
-                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                    if (mem) mem->unmap(points.handle());
-                }
-                return true;
-            }
-
-            if (require_dyadic) {
-                vmap.unmap();
-                release_coord_buffer(base.backend(), coord_buf);
-                if (points_match) {
-                    pmap.unmap();
-                } else if (points_ptr) {
-                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                    if (mem) mem->unmap(points.handle());
-                }
-                return false;
-            }
-
-            DYADIC_SCATTER_LOGF("[dyadic] scatter_add_2d: dyadic path failed, falling back\n");
-        }
-
-        bmap = map_dense(base);
-        omap = map_dense_mut(*out);
-        if (!bmap.ok || !omap.ok) {
-            vmap.unmap();
-            release_coord_buffer(base.backend(), coord_buf);
-            if (points_match) {
-                pmap.unmap();
-            } else if (points_ptr) {
-                auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                if (mem) mem->unmap(points.handle());
-            }
-            bmap.unmap();
-            omap.unmap();
-            return false;
-        }
-
-        const bool use_span_tiling = span_tiling_enabled_from_env("NODUS_SCATTER_SPAN_TILING");
-        if (use_span_tiling) {
-            SpanOpConfig span_op{};
-            span_op.aggregate = SpanAggregateOp::Add;
-            if (span_scatter_add_2d<Scalar>(coords,
-                                            in_bounds,
-                                            count,
-                                            width,
-                                            height,
-                                            channels,
-                                            val_scalar,
-                                            vmap.data,
-                                            omap.data,
-                                            base.backend(),
-                                            tile_px,
-                                            span_op)) {
-                bmap.unmap();
-                omap.unmap();
-                vmap.unmap();
-                release_coord_buffer(base.backend(), coord_buf);
-                if (points_match) {
-                    pmap.unmap();
-                } else if (points_ptr) {
-                    auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-                    if (mem) mem->unmap(points.handle());
-                }
-                return true;
+            dyadic_ok = dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+                coord_buf,
+                count,
+                2u,
+                bd.shape.dims.data(),
+                channels,
+                val_scalar,
+                vmap.data,
+                *out,
+                base.backend());
+            if (!dyadic_ok) {
+                DYADIC_SCATTER_LOGF("[dyadic] scatter_add_2d: dyadic path failed\n");
             }
         }
 
-        auto& bins = tile_bins_2d();
-        const TileBinning2D tile = build_tile_bins_2d(bd, coords, in_bounds,
-                                                      count, width, height, pcols, bins);
-
-        struct ScatterCtx {
-            const int64_t* coords = nullptr;
-            const Scalar* values = nullptr;
-            Scalar* out = nullptr;
-            const uint32_t* offsets = nullptr;
-            const uint32_t* indices = nullptr;
-            const uint64_t* tile_mask = nullptr;
-            uint32_t tile_count = 0;
-            uint32_t width = 0;
-            uint32_t height = 0;
-            uint32_t channels = 0;
-            uint32_t pcols = 0;
-            uint32_t tiles_x = 0;
-            uint32_t tile_px = 0;
-            uint32_t tile_len = 0;
-            TensorBackend* backend = nullptr;
-            bool val_scalar = false;
-            bool dense_grid = false;
-            float dense_threshold = 0.0f;
-        };
-
-        auto scatter_rows = [](const void* vctx, uint32_t t0, uint32_t t1) {
-            const auto* ctx = static_cast<const ScatterCtx*>(vctx);
-            const uint32_t width = ctx->width;
-            const uint32_t channels = ctx->channels;
-            auto* mem = dynamic_cast<InMemoryBackend*>(ctx->backend);
-            if (!mem) return;
-            static thread_local AbstractTensorPool tile_pool(tile_pool_options());
-            static thread_local AbstractTensorPool::PooledTensor tile_buf;
-            TensorDesc tile_desc{};
-            tile_desc.dtype = DType;
-            tile_desc.layout = TensorLayout::Dense;
-            tile_desc.shape.dims = {ctx->tile_len, channels};
-
-            if (!tile_buf.valid() ||
-                tile_buf.tensor().desc().shape.dims != tile_desc.shape.dims) {
-                tile_buf = tile_pool.acquire(tile_desc, ctx->backend);
-            }
-            if (!tile_buf.valid()) return;
-
-            (void)ensure_tensor_zeroed(tile_buf.tensor());
-            void* tile_ptr_v = nullptr;
-            size_t tile_bytes = 0;
-            if (!mem->map(tile_buf.tensor().handle(), &tile_ptr_v, &tile_bytes)) return;
-            auto* tile = static_cast<Scalar*>(tile_ptr_v);
-            const size_t tile_elems = static_cast<size_t>(ctx->tile_len) * channels;
-
-            for (uint32_t ti = t0; ti < t1; ++ti) {
-                const uint32_t tid = ti;
-                const uint32_t word = tid >> 6;
-                const uint32_t bit = tid & 63u;
-                if ((ctx->tile_mask[word] & (1ull << bit)) == 0ull) continue;
-                const uint32_t begin = ctx->offsets[tid];
-                const uint32_t end = ctx->offsets[tid + 1];
-                if (begin == end) continue;
-                auto tile_lock = acquire_tile_lock(tid);
-                const uint32_t ty = tid / ctx->tiles_x;
-                const uint32_t tx = tid - ty * ctx->tiles_x;
-                const uint32_t tile_origin_x = tx * ctx->tile_px;
-                const uint32_t tile_origin_y = ty * ctx->tile_px;
-                const uint32_t y_end = std::min<uint32_t>(ctx->height, tile_origin_y + ctx->tile_px);
-                const uint32_t x_end = std::min<uint32_t>(ctx->width, tile_origin_x + ctx->tile_px);
-                const uint32_t rows = y_end - tile_origin_y;
-                const uint32_t cols = x_end - tile_origin_x;
-
-                const uint32_t hits = end - begin;
-                const uint32_t tile_area = rows * cols;
-                if (ctx->dense_grid && tile_area > 0) {
-                    const float density = static_cast<float>(hits) / static_cast<float>(tile_area);
-                    if (density >= ctx->dense_threshold) {
-                        const uint32_t out_row_stride = width * channels;
-                        Scalar* out_ptr =
-                            ctx->out + (static_cast<uint64_t>(tile_origin_y) * width + tile_origin_x) * channels;
-                        for (uint32_t ly = 0; ly < rows; ++ly) {
-                            const uint32_t y = tile_origin_y + ly;
-                            Scalar* dst = out_ptr + static_cast<uint64_t>(ly) * out_row_stride;
-                            if (ctx->val_scalar) {
-                                const Scalar* src = ctx->values + static_cast<size_t>(y) * width + tile_origin_x;
-                                for (uint32_t lx = 0; lx < cols; ++lx) {
-                                    const Scalar v = src[lx];
-                                    for (uint32_t c = 0; c < channels; ++c) {
-                                        dst[lx * channels + c] += v;
-                                    }
-                                }
-                            } else {
-                                const Scalar* src = ctx->values +
-                                    (static_cast<size_t>(y) * width + tile_origin_x) * channels;
-                                for (uint32_t lx = 0; lx < cols; ++lx) {
-                                    const Scalar* src_row = src + static_cast<uint64_t>(lx) * channels;
-                                    for (uint32_t c = 0; c < channels; ++c) {
-                                        dst[lx * channels + c] += src_row[c];
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                }
-
-                for (uint32_t idx = begin; idx < end; ++idx) {
-                    const uint32_t i = ctx->indices[idx];
-                    const int64_t xi = ctx->coords[static_cast<size_t>(i) * 2 + 0];
-                    const int64_t yi = ctx->coords[static_cast<size_t>(i) * 2 + 1];
-                    if (xi < 0 || yi < 0 || xi >= static_cast<int64_t>(width) ||
-                        yi >= static_cast<int64_t>(ctx->height)) {
-                        continue;
-                    }
-                    const uint32_t lx = static_cast<uint32_t>(xi) - tile_origin_x;
-                    const uint32_t ly = static_cast<uint32_t>(yi) - tile_origin_y;
-                    if (lx >= ctx->tile_px || ly >= ctx->tile_px) continue;
-                    const uint32_t local = ly * ctx->tile_px + lx;
-                    const uint64_t base_idx = static_cast<uint64_t>(local) * channels;
-                    if (ctx->val_scalar) {
-                        const Scalar v = ctx->values[i];
-                        for (uint32_t c = 0; c < channels; ++c) {
-                            tile[base_idx + c] += v;
-                        }
-                    } else {
-                        const Scalar* src = ctx->values + static_cast<uint64_t>(i) * channels;
-                        for (uint32_t c = 0; c < channels; ++c) {
-                            tile[base_idx + c] += src[c];
-                        }
-                    }
-                }
-
-                const uint32_t out_row_stride = width * channels;
-                const uint32_t x_row_stride = ctx->tile_px * channels;
-                if constexpr (std::is_same_v<Scalar, float>) {
-                    float* out_ptr =
-                        ctx->out + (static_cast<uint64_t>(tile_origin_y) * width + tile_origin_x) * channels;
-                    nodus_fused_add_f32_strided(out_ptr,
-                                                out_row_stride,
-                                                tile,
-                                                x_row_stride,
-                                                rows,
-                                                cols,
-                                                channels,
-                                                0u,
-                                                0.0f);
-                } else {
-                    Scalar* out_ptr =
-                        ctx->out + (static_cast<uint64_t>(tile_origin_y) * width + tile_origin_x) * channels;
-                    for (uint32_t r = 0; r < rows; ++r) {
-                        Scalar* dst = out_ptr + static_cast<uint64_t>(r) * out_row_stride;
-                        const Scalar* xv = tile + static_cast<uint64_t>(r) * x_row_stride;
-                        for (uint32_t j = 0; j < cols; ++j) {
-                            Scalar* drow = dst + static_cast<uint64_t>(j) * channels;
-                            const Scalar* xrow = xv + static_cast<uint64_t>(j) * channels;
-                            for (uint32_t cc = 0; cc < channels; ++cc) {
-                                drow[cc] += xrow[cc];
-                            }
-                        }
-                    }
-                }
-            }
-            mem->unmap(tile_buf.tensor().handle());
-        };
-
-        ScatterCtx ctx{};
-        ctx.coords = coords;
-        ctx.values = vmap.data;
-        ctx.out = omap.data;
-        ctx.offsets = bins.offsets.data();
-        ctx.indices = bins.indices.data();
-        ctx.tile_mask = bins.tile_mask.data();
-        ctx.tile_count = tile.tile_count;
-        ctx.width = width;
-        ctx.height = height;
-        ctx.channels = channels;
-        ctx.pcols = pcols;
-        ctx.tiles_x = tile.tiles_x;
-        ctx.tile_px = tile.tile_px;
-        ctx.tile_len = tile.tile_px * tile.tile_px;
-        ctx.backend = base.backend();
-        ctx.val_scalar = val_scalar;
-        ctx.dense_grid = tile.dense_grid;
-        ctx.dense_threshold = tile.dense_threshold;
-
-        submit_row_jobs(tensor_op_pool(), scatter_rows, &ctx, 0, ctx.tile_count);
-
-        bmap.unmap();
-        omap.unmap();
         vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
-        if (points_match) {
-            pmap.unmap();
-        } else if (points_ptr) {
-            auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
-            if (mem) mem->unmap(points.handle());
-        }
-        return true;
+        pmap.unmap();
+
+        return dyadic_ok;
     }
 
     static bool gather_2d(const AbstractTensor& base,

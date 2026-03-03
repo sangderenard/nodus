@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <random>
 #include <string>
@@ -25,6 +26,25 @@ static TensorDesc make_dense_desc(TensorDType dtype, std::initializer_list<uint3
     desc.layout = TensorLayout::Dense;
     desc.shape.dims = dims;
     return desc;
+}
+
+static void log_tensor_meta(const char* tag, const AbstractTensor& t) {
+    const TensorDesc& d = t.desc();
+    std::fprintf(stderr, "[scatter_indices][%s] valid=%d handle=%llu dtype=%d layout=%d rank=%zu dims=",
+                 tag,
+                 t.valid() ? 1 : 0,
+                 static_cast<unsigned long long>(t.handle().id),
+                 static_cast<int>(d.dtype),
+                 static_cast<int>(d.layout),
+                 d.shape.dims.size());
+    std::fprintf(stderr, "[");
+    for (size_t i = 0; i < d.shape.dims.size(); ++i) {
+        std::fprintf(stderr, "%u", d.shape.dims[i]);
+        if (i + 1u < d.shape.dims.size()) {
+            std::fprintf(stderr, ",");
+        }
+    }
+    std::fprintf(stderr, "]\n");
 }
 
 static void set_threads_env(bool enable, uint32_t threads = THREADS) {
@@ -435,7 +455,23 @@ int main() {
         cfg.postmix_scatter = TensorMixPolicy::Add;
         cfg.clamp = true;
         if (!out || !out->valid()) return false;
-        return values_tensor.scatter(points_tensor, *out, AbstractTensor{}, cfg);
+        static bool logged_first = false;
+        if (!logged_first) {
+            logged_first = true;
+            const char* threads_env = std::getenv("NODUS_TENSOR_OP_THREADS");
+            std::fprintf(stderr, "[scatter_indices] first scatter_add_dispatch threads_env=%s\n",
+                         threads_env ? threads_env : "(unset)");
+            log_tensor_meta("base", base_tensor);
+            log_tensor_meta("points", points_tensor);
+            log_tensor_meta("values", values_tensor);
+            log_tensor_meta("out", *out);
+            std::fprintf(stderr, "[scatter_indices] first scatter_add_dispatch begin\n");
+        }
+        const bool ok = values_tensor.scatter(AbstractTensor{}, *out, points_tensor, cfg);
+        if (logged_first) {
+            std::fprintf(stderr, "[scatter_indices] first scatter_add_dispatch end ok=%d\n", ok ? 1 : 0);
+        }
+        return ok;
     };
 
     auto benchmark = [&](const char* label,
@@ -1041,10 +1077,20 @@ int main() {
                                      const AbstractTensor& values_tensor,
                                      const TensorTransferConfig& cfg) -> bool {
             AbstractTensor base_copy = AbstractTensor::create(base_tensor.desc(), base_tensor.backend());
-            if (!base_copy.valid()) return false;
+            if (!base_copy.valid()){
+                printf("Failed to create base copy tensor\n");
+                return false;
+            }
             TensorTransferConfig copy_cfg{};
-            if (!base_tensor.transfer(AbstractTensor{}, base_copy, AbstractTensor{}, true, copy_cfg)) return false;
+            if (!base_tensor.transfer(AbstractTensor{}, base_copy, AbstractTensor{}, true, copy_cfg)){
+                printf("Failed to copy base tensor to out tensor\n");
+                return false;
+            }
             const bool ok = values_tensor.scatter(AbstractTensor{}, base_copy, points_tensor, cfg);
+            if(!ok){
+                printf("Scatter operation failed\n");
+                return false;
+            }
             out = std::move(base_copy);
             return ok;
         };

@@ -1,5 +1,6 @@
 #pragma once
-
+#include <typeindex>
+#include <typeinfo>
 #include <cstdint>
 #include <initializer_list>
 
@@ -24,6 +25,8 @@ public:
     AbstractTensor(AbstractTensor&& other) noexcept;
     AbstractTensor& operator=(AbstractTensor&& other) noexcept;
     ~AbstractTensor();
+
+    static std::type_index obtain_ctype(TensorDType dtype);
 
     static AbstractTensor create(const TensorDesc& desc, TensorBackend* backend = nullptr);
     static AbstractTensor wrap(AbstractTensorHandle handle,

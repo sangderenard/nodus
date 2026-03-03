@@ -48,7 +48,9 @@ venv/
 .venv/
 .env.*
 .pytest_cache/
-
+# ML data and run artifacts (toys_to_survive_development)
+/toys_to_survive_development/data/
+/toys_to_survive_development/wav_pipeline_runs/
 # Editors/IDEs
 .vscode/
 .idea/

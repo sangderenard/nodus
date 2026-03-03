@@ -666,6 +666,12 @@ add_executable(test_tensor_compare
 target_link_libraries(test_tensor_compare PRIVATE canvas_tables_static)
 add_test(NAME tensor_compare_test COMMAND test_tensor_compare)
 
+add_executable(test_abstract_tensor_pool_torture
+  tests/abstract_tensor_pool_torture_test.cpp
+)
+target_link_libraries(test_abstract_tensor_pool_torture PRIVATE canvas_tables_static)
+add_test(NAME abstract_tensor_pool_torture_test COMMAND test_abstract_tensor_pool_torture)
+
 add_executable(test_scatter_indices
   tests/scatter_indices_test.cpp
 )
@@ -733,6 +739,7 @@ set(NODUS_TEST_TARGETS
   test_graph_sparse
   test_thread_pool
   test_tensor_compare
+  test_abstract_tensor_pool_torture
   test_scatter_indices
   test_edge_fifo_sparse_delta
   test_tensor_ops_lowering

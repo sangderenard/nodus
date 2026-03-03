@@ -2,11 +2,20 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 
 #include "common/tensors/abstraction/in_memory_backend.h"
 #include "common/tensors/abstraction/tensor_registry.h"
 
 namespace nodus::tensors {
+
+// Uncomment to enable pool logging while debugging.
+#define NODUS_POOL_LOGGING 1
+#if defined(NODUS_POOL_LOGGING)
+#define NODUS_POOL_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
+#else
+#define NODUS_POOL_LOGF(...) ((void)0)
+#endif
 
 AbstractTensorPool::PooledTensor::PooledTensor(AbstractTensorPool* pool, AbstractTensor tensor, TensorDesc pool_desc)
     : pool_(pool), tensor_(std::move(tensor)), pool_desc_(std::move(pool_desc)) {}
@@ -41,6 +50,7 @@ AbstractTensorPool::PooledTensor& AbstractTensorPool::PooledTensor::operator=(Po
 AbstractTensorPool::PooledTensor::~PooledTensor() {
     if (pool_) {
         if (tensor_.valid()) {
+            NODUS_POOL_LOGF("[tensor_pool] pooled dtor release handle\n");
             AbstractTensorHandle handle = tensor_.handle();
             TensorBackend* backend = tensor_.backend();
             TensorDesc pool_desc = pool_desc_;
@@ -63,15 +73,66 @@ AbstractTensorPool::PooledTensor AbstractTensorPool::acquire(const TensorDesc& d
     if (!use_backend) return PooledTensor{};
 
     stats_.acquire_calls++;
-    const TensorDesc pool_desc = desc;
+    const TensorDesc pool_desc = bucket_desc(desc);
+    if (pool_desc.shape.dims != desc.shape.dims ||
+        pool_desc.layout != desc.layout ||
+        pool_desc.dtype != desc.dtype) {
+        stats_.bucketed_acquires++;
+    }
 
-    AbstractTensor cap = AbstractTensor::create_raw(pool_desc, use_backend);
-    if (!cap.valid()) return PooledTensor{};
-    stats_.created_handles++;
-    AbstractTensorHandle handle = cap.handle();
-    cap.release();
-    cap.reset();
+    AbstractTensorHandle handle{};
+    if (options_.cache_handles) {
+        const PoolKey key{use_backend, make_desc_key(pool_desc)};
+        auto it = pool_.find(key);
+        if (it != pool_.end() && !it->second.empty()) {
+            handle = it->second.back();
+            it->second.pop_back();
+            if (it->second.empty()) {
+                pool_.erase(it);
+            }
+            stats_.cache_hits++;
+            NODUS_POOL_LOGF("[tensor_pool] acquire hit dtype=%d layout=%d rank=%zu\n",
+                            static_cast<int>(pool_desc.dtype),
+                            static_cast<int>(pool_desc.layout),
+                            pool_desc.shape.dims.size());
+        } else {
+            stats_.cache_misses++;
+            NODUS_POOL_LOGF("[tensor_pool] acquire miss dtype=%d layout=%d rank=%zu\n",
+                            static_cast<int>(pool_desc.dtype),
+                            static_cast<int>(pool_desc.layout),
+                            pool_desc.shape.dims.size());
+        }
+    }
+
+    if (!abstract_tensor_handle_is_valid(handle)) {
+        NODUS_POOL_LOGF("[tensor_pool] create_raw begin dtype=%d layout=%d rank=%zu\n",
+                        static_cast<int>(pool_desc.dtype),
+                        static_cast<int>(pool_desc.layout),
+                        pool_desc.shape.dims.size());
+        AbstractTensor cap = AbstractTensor::create_raw(pool_desc, use_backend);
+        if (!cap.valid()) {
+            std::fprintf(stderr, "[tensor_pool] create_raw failed: dtype=%d layout=%d rank=%zu dims=[",
+                         static_cast<int>(pool_desc.dtype),
+                         static_cast<int>(pool_desc.layout),
+                         pool_desc.shape.dims.size());
+            for (size_t i = 0; i < pool_desc.shape.dims.size(); ++i) {
+                std::fprintf(stderr, "%u", pool_desc.shape.dims[i]);
+                if (i + 1u < pool_desc.shape.dims.size()) {
+                    std::fprintf(stderr, ",");
+                }
+            }
+            std::fprintf(stderr, "]\n");
+            return PooledTensor{};
+        }
+        stats_.created_handles++;
+        handle = cap.handle();
+        cap.release();
+        cap.reset();
+        NODUS_POOL_LOGF("[tensor_pool] create_raw ok\n");
+    }
+
     AbstractTensor tensor = AbstractTensor::wrap(handle, desc, use_backend, true);
+    NODUS_POOL_LOGF("[tensor_pool] pooled acquire wrap ok\n");
     return PooledTensor(this, std::move(tensor), pool_desc);
 }
 
@@ -102,15 +163,69 @@ void AbstractTensorPool::release(AbstractTensor&& tensor) {
 
 void AbstractTensorPool::release_handle(AbstractTensorHandle handle, TensorBackend* backend, const TensorDesc& pool_desc) {
     if (!backend || !abstract_tensor_handle_is_valid(handle)) return;
-    (void)pool_desc;
-    backend->destroy(handle);
+    if (!options_.cache_handles) {
+        NODUS_POOL_LOGF("[tensor_pool] release_handle destroy (no cache)\n");
+        backend->destroy(handle);
+        return;
+    }
+
+    if (options_.clear_on_release) {
+        clear_tensor(backend, handle, pool_desc);
+    }
+
+    const PoolKey key{backend, make_desc_key(pool_desc)};
+    auto& list = pool_[key];
+    list.push_back(handle);
+
+    if (options_.max_cached_handles_per_key > 0) {
+        while (list.size() > options_.max_cached_handles_per_key) {
+            const AbstractTensorHandle to_destroy = list.back();
+            list.pop_back();
+            backend->destroy(to_destroy);
+        }
+        if (list.empty()) {
+            pool_.erase(key);
+        }
+    }
+    enforce_cache_limits();
 }
 
 void AbstractTensorPool::preallocate(const TensorDesc& desc, TensorBackend* backend, size_t count) {
     TensorBackend* use_backend = backend ? backend : default_backend();
     if (!use_backend || count == 0) return;
-    (void)desc;
-    (void)count;
+    if (!options_.cache_handles) return;
+    const TensorDesc pool_desc = bucket_desc(desc);
+    const PoolKey key{use_backend, make_desc_key(pool_desc)};
+
+    NODUS_POOL_LOGF("[tensor_pool] preallocate begin count=%zu dtype=%d layout=%d rank=%zu\n",
+                    count,
+                    static_cast<int>(pool_desc.dtype),
+                    static_cast<int>(pool_desc.layout),
+                    pool_desc.shape.dims.size());
+
+    auto& list = pool_[key];
+    while (count-- > 0) {
+        AbstractTensor cap = AbstractTensor::create_raw(pool_desc, use_backend);
+        if (!cap.valid()) {
+            NODUS_POOL_LOGF("[tensor_pool] preallocate create_raw failed\n");
+            break;
+        }
+        stats_.created_handles++;
+        AbstractTensorHandle handle = cap.handle();
+        cap.release();
+        cap.reset();
+        if (options_.clear_on_release) {
+            clear_tensor(use_backend, handle, pool_desc);
+        }
+        list.push_back(handle);
+        if (options_.max_cached_handles_per_key > 0 && list.size() > options_.max_cached_handles_per_key) {
+            const AbstractTensorHandle to_destroy = list.back();
+            list.pop_back();
+            use_backend->destroy(to_destroy);
+        }
+    }
+    enforce_cache_limits();
+    NODUS_POOL_LOGF("[tensor_pool] preallocate end\n");
 }
 
 void AbstractTensorPool::clear() {

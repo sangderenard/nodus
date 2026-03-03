@@ -52,17 +52,33 @@ AbstractTensor::~AbstractTensor() {
 
 namespace {
 AbstractTensorPool& default_tensor_pool() {
-    static AbstractTensorPool pool([] {
-        AbstractTensorPool::Options opt;
-        opt.cache_handles = false;
-        return opt;
-    }());
+    static AbstractTensorPool pool;
     return pool;
 }
 }
 
 AbstractTensor AbstractTensor::create(const TensorDesc& desc, TensorBackend* backend) {
     return default_tensor_pool().acquire_tensor(desc, backend);
+}
+
+
+
+inline std::type_index AbstractTensor::obtain_ctype(TensorDType dtype) {
+    switch (dtype) {
+        case TensorDType::F32:  return typeid(float);
+        case TensorDType::F64:  return typeid(double);
+        case TensorDType::I8:   return typeid(int8_t);
+        case TensorDType::I16:  return typeid(int16_t);
+        case TensorDType::I32:  return typeid(int32_t);
+        case TensorDType::I64:  return typeid(int64_t);
+        case TensorDType::U8:   return typeid(uint8_t);
+        case TensorDType::U16:  return typeid(uint16_t);
+        case TensorDType::U32:  return typeid(uint32_t);
+        case TensorDType::U64:  return typeid(uint64_t);
+        case TensorDType::Bool: return typeid(bool);
+        case TensorDType::Ptr:  return typeid(void*);
+        default:                return typeid(void); // type tag is fine here
+    }
 }
 
 AbstractTensor AbstractTensor::create_raw(const TensorDesc& desc, TensorBackend* backend) {

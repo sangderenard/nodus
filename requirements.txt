@@ -4,4 +4,5 @@
 # protobuf
 torch
 pygame
+PyOpenGL
 numpy
