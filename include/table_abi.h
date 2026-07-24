@@ -491,6 +491,17 @@ int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
 int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written, int32_t timeout_ms);
 // Query unread sample count for a subscriber on an edge.
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count);
+// Quiescent transaction checkpoint for managed scientific rollback. These
+// functions include writer binding and every active reader key/sequence in
+// addition to FIFO storage and publication tags. The caller must ensure no
+// process is publishing, consuming, subscribing, or unsubscribing while a
+// checkpoint is captured or restored.
+int32_t gp_table_edge_transaction_snapshot_size(
+    GP_TableContext* ctx, int32_t edge_idx, size_t* out_size);
+int32_t gp_table_edge_transaction_snapshot_fill(
+    GP_TableContext* ctx, int32_t edge_idx, void* out_buf, size_t out_len);
+int32_t gp_table_edge_transaction_snapshot_restore(
+    GP_TableContext* ctx, int32_t edge_idx, const void* buf, size_t buf_len);
 int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata);
 int32_t gp_table_edge_get_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, GP_TableEdgeBatchMetadata* out_metadata);
 // Set/get policy subgroup flags for a specific edge. These flags are used to

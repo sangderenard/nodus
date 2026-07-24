@@ -350,6 +350,37 @@ add_library(canvas_tables SHARED
 
 add_library(canvas_tables_static STATIC)
 
+add_executable(edge_reader_registry_test
+  tests/edge_reader_registry_test.cpp
+)
+target_include_directories(edge_reader_registry_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+add_test(NAME edge_reader_registry_test COMMAND edge_reader_registry_test)
+
+add_library(edge_tensor_fifo_compile_check OBJECT
+  tests/edge_tensor_fifo_compile_check.cpp
+)
+target_include_directories(edge_tensor_fifo_compile_check PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+add_library(nodus_runtime SHARED
+  src/runtime/edge_runtime_abi.cpp
+  src/mem_backend_host.cpp
+  src/spirv_translation.cpp
+)
+target_compile_definitions(nodus_runtime PRIVATE NODUS_RUNTIME_BUILD=1)
+target_include_directories(nodus_runtime PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+add_executable(edge_runtime_abi_test
+  tests/edge_runtime_abi_test.cpp
+)
+target_link_libraries(edge_runtime_abi_test PRIVATE nodus_runtime)
+add_test(NAME edge_runtime_abi_test COMMAND edge_runtime_abi_test)
+
 # Small helper executable to run the module actualizer from the built project
 add_executable(modlib_actualize tools/modlib_actualize_main.cpp)
 target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -696,6 +727,12 @@ add_executable(test_edge_fifo_sparse_delta
 )
 target_link_libraries(test_edge_fifo_sparse_delta PRIVATE canvas_tables_static)
 add_test(NAME edge_fifo_sparse_delta_test COMMAND test_edge_fifo_sparse_delta)
+
+add_executable(test_edge_fifo_drop_contract
+  tests/edge_fifo_drop_contract_test.cpp
+)
+target_link_libraries(test_edge_fifo_drop_contract PRIVATE canvas_tables_static)
+add_test(NAME edge_fifo_drop_contract_test COMMAND test_edge_fifo_drop_contract)
 
 add_executable(test_tensor_ops_lowering
   tests/tensor_ops_lowering_test.cpp

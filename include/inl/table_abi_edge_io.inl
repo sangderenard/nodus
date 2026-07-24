@@ -1,5 +1,6 @@
 // Edge list helpers
 #include "console_logger.h"
+#include "edge_tensor_fifo_transaction.h"
 #include <cmath>
 #ifndef printf
 #define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
@@ -232,6 +233,61 @@ extern "C" int32_t gp_table_edge_deserialize_snapshot(GP_TableContext* ctx, int3
 
     return 1;
 }
+
+// Versioned quiescent transaction snapshot. The byte format and state restore
+// live with EdgeTensorFifo so table and runtime-only ABIs share one authority.
+extern "C" int32_t gp_table_edge_transaction_snapshot_size(
+    GP_TableContext* ctx, int32_t edge_idx, size_t* out_size
+) {
+    if (!ctx || !out_size) return 0;
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    const size_t size = nodus::runtime::edge_transaction_snapshot_size(
+        ctx->edge_fifos[static_cast<size_t>(edge_idx)]
+    );
+    if (size == 0) return 0;
+    *out_size = size;
+    return 1;
+}
+
+extern "C" int32_t gp_table_edge_transaction_snapshot_fill(
+    GP_TableContext* ctx, int32_t edge_idx, void* out_buf, size_t out_len
+) {
+    if (!ctx || edge_idx < 0 ||
+        edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    return nodus::runtime::edge_transaction_snapshot_fill(
+        ctx->edge_fifos[static_cast<size_t>(edge_idx)], out_buf, out_len
+    ) ? 1 : 0;
+}
+
+extern "C" int32_t gp_table_edge_transaction_snapshot_restore(
+    GP_TableContext* ctx, int32_t edge_idx, const void* buf, size_t buf_len
+) {
+    if (!ctx || edge_idx < 0 ||
+        edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    auto& fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!nodus::runtime::edge_transaction_snapshot_restore(fifo, buf, buf_len)) {
+        return 0;
+    }
+
+    // The FIFO is authoritative. Keep the legacy coordinator mirror current
+    // for table scheduling/diagnostics after the exact state is restored.
+    ThreadManager* tm = ThreadManager::global();
+    if (tm && static_cast<size_t>(edge_idx) < ctx->edge_subscriber_slots.size()) {
+        auto& slots_by_key = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        for (size_t i = 0; i < EdgeTensorFifo::kMaxReaders; ++i) {
+            const uint64_t key = fifo.impl->readers[i].key.load(std::memory_order_acquire);
+            if (key == 0) continue;
+            const auto found = slots_by_key.find(key);
+            if (found != slots_by_key.end() && found->second > 0) {
+                tm->update_reader_seq(
+                    found->second,
+                    fifo.impl->readers[i].seq.load(std::memory_order_acquire)
+                );
+            }
+        }
+    }
+    return 1;
+}
 int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b) {
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);
@@ -449,7 +505,9 @@ extern "C" int32_t gp_table_ring_set_tensor_spec(GP_TableContext* ctx, int32_t r
 extern "C" int32_t gp_table_ring_get_tensor_spec(GP_TableContext* ctx, int32_t ring_entry_idx, GP_TableEdgeTensorSpecTyped* out_spec) {
     if (!ctx || !out_spec) return 0;
     if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
-    *out_spec = ctx->rings[static_cast<size_t>(ring_entry_idx)].fifo.to_spec();
+    *out_spec = edge_fifo_to_table_spec(
+        ctx->rings[static_cast<size_t>(ring_entry_idx)].fifo
+    );
     return 1;
 }
 
@@ -612,7 +670,9 @@ int32_t gp_table_edge_get_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, GP
     if (!ctx || !out_spec) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
-    *out_spec = ctx->edge_fifos[static_cast<size_t>(edge_idx)].to_spec();
+    *out_spec = edge_fifo_to_table_spec(
+        ctx->edge_fifos[static_cast<size_t>(edge_idx)]
+    );
     return 1;
 }
 

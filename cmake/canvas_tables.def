@@ -272,6 +272,9 @@ EXPORTS
     gp_table_edge_subscribe
     gp_table_edge_subscribe_ex
     gp_table_edge_swap_backend
+    gp_table_edge_transaction_snapshot_fill
+    gp_table_edge_transaction_snapshot_restore
+    gp_table_edge_transaction_snapshot_size
     gp_table_edge_unread
     gp_table_edge_unsubscribe
     gp_table_enqueue_add_edge

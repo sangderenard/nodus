@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <array>
+#include "edge_reader_registry.h"
 #include "table_abi.h"
 #include "value_types.h"
 
@@ -341,11 +342,10 @@ private:
     std::vector<ModuleLedger> module_ledger_;
     // Optional timing enable flag (controls whether we record wall-time per run)
     std::atomic<bool> timing_enabled_{false};
-    // Reader-table scaffold: map slot -> edge_id and per-edge min seq snapshot.
-    int next_reader_slot_ = 0;
-    std::unordered_map<int, uint64_t> reader_slot_to_edge_;
-    std::unordered_map<int, uint64_t> reader_slot_seq_;
-    std::unordered_map<uint64_t, uint64_t> reader_min_seq_by_edge_;
+    // Domain-neutral reader-frontier accounting. Kept as an owned component
+    // so unrelated runtime contexts never collide through a process-global
+    // edge-id namespace.
+    EdgeReaderRegistry edge_reader_registry_;
     // Last applied RGBA per toolbar subgroup (to avoid repeated reapplication when peeking)
     std::unordered_map<int, std::array<float,4>> last_applied_rgba_subgroup_;
     // Per-edge assembly buffer when producer emits stride<4 and color is encoded

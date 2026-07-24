@@ -422,57 +422,19 @@ void ThreadManager::run_loop() {
 
 // Reader-table bridge implementation
 int ThreadManager::register_reader_for_edge(uint64_t edge_id) {
-    std::lock_guard<std::mutex> lk(mu_);
-    int slot = ++next_reader_slot_;
-    reader_slot_to_edge_.emplace(slot, edge_id);
-    // Ensure entry exists
-    if (reader_min_seq_by_edge_.find(edge_id) == reader_min_seq_by_edge_.end()) {
-        reader_min_seq_by_edge_[edge_id] = 0ull;
-    }
-    return slot;
+    return edge_reader_registry_.register_reader(edge_id);
 }
 
 void ThreadManager::unregister_reader_slot(int slot) {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = reader_slot_to_edge_.find(slot);
-    if (it == reader_slot_to_edge_.end()) return;
-    uint64_t edge_id = it->second;
-    reader_slot_to_edge_.erase(it);
-    // recompute min for this edge conservatively
-    uint64_t minv = UINT64_MAX;
-    for (const auto& kv : reader_slot_to_edge_) {
-        if (kv.second == edge_id) {
-            // unknown per-slot seq; leave as 0 for scaffold
-            minv = std::min(minv, reader_min_seq_by_edge_[edge_id]);
-        }
-    }
-    if (minv == UINT64_MAX) reader_min_seq_by_edge_.erase(edge_id);
-    else reader_min_seq_by_edge_[edge_id] = minv;
+    edge_reader_registry_.unregister_reader(slot);
 }
 
 uint64_t ThreadManager::min_reader_seq_for_edge(uint64_t edge_id) const {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = reader_min_seq_by_edge_.find(edge_id);
-    if (it == reader_min_seq_by_edge_.end()) return UINT64_MAX;
-    return it->second;
+    return edge_reader_registry_.min_reader_seq(edge_id);
 }
 
 void ThreadManager::update_reader_seq(int slot, uint64_t seq) {
-    std::lock_guard<std::mutex> lk(mu_);
-    reader_slot_seq_[slot] = seq;
-    auto it = reader_slot_to_edge_.find(slot);
-    if (it == reader_slot_to_edge_.end()) return;
-    uint64_t edge_id = it->second;
-    uint64_t minv = UINT64_MAX;
-    for (const auto &kv : reader_slot_to_edge_) {
-        if (kv.second != edge_id) continue;
-        int s = kv.first;
-        auto sit = reader_slot_seq_.find(s);
-        uint64_t sv = (sit != reader_slot_seq_.end()) ? sit->second : 0ull;
-        minv = std::min(minv, sv);
-    }
-    if (minv == UINT64_MAX) reader_min_seq_by_edge_.erase(edge_id);
-    else reader_min_seq_by_edge_[edge_id] = minv;
+    (void)edge_reader_registry_.update_reader(slot, seq);
 }
 
 // Global instance

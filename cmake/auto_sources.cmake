@@ -9,6 +9,9 @@ file(GLOB_RECURSE NODUS_CANVAS_SOURCES CONFIGURE_DEPENDS
 )
 
 if(NODUS_CANVAS_SOURCES)
+  # Runtime-only ABI sources have their own dependency-minimal targets and
+  # must not be pulled back into the canvas amalgam by the broad legacy glob.
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]runtime[/\\\\]")
   target_sources(canvas_tables PRIVATE ${NODUS_CANVAS_SOURCES})
   if(TARGET canvas_tables_static)
     target_sources(canvas_tables_static PRIVATE ${NODUS_CANVAS_SOURCES})
