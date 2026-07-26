@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <sstream>
 
 using namespace nodus::tensors;
 
@@ -51,5 +52,53 @@ int main() {
     const bool completed = job.wait();
     assert(completed);
     if (!completed) return 7;
+
+    std::istringstream wire(
+        "fused_program 1\n"
+        "feed 1\n"
+        "step 1 mul 2 1 1 1 2 0\n"
+        "step 2 add 3 1 2 1 1 0\n"
+        "output 3\n"
+        "end\n");
+    FusedProgramTransport transported;
+    std::string error;
+    const bool parsed =
+        parse_fused_program_transport(wire, &transported, &error);
+    assert(parsed);
+    if (!parsed) return 8;
+    auto prepared = PreparedCalculatorProgram::create(
+        transported, desc, &backend, &error);
+    assert(prepared);
+    if (!prepared) return 9;
+    auto* prepared_input = prepared->feed(1);
+    assert(prepared_input);
+    if (!prepared_input ||
+        !backend.map(prepared_input->handle(), &raw, &bytes))
+        return 10;
+    values = static_cast<float*>(raw);
+    for (uint32_t i = 0; i < 128; ++i)
+        values[i] = static_cast<float>(i) / 32.0f;
+    backend.unmap(prepared_input->handle());
+    const bool prepared_executed = prepared->execute();
+    assert(prepared_executed);
+    if (!prepared_executed) return 11;
+    const bool prepared_output_mapped =
+        backend.map(prepared->output()->handle(), &raw, &bytes);
+    assert(prepared_output_mapped);
+    if (!prepared_output_mapped) return 12;
+    values = static_cast<float*>(raw);
+    const bool prepared_matches =
+        std::abs(values[17] - (17.0f / 16.0f + 1.0f)) < 1e-6f;
+    backend.unmap(prepared->output()->handle());
+    assert(prepared_matches);
+    if (!prepared_matches) return 13;
+
+    std::istringstream truncated(
+        "fused_program 1\nfeed 1\noutput 1\n");
+    FusedProgramTransport rejected;
+    const bool accepted_truncated =
+        parse_fused_program_transport(truncated, &rejected, &error);
+    assert(!accepted_truncated);
+    if (accepted_truncated) return 14;
     return 0;
 }

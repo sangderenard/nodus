@@ -442,6 +442,7 @@ target_compile_features(
 add_test(
   NAME nodus_precomposed_calculator_benchmark_smoke
   COMMAND nodus_precomposed_calculator_benchmark
+          --program ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/sigmoid.fused
           --elements 32 --warmup 0 --repeats 2)
 
 add_library(tensor_calculator_bridge_compile_check OBJECT
