@@ -1,8 +1,12 @@
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
 
 #include "canonical_ops.h"
+#include "common/tensors/abstraction/tensor_math.h"
 #include "common/tensors/abstraction/graph_sparse.h"
+#include "tool_ir.h"
+#include "tool_registry.h"
 
+#include <memory>
 #include <optional>
 
 namespace nodus::tensors {
@@ -47,9 +51,12 @@ GraphIrOperatorSet make_abstract_tensor_graph_ir_ops() {
           return false;
         }
 
-        const uint32_t node = ctx.edits->add_node("abstract_tensor_tool");
-        ctx.edits->set_attr(node, "tensor.op", *op);
         const auto* canonical = nodus::ops::find_op(*op);
+        const std::string tool_id = canonical
+            ? "abstract_tensor." + *op
+            : "abstract_tensor.structural";
+        const uint32_t node = ctx.edits->add_node(tool_id);
+        ctx.edits->set_attr(node, "tensor.op", *op);
         ctx.edits->set_attr(node, "tensor.canonical", canonical != nullptr);
         if (canonical) {
           ctx.edits->set_attr(
@@ -105,5 +112,77 @@ GraphIrOperatorSet make_abstract_tensor_graph_ir_ops() {
   return ops;
 }
 
-} // namespace nodus::tensors
+size_t register_abstract_tensor_tool_ir(ToolRegistry& registry) {
+  size_t registered = 0;
+  const ValueTypeId pointer_type =
+      ValueTypeRegistry::global().builtin(VT_VOID_PTR);
 
+  for (const auto& descriptor : nodus::ops::kOps) {
+    if (descriptor.ct_value < 0 ||
+        (descriptor.arity != 1 && descriptor.arity != 2))
+      continue;
+
+    auto ir = std::make_shared<ToolIR>();
+    ir->id = "abstract_tensor." + std::string(descriptor.name);
+    ir->name = "AbstractTensor " + std::string(descriptor.name);
+    ir->caps = ToolCaps::None;
+    const uint8_t arity = descriptor.arity;
+    const auto operation =
+        static_cast<nodus::ops::CanonicalOp>(descriptor.canonical_id);
+
+    ir->port_count = [] { return 2; };
+    ir->port_spec = [arity](int32_t index) {
+      if (index == 0)
+        return ToolPortSpec{ToolPortKind::Argument, arity};
+      if (index == 1)
+        return ToolPortSpec{ToolPortKind::Return, 1};
+      return ToolPortSpec{};
+    };
+    ir->execute_stack = [operation, arity, pointer_type](ToolStackContext& ctx) {
+      if (!ctx.stack.raw || pointer_type == kInvalidValueTypeId) return;
+      RawStackFrame& frame = *ctx.stack.raw;
+      void* right_pointer = nullptr;
+      void* left_pointer = nullptr;
+      if (arity == 2 &&
+          !raw_stack_pop_typed(frame, &right_pointer, pointer_type))
+        return;
+      if (!raw_stack_pop_typed(frame, &left_pointer, pointer_type)) {
+        if (right_pointer)
+          raw_stack_push_typed(frame, &right_pointer, pointer_type);
+        return;
+      }
+      auto* left = static_cast<AbstractTensor*>(left_pointer);
+      auto* right = static_cast<AbstractTensor*>(right_pointer);
+      if (!left || !left->valid() ||
+          (arity == 2 && (!right || !right->valid()))) {
+        raw_stack_push_typed(frame, &left_pointer, pointer_type);
+        if (arity == 2)
+          raw_stack_push_typed(frame, &right_pointer, pointer_type);
+        return;
+      }
+
+      auto output = std::make_unique<AbstractTensor>(
+          left->desc(), left->backend());
+      const bool ok = output->valid() && (
+          arity == 1
+              ? tensor_elementwise_unary(operation, *left, output.get())
+              : tensor_elementwise_binary(
+                    operation, *left, *right, output.get()));
+      if (!ok) {
+        raw_stack_push_typed(frame, &left_pointer, pointer_type);
+        if (arity == 2)
+          raw_stack_push_typed(frame, &right_pointer, pointer_type);
+        return;
+      }
+      void* output_pointer = output.release();
+      if (!raw_stack_push_typed(frame, &output_pointer, pointer_type))
+        delete static_cast<AbstractTensor*>(output_pointer);
+    };
+
+    if (registry.register_tool(tool_ir::make_registry_entry(std::move(ir))))
+      ++registered;
+  }
+  return registered;
+}
+
+} // namespace nodus::tensors

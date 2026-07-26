@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "canonical_ops.h"
 #include "common/tensors/abstraction/tensor_types.h"
 
 namespace nodus::bitops {
@@ -31,7 +32,7 @@ enum class TensorOp : uint8_t {
 
 struct KernelOpDesc {
     nodus::spirv::OpCode op;
-    int32_t binary = 0; // uses nodus::bitops::BinaryOp values when op == OpCode::BINARY
+    nodus::ops::CanonicalOp canonical = nodus::ops::CanonicalOp::ADD;
     bool is_unary = false;
 };
 

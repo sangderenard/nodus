@@ -9,57 +9,57 @@ bool tensor_op_to_kernel(TensorOp op, KernelOpDesc* out) {
     switch (op) {
         case TensorOp::Add:
             out->op = nodus::spirv::OpCode::BINARY;
-            out->binary = static_cast<int32_t>(nodus::bitops::BinaryOp::Add);
+            out->canonical = nodus::ops::CanonicalOp::ADD;
             out->is_unary = false;
             return true;
         case TensorOp::Sub:
             out->op = nodus::spirv::OpCode::BINARY;
-            out->binary = static_cast<int32_t>(nodus::bitops::BinaryOp::Sub);
+            out->canonical = nodus::ops::CanonicalOp::SUB;
             out->is_unary = false;
             return true;
         case TensorOp::Mul:
             out->op = nodus::spirv::OpCode::BINARY;
-            out->binary = static_cast<int32_t>(nodus::bitops::BinaryOp::Mul);
+            out->canonical = nodus::ops::CanonicalOp::MUL;
             out->is_unary = false;
             return true;
         case TensorOp::Div:
             out->op = nodus::spirv::OpCode::BINARY;
-            out->binary = static_cast<int32_t>(nodus::bitops::BinaryOp::Div);
+            out->canonical = nodus::ops::CanonicalOp::TRUEDIV;
             out->is_unary = false;
             return true;
         case TensorOp::Mod:
             out->op = nodus::spirv::OpCode::BINARY;
-            out->binary = static_cast<int32_t>(nodus::bitops::BinaryOp::Mod);
+            out->canonical = nodus::ops::CanonicalOp::MOD;
             out->is_unary = false;
             return true;
         case TensorOp::Shl:
             out->op = nodus::spirv::OpCode::BINARY;
-            out->binary = static_cast<int32_t>(nodus::bitops::BinaryOp::Shl);
+            out->canonical = nodus::ops::CanonicalOp::SHL;
             out->is_unary = false;
             return true;
         case TensorOp::Shr:
             out->op = nodus::spirv::OpCode::BINARY;
-            out->binary = static_cast<int32_t>(nodus::bitops::BinaryOp::Shr);
+            out->canonical = nodus::ops::CanonicalOp::SHR;
             out->is_unary = false;
             return true;
         case TensorOp::And:
             out->op = nodus::spirv::OpCode::AND;
-            out->binary = 0;
+            out->canonical = nodus::ops::CanonicalOp::BITAND;
             out->is_unary = false;
             return true;
         case TensorOp::Or:
             out->op = nodus::spirv::OpCode::OR;
-            out->binary = 0;
+            out->canonical = nodus::ops::CanonicalOp::BITOR;
             out->is_unary = false;
             return true;
         case TensorOp::Xor:
             out->op = nodus::spirv::OpCode::XOR;
-            out->binary = 0;
+            out->canonical = nodus::ops::CanonicalOp::BITXOR;
             out->is_unary = false;
             return true;
         case TensorOp::Not:
             out->op = nodus::spirv::OpCode::NOT;
-            out->binary = 0;
+            out->canonical = nodus::ops::CanonicalOp::INVERT;
             out->is_unary = true;
             return true;
         default:
@@ -89,7 +89,7 @@ bool emit_binary_kernel_op(nodus::bitops::KernelIrBuilder& b,
             *out = b.emit_xor(a, b_in, name);
             return true;
         case nodus::spirv::OpCode::BINARY:
-            *out = b.emit_binary(static_cast<nodus::bitops::BinaryOp>(desc.binary), a, b_in, name);
+            *out = b.emit_binary(desc.canonical, a, b_in, name);
             return true;
         default:
             return false;

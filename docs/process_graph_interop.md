@@ -3,8 +3,8 @@
 Nodus receives Turing computation through two complementary paths:
 
 ```text
-ProcessGraph -> GraphIR -> AbstractTensor tool nodes and ports
-SSA / PrimitiveProgram -> KernelIR or native calculator execution
+ProcessGraph -> GraphIR -> registered AbstractTensor ToolIR nodes and ports
+SSA / FusedProgram -> KernelIR or Nodus in-memory calculator execution
 ```
 
 They are deliberately separate. The graph/tool route preserves composition
@@ -41,14 +41,21 @@ python ops/verify_canonical_ops.py
 - `tensor_input(node, role)`
 - `tensor_output(node, role)`
 
-These emit ordinary Nodus `GraphEdit` records. Canonical operations are marked
-with their arity and KernelIR-lowerability. Structural ProcessGraph nodes remain
-visible and non-canonical.
+These emit ordinary Nodus `GraphEdit` records. Canonical nodes use concrete
+tool ids such as `abstract_tensor.add`; structural ProcessGraph nodes remain
+visible as `abstract_tensor.structural`.
 
-This establishes graph composition and introspection. Binding each canonical
-node to an executable `ToolIR::execute_stack` implementation remains a separate
-step because tensor-handle ownership, descriptors, backend selection, and
-multi-output lifetime must be explicit.
+`register_abstract_tensor_tool_ir` registers stack-executable ToolIR instances
+for the 28 canonical F32/F64 elementwise operations currently implemented by
+Nodus TensorMath. Each tool consumes one or two `AbstractTensor*` values,
+allocates its result in the input backend, executes the same
+`tensor_elementwise_*` semantics used by `InMemoryCalculator`, and pushes the
+result. The graph description and the executable registry therefore agree on
+the tool id rather than being correlated by an attribute-only convention.
+
+Structural input/constant/return nodes and non-elementwise operations remain
+explicit translation boundaries. They need node-instance binding/state and
+must not be disguised as stateless elementwise tools.
 
 ## Verification
 
@@ -56,4 +63,3 @@ multi-output lifetime must be explicit.
 cmake --build build --config Release --target test_graph_ir canonical_ops_test bitops_lowering_test
 ctest --test-dir build -C Release -R "graph_ir|canonical_ops|bitops_lowering" --output-on-failure
 ```
-

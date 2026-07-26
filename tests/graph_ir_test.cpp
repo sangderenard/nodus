@@ -1,7 +1,9 @@
 #include "common/tensors/abstraction/graph_ir.h"
 #include "common/tensors/abstraction/abstract_op_graph.h"
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
+#include "common/tensors/abstraction/in_memory_backend.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
+#include "tool_registry.h"
 
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
 
@@ -62,6 +64,75 @@ int main() {
     if (!require_or_report(ports == 5, "expected five tensor ports")) return 1;
     if (!require_or_report(connections == 2, "expected two tensor connections")) return 1;
     if (!require_or_report(canonical_add, "add should be recognized as canonical")) return 1;
+
+    bool emitted_registered_tool_id = false;
+    for (const auto& edit : result.edits.edits()) {
+      if (edit.kind == GraphEditKind::AddNode &&
+          edit.key == "abstract_tensor.add")
+        emitted_registered_tool_id = true;
+    }
+    if (!require_or_report(
+            emitted_registered_tool_id,
+            "canonical graph node should name its real registered tool"))
+      return 1;
+  }
+
+  // 0b) Canonical graph nodes are actual ToolIR stack tools, not descriptive
+  // attributes on otherwise generic nodes.
+  {
+    ToolRegistry registry;
+    const size_t registered = register_abstract_tensor_tool_ir(registry);
+    if (!require_or_report(registered == 28, "register 28 elementwise tensor tools"))
+      return 1;
+    auto add = registry.create("abstract_tensor.add");
+    if (!require_or_report(add != nullptr, "create abstract_tensor.add ToolIR"))
+      return 1;
+
+    auto& backend = in_memory_backend_singleton();
+    const TensorDesc desc{TensorDType::F64, {{3}}};
+    auto* left = new AbstractTensor(desc, &backend);
+    auto* right = new AbstractTensor(desc, &backend);
+    void* data = nullptr;
+    size_t bytes = 0;
+    backend.map(left->handle(), &data, &bytes);
+    auto* values = static_cast<double*>(data);
+    values[0] = 1.0; values[1] = 2.0; values[2] = 3.0;
+    backend.unmap(left->handle());
+    backend.map(right->handle(), &data, &bytes);
+    values = static_cast<double*>(data);
+    values[0] = 10.0; values[1] = 20.0; values[2] = 30.0;
+    backend.unmap(right->handle());
+
+    RawStackFrame raw{};
+    if (!require_or_report(raw_stack_init_frame(raw, 1024), "initialize tool stack"))
+      return 1;
+    const ValueTypeId pointer_type =
+        ValueTypeRegistry::global().builtin(VT_VOID_PTR);
+    void* left_pointer = left;
+    void* right_pointer = right;
+    raw_stack_push_typed(raw, &left_pointer, pointer_type);
+    raw_stack_push_typed(raw, &right_pointer, pointer_type);
+    ToolStackContext context{};
+    context.stack.raw = &raw;
+    add->execute_stack(context);
+
+    void* output_pointer = nullptr;
+    const bool popped =
+        raw_stack_pop_typed(raw, &output_pointer, pointer_type) != 0;
+    auto* output = static_cast<AbstractTensor*>(output_pointer);
+    bool correct = popped && output && output->valid() &&
+                   backend.map(output->handle(), &data, &bytes);
+    if (correct) {
+      values = static_cast<double*>(data);
+      correct = values[0] == 11.0 && values[1] == 22.0 && values[2] == 33.0;
+      backend.unmap(output->handle());
+    }
+    delete output;
+    delete right;
+    delete left;
+    raw_stack_free_mask(raw);
+    if (!require_or_report(correct, "execute tensor add through ToolIR stack"))
+      return 1;
   }
 
   // 1) Core graph IR parses and emits edits.
