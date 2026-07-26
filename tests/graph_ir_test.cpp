@@ -1,4 +1,6 @@
 #include "common/tensors/abstraction/graph_ir.h"
+#include "common/tensors/abstraction/abstract_op_graph.h"
+#include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
 
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
@@ -16,6 +18,52 @@ static bool require_or_report(bool condition, const char* what) {
 }
 
 int main() {
+  // 0) Turing ProcessGraph-shaped programs become AbstractTensor tool graphs.
+  {
+    const char* src = R"(
+      x = tensor_node("input");
+      xo = tensor_output(x, "value");
+      y = tensor_node("input");
+      yo = tensor_output(y, "value");
+      add = tensor_node("add");
+      ai = tensor_input(add, "lhs");
+      bi = tensor_input(add, "rhs");
+      ao = tensor_output(add, "result");
+      connect(xo, ai);
+      connect(yo, bi);
+    )";
+
+    AbstractOpGraphRunResult result;
+    std::string error;
+    if (!require_or_report(
+            run_graph_ir_on_abstract_graph(
+                src, make_abstract_tensor_graph_ir_ops(), result, &error),
+            "build AbstractTensor tool graph")) {
+      std::cerr << error << "\n";
+      return 1;
+    }
+
+    size_t nodes = 0;
+    size_t ports = 0;
+    size_t connections = 0;
+    bool canonical_add = false;
+    for (const auto& edit : result.edits.edits()) {
+      nodes += edit.kind == GraphEditKind::AddNode ? 1 : 0;
+      ports += edit.kind == GraphEditKind::AddPort ? 1 : 0;
+      connections += edit.kind == GraphEditKind::Connect ? 1 : 0;
+      if (edit.kind == GraphEditKind::SetAttr &&
+          edit.key == "tensor.canonical") {
+        if (const auto* value = std::get_if<bool>(&edit.value)) {
+          canonical_add |= *value;
+        }
+      }
+    }
+    if (!require_or_report(nodes == 3, "expected three tensor tool nodes")) return 1;
+    if (!require_or_report(ports == 5, "expected five tensor ports")) return 1;
+    if (!require_or_report(connections == 2, "expected two tensor connections")) return 1;
+    if (!require_or_report(canonical_add, "add should be recognized as canonical")) return 1;
+  }
+
   // 1) Core graph IR parses and emits edits.
   {
     const char* src = R"(
