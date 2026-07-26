@@ -299,7 +299,52 @@ struct ITool {
 #ifndef NODUS_PLUGIN_SOURCE_NAME
 #define NODUS_PLUGIN_SOURCE_NAME plugin_source_path
 #endif
+// Optional export: called once at DLL load time, before any create_tool call,
+// so a plugin can register new ValueType structs (ValueTypeRegistry::global()
+// .register_struct(...)) that its tools need the value stack/edges to carry.
+// Absent in most plugins -- PluginLoader treats a missing export as a no-op.
+//
+// Scope note: ValueTypeRegistry::global() is a Meyer's singleton defined
+// inline in value_types.h -- it is NOT shared across a real DLL boundary.
+// A plugin built as its own standalone .dll and loaded via LoadLibrary (the
+// repo-ingestion tier's shape, see repo_package.h) gets its own independent
+// copy of the registry; register_struct() calls there are invisible to the
+// host. This export only reaches the host's registry when the plugin source
+// is compiled into the *same* binary as the host (the composite/inlined
+// graph-collapse path in module_library_actualizer.cpp, or a tool linked
+// directly into canvas_tables_static). For genuinely cross-DLL plugins,
+// prefer keeping shared data opaque (VT_VOID_PTR, interpreted only by tools
+// that agree on its shape at compile time) or tensor-shaped
+// (VT_ABSTRACT_TENSOR) rather than registering a new central struct type --
+// nodus staying the sole owner/mutator of its own registry is deliberate,
+// not an oversight. A real cross-DLL registration path (plugin describes
+// fields via a plain POD struct, host commits them into its own registry)
+// is not designed yet; build it only once something concrete needs a
+// struct's fields visible outside the package that defined it.
+#ifndef NODUS_PLUGIN_REGISTER_TYPES_NAME
+#define NODUS_PLUGIN_REGISTER_TYPES_NAME register_types
+#endif
 
 extern "C" {
     typedef ITool* (*CreateToolFn)();
+    typedef void (*RegisterTypesFn)();
 }
+
+// Capability tags describing what a repo-ingested tool actually is, honestly,
+// rather than gatekeeping on IR-translatability. A tool can be none of these
+// (fully opaque, maximally caveated) or several. Numeric on purpose -- no
+// general string-interning utility exists in nodus yet (see repo_package.h);
+// this stays a plain closed enum until one does, without changing the shape
+// of anything that carries these tags.
+enum ToolCapabilityTag : uint32_t {
+    CAP_NONE = 0,
+    // Decomposes into nodus::spirv::KernelIR (src/kernel_isa.h) -- translatable
+    // to any registered backend (SPIR-V, GLSL, CPU, ...) via TranslationMatrix.
+    CAP_ISA = 1u << 0,
+    // Wraps already-compiled opaque native code (a DLL/lib) with no source-level
+    // decomposition offered -- CPU-only, not portable to other backends.
+    CAP_BINARY = 1u << 1,
+    // Supplies a gradient/backward path even if the forward pass is opaque, so
+    // it can still participate in an autodiff graph.
+    CAP_BACKWARD = 1u << 2,
+};

@@ -44,7 +44,23 @@ static int cpu_dispatch_kernel(gp_mem_backend_handle_t backend_h, const nodus::s
     return 1;
 }
 
+// Distinctive tag stored at offset 0 of every CpuBackend so a handle can be
+// recognized and its vtable/type read *by dereferencing the handle pointer*,
+// not by looking it up in a module-static map. This matters because
+// mem_backend_host.cpp is compiled into BOTH canvas_tables (shared) and
+// canvas_tables_static: a process that links the static lib as its host (e.g.
+// a test, or frontend_shell) while also loading canvas_tables.dll plugins ends
+// up with two independent copies of g_handle_vtables/g_handle_types. A handle
+// created by one copy is invisible to the other's map, so every stack/edge
+// push/pop from the "wrong" side silently returns 0 -- the exact defect that
+// makes cross-DLL tool data exchange (and, plausibly, the pooled scatter/gather
+// path) fail nondeterministically. Making CPU/host handles self-describing
+// fixes that class of bug process-wide without a shared registry. The map is
+// kept as a fallback for the filesystem backends, which don't cross this seam.
+static constexpr uint32_t kCpuBackendMagic = 0x4E43'4255u; // "NCBU"
+
 struct CpuBackend {
+    uint32_t magic; // == kCpuBackendMagic; must stay the first member (offset 0)
     std::mutex mu;
     void* ptr;
     size_t size;
@@ -58,7 +74,7 @@ struct CpuBackend {
     uint32_t compute_deploy_limit;
     uint32_t alignment;
     const gp_mem_backend_vtable_t* vtbl;
-    CpuBackend(size_t n): ptr(nullptr), size(0), refs(1), params_blob(nullptr), params_size(0), activate_fn(nullptr), activate_ctx(nullptr),
+    CpuBackend(size_t n): magic(kCpuBackendMagic), ptr(nullptr), size(0), refs(1), params_blob(nullptr), params_size(0), activate_fn(nullptr), activate_ctx(nullptr),
         cpu_thread_ceiling(0), max_alloc_bytes(0), compute_deploy_limit(0), alignment(alignof(void*)), vtbl(nullptr) {
         if (n > 0) {
             ptr = std::malloc(n);
@@ -529,11 +545,17 @@ extern "C" void gp_mem_backend_release(gp_mem_backend_handle_t h) {
         auto it = g_handle_vtables.find(h);
         if (it != g_handle_vtables.end()) g_handle_vtables.erase(it);
     }
-    // Determine handle type and perform type-correct release
+    // Determine handle type and perform type-correct release. Prefer the
+    // self-describing CPU/host tag so a handle created by another module copy
+    // (whose map never saw it) is still released type-correctly rather than
+    // falling through to the generic path (see gp_mem_backend_get_vtable).
     std::lock_guard<std::mutex> lk(g_vt_mu);
     auto it_type = g_handle_types.find(h);
     int t = (it_type != g_handle_types.end()) ? it_type->second : -1;
     if (it_type != g_handle_types.end()) g_handle_types.erase(it_type);
+    if (t < 0 && reinterpret_cast<const CpuBackend*>(h)->magic == kCpuBackendMagic) {
+        t = (int)GP_MEM_BACKEND_CPU;
+    }
     // If this handle is a registered backend context, treat it accordingly
     if (g_backend_contexts.find(h) != g_backend_contexts.end()) {
         // filesystem backend context
@@ -617,6 +639,10 @@ extern "C" uint64_t gp_mem_backend_get_capabilities(gp_mem_backend_handle_t h) {
 
 extern "C" int gp_mem_backend_get_type(gp_mem_backend_handle_t h) {
     if (!h) return -1;
+    // Fast path: self-describing CPU/host backend (see gp_mem_backend_get_vtable).
+    if (reinterpret_cast<const CpuBackend*>(h)->magic == kCpuBackendMagic) {
+        return (int)GP_MEM_BACKEND_CPU;
+    }
     std::lock_guard<std::mutex> lk(g_vt_mu);
     auto it = g_handle_types.find(h);
     if (it != g_handle_types.end()) return it->second;
@@ -633,6 +659,14 @@ extern "C" uintptr_t gp_mem_backend_native_handle(gp_mem_backend_handle_t h) {
 // Return vtable pointer for a given handle if known.
 extern "C" const gp_mem_backend_vtable_t* gp_mem_backend_get_vtable(gp_mem_backend_handle_t h) {
     if (!h) return nullptr;
+    // Fast path: self-describing CPU/host backend. Reading magic at offset 0 is
+    // safe for any live backend handle (all backend structs have an
+    // initialized first member); only a genuine CpuBackend matches the tag.
+    // This works across independent module copies of this TU, unlike the map.
+    if (reinterpret_cast<const CpuBackend*>(h)->magic == kCpuBackendMagic) {
+        return reinterpret_cast<const CpuBackend*>(h)->vtbl;
+    }
+    // Fallback: map lookup (filesystem backends; legacy registrations).
     std::lock_guard<std::mutex> lk(g_vt_mu);
     auto it = g_handle_vtables.find(h);
     if (it != g_handle_vtables.end()) return it->second;

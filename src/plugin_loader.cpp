@@ -138,6 +138,14 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
     info->plugin_init = (LoadedModuleInfo::plugin_init_fn_t)GetProcAddress(h, "plugin_init");
     info->plugin_shutdown = (LoadedModuleInfo::plugin_shutdown_fn_t)GetProcAddress(h, "plugin_shutdown");
 
+    // Optional: register any new ValueType structs this DLL's tools need,
+    // once, before any tool instance is created. Absent in most plugins.
+    if (auto register_types_fn = reinterpret_cast<RegisterTypesFn>(GetProcAddress(h, "register_types"))) {
+        try { register_types_fn(); } catch (...) {
+            std::cerr << "register_types threw in " << path << "\n";
+        }
+    }
+
     // instantiate temporary tool to ensure create/destroy are viable
     ITool* tmp = create_fn();
     std::cerr << "DEBUG: plugin_loader: create_tool returned " << tmp << " for " << path << "\n";

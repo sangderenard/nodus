@@ -343,12 +343,61 @@ if(NODUS_DEPS_ONLY)
   return()
 endif()
 
+set(NODUS_TENSOR_CALCULATOR_ROOT
+  "${CMAKE_CURRENT_SOURCE_DIR}/../tensor-calculator"
+  CACHE PATH "Tensor Calculator source tree")
+if(EXISTS "${NODUS_TENSOR_CALCULATOR_ROOT}/CMakeLists.txt"
+   AND NOT TARGET tensor_calculator_static)
+  add_subdirectory(
+    "${NODUS_TENSOR_CALCULATOR_ROOT}"
+    "${CMAKE_CURRENT_BINARY_DIR}/tensor-calculator")
+endif()
+
+# nodus_tensor_core: the single, process-wide-shared home for the tensor
+# subsystem's stateful singletons (backend registry, the InMemoryBackend
+# instance, the default tensor pool, GP_MemBackend handle maps). Deliberately
+# a standalone SHARED library, built and linked before canvas_tables/
+# canvas_tables_static, so that the DLL, any canvas_tables_static-linked
+# host, and any plugin DLL that also links it all resolve to the SAME loaded
+# nodus_tensor_core.dll -- one instance of each singleton process-wide,
+# regardless of how many places link it. This is what makes a tensor handle
+# created in one module valid when read back in another (see
+# research/12_substrate_blocker.md). Torch-free by design (kept that way
+# deliberately -- do not add a Torch dependency here without re-checking
+# that constraint) so it carries no extra build/runtime weight.
+add_library(nodus_tensor_core SHARED
+  src/common/tensors/abstraction/tensor_registry.cpp
+  src/common/tensors/abstraction/in_memory_backend.cpp
+  src/common/tensors/abstraction/abstract_tensor.cpp
+  src/common/tensors/abstraction/abstract_tensor_pool.cpp
+  src/common/tensors/abstraction/tensor_math.cpp
+  src/common/tensors/abstraction/tensor_calculator_bridge.cpp
+  src/mem_backend_host.cpp
+  src/spirv_translation.cpp
+)
+target_include_directories(nodus_tensor_core PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+set_target_properties(nodus_tensor_core PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+target_compile_features(nodus_tensor_core PUBLIC cxx_std_20)
+if(TARGET tensor_calculator_static)
+  target_link_libraries(nodus_tensor_core PUBLIC tensor_calculator_static)
+else()
+  message(FATAL_ERROR
+    "Nodus tensor core requires Tensor Calculator at "
+    "${NODUS_TENSOR_CALCULATOR_ROOT}")
+endif()
+
 add_library(canvas_tables SHARED
   # sources are now gathered from src/ via cmake/auto_sources.cmake
   # placeholder to keep CMake syntax valid; real sources appended by include(cmake/auto_sources.cmake)
 )
+target_link_libraries(canvas_tables PUBLIC nodus_tensor_core)
 
 add_library(canvas_tables_static STATIC)
+target_link_libraries(canvas_tables_static PUBLIC nodus_tensor_core)
 
 add_executable(edge_reader_registry_test
   tests/edge_reader_registry_test.cpp
@@ -357,6 +406,23 @@ target_include_directories(edge_reader_registry_test PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 add_test(NAME edge_reader_registry_test COMMAND edge_reader_registry_test)
+
+add_executable(tensor_calculator_bridge_test
+  tests/tensor_calculator_bridge_test.cpp
+)
+target_link_libraries(tensor_calculator_bridge_test PRIVATE nodus_tensor_core)
+add_test(NAME tensor_calculator_bridge_test COMMAND tensor_calculator_bridge_test)
+
+add_library(tensor_calculator_bridge_compile_check OBJECT
+  src/common/tensors/abstraction/tensor_calculator_bridge.cpp
+)
+target_include_directories(tensor_calculator_bridge_compile_check PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_link_libraries(
+  tensor_calculator_bridge_compile_check PRIVATE tensor_calculator_static)
+target_compile_features(
+  tensor_calculator_bridge_compile_check PRIVATE cxx_std_20)
 
 add_library(edge_tensor_fifo_compile_check OBJECT
   tests/edge_tensor_fifo_compile_check.cpp
@@ -381,11 +447,53 @@ add_executable(edge_runtime_abi_test
 target_link_libraries(edge_runtime_abi_test PRIVATE nodus_runtime)
 add_test(NAME edge_runtime_abi_test COMMAND edge_runtime_abi_test)
 
+# Headless (no window/renderer) graph runtime ABI: loads/builds a nodus tool
+# graph, drives ThreadManager's real scheduler to quiescence, and exchanges
+# data at named external ports. Links canvas_tables_static (not just the
+# lean nodus_runtime sources) because it needs gp_canvas_*/gp_table_edge_*/
+# ThreadManager, but exports only its own narrow nodus_headless_* surface.
+add_library(nodus_headless SHARED
+  src/headless/nodus_headless_abi.cpp
+)
+target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
+target_include_directories(nodus_headless PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_link_libraries(nodus_headless PRIVATE canvas_tables_static)
+target_compile_features(nodus_headless PUBLIC cxx_std_20)
+
 # Small helper executable to run the module actualizer from the built project
 add_executable(modlib_actualize tools/modlib_actualize_main.cpp)
 target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(modlib_actualize PRIVATE canvas_tables)
 target_compile_features(modlib_actualize PUBLIC cxx_std_17)
+
+# kpath raster tools: same-repo standalone plugin DLLs (raw create_tool/
+# destroy_tool exports, no REGISTER_TOOL/tool_registry.cpp link) proving the
+# plugin-DLL loading pattern repo_package.cpp's ingestion uses for real
+# cross-repo packages, with zero cross-repo risk -- exposes kpath's
+# rasterizer as loadable nodus tools. Deliberately not folded into the
+# canvas_tables/canvas_tables_static amalgam (auto_sources.cmake); these are
+# meant to be discovered via PluginLoader, same as a real ingested package.
+add_library(kpath_raster_kernel_tool SHARED
+  plugins/kpath_raster_tool/kpath_raster_kernel_tool.cpp
+)
+target_include_directories(kpath_raster_kernel_tool PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
+)
+target_link_libraries(kpath_raster_kernel_tool PRIVATE canvas_tables)
+
+add_library(kpath_raster_scatter_tool SHARED
+  plugins/kpath_raster_tool/kpath_raster_scatter_tool.cpp
+)
+target_include_directories(kpath_raster_scatter_tool PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
+)
+target_link_libraries(kpath_raster_scatter_tool PRIVATE canvas_tables)
 
 # (sdlttf_demo removed)
 
@@ -404,6 +512,13 @@ add_executable(kpath_shaper_tool tools/kpath_shaper_tool.cpp)
 target_include_directories(kpath_shaper_tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(kpath_shaper_tool PRIVATE canvas_tables_static)
 target_compile_features(kpath_shaper_tool PUBLIC cxx_std_20)
+
+# Demo: build a small tool graph and run it to quiescence with no window/renderer,
+# proving nodus_headless end-to-end in pure C++.
+add_executable(nodus_headless_demo tools/nodus_headless_demo.cpp)
+target_include_directories(nodus_headless_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nodus_headless_demo PRIVATE nodus_headless)
+target_compile_features(nodus_headless_demo PUBLIC cxx_std_20)
 
 # Demo: compile relational geometry into kpath outlines and rasterize a composed scene to PNG.
 add_executable(kpath_relgeo_scene_demo tools/kpath_relgeo_scene_demo.cpp)
@@ -572,6 +687,26 @@ add_executable(test_frame_serialization
 )
 target_link_libraries(test_frame_serialization PRIVATE canvas_tables_static)
 add_test(NAME frame_serialization_test COMMAND test_frame_serialization)
+
+add_executable(nodus_headless_runtime_test
+  tests/nodus_headless_runtime_test.cpp
+)
+target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
+target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
+add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
+
+# Python smoke test: exercises nodus_headless via the ctypes bridge
+# (nodus_headless_bridge.py), the same way an external process would.
+# NODUS_HEADLESS_TEST_DLL points the bridge at the freshly-built DLL instead
+# of relying on default search-path discovery.
+add_test(NAME nodus_headless_bridge_smoke
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/nodus_headless_bridge_smoke.py"
+)
+set_tests_properties(nodus_headless_bridge_smoke PROPERTIES
+  ENVIRONMENT "NODUS_HEADLESS_TEST_DLL=$<TARGET_FILE:nodus_headless>"
+  DEPENDS nodus_headless_runtime_test
+)
 
 add_executable(test_edge_backend_coordination
   tests/edge_backend_coordination_test.cpp
@@ -757,6 +892,30 @@ target_compile_definitions(test_tool_dll PRIVATE
   NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
 )
 add_test(NAME tool_dll_test COMMAND test_tool_dll)
+
+add_executable(test_repo_package
+  tests/repo_package_test.cpp
+)
+target_link_libraries(test_repo_package PRIVATE canvas_tables_static)
+target_compile_definitions(test_repo_package PRIVATE
+  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
+  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+)
+add_test(NAME repo_package_test COMMAND test_repo_package)
+
+add_executable(test_kpath_raster_tool
+  tests/kpath_raster_tool_test.cpp
+)
+target_include_directories(test_kpath_raster_tool PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
+)
+target_link_libraries(test_kpath_raster_tool PRIVATE canvas_tables_static)
+target_compile_definitions(test_kpath_raster_tool PRIVATE
+  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
+  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+)
+add_dependencies(test_kpath_raster_tool kpath_raster_kernel_tool kpath_raster_scatter_tool)
+add_test(NAME kpath_raster_tool_test COMMAND test_kpath_raster_tool)
 
 # Many unit tests use assert() for both validation and required side effects
 # (e.g., assert(backend.map(...)) to populate output pointers). In non-Debug

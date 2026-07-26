@@ -93,6 +93,14 @@ static int torch_record_event(gp_mem_backend_handle_t h, void* out_event, size_t
 static int torch_wait_event(gp_mem_backend_handle_t h, const void* event, size_t event_size, uint64_t timeout_ms) { (void)h; (void)event; (void)event_size; (void)timeout_ms; return 0; }
 static uintptr_t torch_get_native_stream(gp_mem_backend_handle_t h) { (void)h; return 0; }
 
+extern "C" int gp_mem_backend_torch_cuda_available(void) {
+    try {
+        return torch::cuda::is_available() ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
 // Expose vtable
 extern "C" const gp_mem_backend_vtable_t g_torch_vtable_real = {
     &torch_map,

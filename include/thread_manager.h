@@ -16,6 +16,7 @@
 #include "value_types.h"
 
 struct GP_TableContext;
+class GraphRuntime;
 
 enum class ModuleRowKind : int8_t {
     Input = 0,
@@ -199,6 +200,14 @@ public:
     // Global accessor: set/get the process-global ThreadManager instance.
     static void set_global(ThreadManager* mgr);
     static ThreadManager* global();
+
+    // The GraphRuntime that owns this ThreadManager (1:1), if any. Tool
+    // dispatch (module_io_rows/module_plugin_instances lookup) reads
+    // through this instead of a process-global canvas singleton, so a
+    // ThreadManager can run a graph with no rendering context involved at
+    // all. Set once by GraphRuntime's constructor.
+    void set_graph_runtime(GraphRuntime* gr) { graph_runtime_ = gr; }
+    GraphRuntime* graph_runtime() const { return graph_runtime_; }
     // Optional per-module timing snapshot structure
     struct ModuleTiming {
         uint64_t run_count = 0;
@@ -313,6 +322,8 @@ private:
 
     void run_loop();
     void run_scheduled_tick(const TickRequest& req);
+
+    GraphRuntime* graph_runtime_ = nullptr;
 
     std::atomic<Mode> mode_{Mode::Scheduled};
     std::atomic<bool> running_{false};

@@ -145,6 +145,36 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[REL-GEO] wrote PNG: " << out_path << " (energy_max=" << energy.max_value() << ")\n";
+
+    // Scatter/gather raster path (rasterize_program_scatter_with_spatial_kernel):
+    // restored this session after sitting stubbed since f7e6e8b (2026-01-17).
+    // Renders the same program through the fast scatter-add engine instead of
+    // the kernel-transform path above, and exports its own PNG so the two are
+    // directly comparable.
+    TensorCanvas2D scatter_energy;
+    TensorCanvas2D scatter_temp;
+    ThermalSimConfig sim{};
+    ScatterTimingBreakdown scatter_timing{};
+    const bool scatter_ok = rasterize_program_scatter_with_spatial_kernel(
+        program, scatter_energy, scatter_temp, machine, xform, kernel_tool,
+        nullptr, sim, nullptr, nullptr, &scatter_timing);
+    if (!scatter_ok) {
+      std::cerr << "[REL-GEO] scatter raster failed\n";
+      return 1;
+    }
+    const std::string scatter_out_path = make_output_path_next_to_exe(
+        (argc > 0) ? argv[0] : "kpath_relgeo_scene_demo", "kpath_relgeo_scene_scatter.png");
+    nodus::tensors::AbstractTensor scatter_image = make_image_tensor_from_canvas(scatter_energy);
+    if (!export_tensor_png(scatter_image, scatter_out_path, true)) {
+      std::cerr << "Failed to write PNG: " << scatter_out_path << "\n";
+      return 1;
+    }
+    std::cout << "[REL-GEO] wrote scatter PNG: " << scatter_out_path
+              << " (energy_max=" << scatter_energy.max_value()
+              << " plan_ms=" << scatter_timing.plan_ms
+              << " deposit_ms=" << scatter_timing.deposit_ms
+              << " unique_sites=" << scatter_timing.unique_sites << ")\n";
+
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "[REL-GEO] error: " << e.what() << "\n";

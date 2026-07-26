@@ -1389,41 +1389,329 @@ bool rasterize_program_scatter_with_spatial_kernel(const ArmatureProgram& progra
                                                    AbstractTensor* temp_state,
                                                    TensorBackend* backend_override,
                                                    ScatterTimingBreakdown* timing) {
-  (void)program;
-  (void)machine;
-  (void)tool;
-  (void)diffusion_kernel;
-  (void)sim;
-  (void)temp_state;
-  (void)backend_override;
-
+  // Restored 2026-07-25: this body was stubbed out to `return false` in
+  // f7e6e8b (2026-01-17, the commit that introduced the dyadic scatter
+  // engine) and never reconnected -- kpath's scatter raster mode has been
+  // dead for six months (frontend_shell's Ctrl+Shift+K kpath toggle
+  // self-disabled on first frame; kpath_raster_tensor_demo silently showed
+  // a blank frame in its scatter/"phased mirror array" mode). The one
+  // real change from the pre-stub version: the scatter-add call at the
+  // bottom used `tensor_scatter_add_2d_f32`, which no longer exists --
+  // superseded by the canonical `tensor_scatter_2d(..., TensorTransferConfig)`
+  // API (see tensor_math.h), which as of this session has a correct,
+  // measured-fast default (naive) scatter path (dyadic is retired/opt-in).
   if (timing) *timing = {};
   const auto t_total_start = now_hr();
 
   if (xform.width_px == 0 || xform.height_px == 0) return false;
 
+  ProgramScatterPlan plan;
   {
     const auto t0 = now_hr();
-    if (out_energy.width != xform.width_px || out_energy.height != xform.height_px) {
-      out_energy.resize(xform.width_px, xform.height_px, 0.0f);
-    } else {
-      out_energy.clear(0.0f);
-    }
-    if (out_temp.width != xform.width_px || out_temp.height != xform.height_px) {
-      out_temp.resize(xform.width_px, xform.height_px, 0.0f);
-    } else {
-      out_temp.clear(0.0f);
-    }
+    if (!plan_program_scatter(program, machine, xform, &plan, true, true, backend_override)) return false;
+    const auto t1 = now_hr();
+    if (timing) timing->plan_ms += elapsed_ms(t0, t1);
+  }
+
+  if (timing) {
+    timing->program_points = static_cast<uint64_t>(program.points.size());
+  }
+
+  {
+    const auto t0 = now_hr();
+  if (out_energy.width != xform.width_px || out_energy.height != xform.height_px) {
+    out_energy.resize(xform.width_px, xform.height_px, 0.0f);
+  } else {
+    out_energy.clear(0.0f);
+  }
+  if (out_temp.width != xform.width_px || out_temp.height != xform.height_px) {
+    out_temp.resize(xform.width_px, xform.height_px, 0.0f);
+  } else {
+    out_temp.clear(0.0f);
+  }
     const auto t1 = now_hr();
     if (timing) timing->clear_ms += elapsed_ms(t0, t1);
   }
 
-  // TODO: Replace with a single rasterization technique that writes contiguous
-  // row-major outputs using integer indices (GLI), no pre-expansion.
-  // Expected shape: precomposed row-major write list for all targets.
+  TensorBackend* backend = backend_override ? backend_override : &in_memory_backend_singleton();
+  if (!backend) return false;
+  auto* mem = dynamic_cast<InMemoryBackend*>(backend);
+  if (!mem) return false;
+
+  AbstractTensor dense_points = coo_points_to_dense_f32(plan.points, backend);
+  if (!dense_points.valid()) return false;
+
+  const TensorDesc& pts_desc = dense_points.desc();
+  const TensorDesc& val_desc = plan.values->desc();
+  if (pts_desc.dtype != TensorDType::F32 || val_desc.dtype != TensorDType::F32) return false;
+  if (pts_desc.layout != TensorLayout::Dense || val_desc.layout != TensorLayout::Dense) return false;
+  if (pts_desc.shape.dims.size() != 2 || pts_desc.shape.dims[1] != 2) return false;
+  if (val_desc.shape.dims.size() != 1 || val_desc.shape.dims[0] != pts_desc.shape.dims[0]) return false;
+
+  void* pts_ptr_v = nullptr;
+  size_t pts_bytes = 0;
+  const auto t_map_start = now_hr();
+  if (!mem->map(dense_points.handle(), &pts_ptr_v, &pts_bytes)) return false;
+  void* val_ptr_v = nullptr;
+  size_t val_bytes = 0;
+  if (!mem->map(plan.values->handle(), &val_ptr_v, &val_bytes)) {
+    mem->unmap(dense_points.handle());
+    return false;
+  }
+  void* cnt_ptr_v = nullptr;
+  size_t cnt_bytes = 0;
+  if (!mem->map(plan.visit_counts->handle(), &cnt_ptr_v, &cnt_bytes)) {
+    mem->unmap(dense_points.handle());
+    mem->unmap(plan.values->handle());
+    return false;
+  }
+  const auto t_map_end = now_hr();
+  if (timing) timing->map_ms += elapsed_ms(t_map_start, t_map_end);
+
+  const float* pts = static_cast<const float*>(pts_ptr_v);
+  const float* vals = static_cast<const float*>(val_ptr_v);
+  const float* counts = static_cast<const float*>(cnt_ptr_v);
+  const SpatialKernel kernel = make_spatial_kernel(tool);
+  const float energy_to_temp = machine.energy_to_temp * sim.heat_gain;
+
+  const uint32_t n = pts_desc.shape.dims[0];
+
+  uint64_t plan_moments = 0;
+  if (timing) {
+    timing->unique_sites = static_cast<uint64_t>(n);
+  }
+
+  struct KernelOffset {
+    int dx = 0;
+    int dy = 0;
+    float w = 0.0f;
+  };
+  std::vector<KernelOffset> offsets;
+  if (kernel.radius == 0) {
+    offsets.push_back(KernelOffset{0, 0, 1.0f});
+  } else {
+    const int r = kernel.radius;
+    offsets.reserve(static_cast<size_t>((2 * r + 1) * (2 * r + 1)));
+    for (int dy = -r; dy <= r; ++dy) {
+      for (int dx = -r; dx <= r; ++dx) {
+        const float w = kernel.at(dx, dy);
+        if (w == 0.0f) continue;
+        offsets.push_back(KernelOffset{dx, dy, w});
+      }
+    }
+  }
+
+  // Prepare stamp buffer for unique pixel counting.
+  ScatterPlanScratch& scratch = scatter_plan_scratch();
+  const uint32_t w = out_energy.width;
+  const uint32_t h = out_energy.height;
+  const size_t pixel_count = static_cast<size_t>(w) * h;
+  if (scratch.pixel_stamp.size() != pixel_count) {
+    scratch.pixel_stamp.assign(pixel_count, 0u);
+    scratch.pixel_epoch = 1u;
+  } else {
+    ++scratch.pixel_epoch;
+    if (scratch.pixel_epoch == 0u) {
+      std::fill(scratch.pixel_stamp.begin(), scratch.pixel_stamp.end(), 0u);
+      scratch.pixel_epoch = 1u;
+    }
+  }
+  const uint32_t epoch = scratch.pixel_epoch;
+  uint64_t pixels_touched = 0;
+  uint64_t site_activations = 0;
+
+  auto stamp_pixel = [&](uint32_t px, uint32_t py, uint32_t visits) {
+    const size_t idx = static_cast<size_t>(py) * w + px;
+    if (scratch.pixel_stamp[idx] != epoch) {
+      scratch.pixel_stamp[idx] = epoch;
+      ++pixels_touched;
+    }
+    site_activations += static_cast<uint64_t>(visits);
+  };
+
+  uint64_t expanded_count = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t visits = static_cast<uint32_t>(std::max<int64_t>(1, std::llround(static_cast<double>(counts[i]))));
+    plan_moments += static_cast<uint64_t>(visits);
+    const int cx = static_cast<int>(std::floor(pts[i * 2 + 0]));
+    const int cy = static_cast<int>(std::floor(pts[i * 2 + 1]));
+    for (const auto& off : offsets) {
+      const int px = cx + off.dx;
+      const int py = cy + off.dy;
+      if (px < 0 || py < 0 || px >= static_cast<int>(w) || py >= static_cast<int>(h)) continue;
+      ++expanded_count;
+      stamp_pixel(static_cast<uint32_t>(px), static_cast<uint32_t>(py), visits);
+    }
+  }
+
+  AbstractTensorPool::PooledTensor expanded_points;
+  AbstractTensorPool::PooledTensor expanded_values;
+  const AbstractTensor* scatter_points = &dense_points;
+  const AbstractTensor* scatter_values = &plan.values.tensor();
+  if (offsets.size() != 1 || offsets[0].dx != 0 || offsets[0].dy != 0 || offsets[0].w != 1.0f) {
+    TensorDesc pts_expand{};
+    pts_expand.dtype = TensorDType::F32;
+    pts_expand.layout = TensorLayout::Dense;
+    pts_expand.shape.dims = {static_cast<uint32_t>(expanded_count), 2u};
+    expanded_points = scatter_plan_pool().acquire(pts_expand, backend);
+    if (!expanded_points.valid()) return false;
+
+    TensorDesc vals_expand{};
+    vals_expand.dtype = TensorDType::F32;
+    vals_expand.layout = TensorLayout::Dense;
+    vals_expand.shape.dims = {static_cast<uint32_t>(expanded_count)};
+    expanded_values = scatter_plan_pool().acquire(vals_expand, backend);
+    if (!expanded_values.valid()) return false;
+
+    void* exp_pts_v = nullptr;
+    size_t exp_pts_bytes = 0;
+    void* exp_vals_v = nullptr;
+    size_t exp_vals_bytes = 0;
+    if (!mem->map(expanded_points->handle(), &exp_pts_v, &exp_pts_bytes)) return false;
+    if (!mem->map(expanded_values->handle(), &exp_vals_v, &exp_vals_bytes)) {
+      mem->unmap(expanded_points->handle());
+      return false;
+    }
+    auto* exp_pts = static_cast<float*>(exp_pts_v);
+    auto* exp_vals = static_cast<float*>(exp_vals_v);
+
+    uint64_t write = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      const int cx = static_cast<int>(std::floor(pts[i * 2 + 0]));
+      const int cy = static_cast<int>(std::floor(pts[i * 2 + 1]));
+      const float energy = vals[i];
+      for (const auto& off : offsets) {
+        const int px = cx + off.dx;
+        const int py = cy + off.dy;
+        if (px < 0 || py < 0 || px >= static_cast<int>(w) || py >= static_cast<int>(h)) continue;
+        exp_pts[write * 2 + 0] = static_cast<float>(px);
+        exp_pts[write * 2 + 1] = static_cast<float>(py);
+        exp_vals[write] = energy * off.w;
+        ++write;
+      }
+    }
+
+    mem->unmap(expanded_points->handle());
+    mem->unmap(expanded_values->handle());
+
+    scatter_points = &expanded_points.tensor();
+    scatter_values = &expanded_values.tensor();
+  }
+
+  mem->unmap(dense_points.handle());
+  mem->unmap(plan.values->handle());
+  mem->unmap(plan.visit_counts->handle());
+
+  if (timing) {
+    timing->plan_moments = plan_moments;
+    timing->site_activations = site_activations;
+    timing->pixels_touched = pixels_touched;
+  }
+
+  TensorDesc base_desc{};
+  base_desc.dtype = TensorDType::F32;
+  base_desc.layout = TensorLayout::Dense;
+  base_desc.shape.dims = {xform.height_px, xform.width_px};
+  auto base = scatter_plan_pool().acquire(base_desc, backend);
+  if (!base.valid()) return false;
+  {
+    const auto t0 = now_hr();
+    void* base_ptr_v = nullptr;
+    size_t base_bytes = 0;
+    if (!mem->map(base->handle(), &base_ptr_v, &base_bytes)) return false;
+    std::memset(base_ptr_v, 0, base_bytes);
+    mem->unmap(base->handle());
+    const auto t1 = now_hr();
+    if (timing) timing->clear_ms += elapsed_ms(t0, t1);
+  }
+
+  AbstractTensor energy_tensor;
+  {
+    const auto t0 = now_hr();
+    TensorTransferConfig scatter_cfg{};
+    scatter_cfg.premix_scatter = TensorMixPolicy::Add;
+    scatter_cfg.postmix_scatter = TensorMixPolicy::Add;
+    scatter_cfg.clamp = true;
+    if (!tensor_scatter_2d(base.tensor(), *scatter_points, *scatter_values, &energy_tensor, scatter_cfg)) return false;
+    const auto t1 = now_hr();
+    if (timing) timing->deposit_ms += elapsed_ms(t0, t1);
+  }
+
+  {
+    const auto t0 = now_hr();
+    if (!copy_tensor_to_canvas_f32(energy_tensor, out_energy)) return false;
+    const auto t1 = now_hr();
+    if (timing) timing->diffusion_copyback_ms += elapsed_ms(t0, t1);
+  }
+
+  AbstractTensor temp_tensor;
+  if (energy_to_temp != 0.0f) {
+    temp_tensor = clone_dense_f32(energy_tensor, backend);
+    if (!temp_tensor.valid()) return false;
+    if (energy_to_temp != 1.0f) {
+      const auto t0 = now_hr();
+      if (!scale_inplace_f32(temp_tensor, energy_to_temp)) return false;
+      const auto t1 = now_hr();
+      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
+    }
+  } else {
+    temp_tensor = clone_dense_f32(base.tensor(), backend);
+    if (!temp_tensor.valid()) return false;
+  }
+
+  const float decay = std::clamp(sim.decay, 0.0f, 1.0f);
+  if (temp_state) {
+    if (!temp_state->valid()) {
+      const auto t0 = now_hr();
+      *temp_state = clone_dense_f32(temp_tensor, backend);
+      if (!temp_state->valid()) return false;
+      const auto t1 = now_hr();
+      if (timing) timing->diffusion_prep_ms += elapsed_ms(t0, t1);
+    }
+    if (decay > 0.0f && decay < 1.0f) {
+      const auto t0 = now_hr();
+      if (!scale_inplace_f32(*temp_state, decay)) return false;
+      const auto t1 = now_hr();
+      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
+    }
+    {
+      const auto t0 = now_hr();
+      if (!add_scaled_inplace_f32(*temp_state, temp_tensor, 1.0f)) return false;
+      const auto t1 = now_hr();
+      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
+    }
+    temp_tensor = AbstractTensor::wrap(temp_state->handle(), temp_state->desc(), temp_state->backend(), false);
+  } else {
+    if (decay > 0.0f && decay < 1.0f) {
+      const auto t0 = now_hr();
+      if (!scale_inplace_f32(temp_tensor, decay)) return false;
+      const auto t1 = now_hr();
+      if (timing) timing->temp_state_accum_ms += elapsed_ms(t0, t1);
+    }
+  }
+
+  if (diffusion_kernel && sim.diffusion_steps > 0) {
+    TensorDesc lap_desc = temp_tensor.desc();
+    auto lap_tensor = scatter_plan_pool().acquire(lap_desc, backend);
+    if (!lap_tensor.valid()) return false;
+    for (uint32_t i = 0; i < sim.diffusion_steps; ++i) {
+      const auto t0 = now_hr();
+      if (!tensor_apply_stencil_2d_f32_into(temp_tensor, *diffusion_kernel, &lap_tensor.tensor())) return false;
+      if (!add_scaled_inplace_f32(temp_tensor, lap_tensor.tensor(), sim.diffusion_dt)) return false;
+      const auto t1 = now_hr();
+      if (timing) timing->diffusion_iter_ms += elapsed_ms(t0, t1);
+    }
+  }
+
+  {
+    const auto t0 = now_hr();
+    if (!copy_tensor_to_canvas_f32(temp_tensor, out_temp)) return false;
+    const auto t1 = now_hr();
+    if (timing) timing->diffusion_copyback_ms += elapsed_ms(t0, t1);
+  }
 
   if (timing) timing->total_ms = elapsed_ms(t_total_start, now_hr());
-  return false;
+  return true;
 }
 
 bool project_beam_program_to_plane(const BeamProgram& beam_prog,

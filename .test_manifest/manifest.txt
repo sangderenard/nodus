@@ -1,2 +1,2 @@
-./.test_manifest/fb_25124_0.bin 1024
-./.test_manifest/fb_25124_1.bin 2048
+./.test_manifest/fb_24504_0.bin 1024
+./.test_manifest/fb_24504_1.bin 2048

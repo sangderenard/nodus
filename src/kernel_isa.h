@@ -51,6 +51,9 @@ struct Operand {
 };
 
 // Kernel IR opcodes: original 20-op set for maximal compatibility
+// [SIC 2026-07-25] "20-op set" is the original design count, preserved as-is. The enum
+// below now also appends logical ops (AND/OR/NOT/XOR), so the live total is higher. The
+// "20" reflects historical intent, not the current count.
 enum class OpCode : uint16_t {
     MODULE_BEGIN,      // env, capabilities, memory_model
     KERNEL_ENTRY,      // name, local_size_xyz, interface_signature

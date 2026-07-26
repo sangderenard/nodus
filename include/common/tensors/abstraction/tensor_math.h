@@ -22,6 +22,12 @@ void submit_row_jobs(::nodus::ThreadPool* pool,
 
 // Dense helpers for affine transforms and quaternions.
 // Note: these are in-memory backend only and return empty tensors on mismatch.
+// [SIC 2026-07-25] The note above is current and accurate, but reads like a defect --
+// it is not. Returning an empty tensor for a non-InMemoryBackend is intentional
+// prototype-stage behavior: operator semantics are proven on native memory first, and
+// cross-backend portability is a separate, later lowering step (KernelIR /
+// TranslationMatrix). Preserved as-is; do NOT "fix" this by making these ops silently
+// accept other backends.
 
 #define NODUS_TENSOR_MATH_DECL(SUFFIX, SCALAR)                                      \
     AbstractTensor tensor_matmul_##SUFFIX(const AbstractTensor& a,                  \

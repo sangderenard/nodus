@@ -15,6 +15,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -171,7 +172,13 @@ static CaseResult run_case(const char* label,
     std::vector<ValueT> values_shuf(static_cast<size_t>(index_count) * kOutChannels);
     uint32_t mismatch_count = 0;
 
-    for (uint32_t iter = 0; iter < iterations; ++iter) {
+    // iter==0 is an untimed warm-up: it pays for first-touch pool/arena
+    // allocation (and, for "small", the very first scatter call in the
+    // whole binary) so that cost doesn't pollute the p50/p90/p99 numbers
+    // below, especially for "large" where only 10 real iterations are
+    // sampled and a single cold iteration would visibly skew p90/p99.
+    for (uint32_t iter = 0; iter < iterations + 1u; ++iter) {
+        const bool is_warmup = (iter == 0u);
         for (uint32_t i = 0; i < index_count; ++i) {
             const int32_t x = dist_x(rng);
             const int32_t y = dist_y(rng);
@@ -234,6 +241,12 @@ static CaseResult run_case(const char* label,
         cfg.premix_scatter = nodus::tensors::TensorMixPolicy::Add;
         cfg.postmix_scatter = nodus::tensors::TensorMixPolicy::Add;
         cfg.clamp = true;
+        // Without this, dyadic_thread_count_from_overrides() defaults to 1
+        // (see tensor_math.cpp) and the whole multithreaded engine runs
+        // single-threaded silently -- this benchmark previously never
+        // exercised the threading it exists to validate.
+        const uint32_t hw_threads = std::thread::hardware_concurrency();
+        cfg.thread_count = hw_threads >= 2u ? hw_threads : 8u;
 
         if (!values_tensor.scatter(nodus::tensors::AbstractTensor{}, output_tensor, points_tensor, cfg)) {
             DYADIC_TEST_LOGGING(stderr, "%s: scatter failed\n", label);
@@ -259,8 +272,10 @@ static CaseResult run_case(const char* label,
 
         const double impl_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double ref_ms = std::chrono::duration<double, std::milli>(tref1 - tref0).count();
-        impl_times.push_back(impl_ms);
-        ref_times.push_back(ref_ms);
+        if (!is_warmup) {
+            impl_times.push_back(impl_ms);
+            ref_times.push_back(ref_ms);
+        }
 
         void* output_ptr = nullptr;
         size_t output_bytes = 0;

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(ls -la \"/c/dev/Powershell/turing\" 2>/dev/null | head -60)"
     ]
   }
 }

@@ -9,8 +9,11 @@
 
 namespace nodus::tensors {
 
-// Uncomment to enable pool logging while debugging.
-#define NODUS_POOL_LOGGING 1
+// Define NODUS_POOL_LOGGING (e.g. via compiler flag) to enable pool logging
+// while debugging. Was unconditionally `#define`d to 1 here -- every
+// acquire/release/create_raw call fprintf'd to stderr, which on any hot
+// path (e.g. per-page pool use inside the dyadic scatter engine) produces
+// enough serialized I/O to make otherwise-correct code look hung.
 #if defined(NODUS_POOL_LOGGING)
 #define NODUS_POOL_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
 #else

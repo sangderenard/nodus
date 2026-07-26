@@ -22,7 +22,9 @@ extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     canvas_ensure_root_table(c);
     // ensure a persistent canvas-root-reflection module is present
     canvas_ensure_root_module(c);
-    c->thread_mgr = std::make_unique<ThreadManager>();
+    // GraphRuntime's constructor already created c->thread_mgr and bound
+    // it back to `c->graph` (see GP_CanvasContextImpl's constructor /
+    // include/graph_runtime.h) -- just configure and start it here.
     c->thread_mgr->set_mode(ThreadManager::Mode::Scheduled);
     c->thread_mgr->start();
     // expose as global for table-layer integration

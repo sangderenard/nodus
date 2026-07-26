@@ -465,7 +465,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     std::vector<FrameLedSnapshot> frame_leds;
     struct FramePortSnapshot { int module_idx = -1; int row = 0; int idx = 0; uint64_t port_uuid = 0ull; };
     std::vector<FramePortSnapshot> frame_port_uuids;
-    std::vector<GP_CanvasContextImpl::NodeContract> nodes;
+    std::vector<GraphRuntime::NodeContract> nodes;
     std::unordered_map<int, std::vector<char>> module_blobs;
     std::vector<CanvasMetaSnapshot> meta_group_snapshots;
 
@@ -571,7 +571,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         } else if (tag == "FRAMEPORTUUID") {
             FramePortSnapshot fps{}; ss >> fps.module_idx >> fps.row >> fps.idx >> fps.port_uuid; frame_port_uuids.push_back(std::move(fps));
         } else if (tag == "NODE") {
-            GP_CanvasContextImpl::NodeContract nc{};
+            GraphRuntime::NodeContract nc{};
             ss >> nc.node_id >> nc.module_idx;
             int in_count = 0; ss >> in_count;
             for (int i = 0; i < in_count; ++i) { int t; ss >> t; nc.input_types.push_back(t); }
@@ -777,7 +777,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         if (c->module_node_id[i] >= 0) continue;
         int nid = ++max_node_id;
         c->module_node_id[i] = nid;
-        GP_CanvasContextImpl::NodeContract nc{};
+        GraphRuntime::NodeContract nc{};
         nc.node_id = nid;
         nc.module_idx = static_cast<int>(i);
         c->nodes.push_back(std::move(nc));

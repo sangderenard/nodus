@@ -13,7 +13,9 @@ EXPORTS
     gp_canvas_autobind_mouse_ports
     gp_canvas_bind_action_enum_to_module_port
     gp_canvas_bind_action_ptr_to_module_port
+    gp_canvas_bind_builtin_tool
     gp_canvas_bind_pending_action_to_module
+    gp_canvas_bind_plugin_tool
     gp_canvas_clear_meta_and_overlays
     gp_canvas_clear_module_bg_callback
     gp_canvas_create
@@ -125,6 +127,9 @@ EXPORTS
     gp_edge_publish_blocking
     gp_edge_publish_ptr
     gp_edge_publish_ptr_many
+    gp_kpath_plan_program_raster_transform_refined
+    gp_kpath_rasterize_program_scatter_with_spatial_kernel
+    gp_kpath_rasterize_program_with_kernel_transformed
     gp_mem_backend_create_cpu
     gp_mem_backend_create_filesystem
     gp_mem_backend_create_host

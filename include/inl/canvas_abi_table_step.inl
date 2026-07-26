@@ -63,7 +63,7 @@ extern "C" int gp_canvas_create_table(GP_CanvasContext* ctx_, int module_idx) {
     if (c->module_node_id[module_idx] < 0) {
         int nid = c->next_node_id++;
         c->module_node_id[module_idx] = nid;
-        GP_CanvasContextImpl::NodeContract nc; nc.node_id = nid; nc.module_idx = module_idx;
+        GraphRuntime::NodeContract nc; nc.node_id = nid; nc.module_idx = module_idx;
         c->nodes.push_back(std::move(nc));
     }
     // attach table to canvas sim
@@ -812,7 +812,7 @@ extern "C" int gp_canvas_attach_table(GP_CanvasContext* ctx_, int module_idx, GP
     if (c->module_node_id[module_idx] < 0) {
         int nid = c->next_node_id++;
         c->module_node_id[module_idx] = nid;
-        GP_CanvasContextImpl::NodeContract nc; nc.node_id = nid; nc.module_idx = module_idx;
+        GraphRuntime::NodeContract nc; nc.node_id = nid; nc.module_idx = module_idx;
         c->nodes.push_back(std::move(nc));
     }
     if (table) {
@@ -863,7 +863,7 @@ extern "C" int gp_canvas_attach_table(GP_CanvasContext* ctx_, int module_idx, GP
         // so the canvas knows what types this module exposes.
         if (module_idx >= 0) {
             // ensure nodes vector contains the contract for this module (created above)
-            GP_CanvasContextImpl::NodeContract* found = nullptr;
+            GraphRuntime::NodeContract* found = nullptr;
             for (auto &n : c->nodes) if (n.module_idx == module_idx) { found = &n; break; }
             if (found) {
                 found->input_types.clear();

@@ -609,22 +609,17 @@ static void module_stack_tail_write(GP_CanvasContextImpl* ctx, int module_idx, c
 static RopeSim* canvas_root_sim(GP_CanvasContextImpl* ctx);
 static RopeSim* canvas_require_root_sim(GP_CanvasContextImpl* ctx);
 
-const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx) {
-    if (!g_canvas_context_singleton) return nullptr;
-    if (module_idx < 0 || module_idx >= static_cast<int>(g_canvas_context_singleton->module_io_rows.size())) return nullptr;
-    return &g_canvas_context_singleton->module_io_rows[module_idx];
-}
-
-// Return the live plugin instance (ITool*) for the given module row, or nullptr.
-ITool* canvas_get_plugin_instance(int module_idx, int row_idx) {
-    if (!g_canvas_context_singleton) return nullptr;
-    auto *ctx = g_canvas_context_singleton;
-    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_plugin_instances.size())) return nullptr;
-    const auto &vec = ctx->module_plugin_instances[module_idx];
-    if (row_idx < 0 || row_idx >= static_cast<int>(vec.size())) return nullptr;
-    auto &p = vec[static_cast<size_t>(row_idx)];
-    return p ? p.get() : nullptr;
-}
+// NOTE: tool-binding lookup (module_io_rows) and plugin-instance dispatch
+// (module_plugin_instances) used to have free-function accessors here
+// (canvas_get_module_io_rows/canvas_get_plugin_instance), reached from
+// ThreadManager via g_canvas_context_singleton. That storage is now
+// GraphRuntime-owned (include/graph_runtime.h) and ThreadManager reads it
+// directly through its own graph_runtime() pointer -- see
+// src/thread_manager.cpp's run_scheduled_tick. ctx->module_io_rows/
+// ctx->module_plugin_instances remain valid here (reference members into
+// ctx->graph, see canvas_abi_context.inl) for canvas's own rendering code
+// (e.g. sync_module_table_io_layout), which still needs to read tool
+// bindings to lay out pixels.
 
 bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state) {
     if (!g_canvas_context_singleton || !out_state) return false;
@@ -5548,6 +5543,88 @@ static void canvas_push_plugin_tool_to_focused(GP_CanvasContextImpl* ctx, const 
 
     auto &tools = ctx->module_tool_stack[focused];
     tools.clear();
+}
+
+// Programmatic counterparts to canvas_push_tool_to_focused/canvas_push_plugin_tool_to_focused
+// above, for callers (e.g. the headless graph ABI) that supply an explicit module_idx instead
+// of relying on ctx->focused_module and simulated tool-menu clicks. They intentionally skip the
+// Keyboard/Mouse-listener row-ordering convenience the interactive menu path provides (rows
+// simply append in call order) since a headless graph builder controls call order directly.
+extern "C" int gp_canvas_bind_builtin_tool(GP_CanvasContext* ctx_, int module_idx, int tool_kind) {
+    GP_CanvasContextImpl* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx) return -1;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return -1;
+    if (module_idx >= static_cast<int>(ctx->module_tool_stack.size())) ctx->module_tool_stack.resize(module_idx + 1);
+    ensure_module_row_order(ctx, module_idx);
+    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) return -1;
+    auto &rows = ctx->module_io_rows[module_idx];
+
+    ModuleToolKind tool = static_cast<ModuleToolKind>(tool_kind);
+    ModuleIORow row;
+    row.kind = ModuleRowKind::Tool;
+    row.contact_idx = -1;
+    row.tool = tool;
+    row.attachment_count = (tool == ModuleToolKind::TableNumber) ? 1 : 0;
+    row.tool_origin = ModuleToolOrigin::Builtin;
+    rows.push_back(row);
+    int new_row_idx = static_cast<int>(rows.size()) - 1;
+
+    auto &tools = ctx->module_tool_stack[module_idx];
+    tools.clear();
+    for (const auto &r : rows) {
+        if (r.kind == ModuleRowKind::Tool) tools.push_back(r.tool);
+    }
+    sync_module_table_io_layout(ctx, module_idx);
+    return new_row_idx;
+}
+
+extern "C" int gp_canvas_bind_plugin_tool(GP_CanvasContext* ctx_, int module_idx, const char* plugin_id) {
+    GP_CanvasContextImpl* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || !plugin_id || !*plugin_id) return -1;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return -1;
+    if (module_idx >= static_cast<int>(ctx->module_tool_stack.size())) ctx->module_tool_stack.resize(module_idx + 1);
+    ensure_module_row_order(ctx, module_idx);
+    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) return -1;
+    auto &rows = ctx->module_io_rows[module_idx];
+
+    std::string pid(plugin_id);
+    ModuleIORow row;
+    row.kind = ModuleRowKind::Tool;
+    row.contact_idx = -1;
+    row.tool = ModuleToolKind::None;
+    row.attachment_count = 0;
+    row.tool_origin = ModuleToolOrigin::Plugin;
+    row.plugin_id = pid;
+    rows.push_back(row);
+    int new_row_idx = static_cast<int>(rows.size()) - 1;
+
+    if (module_idx >= static_cast<int>(ctx->module_plugin_instances.size())) ctx->module_plugin_instances.resize(module_idx + 1);
+    if (ctx->module_plugin_instances[module_idx].size() < rows.size()) ctx->module_plugin_instances[module_idx].resize(rows.size());
+
+    try {
+        auto inst = tool_registry_global().create(pid);
+        if (inst) {
+            ToolInitContext tctx{};
+            tctx.user = reinterpret_cast<void*>(static_cast<intptr_t>(module_idx));
+            try { inst->initialize(tctx); } catch (...) {}
+            ctx->module_plugin_instances[module_idx][new_row_idx] = std::move(inst);
+        }
+    } catch (...) {
+        // creation failed; leave null instance
+    }
+
+    if (const auto* entry = tool_registry_global().find(pid)) {
+        if (entry->auto_mouse_ports > 0) {
+            gp_canvas_autobind_mouse_ports(reinterpret_cast<GP_CanvasContext*>(ctx), module_idx, entry->auto_mouse_ports);
+        }
+        if (entry->auto_keyboard_ports > 0) {
+            gp_canvas_autobind_keyboard_ports(reinterpret_cast<GP_CanvasContext*>(ctx), module_idx, entry->auto_keyboard_ports);
+        }
+    }
+
+    auto &tools = ctx->module_tool_stack[module_idx];
+    tools.clear();
+    return new_row_idx;
 }
 
 static int canvas_handle_module_counter_hit(GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& found) {

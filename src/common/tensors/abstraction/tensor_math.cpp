@@ -18,11 +18,11 @@
 #include <unordered_map>
 #include <type_traits>
 
-//#if defined(NODUS_DYADIC_SCATTER_DEBUG)
+#if defined(NODUS_DYADIC_SCATTER_DEBUG)
 #define DYADIC_SCATTER_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
-//#else
-//#define DYADIC_SCATTER_LOGF(...) ((void)0)
-//#endif
+#else
+#define DYADIC_SCATTER_LOGF(...) ((void)0)
+#endif
 
 #if defined(NODUS_TENSOR_GATHER_DEBUG)
 #define TENSOR_GATHER_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
@@ -885,11 +885,17 @@ static bool build_axpby_plan(const AbstractTensor& a,
     const TensorDesc& bd = b.desc();
     const TensorDesc& od = out.desc();
 
+    if (!compute_broadcast_shape(ad, bd, plan.shape)) return false;
     plan.rank = static_cast<uint32_t>(plan.shape.size());
 
     // Out must match broadcast shape (no implicit output broadcast).
+    if (od.shape.dims.size() != plan.shape.size()) return false;
+    for (size_t i = 0; i < plan.shape.size(); ++i) {
+        if (od.shape.dims[i] != plan.shape[i]) return false;
+    }
 
     auto* mem = dynamic_cast<InMemoryBackend*>(a.backend());
+    if (!mem) return false;
 
     void* ap = nullptr;
     void* bp = nullptr;
@@ -898,10 +904,25 @@ static bool build_axpby_plan(const AbstractTensor& a,
     size_t bb = 0;
     size_t ob = 0;
 
+    if (!mem->map(a.handle(), &ap, &ab)) return false;
+    if (!mem->map(b.handle(), &bp, &bb)) {
+        mem->unmap(a.handle());
+        return false;
+    }
+    if (!mem->map(out.handle(), &op, &ob)) {
+        mem->unmap(a.handle());
+        mem->unmap(b.handle());
+        return false;
+    }
 
-    build_op_tensor(ad, plan.shape, ap, plan.a);
-    build_op_tensor(bd, plan.shape, bp, plan.b);
-    build_op_tensor(od, plan.shape, op, plan.out);
+    if (!build_op_tensor(ad, plan.shape, ap, plan.a) ||
+        !build_op_tensor(bd, plan.shape, bp, plan.b) ||
+        !build_op_tensor(od, plan.shape, op, plan.out)) {
+        mem->unmap(a.handle());
+        mem->unmap(b.handle());
+        mem->unmap(out.handle());
+        return false;
+    }
 
     plan.inner_count = plan.shape.empty() ? 1u : plan.shape.back();
     plan.outer_count = 1u;
@@ -1659,6 +1680,16 @@ struct TensorMathImpl {
 
         const bool use_affine = bd.slice.valid && bd.slice.has_affine;
 
+        // convert_points_to_int_coords' dims==2 fast path (run_xy/store_xy_i64
+        // in affine_xy.h) is documented as taking interleaved [x0,y0,x1,y1,...]
+        // points and bounds-checks component 0 against bounds[0] (x) and
+        // component 1 against bounds[1] (y) directly, with no reordering.
+        // bd.shape.dims is [height, width, channels] storage order -- passing
+        // it directly here would check x (a width-domain value) against
+        // height and y (height-domain) against width, silently dropping any
+        // point with x>=height in a non-square image. Pass width/height in
+        // the [x,y]-matching order the fast path actually expects instead.
+        const uint32_t xy_bounds[2] = {width, height};
         convert_points_to_int_coords(pd,
                                      points_ptr,
                                      count,
@@ -1666,13 +1697,20 @@ struct TensorMathImpl {
                                      false,
                                      use_affine,
                                      bd.slice.affine,
-                                     bd.shape.dims.data(),
+                                     xy_bounds,
                                      true,
                                      coords,
                                      in_bounds);
 
+        // Dyadic scatter is opt-in only (define NODUS_SCATTER_USE_DYADIC in
+        // the environment): measured 60-100x slower than the naive loop
+        // below at real scale, and confirmed to silently produce wrong
+        // output (dyadic bench test's own mismatch counts) -- it returns
+        // "success" while wrong, so a fallback-on-failure strategy alone
+        // doesn't help. This function previously had NO fallback at all if
+        // dyadic was skipped/failed; it always just returned false.
         bool dyadic_ok = false;
-        if (allow_dyadic || require_dyadic) {
+        if ((allow_dyadic || require_dyadic) && scatter_dyadic_enabled_from_env("NODUS_SCATTER_USE_DYADIC")) {
             dyadic_ok = dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
                 coord_buf,
                 count,
@@ -1688,11 +1726,45 @@ struct TensorMathImpl {
             }
         }
 
+        bool ok = dyadic_ok;
+        if (!ok) {
+            // Naive fallback: a direct bounds-checked accumulate loop,
+            // mirroring the equivalent (already-proven) loop in the generic
+            // scatter_add_nd path below.
+            MappedDense out_map = map_dense_mut(*out);
+            if (out_map.ok) {
+                std::vector<uint64_t> strides;
+                if (compute_dense_strides_u64(bd.shape.dims, strides)) {
+                    // coord[0]=x (width-domain, dim 1 in [height,width,channels]
+                    // storage), coord[1]=y (height-domain, dim 0) -- see the
+                    // xy_bounds comment above convert_points_to_int_coords.
+                    for (uint32_t i = 0; i < count; ++i) {
+                        if (!in_bounds[i]) continue;
+                        const int64_t* coord = coords + static_cast<size_t>(i) * 2u;
+                        const uint64_t base_idx = static_cast<uint64_t>(coord[1]) * strides[0] +
+                                                   static_cast<uint64_t>(coord[0]) * strides[1];
+                        if (channels == 1) {
+                            const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
+                            out_map.data[base_idx] += v;
+                        } else if (val_scalar) {
+                            const Scalar v = vmap.data[i];
+                            for (uint32_t c = 0; c < channels; ++c) out_map.data[base_idx + c] += v;
+                        } else {
+                            const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
+                            for (uint32_t c = 0; c < channels; ++c) out_map.data[base_idx + c] += src[c];
+                        }
+                    }
+                    ok = true;
+                }
+            }
+            out_map.unmap();
+        }
+
         vmap.unmap();
         release_coord_buffer(base.backend(), coord_buf);
         pmap.unmap();
 
-        return dyadic_ok;
+        return ok;
     }
 
     static bool gather_2d(const AbstractTensor& base,
@@ -2282,7 +2354,8 @@ struct TensorMathImpl {
         bmap.unmap();
         omap.unmap();
 
-        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+        if (scatter_dyadic_enabled_from_env("NODUS_SCATTER_USE_DYADIC") &&
+            dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
                 coord_buf,
                 count,
                 1u,
@@ -2447,7 +2520,8 @@ struct TensorMathImpl {
 
         bmap.unmap();
         omap.unmap();
-        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+        if (scatter_dyadic_enabled_from_env("NODUS_SCATTER_USE_DYADIC") &&
+            dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
                 coord_buf,
                 count,
                 3u,
@@ -2614,7 +2688,8 @@ struct TensorMathImpl {
 
         bmap.unmap();
         omap.unmap();
-        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+        if (scatter_dyadic_enabled_from_env("NODUS_SCATTER_USE_DYADIC") &&
+            dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
                 coord_buf,
                 count,
                 4u,
@@ -2719,14 +2794,19 @@ struct TensorMathImpl {
 
         DYADIC_SCATTER_LOGF("scatter_add_nd: params dims=%u count=%u out_rank=%zu clamp=%d\n",
                              dims, count, out_rank, clamp ? 1 : 0);
-        //return scatter_add_2d(base, points, values, out, clamp, true, true);
+        // dims==2 used to special-case into scatter_add_2d, which only ever
+        // implements the dyadic path (no naive fallback at all -- see that
+        // function). Dyadic scatter is retired as a default: measured 60-100x
+        // slower than a direct loop at real scale, and it silently produces
+        // wrong output (confirmed via the dyadic bench test's own mismatch
+        // counts) -- "succeeding" while wrong means a try-dyadic-then-
+        // fall-back-on-failure strategy doesn't help, since it never fails,
+        // it's just incorrect. Let dims==2 fall through to the generic path
+        // below like any other dims value; that path's naive per-point loop
+        // is a real, correct, already-proven implementation.
         if (dims == 1 && points_match){
             DYADIC_SCATTER_LOGF("scatter_add_nd: dispatching to scatter_add_nd_1d\n");
             return scatter_add_nd_1d(base, points, values, out, clamp);
-        }
-        if (dims == 2){
-            DYADIC_SCATTER_LOGF("scatter_add_nd: dispatching to scatter_add_2d\n");
-            return scatter_add_2d(base, points, values, out, clamp, true, true);
         }
         if (dims == 3 && points_match) {
             DYADIC_SCATTER_LOGF("scatter_add_nd: dispatching to scatter_add_nd_3d\n");    
@@ -2823,6 +2903,18 @@ struct TensorMathImpl {
         }
         int64_t* coords = coord_buf.coords_ptr;
         uint8_t* in_bounds = coord_buf.mask_ptr;
+        // convert_points_to_int_coords' dims==2 fast path (run_xy in
+        // affine_xy.h) is documented as taking interleaved [x0,y0,...]
+        // points and checks component 0 against bounds[0] (x), component 1
+        // against bounds[1] (y) directly, with no reordering -- but every
+        // other dims count uses a plain dim-for-dim conversion where
+        // bounds[d] legitimately matches bd.shape.dims[d]. Passing
+        // bd.shape.dims ([height,width,...]) straight through only for
+        // dims==2 would check x against height and y against width.
+        std::vector<uint32_t> bounds_vec(bd.shape.dims.begin(), bd.shape.dims.end());
+        if (dims == 2u && bounds_vec.size() >= 2u) {
+            std::swap(bounds_vec[0], bounds_vec[1]);
+        }
         convert_points_to_int_coords(pd,
                                      points_ptr,
                                      count,
@@ -2830,7 +2922,7 @@ struct TensorMathImpl {
                                      points_match,
                                      use_affine,
                                      bd.slice.affine,
-                                     bd.shape.dims.data(),
+                                     bounds_vec.data(),
                                      true,
                                      coords,
                                      in_bounds);
@@ -2838,11 +2930,12 @@ struct TensorMathImpl {
         bmap.unmap();
         omap.unmap();
 
-        if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+        if (scatter_dyadic_enabled_from_env("NODUS_SCATTER_USE_DYADIC") &&
+            dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
                 coord_buf,
                 count,
                 dims,
-                bd.shape.dims.data(),
+                bounds_vec.data(),
                 channels,
                 val_scalar,
                 vmap.data,
@@ -2871,12 +2964,20 @@ struct TensorMathImpl {
             }
             return false;
         }
+        // coord[d] pairs with strides[d] directly for every dims count
+        // except 2, where coord[0]=x (dim 1 in storage order) and
+        // coord[1]=y (dim 0) per the bounds_vec comment above.
         for (uint32_t i = 0; i < count; ++i) {
             if (!in_bounds[i]) continue;
             uint64_t base_idx = 0;
             const int64_t* coord = coords + static_cast<size_t>(i) * dims;
-            for (uint32_t d = 0; d < dims; ++d) {
-                base_idx += static_cast<uint64_t>(coord[d]) * strides[d];
+            if (dims == 2u) {
+                base_idx = static_cast<uint64_t>(coord[1]) * strides[0] +
+                           static_cast<uint64_t>(coord[0]) * strides[1];
+            } else {
+                for (uint32_t d = 0; d < dims; ++d) {
+                    base_idx += static_cast<uint64_t>(coord[d]) * strides[d];
+                }
             }
             if (channels == 1) {
                 const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
@@ -6834,6 +6935,12 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
 
     const bool use_affine = bd.slice.valid && bd.slice.has_affine;
 
+    // See the matching comment in scatter_add_2d: the dims==2 fast path
+    // expects interleaved [x,y] points and bounds-checks component 0
+    // against bounds[0] directly (no reordering) -- pass [width,height],
+    // not bd.shape.dims ([height,width,channels]), or x gets checked
+    // against height and y against width.
+    const uint32_t xy_bounds[2] = {width, height};
     convert_points_to_int_coords(pd,
                                  points_ptr,
                                  count,
@@ -6841,7 +6948,7 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
                                  points_match,
                                  use_affine,
                                  bd.slice.affine,
-                                 bd.shape.dims.data(),
+                                 xy_bounds,
                                  true,
                                  coords,
                                  in_bounds);
@@ -6849,7 +6956,8 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
     bmap.unmap();
     omap.unmap();
 
-    if (dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
+    if (scatter_dyadic_enabled_from_env("NODUS_SCATTER_USE_DYADIC") &&
+        dyadic_scatter_from_coords_auto<Scalar, policies::Add, policies::Add>(
             coord_buf,
             count,
             2u,
@@ -6870,6 +6978,34 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
         return true;
     }
 
+    // Naive fallback (dyadic is opt-in only -- see scatter_add_2d for why).
+    bool ok = false;
+    {
+        MappedDenseTyped<Scalar, DTypeValue> out_map = map_dense_typed<Scalar, DTypeValue>(*out);
+        std::vector<uint64_t> strides;
+        if (out_map.ok && compute_dense_strides_u64(bd.shape.dims, strides)) {
+            // coord[0]=x (width-domain, dim 1), coord[1]=y (height-domain, dim 0).
+            for (uint32_t i = 0; i < count; ++i) {
+                if (!in_bounds[i]) continue;
+                const int64_t* coord = coords + static_cast<size_t>(i) * 2u;
+                const uint64_t base_idx = static_cast<uint64_t>(coord[1]) * strides[0] +
+                                           static_cast<uint64_t>(coord[0]) * strides[1];
+                if (channels == 1) {
+                    const Scalar v = val_scalar ? vmap.data[i] : vmap.data[i * channels];
+                    out_map.data[base_idx] += v;
+                } else if (val_scalar) {
+                    const Scalar v = vmap.data[i];
+                    for (uint32_t c = 0; c < channels; ++c) out_map.data[base_idx + c] += v;
+                } else {
+                    const Scalar* src = vmap.data + static_cast<uint64_t>(i) * channels;
+                    for (uint32_t c = 0; c < channels; ++c) out_map.data[base_idx + c] += src[c];
+                }
+            }
+            ok = true;
+        }
+        out_map.unmap();
+    }
+
     vmap.unmap();
     release_coord_buffer(base.backend(), coord_buf);
     if (points_match) {
@@ -6878,7 +7014,7 @@ static bool scatter_add_2d_typed(const AbstractTensor& base,
         auto* mem = dynamic_cast<InMemoryBackend*>(base.backend());
         if (mem) mem->unmap(points.handle());
     }
-    return false;
+    return ok;
 
 }
 

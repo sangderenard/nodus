@@ -1,31 +1,43 @@
-Purpose
--------
-This folder is a standalone snapshot of the canvas + table ABIs and their minimal implementations.
-You can copy this folder into a new repository and build a small shared library plus the demo.
+# Nodus
 
-What's included
-- ABI headers: `table_abi.h`, `canvas_abi.h`, `menu_waveform_abi.h`
-- Implementations: `table_abi.cpp`, `canvas_abi.cpp`, `menu_waveform_abi.cpp`, `menu_waveform.cpp`, `rope_sim.cpp`, `text_render_helper.cpp`, `table_node_groups.cpp`
-- Helpers: `rope_sim.h`, `text_render_helper.h`, `table_node_groups.h`, `menu_waveform.hpp`
-- Demo: `demo_canvas_tables.py`
-- Build: `CMakeLists.txt`
-- Third-party: `stb_easy_font.h` (from https://github.com/nothings/stb)
+Nodus is a C++20 graph editor and runtime. What began as a compact canvas/table ABI snapshot now includes graph execution, plugin and repository ingestion, headless access, tensor-backed edge data, portable kernel IR, and browser-facing inspection surfaces.
 
-Build (from this folder)
-1. Configure/build:
+## Major surfaces
 
-	- Configure: `cmake -S . -B build`
-	- Build: `cmake --build build --config Release`
+- `include/` and `src/`: canvas, table, graph-runtime, tool, memory-backend, and headless APIs and implementations.
+- `src/common/tensors/`: handle-based tensor abstraction, backends, pooling, structured tensor mathematics, and k-path geometry/raster operations.
+- `plugins/`: dynamically loaded tools and package examples.
+- `module_library/`: graph-collapse/module tooling.
+- `tools/`: native frontends and demos.
+- `tests/`: C++ and Python regression coverage.
+- `docs/`: focused design notes and integration contracts.
 
-	vcpkg is used for dependencies. The configure step auto-detects vcpkg via `VCPKG_ROOT` / `VCPKG_INSTALLATION_ROOT`, `vcpkg` on `PATH`, or common locations like `C:/vcpkg`.
+The shared library retains the historical name `canvas_tables`; do not infer from that name that the project is limited to canvas and table widgets.
 
-	(Optional) You can also use CMake presets: `cmake --preset regular && cmake --build --preset regular-build`.
-2. `cmake --build build --config Release`
+## Build
 
-Run the demo (from this folder)
-- `python demo_canvas_tables.py --mode server --port 8000`
-- Optional: set `CANVAS_TABLES_LIB` to a full path if you want to override library discovery.
+```powershell
+cmake -S . -B build
+cmake --build build --config Release
+```
 
-Notes
-- The library name is `canvas_tables` (e.g., `canvas_tables.dll`, `libcanvas_tables.so`).
-- `text_render_helper.cpp` requires `stb_easy_font.h`, which is included in this folder.
+Vcpkg is discovered through `VCPKG_ROOT`, `VCPKG_INSTALLATION_ROOT`, `vcpkg` on `PATH`, or common installation locations. CMake presets are also available. The working tree is under active development, so build targeted components before assuming a full-tree build is green.
+
+## Run and integrate
+
+- `python demo_canvas_tables.py --mode server --port 8000` runs the historical canvas/table demo.
+- `nodus_headless_bridge.py` exposes the headless runtime to Python.
+- [`docs/BUILD_YOUR_OWN_PLUGIN.md`](docs/BUILD_YOUR_OWN_PLUGIN.md) introduces the plugin boundary.
+- [`docs/module_library_build.md`](docs/module_library_build.md) covers generated module tools.
+
+Set `CANVAS_TABLES_LIB` to override shared-library discovery when needed.
+
+## Cross-repository context
+
+- [`../NODUS_PLUCK_HANDOFF.md`](../NODUS_PLUCK_HANDOFF.md): Nodus ↔ Pluck integration.
+- [`../NODUS_TENSOR_CORE_EXTRACTION_HANDOFF.md`](../NODUS_TENSOR_CORE_EXTRACTION_HANDOFF.md): dated tensor-substrate extraction status.
+- [`../research/README.md`](../research/README.md): Turing ↔ Nodus tensor and translation research. Its conclusions are orientation, not a substitute for checking current source.
+
+## Historical note
+
+The old description of Nodus as a “standalone snapshot of the canvas + table ABIs” describes its origin, not its present scope. `README_SCAFFOLD.md` preserves related early context.

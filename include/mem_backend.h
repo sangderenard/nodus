@@ -237,6 +237,13 @@ int gp_mem_backend_unregister_gl_context(uintptr_t ctx_id);
 // Returns native context pointer or 0 if not found.
 uintptr_t gp_mem_backend_get_registered_gl_context(uintptr_t ctx_id);
 
+// Torch capability query, isolated behind the C ABI so callers never need to
+// include <torch/torch.h> just to ask "is CUDA available?". Implemented in
+// mem_backend_torch.cpp (the one translation unit allowed to depend on real
+// libtorch headers). Returns 1 if libtorch reports a usable CUDA device, 0
+// otherwise (including builds where the Torch backend isn't compiled in).
+int gp_mem_backend_torch_cuda_available(void);
+
 #ifdef __cplusplus
 }
 #endif

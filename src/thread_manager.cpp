@@ -1,5 +1,6 @@
 #include "thread_manager.h"
 
+#include "graph_runtime.h"
 #include "table_abi.h"
 #include "stage_abi.h"
 #include "canvas_abi.h"
@@ -42,7 +43,6 @@
 // EventPayload is declared in canvas_abi.h and used for pointer-mode FIFO
 // events published by the canvas.
 
-extern const std::vector<ModuleIORow>* canvas_get_module_io_rows(int module_idx);
 extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
 extern void canvas_clear_module_input_pulses(int module_idx);
 extern void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count);
@@ -55,7 +55,6 @@ GP_TableTensorToolState* get_tensor_tool_state() {
 }
 } // namespace
 extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
-extern ITool* canvas_get_plugin_instance(int module_idx, int row_idx);
 
 // Scheduling helpers used inside run_scheduled_tick.
 namespace {
@@ -691,7 +690,16 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         }
         std::vector<ModuleIORow> io_rows;
         {
-            if (const auto* rows = canvas_get_module_io_rows(mod_idx)) {
+            // Tool/plugin bindings are GraphRuntime-owned (not a canvas/
+            // rendering concern) -- read them directly from this
+            // ThreadManager's own GraphRuntime instead of a canvas
+            // singleton, so scheduling never depends on a live canvas.
+            const std::vector<ModuleIORow>* rows = nullptr;
+            if (graph_runtime_ && mod_idx >= 0 &&
+                mod_idx < static_cast<int>(graph_runtime_->module_io_rows.size())) {
+                rows = &graph_runtime_->module_io_rows[static_cast<size_t>(mod_idx)];
+            }
+            if (rows) {
                 io_rows = *rows;
             } else {
                 int row_count = gp_table_get_row_count(mod.table);
@@ -876,7 +884,13 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
             if (meta.kind == ModuleRowKind::Tool) {
                 // If this is a plugin-origin row, attempt to dispatch to the live plugin instance
                 if (meta.tool_origin == ModuleToolOrigin::Plugin) {
-                    ITool* inst = canvas_get_plugin_instance(mod_idx, row);
+                    ITool* inst = nullptr;
+                    if (graph_runtime_ && mod_idx >= 0 &&
+                        mod_idx < static_cast<int>(graph_runtime_->module_plugin_instances.size()) &&
+                        row >= 0 &&
+                        row < static_cast<int>(graph_runtime_->module_plugin_instances[static_cast<size_t>(mod_idx)].size())) {
+                        inst = graph_runtime_->module_plugin_instances[static_cast<size_t>(mod_idx)][static_cast<size_t>(row)].get();
+                    }
                     if (inst) {
                         ToolStackFrame frame{};
                         frame.raw = module_stack;

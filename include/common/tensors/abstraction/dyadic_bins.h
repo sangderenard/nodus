@@ -55,9 +55,23 @@ inline void dyadic_logf(FILE* file, const char* fmt, ...) {
     va_end(args);
 }
 } // namespace nodus::tensors
+// Was unconditionally on (fprintf per classify/tick call) -- at any
+// non-trivial index count this produces millions of log lines, making the
+// engine appear hung when it is actually just I/O-bound flushing debug
+// text. Off by default; define NODUS_DYADIC_VERBOSE_LOGGING to re-enable
+// for targeted debugging.
+#ifdef NODUS_DYADIC_VERBOSE_LOGGING
 #define DYADIC_LOGGING(...) ::nodus::tensors::dyadic_logf(__VA_ARGS__)
-//#define DYADIC_LOGGING(...) ((void)0)
+#else
+#define DYADIC_LOGGING(...) ((void)0)
+#endif
+// Same story as DYADIC_LOGGING above -- unconditionally on, separate macro,
+// same fix.
+#ifdef NODUS_DYADIC_VERBOSE_LOGGING
 #define DYADIC_TRACE_LOGF(...) std::fprintf(stderr, __VA_ARGS__)
+#else
+#define DYADIC_TRACE_LOGF(...) ((void)0)
+#endif
 constexpr uint32_t kMaxStagePages = 4096u;
 
 namespace nodus::tensors {
@@ -3571,8 +3585,15 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
             sjob.user = &scan_ctx; \
             auto sbatch = spool.submit_batch(&sjob, 1u); \
             DYADIC_LOGGING("Dyadic Binning: waiting for stage pages to drain...\n"); \
-            if (sbatch) sbatch->wait(); \
-            DYADIC_LOGGING("Dyadic Binning: stage pages drained, finalizing writes...\n"); \
+            /* dyadic_queue_scanner_job_fn's own for(;;) loop only exits once it \
+             * observes `stop`==true; that flag is set by the quiescence check \
+             * below. This detection MUST run before sbatch->wait(), not after: \
+             * waiting on the scanner batch first deadlocks, because the code \
+             * that ever sets stop=true would then be unreachable (it came after \
+             * the wait in program order) -- the calling thread blocks forever \
+             * in sbatch->wait(), and the scanner/writer threads spin at 100% \
+             * CPU forever re-checking a flag nothing will ever set. \
+             */ \
             for (;;) { \
                 bool queues_empty = true; \
                 for (uint32_t bin = 0; bin < stage_pages.total_bins; ++bin) { \
@@ -3590,6 +3611,8 @@ inline bool dyadic_emit_stage_linear(AbstractTensor& output,
                     break; \
                 } \
             } \
+            if (sbatch) sbatch->wait(); \
+            DYADIC_LOGGING("Dyadic Binning: stage pages drained, finalizing writes...\n"); \
             if (wbatch) wbatch->wait(); \
             stage_pages.stop_recycler(); \
             if (inbox_ptr_void) mem->unmap(inbox_tensor.handle()); \

@@ -412,6 +412,15 @@ int gp_canvas_get_table_tool_number(GP_CanvasContext* ctx, int* out_value);
 // Returns how many ports were bound.
 int gp_canvas_autobind_actions(GP_CanvasContext* ctx, int module_idx, const int32_t* action_ids, int action_count, int max_ports);
 int gp_canvas_autobind_mouse_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
+
+// Programmatic tool binding, factored out of the interactive tool-menu path
+// (which only ever operates on the UI's "focused module" via simulated
+// clicks). These take an explicit module_idx so a headless caller can build
+// a tool graph without any menu/window state. Both always append a new Tool
+// row to the module and return its row index, or -1 on failure. `tool_kind`
+// is a ModuleToolKind (thread_manager.h) value.
+int gp_canvas_bind_builtin_tool(GP_CanvasContext* ctx, int module_idx, int tool_kind);
+int gp_canvas_bind_plugin_tool(GP_CanvasContext* ctx, int module_idx, const char* plugin_id);
 int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
 
 // Thread manager / scheduler mode (0 = free-spinning, 1 = scheduled).

@@ -32,18 +32,7 @@
 #include "common/tensors/abstraction/kpath/kpath_raster_utils.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
-#if defined(__has_include)
-# if __has_include(<torch/torch.h>)
-#  include <torch/torch.h>
-#  define NODUS_HAVE_LIBTORCH 1
-# else
-#  define NODUS_HAVE_LIBTORCH 0
-namespace torch { class Tensor; class Device; }
-# endif
-#else
-# include <torch/torch.h>
-# define NODUS_HAVE_LIBTORCH 1
-#endif
+#include "mem_backend.h" // gp_mem_backend_torch_cuda_available() -- avoids needing <torch/torch.h> here
 #include <filesystem>
 #include <system_error>
 #ifdef _WIN32
@@ -219,8 +208,10 @@ struct FrontendResources {
     SDL_Texture* canvas_texture = nullptr;
     int canvas_texture_width = 0;
     int canvas_texture_height = 0;
-    torch::Device torch_device = torch::kCPU;
-    torch::Tensor torch_handle;
+    // Device selection is tracked as a plain string; the actual torch::Device/
+    // torch::Tensor types are never named here so this file never needs
+    // <torch/torch.h> (see gp_mem_backend_torch_cuda_available()).
+    std::string torch_device_name = "cpu";
     std::array<CanvasHead, kMaxCanvasHeads> canvas_heads{};
     size_t active_canvas_index = 0;
     CanvasCollectionState collection_state{};
@@ -2423,33 +2414,23 @@ void render_frame(FrontendResources& resources, CanvasTickController& controller
 }
 
 void prepare_torch(FrontendResources& resources, const FrontendOptions& opts) {
-    // Decide device based on options and availability
+    // Decide device based on options and availability. The CUDA probe itself
+    // runs inside mem_backend_torch.cpp (the sole translation unit that
+    // includes <torch/torch.h>); this file only ever sees a plain int/string.
     std::string dev = to_lower(opts.device);
-    bool cuda_available = false;
-    // runtime check for CUDA availability
-    try {
-        cuda_available = torch::cuda::is_available();
-    } catch (...) {
-        cuda_available = false;
-    }
+    bool cuda_available = gp_mem_backend_torch_cuda_available() != 0;
     if (dev == "cpu") {
-        resources.torch_device = torch::Device(torch::kCPU);
+        resources.torch_device_name = "cpu";
     } else if (dev == "cuda") {
         if (cuda_available) {
-            resources.torch_device = torch::Device(torch::kCUDA);
+            resources.torch_device_name = "cuda";
         } else {
             std::cerr << "Requested CUDA but CUDA not available; falling back to CPU\n";
-            resources.torch_device = torch::Device(torch::kCPU);
+            resources.torch_device_name = "cpu";
         }
     } else { // auto or unknown -> prefer CUDA if available
-        if (cuda_available) {
-            resources.torch_device = torch::Device(torch::kCUDA);
-        } else {
-            resources.torch_device = torch::Device(torch::kCPU);
-        }
+        resources.torch_device_name = cuda_available ? "cuda" : "cpu";
     }
-
-    resources.torch_handle = torch::zeros({64, 64}, torch::dtype(torch::kFloat32).device(resources.torch_device));
 
     // Apply display/workspace hints from options
     resources.canvas_width_hint = opts.width;
@@ -2459,7 +2440,7 @@ void prepare_torch(FrontendResources& resources, const FrontendOptions& opts) {
     }
 
     if (opts.verbose) {
-        std::cout << "Using Torch device: " << resources.torch_device.str() << "\n";
+        std::cout << "Using Torch device: " << resources.torch_device_name << "\n";
         std::cout << "Canvas size hint: " << resources.canvas_width_hint << "x" << resources.canvas_height_hint << "\n";
         if (!opts.workspace_path.empty()) std::cout << "Workspace: " << opts.workspace_path << "\n";
     }
@@ -2517,7 +2498,7 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    std::cout << "Torch backend: " << resources.torch_device.str() << "\n";
+    std::cout << "Torch backend: " << resources.torch_device_name << "\n";
 
     constexpr float kCanvasStepDt = 1.0f / 60.0f;
     CanvasTickController tick_controller(resources);

@@ -6,6 +6,15 @@
 typedef uint64_t (*GP_CanvasIdHookFn)(GP_CanvasContext* ctx, uint64_t hint);
 struct GP_CanvasContextImpl {
     int width=0, height=0;
+    // GraphRuntime owns tool-binding/exec-policy/scheduling state (see
+    // include/graph_runtime.h). Declared first because the reference
+    // members below alias storage inside it, and C++ initializes members
+    // in declaration order -- `graph` must exist before anything binds a
+    // reference into it. Canvas keeps read/write access to that same
+    // storage through the references (unchanged call sites), while
+    // ThreadManager (owned by `graph`) reads it directly through its own
+    // GraphRuntime pointer instead of a process-global canvas singleton.
+    std::unique_ptr<GraphRuntime> graph;
     std::vector<GP_CanvasModuleDesc> modules;
     // internal edge info bundles the desc, rope index, and per-edge hues
     struct EdgeInfo {
@@ -64,21 +73,23 @@ struct GP_CanvasContextImpl {
     };
     std::vector<ModuleBg> module_bg;
     // per-module IO counts (inputs, outputs) exposed in the control bar
-    std::vector<int> module_io_in_count;
-    std::vector<int> module_io_out_count;
-    std::vector<int> module_sim_enabled; // per-module sim enable flag (1=simulate,0=skip)
-    std::vector<int> module_skip; // per-module full-skip flag (1=skip entire module work)
-    std::vector<int> module_exec_skip_count; // per-module execution cadence skip count (0 = every frame)
+    // -- GraphRuntime-owned (feeds ThreadManager::ModuleContract directly)
+    std::vector<int>& module_io_in_count;
+    std::vector<int>& module_io_out_count;
+    std::vector<int>& module_sim_enabled; // per-module sim enable flag (1=simulate,0=skip)
+    std::vector<int>& module_skip; // per-module full-skip flag (1=skip entire module work)
+    std::vector<int>& module_exec_skip_count; // per-module execution cadence skip count (0 = every frame)
     // per-module execution mode override: -1 = use global/default, 0=Sequential, 1=Pooled, 2=Slip, 3=Free
-    std::vector<int> module_exec_mode;
+    std::vector<int>& module_exec_mode;
     std::vector<std::vector<int>> module_io_input_rows;
     std::vector<std::vector<int>> module_io_output_rows;
     std::vector<MolexLayoutInfo> module_input_layout;
     std::vector<MolexLayoutInfo> module_output_layout;
-    std::vector<std::vector<ModuleIORow>> module_io_rows;
+    // Tool/plugin bindings -- GraphRuntime-owned.
+    std::vector<std::vector<ModuleIORow>>& module_io_rows;
     // parallel structure to `module_io_rows` storing instantiated plugin tool
     // instances for plugin-origin rows; null entries indicate no instance.
-    std::vector<std::vector<std::unique_ptr<ITool, std::function<void(ITool*)>>>> module_plugin_instances;
+    std::vector<std::vector<std::unique_ptr<ITool, std::function<void(ITool*)>>>>& module_plugin_instances;
     std::vector<std::vector<ModuleIORow>> module_table_rows;
     std::vector<ModuleFrameLedGroup> module_frame_leds;
     std::vector<ModuleFrameLink> module_frame_links;
@@ -87,7 +98,8 @@ struct GP_CanvasContextImpl {
     std::vector<std::unordered_map<int, std::vector<float>>> module_stack_snapshots;
     // Per-module per-row stack item metadata: pair(type_id, element_count)
     std::vector<std::unordered_map<int, std::vector<std::pair<int,int>>>> module_stack_snapshot_meta;
-    std::vector<std::vector<ModuleToolKind>> module_tool_stack;
+    // Ordered tool-kind stack per module -- GraphRuntime-owned.
+    std::vector<std::vector<ModuleToolKind>>& module_tool_stack;
     // Action subscriber registry: map action_id -> list of (callback,user)
     std::unordered_map<int32_t, std::vector<std::pair<GP_CanvasActionSubscriberFn, void*>>> action_subscribers;
     std::mutex action_subscribers_mu;
@@ -107,7 +119,8 @@ struct GP_CanvasContextImpl {
     std::vector<int> pending_module_commits;
     // Managed event payloads stashed by the manager when delivering action
     // events to module frame ports. Keyed by (module_idx<<32)|led_idx.
-    std::unordered_map<uint64_t, void*> managed_event_payloads;
+    // GraphRuntime-owned.
+    std::unordered_map<uint64_t, void*>& managed_event_payloads;
     // cable style/hues
     int jacket_px = 4;
     int jacket_border = 2;
@@ -219,7 +232,8 @@ struct GP_CanvasContextImpl {
     // map module port UUID -> (module_idx, row, led_idx)
     std::unordered_map<uint64_t, std::array<int,3>> module_port_uuid_map;
     // Mapping from (module_idx<<32)|contact_idx -> binding id generated at bind time.
-    std::unordered_map<uint64_t, uint64_t> module_binding_id_map;
+    // GraphRuntime-owned.
+    std::unordered_map<uint64_t, uint64_t>& module_binding_id_map;
     // map overlay sentinel keys -> overlay id for fast lookup and to
     // ensure we never create duplicate overlays for the same keys
     std::unordered_map<unsigned long long, int> overlay_key_map;
@@ -295,20 +309,16 @@ struct GP_CanvasContextImpl {
     std::vector<void*> windows;
     // mapping from window pointer to stable node id for backing graph
     std::unordered_map<void*, int> window_node_ids;
-    // next unique node id for graph nodes
-    int next_node_id = 1;
-    // per-module node id (aligned with `modules`) or -1 if none
-    std::vector<int> module_node_id;
+    // next unique node id for graph nodes -- GraphRuntime-owned.
+    int& next_node_id;
+    // per-module node id (aligned with `modules`) or -1 if none --
+    // GraphRuntime-owned.
+    std::vector<int>& module_node_id;
     // per-module stable UUIDs (monotonic 64-bit). 0 == unset
     std::vector<uint64_t> module_uuids;
-    // graph node/contract representation
-    struct NodeContract {
-        int node_id = -1;
-        int module_idx = -1; // which module this node belongs to (-1 if none)
-        std::vector<int> input_types; // supported input type ids
-        std::vector<int> output_types; // supported output type ids
-    };
-    std::vector<NodeContract> nodes;
+    // graph node/contract representation -- see GraphRuntime::NodeContract
+    // (include/graph_runtime.h); GraphRuntime-owned.
+    std::vector<GraphRuntime::NodeContract>& nodes;
     // UI control bar height (in canvas-local pixels)
     int control_bar_h = 56;
     // viewport offset (world origin visible at (0,0) in screen space)
@@ -325,8 +335,29 @@ struct GP_CanvasContextImpl {
     bool thread_mgr_paused = true;
     int thread_mgr_delay_ms = 0;
     double thread_mgr_delay_accum_s = 0.0;
-    std::unique_ptr<ThreadManager> thread_mgr;
-    GP_CanvasContextImpl(int w, int h): width(w), height(h) {}
+    // The scheduler itself -- GraphRuntime-owned (constructed by
+    // GraphRuntime's own constructor, which also binds
+    // ThreadManager::set_graph_runtime(this)).
+    std::unique_ptr<ThreadManager>& thread_mgr;
+
+    GP_CanvasContextImpl(int w, int h): width(w), height(h),
+        graph(std::make_unique<GraphRuntime>()),
+        module_io_in_count(graph->module_io_in_count),
+        module_io_out_count(graph->module_io_out_count),
+        module_sim_enabled(graph->module_sim_enabled),
+        module_skip(graph->module_skip),
+        module_exec_skip_count(graph->module_exec_skip_count),
+        module_exec_mode(graph->module_exec_mode),
+        module_io_rows(graph->module_io_rows),
+        module_plugin_instances(graph->module_plugin_instances),
+        module_tool_stack(graph->module_tool_stack),
+        managed_event_payloads(graph->managed_event_payloads),
+        module_binding_id_map(graph->module_binding_id_map),
+        next_node_id(graph->next_node_id),
+        module_node_id(graph->module_node_id),
+        nodes(graph->nodes),
+        thread_mgr(graph->thread_mgr)
+    {}
 };
 
 // (global drag map removed; each canvas has its own DragState member)

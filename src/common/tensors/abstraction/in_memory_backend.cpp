@@ -127,6 +127,22 @@ struct Arena {
     uint64_t free_calls = 0;
     uint64_t alloc_fail_oom = 0;
     uint64_t free_drop_no_nodes = 0;
+
+    // Without this, the compiler-generated destructor destroys
+    // cleaner_thread directly; std::thread::~thread() calls
+    // std::terminate() if the thread is still joinable. g_arena_books
+    // (below) is a static container, so every Arena with a running
+    // background cleaner thread gets destroyed at process-exit static
+    // teardown -- previously only InMemoryBackend::reset_arena_for_testing()
+    // did the stop+join dance, and only test code that explicitly calls it
+    // was ever safe. Ordinary global destruction was not.
+    ~Arena() {
+        cleaner_stop.store(true, std::memory_order_release);
+        cleaner_cv.notify_all();
+        if (cleaner_thread.joinable()) {
+            cleaner_thread.join();
+        }
+    }
 };
 
 static std::vector<std::unique_ptr<Arena>> g_arena_books;
@@ -785,8 +801,7 @@ static bool arena_alloc(uint64_t bytes, uint64_t* out_offset, uint64_t* out_capa
                                          static_cast<unsigned long long>(g_arena.reserve_bytes));
                             return;
                         }
-                        std::fprintf(stderr,
-                                     "[in_memory_backend] dirty span memset base=%p off=%llu sz=%llu\n",
+                        NODUS_INMEM_LOGGING("[in_memory_backend] dirty span memset base=%p off=%llu sz=%llu\n",
                                      static_cast<void*>(g_arena.base),
                                      static_cast<unsigned long long>(off),
                                      static_cast<unsigned long long>(sz));

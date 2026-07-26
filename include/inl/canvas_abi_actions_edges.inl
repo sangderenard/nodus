@@ -736,8 +736,8 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
         int nb = (desc->b_module < static_cast<int>(c->module_node_id.size())) ? c->module_node_id[desc->b_module] : -1;
         if (na < 0 || nb < 0) return -1;
         // find node contracts
-        GP_CanvasContextImpl::NodeContract* nodeA = nullptr;
-        GP_CanvasContextImpl::NodeContract* nodeB = nullptr;
+        GraphRuntime::NodeContract* nodeA = nullptr;
+        GraphRuntime::NodeContract* nodeB = nullptr;
         for (auto &n : c->nodes) {
             if (n.node_id == na) nodeA = &n;
             if (n.node_id == nb) nodeB = &n;

@@ -5,6 +5,7 @@
 #include "stage_abi.h"
 #include "text_render_helper.h"
 #include "thread_manager.h"
+#include "graph_runtime.h"
 #include "module_library.h"
 #include "module_library_actualizer.h"
 #include "labels.h"

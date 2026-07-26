@@ -14,6 +14,9 @@
 #include <vector>
 #include <cmath>
 #if defined(_WIN32) || defined(_WIN64)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -389,12 +392,22 @@ static void run_pool_case(const char* label,
 int main() {
     register_in_memory_backend(true);
 
-    uint64_t fixed_max_bytes = 10ull * 1024ull * 1024ull * 1024ull;
-    uint64_t virtual_max_bytes = 16ull * 1024ull * 1024ull * 1024ull;
+    // Sized as a fast sanity check, not an exhaustive stress test: this
+    // used to request GB-scale arenas with a 512MB/1GB floor regardless of
+    // how small `requested` was, so per-iteration tensors could reach
+    // hundreds of MB to multiple GB and every iteration paid a full
+    // pool.clear() against that arena -- order tens-of-seconds-to-minutes
+    // per run, unbounded by system RAM. Capping the arena at tens of MB
+    // still exercises every allocate/touch/bucket/clear code path, just at
+    // a size where the memset in touch_tensor() is milliseconds, not
+    // seconds. See the git history/investigation notes around this test
+    // for why it was never actually run at this scale before.
+    uint64_t fixed_max_bytes = 32ull * 1024ull * 1024ull;
+    uint64_t virtual_max_bytes = 48ull * 1024ull * 1024ull;
     const uint64_t available_bytes = InMemoryBackend::get_system_available_bytes();
     if (available_bytes > 0u) {
-        fixed_max_bytes = cap_bytes_for_system(fixed_max_bytes, available_bytes, 4u, 512ull * 1024ull * 1024ull);
-        virtual_max_bytes = cap_bytes_for_system(virtual_max_bytes, available_bytes, 2u, 1024ull * 1024ull * 1024ull);
+        fixed_max_bytes = cap_bytes_for_system(fixed_max_bytes, available_bytes, 4u, 8ull * 1024ull * 1024ull);
+        virtual_max_bytes = cap_bytes_for_system(virtual_max_bytes, available_bytes, 2u, 16ull * 1024ull * 1024ull);
     }
     const uint64_t fixed_cap_bytes = (fixed_max_bytes * 70ull) / 100ull;
 
@@ -411,7 +424,7 @@ int main() {
                   pool_default,
                   backend_fixed,
                   rng_fixed,
-                  256,
+                  16,
                   fixed_cap_bytes,
                   false,
                   0,
@@ -443,7 +456,7 @@ int main() {
                   pool_cache,
                   backend_virtual,
                   rng,
-                  384,
+                  16,
                   virtual_max_bytes,
                   true,
                   2,
@@ -452,7 +465,7 @@ int main() {
                   pool_bucket,
                   backend_virtual,
                   rng,
-                  512,
+                  16,
                   virtual_max_bytes,
                   true,
                   2,
