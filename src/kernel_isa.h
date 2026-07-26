@@ -86,8 +86,20 @@ enum class OpCode : uint16_t {
 };
 
 // IR instruction
+//
+// `sub_op` supplies the operation selector that UNARY / BINARY / TERNARY / CMP / CAST
+// have always implied in their comments above ("op, x", "op, a, b", "pred, a, b",
+// "kind, x, dst_type") but never had a value space for -- so those opcodes were
+// unspecifiable and no emitter could lower them. Non-negative values are
+// `nodus::ops::CanonicalOp` (see include/canonical_ops.h, generated from
+// ops/canonical_ops.json); -1 means "not applicable to this opcode".
+//
+// Deliberately a plain int32_t rather than the enum type: kernel_isa.h stays free of
+// any dependency on the generated header. Canonical IDs are append-only catalog
+// positions; CTensorOp ordinals are a separate backend capability field.
 struct Instruction {
     OpCode op{};
+    int32_t sub_op = -1;
     std::vector<Operand> inputs;
     std::vector<ValueRef> outputs;
 };

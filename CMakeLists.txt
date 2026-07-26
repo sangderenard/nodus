@@ -372,6 +372,7 @@ add_library(nodus_tensor_core SHARED
   src/common/tensors/abstraction/abstract_tensor_pool.cpp
   src/common/tensors/abstraction/tensor_math.cpp
   src/common/tensors/abstraction/tensor_calculator_bridge.cpp
+  src/common/thread_pool.cpp
   src/mem_backend_host.cpp
   src/spirv_translation.cpp
 )
@@ -407,11 +408,58 @@ target_include_directories(edge_reader_registry_test PRIVATE
 )
 add_test(NAME edge_reader_registry_test COMMAND edge_reader_registry_test)
 
+# Canonical operation table (include/canonical_ops.h, generated from ops/canonical_ops.json).
+# Links nothing on purpose: the generated header is dependency-free and kernel_isa.h is
+# structs only, so this runs even while the canvas_tables amalgam is mid-refactor.
+add_executable(canonical_ops_test
+  tests/canonical_ops_test.cpp
+)
+target_include_directories(canonical_ops_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_features(canonical_ops_test PRIVATE cxx_std_20)
+add_test(NAME canonical_ops_test COMMAND canonical_ops_test)
+
+add_executable(bitops_lowering_test
+  tests/test_bitops_lowering.cpp
+)
+target_include_directories(bitops_lowering_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(bitops_lowering_test PRIVATE cxx_std_20)
+add_test(NAME bitops_lowering_test COMMAND bitops_lowering_test)
+
+# Guard against hand-edited generated output, and against canonical_ops.json drifting from
+# turing's CTensorOp (whose ordinals it vendors). Both are opt-in on Python being present.
+if(EXISTS "${NODUS_PYTHON_EXECUTABLE}")
+  add_test(NAME canonical_ops_generated_fresh
+    COMMAND "${NODUS_PYTHON_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ops/generate_canonical_ops.py" --check)
+  # Skips itself (exit 2) when the sibling turing checkout is absent.
+  add_test(NAME canonical_ops_agrees_with_turing
+    COMMAND "${NODUS_PYTHON_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ops/verify_canonical_ops.py")
+  set_tests_properties(canonical_ops_agrees_with_turing PROPERTIES SKIP_RETURN_CODE 2)
+endif()
+
 add_executable(tensor_calculator_bridge_test
   tests/tensor_calculator_bridge_test.cpp
 )
 target_link_libraries(tensor_calculator_bridge_test PRIVATE nodus_tensor_core)
 add_test(NAME tensor_calculator_bridge_test COMMAND tensor_calculator_bridge_test)
+
+add_executable(nodus_precomposed_calculator_benchmark
+  tools/nodus_precomposed_calculator_benchmark.cpp
+)
+target_link_libraries(
+  nodus_precomposed_calculator_benchmark PRIVATE nodus_tensor_core)
+target_compile_features(
+  nodus_precomposed_calculator_benchmark PRIVATE cxx_std_20)
+add_test(
+  NAME nodus_precomposed_calculator_benchmark_smoke
+  COMMAND nodus_precomposed_calculator_benchmark
+          --elements 32 --warmup 0 --repeats 2)
 
 add_library(tensor_calculator_bridge_compile_check OBJECT
   src/common/tensors/abstraction/tensor_calculator_bridge.cpp

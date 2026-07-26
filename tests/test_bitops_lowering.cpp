@@ -18,6 +18,9 @@ int main() {
         // SHR is encoded as OpCode::BINARY, then XOR.
         assert(b.kernel().instrs.size() == 2);
         assert(b.kernel().instrs[0].op == spirv::OpCode::BINARY);
+        assert(b.kernel().instrs[0].sub_op ==
+               static_cast<int32_t>(ops::CanonicalOp::SHR));
+        assert(b.kernel().instrs[0].inputs.size() == 2);
         expect_last_op(b.kernel(), spirv::OpCode::XOR);
     }
 
@@ -27,6 +30,8 @@ int main() {
         (void)bitops::lower_getbit_u32(b, spirv::Operand::ref(x), spirv::Operand::u(7u));
         assert(b.kernel().instrs.size() == 2);
         assert(b.kernel().instrs[0].op == spirv::OpCode::BINARY);
+        assert(b.kernel().instrs[0].sub_op ==
+               static_cast<int32_t>(ops::CanonicalOp::SHR));
         expect_last_op(b.kernel(), spirv::OpCode::AND);
     }
 
@@ -38,6 +43,8 @@ int main() {
         // Pattern: shl, not, and, and, shl, or
         assert(b.kernel().instrs.size() == 6);
         assert(b.kernel().instrs[0].op == spirv::OpCode::BINARY);
+        assert(b.kernel().instrs[0].sub_op ==
+               static_cast<int32_t>(ops::CanonicalOp::SHL));
         assert(b.kernel().instrs[1].op == spirv::OpCode::NOT);
         assert(b.kernel().instrs[2].op == spirv::OpCode::AND);
         assert(b.kernel().instrs[3].op == spirv::OpCode::AND);

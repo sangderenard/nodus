@@ -26,6 +26,7 @@ if(NODUS_CANVAS_SOURCES)
   # on one side silently failed to resolve on the other. See
   # research/12_substrate_blocker.md for the diagnosis.
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]tensors[/\\\\]abstraction[/\\\\](tensor_registry|in_memory_backend|abstract_tensor|abstract_tensor_pool|tensor_math)\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]thread_pool\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]mem_backend_host\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]spirv_translation\\.cpp$")
   target_sources(canvas_tables PRIVATE ${NODUS_CANVAS_SOURCES})
