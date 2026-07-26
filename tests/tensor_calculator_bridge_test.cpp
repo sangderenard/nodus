@@ -23,8 +23,10 @@ int main() {
     backend.unmap(input.handle());
 
     const CalculatorInstruction program[] = {
-        {TC_MUL, &temporary, &input, nullptr, 2.0, true, false},
-        {TC_ADD, &output, &temporary, nullptr, 1.0, true, false},
+        {nodus::ops::CanonicalOp::MUL,
+         &temporary, &input, nullptr, 2.0, true, false},
+        {nodus::ops::CanonicalOp::ADD,
+         &output, &temporary, nullptr, 1.0, true, false},
     };
     auto& calculator = InMemoryCalculator::instance();
     assert(calculator.available());

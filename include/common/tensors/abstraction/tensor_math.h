@@ -1,5 +1,6 @@
 #pragma once
 
+#include "canonical_ops.h"
 #include "common/tensors/abstraction/abstract_tensor.h"
 
 #include <functional>
@@ -1386,6 +1387,22 @@ bool tensor_axpby_f32(const AbstractTensor& a,
                       const AbstractTensor& b,
                       float beta,
                       AbstractTensor* out);
+
+// Canonical elementwise execution for the InMemoryBackend. These functions are
+// the CPU semantics used by the calculator, graph tools, and direct tensor
+// programs; those callers must not carry private copies of the operator math.
+bool tensor_elementwise_unary(nodus::ops::CanonicalOp op,
+                              const AbstractTensor& input,
+                              AbstractTensor* output);
+bool tensor_elementwise_binary(nodus::ops::CanonicalOp op,
+                               const AbstractTensor& left,
+                               const AbstractTensor& right,
+                               AbstractTensor* output);
+bool tensor_elementwise_scalar(nodus::ops::CanonicalOp op,
+                               const AbstractTensor& tensor,
+                               double scalar,
+                               bool scalar_on_left,
+                               AbstractTensor* output);
 
 bool tensor_pack_rgba_from_film_f32(const AbstractTensor& film,
                                      AbstractTensor* rgba,

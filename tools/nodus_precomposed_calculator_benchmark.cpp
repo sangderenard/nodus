@@ -1,6 +1,6 @@
 #include "common/tensors/abstraction/abstract_tensor.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
-#include "tensor_calculator.h"
+#include "common/tensors/abstraction/tensor_calculator_bridge.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -18,14 +18,15 @@
 namespace {
 
 using nodus::tensors::AbstractTensor;
+using nodus::tensors::CalculatorInstruction;
 using nodus::tensors::InMemoryBackend;
+using nodus::tensors::InMemoryCalculator;
 using nodus::tensors::TensorDType;
 using nodus::tensors::TensorDesc;
 
 struct Binding {
     InMemoryBackend* backend = nullptr;
     AbstractTensor* tensor = nullptr;
-    tc_tensor_handle handle = 0;
     void* data = nullptr;
 
     Binding() = default;
@@ -35,11 +36,9 @@ struct Binding {
     Binding(Binding&& other) noexcept
         : backend(other.backend),
           tensor(other.tensor),
-          handle(other.handle),
           data(other.data) {
         other.backend = nullptr;
         other.tensor = nullptr;
-        other.handle = 0;
         other.data = nullptr;
     }
 };
@@ -60,7 +59,6 @@ uint64_t parse_u64(
 }
 
 bool bind_tensor(
-    tc_calculator* calculator,
     InMemoryBackend& backend,
     AbstractTensor& tensor,
     Binding* output) {
@@ -68,26 +66,17 @@ bool bind_tensor(
     void* data = nullptr;
     size_t bytes = 0;
     if (!backend.map(tensor.handle(), &data, &bytes)) return false;
-    tc_tensor_handle handle = 0;
-    const tc_tensor_desc desc{TC_F64, tensor.desc().shape.element_count()};
-    if (tc_tensor_bind_external(calculator, desc, data, bytes, &handle) != TC_OK) {
-        backend.unmap(tensor.handle());
-        return false;
-    }
     output->backend = &backend;
     output->tensor = &tensor;
-    output->handle = handle;
     output->data = data;
     return true;
 }
 
-void release_binding(tc_calculator* calculator, Binding& binding) {
-    if (binding.handle) tc_tensor_release(calculator, binding.handle);
+void release_binding(Binding& binding) {
     if (binding.backend && binding.tensor)
         binding.backend->unmap(binding.tensor->handle());
     binding.backend = nullptr;
     binding.tensor = nullptr;
-    binding.handle = 0;
     binding.data = nullptr;
 }
 
@@ -140,21 +129,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    tc_config config{};
-    tc_calculator* calculator = tc_create(&config);
-    if (!calculator) {
-        std::cerr << "failed to create calculator\n";
-        return 1;
-    }
-
     std::vector<Binding> bindings(5);
     AbstractTensor* tensors[] = {
         &input, &negated, &exponent, &denominator, &output};
     for (size_t i = 0; i < bindings.size(); ++i) {
-        if (!bind_tensor(calculator, backend, *tensors[i], &bindings[i])) {
+        if (!bind_tensor(backend, *tensors[i], &bindings[i])) {
             std::cerr << "failed to bind Nodus tensor " << i << "\n";
-            for (auto& binding : bindings) release_binding(calculator, binding);
-            tc_destroy(calculator);
+            for (auto& binding : bindings) release_binding(binding);
             return 1;
         }
     }
@@ -165,34 +146,24 @@ int main(int argc, char** argv) {
             static_cast<double>(static_cast<int64_t>(i % 1024) - 512) / 128.0;
     }
 
-    const tc_instruction instructions[] = {
-        {TC_NEG, bindings[1].handle, bindings[0].handle,
-         TC_OPERAND_NONE, 0, 0.0, 0},
-        {TC_EXP, bindings[2].handle, bindings[1].handle,
-         TC_OPERAND_NONE, 0, 0.0, 0},
-        {TC_ADD, bindings[3].handle, bindings[2].handle,
-         TC_OPERAND_SCALAR, 0, 1.0, 0},
-        {TC_DIV, bindings[4].handle, bindings[3].handle,
-         TC_OPERAND_SCALAR, 0, 1.0, 1},
+    const CalculatorInstruction instructions[] = {
+        {nodus::ops::CanonicalOp::NEG,
+         &negated, &input, nullptr, 0.0, false, false},
+        {nodus::ops::CanonicalOp::EXP,
+         &exponent, &negated, nullptr, 0.0, false, false},
+        {nodus::ops::CanonicalOp::ADD,
+         &denominator, &exponent, nullptr, 1.0, true, false},
+        {nodus::ops::CanonicalOp::TRUEDIV,
+         &output, &denominator, nullptr, 1.0, true, true},
     };
-    const tc_program program{
-        instructions, static_cast<uint32_t>(std::size(instructions))};
-    tc_prepared_program* prepared = nullptr;
-    if (tc_prepare(calculator, &program, &prepared) != TC_OK) {
-        std::cerr << "failed to prepare calculator program\n";
-        for (auto& binding : bindings) release_binding(calculator, binding);
-        tc_destroy(calculator);
-        return 1;
-    }
+    auto& calculator = InMemoryCalculator::instance();
     const double setup_sec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - setup_started).count();
 
     for (uint64_t i = 0; i < warmup; ++i) {
-        if (tc_prepared_execute(prepared) != TC_OK) {
+        if (!calculator.execute(instructions)) {
             std::cerr << "warmup execution failed\n";
-            tc_prepared_release(prepared);
-            for (auto& binding : bindings) release_binding(calculator, binding);
-            tc_destroy(calculator);
+            for (auto& binding : bindings) release_binding(binding);
             return 1;
         }
     }
@@ -201,11 +172,9 @@ int main(int argc, char** argv) {
     timings.reserve(static_cast<size_t>(repeats));
     for (uint64_t i = 0; i < repeats; ++i) {
         const auto started = std::chrono::steady_clock::now();
-        if (tc_prepared_execute(prepared) != TC_OK) {
+        if (!calculator.execute(instructions)) {
             std::cerr << "timed execution failed\n";
-            tc_prepared_release(prepared);
-            for (auto& binding : bindings) release_binding(calculator, binding);
-            tc_destroy(calculator);
+            for (auto& binding : bindings) release_binding(binding);
             return 1;
         }
         const auto stopped = std::chrono::steady_clock::now();
@@ -244,8 +213,6 @@ int main(int argc, char** argv) {
               << "\"last\":" << result[elements - 1] << ","
               << "\"max_abs_error\":" << max_abs_error << "}\n";
 
-    tc_prepared_release(prepared);
-    for (auto& binding : bindings) release_binding(calculator, binding);
-    tc_destroy(calculator);
+    for (auto& binding : bindings) release_binding(binding);
     return std::isfinite(checksum) && max_abs_error <= 2e-12 ? 0 : 1;
 }

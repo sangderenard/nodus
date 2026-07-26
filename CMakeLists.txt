@@ -343,16 +343,6 @@ if(NODUS_DEPS_ONLY)
   return()
 endif()
 
-set(NODUS_TENSOR_CALCULATOR_ROOT
-  "${CMAKE_CURRENT_SOURCE_DIR}/../tensor-calculator"
-  CACHE PATH "Tensor Calculator source tree")
-if(EXISTS "${NODUS_TENSOR_CALCULATOR_ROOT}/CMakeLists.txt"
-   AND NOT TARGET tensor_calculator_static)
-  add_subdirectory(
-    "${NODUS_TENSOR_CALCULATOR_ROOT}"
-    "${CMAKE_CURRENT_BINARY_DIR}/tensor-calculator")
-endif()
-
 # nodus_tensor_core: the single, process-wide-shared home for the tensor
 # subsystem's stateful singletons (backend registry, the InMemoryBackend
 # instance, the default tensor pool, GP_MemBackend handle maps). Deliberately
@@ -383,13 +373,6 @@ target_include_directories(nodus_tensor_core PUBLIC
 )
 set_target_properties(nodus_tensor_core PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_compile_features(nodus_tensor_core PUBLIC cxx_std_20)
-if(TARGET tensor_calculator_static)
-  target_link_libraries(nodus_tensor_core PUBLIC tensor_calculator_static)
-else()
-  message(FATAL_ERROR
-    "Nodus tensor core requires Tensor Calculator at "
-    "${NODUS_TENSOR_CALCULATOR_ROOT}")
-endif()
 
 add_library(canvas_tables SHARED
   # sources are now gathered from src/ via cmake/auto_sources.cmake
@@ -468,7 +451,7 @@ target_include_directories(tensor_calculator_bridge_compile_check PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 target_link_libraries(
-  tensor_calculator_bridge_compile_check PRIVATE tensor_calculator_static)
+  tensor_calculator_bridge_compile_check PRIVATE nodus_tensor_core)
 target_compile_features(
   tensor_calculator_bridge_compile_check PRIVATE cxx_std_20)
 

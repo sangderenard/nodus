@@ -7649,6 +7649,216 @@ struct TensorOpThreadOverrideGuard {
     return pool;
 }
 
+template <class Scalar>
+static Scalar canonical_unary_value(nodus::ops::CanonicalOp op, Scalar value) {
+    using Op = nodus::ops::CanonicalOp;
+    switch (op) {
+        case Op::SQRT: return static_cast<Scalar>(std::sqrt(value));
+        case Op::EXP: return static_cast<Scalar>(std::exp(value));
+        case Op::LOG: return static_cast<Scalar>(std::log(value));
+        case Op::NEG: return -value;
+        case Op::ABS: return static_cast<Scalar>(std::abs(value));
+        case Op::ROUND: return static_cast<Scalar>(std::round(value));
+        case Op::TRUNC: return static_cast<Scalar>(std::trunc(value));
+        case Op::FLOOR: return static_cast<Scalar>(std::floor(value));
+        case Op::CEIL: return static_cast<Scalar>(std::ceil(value));
+        case Op::ISFINITE: return static_cast<Scalar>(std::isfinite(value));
+        case Op::ISNAN: return static_cast<Scalar>(std::isnan(value));
+        case Op::ISINF: return static_cast<Scalar>(std::isinf(value));
+        case Op::LOGICAL_NOT: return static_cast<Scalar>(!value);
+        default: return std::numeric_limits<Scalar>::quiet_NaN();
+    }
+}
+
+template <class Scalar>
+static Scalar canonical_binary_value(
+    nodus::ops::CanonicalOp op, Scalar left, Scalar right) {
+    using Op = nodus::ops::CanonicalOp;
+    switch (op) {
+        case Op::ADD: return left + right;
+        case Op::SUB: return left - right;
+        case Op::MUL: return left * right;
+        case Op::TRUEDIV: return left / right;
+        case Op::POW: return static_cast<Scalar>(std::pow(left, right));
+        case Op::MOD: return left - std::floor(left / right) * right;
+        case Op::FLOORDIV: return static_cast<Scalar>(std::floor(left / right));
+        case Op::LESS: return static_cast<Scalar>(left < right);
+        case Op::LESS_EQUAL: return static_cast<Scalar>(left <= right);
+        case Op::GREATER: return static_cast<Scalar>(left > right);
+        case Op::GREATER_EQUAL: return static_cast<Scalar>(left >= right);
+        case Op::EQUAL: return static_cast<Scalar>(left == right);
+        case Op::NOT_EQUAL: return static_cast<Scalar>(left != right);
+        case Op::MAXIMUM: return std::max(left, right);
+        case Op::MINIMUM: return std::min(left, right);
+        default: return std::numeric_limits<Scalar>::quiet_NaN();
+    }
+}
+
+static bool canonical_is_unary(nodus::ops::CanonicalOp op) {
+    using Op = nodus::ops::CanonicalOp;
+    return op >= Op::SQRT && op <= Op::LOGICAL_NOT;
+}
+
+static bool canonical_is_binary(nodus::ops::CanonicalOp op) {
+    using Op = nodus::ops::CanonicalOp;
+    return (op >= Op::ADD && op <= Op::FLOORDIV) ||
+           (op >= Op::LESS && op <= Op::MINIMUM);
+}
+
+template <class Scalar>
+static void elementwise_range(
+    const TensorOpPlan& plan,
+    nodus::ops::CanonicalOp op,
+    bool has_right_tensor,
+    Scalar right_scalar,
+    bool scalar_on_left,
+    uint64_t outer_begin,
+    uint64_t outer_end) {
+    const uint64_t inner = plan.inner_count;
+    const size_t rank = plan.shape.size();
+    auto* left_base = static_cast<uint8_t*>(plan.a.base);
+    auto* right_base = static_cast<uint8_t*>(plan.b.base);
+    auto* output_base = static_cast<uint8_t*>(plan.out.base);
+
+    for (uint64_t outer_index = outer_begin; outer_index < outer_end; ++outer_index) {
+        uint64_t left_offset = 0;
+        uint64_t right_offset = 0;
+        uint64_t output_offset = 0;
+        if (rank > 1) {
+            uint64_t remaining = outer_index;
+            for (size_t dimension = 0; dimension < plan.outer_shape.size(); ++dimension) {
+                const uint64_t stride = plan.outer_strides[dimension];
+                const uint64_t coordinate =
+                    stride == 0 ? 0 : remaining / stride;
+                remaining = stride == 0 ? remaining : remaining % stride;
+                left_offset += coordinate * plan.a.byte_strides[dimension];
+                if (has_right_tensor)
+                    right_offset += coordinate * plan.b.byte_strides[dimension];
+                output_offset += coordinate * plan.out.byte_strides[dimension];
+            }
+        }
+        auto* left = reinterpret_cast<Scalar*>(left_base + left_offset);
+        auto* right = has_right_tensor
+            ? reinterpret_cast<Scalar*>(right_base + right_offset)
+            : nullptr;
+        auto* output = reinterpret_cast<Scalar*>(output_base + output_offset);
+        const uint64_t left_step =
+            rank == 0 ? 0 : plan.a.byte_strides.back() / sizeof(Scalar);
+        const uint64_t right_step =
+            !has_right_tensor || rank == 0
+                ? 0
+                : plan.b.byte_strides.back() / sizeof(Scalar);
+        const uint64_t output_step =
+            rank == 0 ? 0 : plan.out.byte_strides.back() / sizeof(Scalar);
+
+        uint64_t li = 0;
+        uint64_t ri = 0;
+        uint64_t oi = 0;
+        for (uint64_t index = 0; index < inner; ++index) {
+            if (canonical_is_unary(op)) {
+                output[oi] = canonical_unary_value(op, left[li]);
+            } else {
+                const Scalar rhs = has_right_tensor ? right[ri] : right_scalar;
+                output[oi] = scalar_on_left
+                    ? canonical_binary_value(op, rhs, left[li])
+                    : canonical_binary_value(op, left[li], rhs);
+            }
+            li += left_step;
+            ri += right_step;
+            oi += output_step;
+        }
+    }
+}
+
+template <class Scalar>
+static bool execute_elementwise_plan(
+    const TensorOpPlan& plan,
+    nodus::ops::CanonicalOp op,
+    bool has_right_tensor,
+    double right_scalar,
+    bool scalar_on_left) {
+    if ((canonical_is_unary(op) && has_right_tensor) ||
+        (!canonical_is_unary(op) && !canonical_is_binary(op)))
+        return false;
+    elementwise_range<Scalar>(
+        plan,
+        op,
+        has_right_tensor,
+        static_cast<Scalar>(right_scalar),
+        scalar_on_left,
+        0,
+        plan.outer_count);
+    return true;
+}
+
+static bool same_elementwise_dtype(
+    const AbstractTensor& input, const AbstractTensor& output) {
+    return input.valid() && output.valid() &&
+           input.backend() == output.backend() &&
+           input.desc().dtype == output.desc().dtype &&
+           (input.desc().dtype == TensorDType::F32 ||
+            input.desc().dtype == TensorDType::F64);
+}
+
+bool tensor_elementwise_unary(
+    nodus::ops::CanonicalOp op,
+    const AbstractTensor& input,
+    AbstractTensor* output) {
+    if (!output || !same_elementwise_dtype(input, *output) ||
+        !canonical_is_unary(op))
+        return false;
+    TensorOpPlan plan{};
+    if (!build_unary_plan(input, *output, plan)) return false;
+    const bool ok = input.desc().dtype == TensorDType::F32
+        ? execute_elementwise_plan<float>(plan, op, false, 0.0, false)
+        : execute_elementwise_plan<double>(plan, op, false, 0.0, false);
+    auto* backend = dynamic_cast<InMemoryBackend*>(input.backend());
+    backend->unmap(output->handle());
+    backend->unmap(input.handle());
+    return ok;
+}
+
+bool tensor_elementwise_binary(
+    nodus::ops::CanonicalOp op,
+    const AbstractTensor& left,
+    const AbstractTensor& right,
+    AbstractTensor* output) {
+    if (!output || !same_elementwise_dtype(left, *output) ||
+        !same_elementwise_dtype(right, *output) ||
+        left.backend() != right.backend() || !canonical_is_binary(op))
+        return false;
+    TensorOpPlan plan{};
+    if (!build_axpby_plan(left, right, *output, plan)) return false;
+    const bool ok = left.desc().dtype == TensorDType::F32
+        ? execute_elementwise_plan<float>(plan, op, true, 0.0, false)
+        : execute_elementwise_plan<double>(plan, op, true, 0.0, false);
+    auto* backend = dynamic_cast<InMemoryBackend*>(left.backend());
+    backend->unmap(output->handle());
+    backend->unmap(right.handle());
+    backend->unmap(left.handle());
+    return ok;
+}
+
+bool tensor_elementwise_scalar(
+    nodus::ops::CanonicalOp op,
+    const AbstractTensor& tensor,
+    double scalar,
+    bool scalar_on_left,
+    AbstractTensor* output) {
+    if (!output || !same_elementwise_dtype(tensor, *output) ||
+        !canonical_is_binary(op))
+        return false;
+    TensorOpPlan plan{};
+    if (!build_unary_plan(tensor, *output, plan)) return false;
+    const bool ok = tensor.desc().dtype == TensorDType::F32
+        ? execute_elementwise_plan<float>(plan, op, false, scalar, scalar_on_left)
+        : execute_elementwise_plan<double>(plan, op, false, scalar, scalar_on_left);
+    auto* backend = dynamic_cast<InMemoryBackend*>(tensor.backend());
+    backend->unmap(output->handle());
+    backend->unmap(tensor.handle());
+    return ok;
+}
+
 bool tensor_axpby_f32(const AbstractTensor& a,
                       float alpha,
                       const AbstractTensor& b,
