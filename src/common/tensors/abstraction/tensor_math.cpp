@@ -7666,6 +7666,18 @@ static Scalar canonical_unary_value(nodus::ops::CanonicalOp op, Scalar value) {
         case Op::ISNAN: return static_cast<Scalar>(std::isnan(value));
         case Op::ISINF: return static_cast<Scalar>(std::isinf(value));
         case Op::LOGICAL_NOT: return static_cast<Scalar>(!value);
+        case Op::TANH: return static_cast<Scalar>(std::tanh(value));
+        case Op::SIN: return static_cast<Scalar>(std::sin(value));
+        case Op::COS: return static_cast<Scalar>(std::cos(value));
+        case Op::TAN: return static_cast<Scalar>(std::tan(value));
+        case Op::ASIN: return static_cast<Scalar>(std::asin(value));
+        case Op::ACOS: return static_cast<Scalar>(std::acos(value));
+        case Op::ATAN: return static_cast<Scalar>(std::atan(value));
+        case Op::SINH: return static_cast<Scalar>(std::sinh(value));
+        case Op::COSH: return static_cast<Scalar>(std::cosh(value));
+        case Op::ASINH: return static_cast<Scalar>(std::asinh(value));
+        case Op::ACOSH: return static_cast<Scalar>(std::acosh(value));
+        case Op::ATANH: return static_cast<Scalar>(std::atanh(value));
         default: return std::numeric_limits<Scalar>::quiet_NaN();
     }
 }
@@ -7696,7 +7708,8 @@ static Scalar canonical_binary_value(
 
 static bool canonical_is_unary(nodus::ops::CanonicalOp op) {
     using Op = nodus::ops::CanonicalOp;
-    return op >= Op::SQRT && op <= Op::LOGICAL_NOT;
+    return (op >= Op::SQRT && op <= Op::LOGICAL_NOT) ||
+           (op >= Op::SIN && op <= Op::ATANH);
 }
 
 static bool canonical_is_binary(nodus::ops::CanonicalOp op) {

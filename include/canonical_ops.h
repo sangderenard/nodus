@@ -54,18 +54,18 @@ enum class CanonicalOp : uint16_t {
     MINIMUM = 27,  // CT_OP_MINIMUM
     SIGN = 28,
     INVERT = 29,
-    SIN = 30,
-    COS = 31,
-    TAN = 32,
-    ASIN = 33,
-    ACOS = 34,
-    ATAN = 35,
-    SINH = 36,
-    COSH = 37,
-    TANH = 38,
-    ASINH = 39,
-    ACOSH = 40,
-    ATANH = 41,
+    SIN = 30,  // CT_OP_SIN
+    COS = 31,  // CT_OP_COS
+    TAN = 32,  // CT_OP_TAN
+    ASIN = 33,  // CT_OP_ASIN
+    ACOS = 34,  // CT_OP_ACOS
+    ATAN = 35,  // CT_OP_ATAN
+    SINH = 36,  // CT_OP_SINH
+    COSH = 37,  // CT_OP_COSH
+    TANH = 38,  // CT_OP_TANH
+    ASINH = 39,  // CT_OP_ASINH
+    ACOSH = 40,  // CT_OP_ACOSH
+    ATANH = 41,  // CT_OP_ATANH
     BITAND = 42,
     BITOR = 43,
     BITXOR = 44,
@@ -141,18 +141,18 @@ inline constexpr OpDesc kOps[] = {
     {"minimum", 27, OpClass::Binary, 27, "CT_OP_MINIMUM", 2, false, true, false, "BINARY", "", ""},
     {"sign", 28, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "", ""},
     {"invert", 29, OpClass::Unary, -1, "", 1, false, true, false, "NOT", "Not", ""},
-    {"sin", 30, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"cos", 31, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"tan", 32, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"asin", 33, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"acos", 34, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"atan", 35, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"sinh", 36, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"cosh", 37, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"tanh", 38, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"asinh", 39, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"acosh", 40, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
-    {"atanh", 41, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "Call", ""},
+    {"sin", 30, OpClass::Unary, 29, "CT_OP_SIN", 1, false, true, false, "UNARY", "Call", ""},
+    {"cos", 31, OpClass::Unary, 30, "CT_OP_COS", 1, false, true, false, "UNARY", "Call", ""},
+    {"tan", 32, OpClass::Unary, 31, "CT_OP_TAN", 1, false, true, false, "UNARY", "Call", ""},
+    {"asin", 33, OpClass::Unary, 32, "CT_OP_ASIN", 1, false, true, false, "UNARY", "Call", ""},
+    {"acos", 34, OpClass::Unary, 33, "CT_OP_ACOS", 1, false, true, false, "UNARY", "Call", ""},
+    {"atan", 35, OpClass::Unary, 34, "CT_OP_ATAN", 1, false, true, false, "UNARY", "Call", ""},
+    {"sinh", 36, OpClass::Unary, 35, "CT_OP_SINH", 1, false, true, false, "UNARY", "Call", ""},
+    {"cosh", 37, OpClass::Unary, 36, "CT_OP_COSH", 1, false, true, false, "UNARY", "Call", ""},
+    {"tanh", 38, OpClass::Unary, 28, "CT_OP_TANH", 1, false, true, false, "UNARY", "Call", ""},
+    {"asinh", 39, OpClass::Unary, 37, "CT_OP_ASINH", 1, false, true, false, "UNARY", "Call", ""},
+    {"acosh", 40, OpClass::Unary, 38, "CT_OP_ACOSH", 1, false, true, false, "UNARY", "Call", ""},
+    {"atanh", 41, OpClass::Unary, 39, "CT_OP_ATANH", 1, false, true, false, "UNARY", "Call", ""},
     {"bitand", 42, OpClass::Binary, -1, "", 2, false, true, false, "AND", "And", ""},
     {"bitor", 43, OpClass::Binary, -1, "", 2, false, true, false, "OR", "Or", ""},
     {"bitxor", 44, OpClass::Binary, -1, "", 2, false, true, false, "XOR", "Xor", ""},

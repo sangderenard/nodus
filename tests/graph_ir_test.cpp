@@ -3,10 +3,12 @@
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
+#include "canonical_ops.h"
 #include "tool_registry.h"
 
 #include "common/tensors/abstraction/kpath/kpath_relgeo.h"
 
+#include <cmath>
 #include <iostream>
 #include <string>
 
@@ -82,7 +84,15 @@ int main() {
   {
     ToolRegistry registry;
     const size_t registered = register_abstract_tensor_tool_ir(registry);
-    if (!require_or_report(registered == 28, "register 28 elementwise tensor tools"))
+    size_t expected_registered = 0;
+    for (const auto& descriptor : nodus::ops::kOps) {
+      expected_registered +=
+          descriptor.ct_value >= 0 &&
+          (descriptor.arity == 1 || descriptor.arity == 2);
+    }
+    if (!require_or_report(
+            registered == expected_registered,
+            "register every native canonical elementwise tensor tool"))
       return 1;
     auto add = registry.create("abstract_tensor.add");
     if (!require_or_report(add != nullptr, "create abstract_tensor.add ToolIR"))
@@ -130,8 +140,37 @@ int main() {
     delete output;
     delete right;
     delete left;
-    raw_stack_free_mask(raw);
     if (!require_or_report(correct, "execute tensor add through ToolIR stack"))
+      return 1;
+
+    auto tanh = registry.create("abstract_tensor.tanh");
+    if (!require_or_report(tanh != nullptr, "create abstract_tensor.tanh ToolIR"))
+      return 1;
+    auto* unary_input = new AbstractTensor(desc, &backend);
+    backend.map(unary_input->handle(), &data, &bytes);
+    values = static_cast<double*>(data);
+    values[0] = -1.0; values[1] = 0.0; values[2] = 1.0;
+    backend.unmap(unary_input->handle());
+    void* unary_pointer = unary_input;
+    raw_stack_push_typed(raw, &unary_pointer, pointer_type);
+    tanh->execute_stack(context);
+    output_pointer = nullptr;
+    const bool unary_popped =
+        raw_stack_pop_typed(raw, &output_pointer, pointer_type) != 0;
+    output = static_cast<AbstractTensor*>(output_pointer);
+    correct = unary_popped && output && output->valid() &&
+              backend.map(output->handle(), &data, &bytes);
+    if (correct) {
+      values = static_cast<double*>(data);
+      correct = std::abs(values[0] + std::tanh(1.0)) < 1e-12 &&
+                values[1] == 0.0 &&
+                std::abs(values[2] - std::tanh(1.0)) < 1e-12;
+      backend.unmap(output->handle());
+    }
+    delete output;
+    delete unary_input;
+    raw_stack_free_mask(raw);
+    if (!require_or_report(correct, "execute tensor tanh through ToolIR stack"))
       return 1;
   }
 
