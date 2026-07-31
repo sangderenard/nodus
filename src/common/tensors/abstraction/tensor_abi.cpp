@@ -13,7 +13,10 @@
 #include <algorithm>
 #include <cstring>
 
+#include "canonical_ops.h"
+#include "common/tensors/abstraction/abstract_tensor.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/tensor_math.h"
 #include "common/tensors/abstraction/tensor_types.h"
 
 namespace {
@@ -64,6 +67,32 @@ uint64_t payload_bytes(const TensorDesc& desc) {
         return (furthest + 1) * element_bytes;
     }
     return desc.shape.element_count() * element_bytes;
+}
+
+bool op_from_int(int32_t value, nodus::ops::CanonicalOp* out) {
+    if (value < 0 || value > static_cast<int32_t>(nodus::ops::CanonicalOp::COUNT)) {
+        return false;
+    }
+    *out = static_cast<nodus::ops::CanonicalOp>(static_cast<uint16_t>(value));
+    return true;
+}
+
+// A borrowed AbstractTensor over a handle the ABI already owns. AbstractTensor
+// is move-only and its destructor releases what it owns, so every wrapper here
+// is explicitly non-owning: the caller's handle outlives the call, and
+// destroying it here would free a tensor the caller still holds.
+struct Wrapped {
+    nodus::tensors::AbstractTensor tensor;
+};
+
+bool wrap_handle(uint64_t handle, Wrapped* out) {
+    TensorDesc desc{};
+    if (!backend().describe(to_handle(handle), &desc)) {
+        return false;
+    }
+    out->tensor = nodus::tensors::AbstractTensor::wrap(
+        to_handle(handle), desc, &backend(), /*owns_handle=*/false);
+    return true;
 }
 
 }  // namespace
@@ -314,6 +343,59 @@ int32_t nodus_tensor_allocation(uint64_t handle,
         *out_bucket = info.bucket;
     }
     return info.alive ? NODUS_OK : NODUS_ERR_UNKNOWN_HANDLE;
+}
+
+int32_t nodus_tensor_unary(int32_t op, uint64_t input, uint64_t output) {
+    nodus::ops::CanonicalOp typed{};
+    if (!op_from_int(op, &typed) || !input || !output) {
+        return NODUS_ERR_INVALID_ARG;
+    }
+    Wrapped in_wrap;
+    Wrapped out_wrap;
+    if (!wrap_handle(input, &in_wrap) || !wrap_handle(output, &out_wrap)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    return nodus::tensors::tensor_elementwise_unary(
+               typed, in_wrap.tensor, &out_wrap.tensor)
+               ? NODUS_OK
+               : NODUS_ERR_UNSUPPORTED;
+}
+
+int32_t nodus_tensor_binary(int32_t op, uint64_t left, uint64_t right,
+                            uint64_t output) {
+    nodus::ops::CanonicalOp typed{};
+    if (!op_from_int(op, &typed) || !left || !right || !output) {
+        return NODUS_ERR_INVALID_ARG;
+    }
+    Wrapped left_wrap;
+    Wrapped right_wrap;
+    Wrapped out_wrap;
+    if (!wrap_handle(left, &left_wrap) || !wrap_handle(right, &right_wrap) ||
+        !wrap_handle(output, &out_wrap)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    return nodus::tensors::tensor_elementwise_binary(
+               typed, left_wrap.tensor, right_wrap.tensor, &out_wrap.tensor)
+               ? NODUS_OK
+               : NODUS_ERR_UNSUPPORTED;
+}
+
+int32_t nodus_tensor_scalar(int32_t op, uint64_t tensor, double scalar,
+                            int32_t scalar_on_left, uint64_t output) {
+    nodus::ops::CanonicalOp typed{};
+    if (!op_from_int(op, &typed) || !tensor || !output) {
+        return NODUS_ERR_INVALID_ARG;
+    }
+    Wrapped in_wrap;
+    Wrapped out_wrap;
+    if (!wrap_handle(tensor, &in_wrap) || !wrap_handle(output, &out_wrap)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    return nodus::tensors::tensor_elementwise_scalar(
+               typed, in_wrap.tensor, scalar, scalar_on_left != 0,
+               &out_wrap.tensor)
+               ? NODUS_OK
+               : NODUS_ERR_UNSUPPORTED;
 }
 
 uint32_t nodus_tensor_dtype_size(int32_t dtype) {

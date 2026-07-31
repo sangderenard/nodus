@@ -140,6 +140,30 @@ int32_t nodus_tensor_allocation(uint64_t handle,
 
 uint32_t nodus_tensor_dtype_size(int32_t dtype);
 
+// -- operators -----------------------------------------------------------
+//
+// Dispatched by nodus::ops::CanonicalOp rather than one entry point per
+// operation: the operator table already exists, the CT_OP_* codes it carries
+// already agree with the caller's, and a per-operation ABI would be a second
+// copy of that agreement that could drift from it.
+//
+// These call tensor_elementwise_* directly, which the tensor math header
+// names as the CPU semantics every caller must share instead of keeping a
+// private copy of the operator math.
+
+// Arity is deliberately not exposed here. The classification lives inside
+// tensor_math.cpp as file-static range checks over the enum, and re-deriving
+// it at this boundary would be a second copy of the operator table that could
+// disagree with the first. A caller routes from its own canonical table.
+
+int32_t nodus_tensor_unary(int32_t op, uint64_t input, uint64_t output);
+int32_t nodus_tensor_binary(int32_t op, uint64_t left, uint64_t right,
+                            uint64_t output);
+// scalar_on_left distinguishes ``scalar - tensor`` from ``tensor - scalar``;
+// for a commutative op it makes no difference and may be 0.
+int32_t nodus_tensor_scalar(int32_t op, uint64_t tensor, double scalar,
+                            int32_t scalar_on_left, uint64_t output);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
