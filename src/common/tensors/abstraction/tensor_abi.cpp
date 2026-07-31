@@ -232,11 +232,22 @@ int64_t nodus_tensor_write(uint64_t handle, uint64_t byte_offset,
     if (!handle || !source) {
         return NODUS_ERR_INVALID_ARG;
     }
+    TensorDesc desc{};
+    if (!backend().describe(to_handle(handle), &desc)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
     void* data = nullptr;
     size_t mapped = 0;
     if (!backend().map(to_handle(handle), &data, &mapped)) {
         return NODUS_ERR_UNKNOWN_HANDLE;
     }
+    // The lease is aligned up (64 bytes), so it is routinely larger than the
+    // tensor. Clamping to the mapping would let a caller run past the
+    // tensor's own extent and still land inside allocated memory, which is
+    // the kind of overrun that is not caught until something else reads it.
+    const uint64_t limit =
+        std::min<uint64_t>(payload_bytes(desc), static_cast<uint64_t>(mapped));
+    mapped = static_cast<size_t>(limit);
     int64_t written = 0;
     if (byte_offset < static_cast<uint64_t>(mapped)) {
         const uint64_t room = static_cast<uint64_t>(mapped) - byte_offset;
@@ -254,11 +265,22 @@ int64_t nodus_tensor_read(uint64_t handle, uint64_t byte_offset,
     if (!handle || !destination) {
         return NODUS_ERR_INVALID_ARG;
     }
+    TensorDesc desc{};
+    if (!backend().describe(to_handle(handle), &desc)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
     void* data = nullptr;
     size_t mapped = 0;
     if (!backend().map(to_handle(handle), &data, &mapped)) {
         return NODUS_ERR_UNKNOWN_HANDLE;
     }
+    // The lease is aligned up (64 bytes), so it is routinely larger than the
+    // tensor. Clamping to the mapping would let a caller run past the
+    // tensor's own extent and still land inside allocated memory, which is
+    // the kind of overrun that is not caught until something else reads it.
+    const uint64_t limit =
+        std::min<uint64_t>(payload_bytes(desc), static_cast<uint64_t>(mapped));
+    mapped = static_cast<size_t>(limit);
     int64_t got = 0;
     if (byte_offset < static_cast<uint64_t>(mapped)) {
         const uint64_t room = static_cast<uint64_t>(mapped) - byte_offset;
