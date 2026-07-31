@@ -358,6 +358,7 @@ endif()
 add_library(nodus_tensor_core SHARED
   src/common/tensors/abstraction/tensor_registry.cpp
   src/common/tensors/abstraction/in_memory_backend.cpp
+  src/common/tensors/abstraction/tensor_abi.cpp
   src/common/tensors/abstraction/abstract_tensor.cpp
   src/common/tensors/abstraction/abstract_tensor_pool.cpp
   src/common/tensors/abstraction/tensor_math.cpp
