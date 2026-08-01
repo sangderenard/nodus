@@ -398,6 +398,75 @@ int32_t nodus_tensor_scalar(int32_t op, uint64_t tensor, double scalar,
                : NODUS_ERR_UNSUPPORTED;
 }
 
+int32_t nodus_tensor_matmul(uint64_t left, uint64_t right, uint64_t output) {
+    if (!left || !right || !output) {
+        return NODUS_ERR_INVALID_ARG;
+    }
+    Wrapped left_wrap;
+    Wrapped right_wrap;
+    Wrapped out_wrap;
+    if (!wrap_handle(left, &left_wrap) || !wrap_handle(right, &right_wrap) ||
+        !wrap_handle(output, &out_wrap)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    // tensor_matmul_* is declared per scalar type rather than over a dtype
+    // enum, so the dispatch is here rather than inside the math. Anything
+    // that is not f32/f64 is refused instead of being converted, which would
+    // change the caller's numerics without saying so.
+    const TensorDType dtype = left_wrap.tensor.desc().dtype;
+    if (dtype != right_wrap.tensor.desc().dtype ||
+        dtype != out_wrap.tensor.desc().dtype) {
+        return NODUS_ERR_INVALID_ARG;
+    }
+    // Rank and inner-extent agreement are checked by TensorMathImpl::matmul
+    // itself, which reports a mismatch as an empty tensor; that is handled
+    // below with every other mismatch, so this boundary keeps no second copy
+    // of the rule.
+    nodus::tensors::AbstractTensor product;
+    if (dtype == TensorDType::F32) {
+        product = nodus::tensors::tensor_matmul_f32(left_wrap.tensor,
+                                                    right_wrap.tensor);
+    } else if (dtype == TensorDType::F64) {
+        product = nodus::tensors::tensor_matmul_f64(left_wrap.tensor,
+                                                    right_wrap.tensor);
+    } else {
+        return NODUS_ERR_UNSUPPORTED;
+    }
+    // These helpers report a shape or backend mismatch by returning an empty
+    // tensor (see the note in tensor_math.h). Treat that as the error it is
+    // rather than letting the caller keep an untouched output buffer.
+    if (!product.valid()) {
+        return NODUS_ERR_INVALID_ARG;
+    }
+    const TensorDesc& product_desc = product.desc();
+    const TensorDesc& out_desc = out_wrap.tensor.desc();
+    if (product_desc.shape.dims != out_desc.shape.dims) {
+        return NODUS_ERR_INVALID_ARG;
+    }
+    const uint64_t bytes = payload_bytes(product_desc);
+    void* source = nullptr;
+    size_t source_bytes = 0;
+    if (!backend().map(product.handle(), &source, &source_bytes)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    void* destination = nullptr;
+    size_t destination_bytes = 0;
+    if (!backend().map(to_handle(output), &destination, &destination_bytes)) {
+        backend().unmap(product.handle());
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    // Sized from the descriptors, never from the mappings: a lease is aligned
+    // up to 64 bytes and is routinely larger than the tensor it holds.
+    const uint64_t limit =
+        std::min<uint64_t>({bytes, static_cast<uint64_t>(source_bytes),
+                            static_cast<uint64_t>(destination_bytes),
+                            payload_bytes(out_desc)});
+    std::memcpy(destination, source, static_cast<size_t>(limit));
+    backend().unmap(to_handle(output));
+    backend().unmap(product.handle());
+    return limit == bytes ? NODUS_OK : NODUS_ERR_INVALID_ARG;
+}
+
 uint32_t nodus_tensor_dtype_size(int32_t dtype) {
     TensorDType typed = TensorDType::Unknown;
     if (!dtype_from_int(dtype, &typed)) {

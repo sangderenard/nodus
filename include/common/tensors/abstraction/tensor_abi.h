@@ -164,6 +164,14 @@ int32_t nodus_tensor_binary(int32_t op, uint64_t left, uint64_t right,
 int32_t nodus_tensor_scalar(int32_t op, uint64_t tensor, double scalar,
                             int32_t scalar_on_left, uint64_t output);
 
+// Matrix multiply, which is not elementwise and so is not a CanonicalOp: it
+// calls tensor_matmul_f32/f64 in tensor_math.h, the same "in-memory backend
+// only" dense helpers named there. f32 and f64 only -- any other dtype is
+// NODUS_ERR_UNSUPPORTED rather than a quiet conversion. Those helpers report
+// a shape or backend mismatch by returning an empty tensor, which becomes
+// NODUS_ERR_INVALID_ARG here rather than a silently empty output.
+int32_t nodus_tensor_matmul(uint64_t left, uint64_t right, uint64_t output);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

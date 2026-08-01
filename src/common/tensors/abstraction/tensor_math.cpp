@@ -34,7 +34,15 @@ namespace nodus::tensors {
 
 struct TensorOpTensor;
 static bool compute_dense_strides_u64(const std::vector<uint32_t>& dims, std::vector<uint64_t>& out) {
-    if (dims.empty()) return false;
+    // A rank-0 tensor is one element addressed at offset 0, so its stride
+    // vector is legitimately empty -- not a failure. Rejecting it here made
+    // every scalar tensor unusable in the elementwise path (the kernels
+    // already special-case rank == 0), so a reduction that produced a scalar
+    // could not then be used in arithmetic.
+    if (dims.empty()) {
+        out.clear();
+        return true;
+    }
     out.resize(dims.size());
     uint64_t stride = 1;
     for (size_t i = dims.size(); i-- > 0;) {
@@ -1230,11 +1238,22 @@ struct TensorMathImpl {
     static AbstractTensor matmul(const AbstractTensor& a, const AbstractTensor& b) {
         const TensorDesc& ad = a.desc();
         const TensorDesc& bd = b.desc();
+        // dims[0]/dims[1] are only addressable on a rank-2 operand, and the
+        // product is only defined when the inner extents agree. Neither was
+        // checked here: a rank-1 operand read past the dims vector, and a
+        // mismatched inner extent produced a wrong answer at the output's
+        // own extent -- a silent one, because the result was correctly
+        // shaped. An empty tensor is this file's documented way of reporting
+        // a mismatch (see the note in tensor_math.h).
+        if (ad.shape.dims.size() != 2 || bd.shape.dims.size() != 2 ||
+            ad.shape.dims[1] != bd.shape.dims[0]) {
+            return AbstractTensor{};
+        }
         const uint32_t m = ad.shape.dims[0];
         const uint32_t n = ad.shape.dims[1];
         const uint32_t n2 = bd.shape.dims[0];
         const uint32_t k = bd.shape.dims[1];
-        
+
         TensorDesc out_desc{};
         out_desc.dtype = DType;
         out_desc.layout = TensorLayout::Dense;
@@ -7656,8 +7675,19 @@ static Scalar canonical_unary_value(nodus::ops::CanonicalOp op, Scalar value) {
         case Op::SQRT: return static_cast<Scalar>(std::sqrt(value));
         case Op::EXP: return static_cast<Scalar>(std::exp(value));
         case Op::LOG: return static_cast<Scalar>(std::log(value));
-        case Op::NEG: return -value;
-        case Op::ABS: return static_cast<Scalar>(std::abs(value));
+        // Negating an unsigned type is well defined (modular) but is almost
+        // never what a caller meant; it is reached only if a caller asked
+        // for NEG on an unsigned tensor, and the modular answer is the one
+        // C++ specifies, so it is returned rather than invented.
+        case Op::NEG: return static_cast<Scalar>(-value);
+        // std::abs has no unsigned overload and would promote to a signed
+        // type; an unsigned value is already its own magnitude.
+        case Op::ABS:
+            if constexpr (std::is_unsigned_v<Scalar>) {
+                return value;
+            } else {
+                return static_cast<Scalar>(std::abs(value));
+            }
         case Op::ROUND: return static_cast<Scalar>(std::round(value));
         case Op::TRUNC: return static_cast<Scalar>(std::trunc(value));
         case Op::FLOOR: return static_cast<Scalar>(std::floor(value));
@@ -7692,8 +7722,38 @@ static Scalar canonical_binary_value(
         case Op::MUL: return left * right;
         case Op::TRUEDIV: return left / right;
         case Op::POW: return static_cast<Scalar>(std::pow(left, right));
-        case Op::MOD: return left - std::floor(left / right) * right;
-        case Op::FLOORDIV: return static_cast<Scalar>(std::floor(left / right));
+        // Floor semantics, matching Python and NumPy rather than C's
+        // truncate-toward-zero: -7 // 2 is -4 and -7 % 2 is 1. Computing
+        // these through std::floor on a double would be wrong for integers
+        // past 2^53, so the integer case is done in integer arithmetic.
+        case Op::MOD:
+            if constexpr (std::is_integral_v<Scalar>) {
+                if (right == Scalar{0}) return Scalar{0};
+                Scalar remainder = static_cast<Scalar>(left % right);
+                if constexpr (std::is_signed_v<Scalar>) {
+                    if (remainder != Scalar{0} &&
+                        ((remainder < Scalar{0}) != (right < Scalar{0}))) {
+                        remainder = static_cast<Scalar>(remainder + right);
+                    }
+                }
+                return remainder;
+            } else {
+                return left - std::floor(left / right) * right;
+            }
+        case Op::FLOORDIV:
+            if constexpr (std::is_integral_v<Scalar>) {
+                if (right == Scalar{0}) return Scalar{0};
+                Scalar quotient = static_cast<Scalar>(left / right);
+                if constexpr (std::is_signed_v<Scalar>) {
+                    if ((left % right != Scalar{0}) &&
+                        ((left < Scalar{0}) != (right < Scalar{0}))) {
+                        quotient = static_cast<Scalar>(quotient - Scalar{1});
+                    }
+                }
+                return quotient;
+            } else {
+                return static_cast<Scalar>(std::floor(left / right));
+            }
         case Op::LESS: return static_cast<Scalar>(left < right);
         case Op::LESS_EQUAL: return static_cast<Scalar>(left <= right);
         case Op::GREATER: return static_cast<Scalar>(left > right);
@@ -7703,6 +7763,42 @@ static Scalar canonical_binary_value(
         case Op::MAXIMUM: return std::max(left, right);
         case Op::MINIMUM: return std::min(left, right);
         default: return std::numeric_limits<Scalar>::quiet_NaN();
+    }
+}
+
+// Which operations keep their meaning when the element type is an integer.
+//
+// The rest are excluded for a reason, not an omission. An elementwise result
+// here has the operand's dtype (same_elementwise_dtype), so anything whose
+// true result is real-valued -- TRUEDIV, SQRT/EXP/LOG, the trigonometric
+// family -- would have to be truncated back into the integer it came from,
+// silently returning 3 for sqrt(10) or 0 for 1/2. Those stay unsupported so
+// the caller can promote to F64 and get the answer it actually asked for,
+// which is what NumPy's own type promotion does at the same boundary.
+// ISNAN/ISINF/ISFINITE are likewise excluded: they are constants over the
+// integers and answering them here would only hide a caller's confusion.
+static bool canonical_is_integer_exact(nodus::ops::CanonicalOp op) {
+    using Op = nodus::ops::CanonicalOp;
+    switch (op) {
+        case Op::ADD:
+        case Op::SUB:
+        case Op::MUL:
+        case Op::MOD:
+        case Op::FLOORDIV:
+        case Op::NEG:
+        case Op::ABS:
+        case Op::LOGICAL_NOT:
+        case Op::LESS:
+        case Op::LESS_EQUAL:
+        case Op::GREATER:
+        case Op::GREATER_EQUAL:
+        case Op::EQUAL:
+        case Op::NOT_EQUAL:
+        case Op::MAXIMUM:
+        case Op::MINIMUM:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -7804,13 +7900,87 @@ static bool execute_elementwise_plan(
     return true;
 }
 
+// Every element type the elementwise kernels can be instantiated for. This
+// was F32/F64 only, which meant an integer tensor could not be added at all
+// -- every integer caller had to be served somewhere else, and one that did
+// not notice got a hard failure at the boundary instead of an answer.
+static bool elementwise_dtype_is_supported(TensorDType dtype) {
+    switch (dtype) {
+        case TensorDType::F32:
+        case TensorDType::F64:
+        case TensorDType::I8:
+        case TensorDType::I16:
+        case TensorDType::I32:
+        case TensorDType::I64:
+        case TensorDType::U8:
+        case TensorDType::U16:
+        case TensorDType::U32:
+        case TensorDType::U64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool dtype_is_integral(TensorDType dtype) {
+    return dtype != TensorDType::F32 && dtype != TensorDType::F64;
+}
+
+// Run one elementwise plan at the tensor's own element type. Integer types
+// only accept the operations that stay exact in integers; anything else is
+// refused here rather than truncated into the operand's type.
+static bool dispatch_elementwise_plan(
+    TensorDType dtype,
+    const TensorOpPlan& plan,
+    nodus::ops::CanonicalOp op,
+    bool has_right_tensor,
+    double right_scalar,
+    bool scalar_on_left) {
+    if (dtype_is_integral(dtype) && !canonical_is_integer_exact(op)) {
+        return false;
+    }
+    switch (dtype) {
+        case TensorDType::F32:
+            return execute_elementwise_plan<float>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::F64:
+            return execute_elementwise_plan<double>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::I8:
+            return execute_elementwise_plan<int8_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::I16:
+            return execute_elementwise_plan<int16_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::I32:
+            return execute_elementwise_plan<int32_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::I64:
+            return execute_elementwise_plan<int64_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::U8:
+            return execute_elementwise_plan<uint8_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::U16:
+            return execute_elementwise_plan<uint16_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::U32:
+            return execute_elementwise_plan<uint32_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        case TensorDType::U64:
+            return execute_elementwise_plan<uint64_t>(
+                plan, op, has_right_tensor, right_scalar, scalar_on_left);
+        default:
+            return false;
+    }
+}
+
 static bool same_elementwise_dtype(
     const AbstractTensor& input, const AbstractTensor& output) {
     return input.valid() && output.valid() &&
            input.backend() == output.backend() &&
            input.desc().dtype == output.desc().dtype &&
-           (input.desc().dtype == TensorDType::F32 ||
-            input.desc().dtype == TensorDType::F64);
+           elementwise_dtype_is_supported(input.desc().dtype);
 }
 
 bool tensor_elementwise_unary(
@@ -7822,9 +7992,8 @@ bool tensor_elementwise_unary(
         return false;
     TensorOpPlan plan{};
     if (!build_unary_plan(input, *output, plan)) return false;
-    const bool ok = input.desc().dtype == TensorDType::F32
-        ? execute_elementwise_plan<float>(plan, op, false, 0.0, false)
-        : execute_elementwise_plan<double>(plan, op, false, 0.0, false);
+    const bool ok = dispatch_elementwise_plan(
+        input.desc().dtype, plan, op, false, 0.0, false);
     auto* backend = dynamic_cast<InMemoryBackend*>(input.backend());
     backend->unmap(output->handle());
     backend->unmap(input.handle());
@@ -7842,9 +8011,8 @@ bool tensor_elementwise_binary(
         return false;
     TensorOpPlan plan{};
     if (!build_axpby_plan(left, right, *output, plan)) return false;
-    const bool ok = left.desc().dtype == TensorDType::F32
-        ? execute_elementwise_plan<float>(plan, op, true, 0.0, false)
-        : execute_elementwise_plan<double>(plan, op, true, 0.0, false);
+    const bool ok = dispatch_elementwise_plan(
+        left.desc().dtype, plan, op, true, 0.0, false);
     auto* backend = dynamic_cast<InMemoryBackend*>(left.backend());
     backend->unmap(output->handle());
     backend->unmap(right.handle());
@@ -7863,9 +8031,8 @@ bool tensor_elementwise_scalar(
         return false;
     TensorOpPlan plan{};
     if (!build_unary_plan(tensor, *output, plan)) return false;
-    const bool ok = tensor.desc().dtype == TensorDType::F32
-        ? execute_elementwise_plan<float>(plan, op, false, scalar, scalar_on_left)
-        : execute_elementwise_plan<double>(plan, op, false, scalar, scalar_on_left);
+    const bool ok = dispatch_elementwise_plan(
+        tensor.desc().dtype, plan, op, false, scalar, scalar_on_left);
     auto* backend = dynamic_cast<InMemoryBackend*>(tensor.backend());
     backend->unmap(output->handle());
     backend->unmap(tensor.handle());
