@@ -366,6 +366,14 @@ add_library(nodus_tensor_core SHARED
   src/common/thread_pool.cpp
   src/mem_backend_host.cpp
   src/spirv_translation.cpp
+  src/kernels/kernel_spirv.cpp
+  src/kernels/kernel_ir_text.cpp
+  # vocabulary_actualizer: canonical catalog -> per-op, backend-grouped tool
+  # sources (the vocabulary side of the module-library reduction pipeline).
+  # Lives here, not in canvas_tables, because generated tool DLLs and their
+  # hosts link nodus_tensor_core for shared arena identity, and the
+  # actualizer entry point rides the same export-all surface.
+  src/vocabulary_actualizer.cpp
 )
 target_include_directories(nodus_tensor_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -413,6 +421,34 @@ target_include_directories(bitops_lowering_test PRIVATE
 )
 target_compile_features(bitops_lowering_test PRIVATE cxx_std_20)
 add_test(NAME bitops_lowering_test COMMAND bitops_lowering_test)
+
+# Direct KernelIR -> SPIR-V assembly (src/kernels/kernel_spirv.cpp). Compiles
+# the assembler into the test directly so, like bitops_lowering_test, it runs
+# even while the canvas_tables amalgam is mid-refactor.
+add_executable(spirv_assembler_test
+  tests/test_spirv_assembler.cpp
+  src/kernels/kernel_spirv.cpp
+  src/kernels/kernel_ir_text.cpp
+)
+target_include_directories(spirv_assembler_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(spirv_assembler_test PRIVATE cxx_std_20)
+add_test(NAME spirv_assembler_test COMMAND spirv_assembler_test)
+
+# The membrane crossing as a command: KIRTEXT (from turing's
+# kernel_ir_lowering.serialize_kernel_ir) -> direct SPIR-V binary.
+add_executable(kir_to_spirv
+  tools/kir_to_spirv_main.cpp
+  src/kernels/kernel_ir_text.cpp
+  src/kernels/kernel_spirv.cpp
+)
+target_include_directories(kir_to_spirv PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(kir_to_spirv PRIVATE cxx_std_20)
 
 # Guard against hand-edited generated output, and against canonical_ops.json drifting from
 # turing's CTensorOp (whose ordinals it vendors). Both are opt-in on Python being present.
@@ -468,6 +504,8 @@ add_library(nodus_runtime SHARED
   src/runtime/edge_runtime_abi.cpp
   src/mem_backend_host.cpp
   src/spirv_translation.cpp
+  src/kernels/kernel_spirv.cpp
+  src/kernels/kernel_ir_text.cpp
 )
 target_compile_definitions(nodus_runtime PRIVATE NODUS_RUNTIME_BUILD=1)
 target_include_directories(nodus_runtime PUBLIC
@@ -552,6 +590,14 @@ add_executable(nodus_headless_demo tools/nodus_headless_demo.cpp)
 target_include_directories(nodus_headless_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_demo PRIVATE nodus_headless)
 target_compile_features(nodus_headless_demo PUBLIC cxx_std_20)
+
+# Loads a real bridge-generated canvas (turing's nodus_canvas_kpn.py output)
+# headlessly, validates its computed output against an independent Python
+# oracle, and benchmarks steady-state per-sample throughput against NumPy.
+add_executable(nodus_headless_validate tools/nodus_headless_validate.cpp)
+target_include_directories(nodus_headless_validate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nodus_headless_validate PRIVATE nodus_headless)
+target_compile_features(nodus_headless_validate PUBLIC cxx_std_20)
 
 # Demo: compile relational geometry into kpath outlines and rasterize a composed scene to PNG.
 add_executable(kpath_relgeo_scene_demo tools/kpath_relgeo_scene_demo.cpp)
@@ -925,6 +971,22 @@ target_compile_definitions(test_tool_dll PRIVATE
   NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
 )
 add_test(NAME tool_dll_test COMMAND test_tool_dll)
+
+# The vocabulary table checker: actualizes the canonical catalog into per-op
+# backend-grouped tool DLLs, then loads and executes every one against real
+# tensors, verifying results against an independent <cmath> reference and
+# cross-checking engines against each other. Links nodus_tensor_core (shared)
+# so host and generated plugins agree on one arena; needs no canvas_tables.
+add_executable(test_vocab_tool_dll
+  tests/vocab_tool_dll_test.cpp
+)
+target_link_libraries(test_vocab_tool_dll PRIVATE nodus_tensor_core)
+target_compile_definitions(test_vocab_tool_dll PRIVATE
+  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
+  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+)
+target_compile_features(test_vocab_tool_dll PRIVATE cxx_std_20)
+add_test(NAME vocab_tool_dll_test COMMAND test_vocab_tool_dll)
 
 add_executable(test_repo_package
   tests/repo_package_test.cpp

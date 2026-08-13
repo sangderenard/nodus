@@ -719,7 +719,20 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                 }
             }
         }
-        int row_count = gp_table_get_row_count(mod.table);
+        // The row-execution loop below already defensively bounds-checks
+        // against io_rows.size() before indexing (`row < (int)io_rows.size()
+        // ? io_rows[row] : ...`), so it was always meant to iterate the real,
+        // GraphRuntime-owned semantic row list -- not gp_table_get_row_count
+        // (mod.table)'s row count, which reflects the per-module RENDERING
+        // table and is only ever populated by sync_module_table_io_layout, a
+        // GUI-only render-sync function. A headless-loaded canvas never calls
+        // that function, so that table stays at 0 rows even though io_rows is
+        // correctly loaded, and every row (Input/Tool/Output) silently never
+        // executed for any module. Confirmed directly: table_row_count was 0
+        // for all 4 modules of a real bridge-generated canvas while
+        // io_rows.size() correctly read 4/5/4/17, matching the source file's
+        // real row counts exactly.
+        int row_count = static_cast<int>(io_rows.size());
         RawStackFrame* module_stack = (mod.module_idx >= 0) ? ensure_module_tool_stack(mod.module_idx) : nullptr;
         if (!module_stack) return;
         ValueTypeId stack_default_type = module_tool_stack_default_type();
@@ -825,6 +838,26 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             break;
                         }
                     }
+                    // A genuinely external/boundary contact (nothing inside the
+                    // canvas produces it) has no GP_CanvasEdgeDesc in c->edges,
+                    // so it is absent from req.edges above -- but a headless-
+                    // declared port (nodus_headless_declare_input_port) still
+                    // creates a real table edge, self-keyed at exactly
+                    // gp_canvas_get_tool_row_id(mod_idx, contact_idx), the same
+                    // resolution canvas_abi_table_step.inl uses for every real
+                    // inter-module edge. Without this fallback a value pushed
+                    // through that port is silently invisible here and the row
+                    // always sees the val=0.0f default below, regardless of
+                    // what was pushed. Resolve it the same way real edges do.
+                    if (edge_idx < 0 && fifo_table) {
+                        GP_CanvasContext* cvs_for_key = gp_canvas_get_singleton();
+                        if (cvs_for_key) {
+                            uint64_t port_key = gp_canvas_get_tool_row_id(cvs_for_key, mod_idx, contact_idx);
+                            if (port_key != 0ull) {
+                                gp_table_edge_index_for_key(fifo_table, port_key, &edge_idx);
+                            }
+                        }
+                    }
                     if (edge_idx >= 0 && fifo_table) {
                         int32_t unread = 0;
                         gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
@@ -916,9 +949,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         } else {
                             tctx.input = nullptr;
                         }
+                        fprintf(stderr, "[DIAG-EXEC] mod=%d row=%d inst=%p pre-execute_stack\n", mod_idx, row, (void*)inst);
                         try {
                             inst->execute_stack(tctx);
                         } catch (...) {}
+                        fprintf(stderr, "[DIAG-EXEC] mod=%d row=%d post-execute_stack\n", mod_idx, row);
                         continue; // plugin handled this row
                     }
                 }
@@ -1321,6 +1356,24 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         if (e.a_module == mod_idx && e.a_contact_idx == contact_idx) {
                             edge_idx = e.edge_idx;
                             break;
+                        }
+                    }
+                    // Mirror of the Input-row fallback above: a terminal output
+                    // contact (nothing downstream consumes it inside the
+                    // canvas -- e.g. a pipeline's final result) has no
+                    // GP_CanvasEdgeDesc either, so it is likewise absent from
+                    // req.edges and this publish was silently discarded every
+                    // tick regardless of a headless-declared output port at
+                    // the same (mod_idx, contact_idx). Same resolution, same
+                    // reason: that port's edge was already created self-keyed
+                    // at gp_canvas_get_tool_row_id(mod_idx, contact_idx).
+                    if (edge_idx < 0 && fifo_table) {
+                        GP_CanvasContext* cvs_for_key = gp_canvas_get_singleton();
+                        if (cvs_for_key) {
+                            uint64_t port_key = gp_canvas_get_tool_row_id(cvs_for_key, mod_idx, contact_idx);
+                            if (port_key != 0ull) {
+                                gp_table_edge_index_for_key(fifo_table, port_key, &edge_idx);
+                            }
                         }
                     }
                     if (edge_idx >= 0 && fifo_table) {

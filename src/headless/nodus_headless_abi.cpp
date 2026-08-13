@@ -3,6 +3,7 @@
 #include "canvas_abi.h"
 #include "table_abi.h"
 
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -127,6 +128,16 @@ extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
         return nullptr;
     }
     g->table = gp_canvas_get_container_table(g->ctx);
+    // GP_CanvasContextImpl::thread_mgr_paused defaults to true (canvas_abi_
+    // context.inl); gp_canvas_step's real tick submission is entirely gated
+    // on it being false (canvas_abi_table_step.inl's `if (c->thread_mgr &&
+    // !c->thread_mgr_paused)`). The GUI path clears it once at canvas-head
+    // init (frontend_shell.cpp) when the window opens; a headless graph has
+    // no such init step, so without this call nodus_headless_step/run_to_
+    // quiescence silently never submits a single tick, for any graph,
+    // regardless of topology -- this is the ABI's own contract ("drive
+    // ThreadManager's real scheduler to quiescence"), not an optional mode.
+    gp_canvas_set_thread_manager_paused(g->ctx, 0);
     return g;
 }
 

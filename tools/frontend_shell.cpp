@@ -2557,5 +2557,10 @@ int main(int argc, char** argv) {
     save_frontend_collection_state(resources.collection_state);
 
     cleanup(resources);
-    return EXIT_SUCCESS;
+    // Exit without running DLL static destructors: torch/CUDA teardown at
+    // process exit raises the CRT abort dialog after everything meaningful
+    // (state save, SDL shutdown, thread joins) has already completed. All
+    // owned state is flushed above, so skipping atexit teardown is safe.
+    std::fflush(nullptr);
+    _exit(EXIT_SUCCESS);
 }

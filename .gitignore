@@ -68,12 +68,14 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+*.bak_*
 *.cache
 
 # Images / generated assets
 *.png
 *.jpg
 *.jpeg
+/generated_program_canvas*.txt
 
 # Misc
 *.user

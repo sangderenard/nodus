@@ -185,4 +185,21 @@ size_t register_abstract_tensor_tool_ir(ToolRegistry& registry) {
   return registered;
 }
 
+// Live registration of the canonical vocabulary, same static-init idiom as
+// REGISTER_TOOL (tool_registry.h). Until now register_abstract_tensor_tool_ir
+// was reachable only from graph_ir_test.cpp, so canvas ROWS records naming
+// "abstract_tensor.<op>" plugin ids had nothing to instantiate. The coverage
+// filter above (ct_value present, arity 1..2) is deliberate and must not be
+// widened ahead of the evaluator: tensor_math's elementwise plan executor
+// implements exactly the CT-marked subset and answers quiet-NaN outside it,
+// so a wider registration would mint tools that silently compute wrong.
+namespace {
+struct AbstractTensorVocabularyRegistrar {
+  AbstractTensorVocabularyRegistrar() {
+    register_abstract_tensor_tool_ir(tool_registry_global());
+  }
+};
+static AbstractTensorVocabularyRegistrar g_abstract_tensor_vocabulary_registrar;
+} // namespace
+
 } // namespace nodus::tensors

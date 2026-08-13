@@ -7,7 +7,7 @@
 #define fprintf(file, ...) CONSOLE_PRINTF(__VA_ARGS__)
 #endif
 #ifndef NODUS_DEBUG_PLUGIN_DEPLOY
-#define NODUS_DEBUG_PLUGIN_DEPLOY 0
+#define NODUS_DEBUG_PLUGIN_DEPLOY 1
 #endif
 #if NODUS_DEBUG_PLUGIN_DEPLOY
 #define PLUGIN_DEPLOYF(...) printf(__VA_ARGS__)
@@ -715,6 +715,12 @@ static void stage_bg_callback(void* user, int module_idx, int width, int height,
 static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_idx);
 
 static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, const std::vector<ModuleIORow>& rows) {
+    fprintf(stderr, "[DIAG-APPLYROWS] enter module_idx=%d rows.size=%zu\n", module_idx, rows.size());
+    for (size_t ri = 0; ri < rows.size(); ++ri) {
+        fprintf(stderr, "[DIAG-APPLYROWS]   row[%zu] kind=%d tool=%d attach=%d origin=%d plugin_id=%s\n",
+            ri, static_cast<int>(rows[ri].kind), static_cast<int>(rows[ri].tool), rows[ri].attachment_count,
+            static_cast<int>(rows[ri].tool_origin), rows[ri].plugin_id.c_str());
+    }
     if (!ctx) return;
     if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
     if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
@@ -764,23 +770,35 @@ static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, cons
     // attempt to instantiate plugin-origin rows immediately if registry has them
     for (size_t ri = 0; ri < ctx->module_io_rows[module_idx].size(); ++ri) {
         const auto &r = ctx->module_io_rows[module_idx][ri];
+        fprintf(stderr, "[DIAG-STOREDROW] module=%d row=%zu kind=%d tool_origin=%d plugin_id_empty=%d plugin_id=%s\n",
+            module_idx, ri, static_cast<int>(r.kind), static_cast<int>(r.tool_origin), (int)r.plugin_id.empty(), r.plugin_id.c_str());
         if (r.kind == ModuleRowKind::Tool && r.tool_origin == ModuleToolOrigin::Plugin && !r.plugin_id.empty()) {
-            PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] apply_io_rows: module=%d row=%zu plugin_id=%s\n",
-                module_idx, ri, r.plugin_id.c_str());
+            fprintf(stderr, "[DIAG-CREATE] about to call tool_registry_global().create(%s)\n", r.plugin_id.c_str());
             try {
                 auto inst = tool_registry_global().create(r.plugin_id);
+                fprintf(stderr, "[DIAG-CREATE] create() returned, inst=%p\n", (void*)inst.get());
                 if (inst) {
                     ToolInitContext tctx{};
                     tctx.user = reinterpret_cast<void*>(static_cast<intptr_t>(module_idx));
-                    try { inst->initialize(tctx); } catch (...) {}
+                    try {
+                        inst->initialize(tctx);
+                        fprintf(stderr, "[DIAG-CREATE] initialize() ok\n");
+                    } catch (const std::exception& e) {
+                        fprintf(stderr, "[DIAG-CREATE] initialize() threw std::exception: %s\n", e.what());
+                    } catch (...) {
+                        fprintf(stderr, "[DIAG-CREATE] initialize() threw unknown exception\n");
+                    }
                     ctx->module_plugin_instances[module_idx][ri] = std::move(inst);
-                    PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] apply_io_rows: module=%d row=%zu plugin_id=%s instance=ok\n",
-                        module_idx, ri, r.plugin_id.c_str());
+                    fprintf(stderr, "[DIAG-CREATE] stored, module_plugin_instances[%d][%zu] now truthy=%d\n",
+                        module_idx, ri, (int)(bool)ctx->module_plugin_instances[module_idx][ri]);
                 } else {
-                    PLUGIN_DEPLOYF("[PLUGIN_DEPLOY] apply_io_rows: module=%d row=%zu plugin_id=%s instance=null\n",
-                        module_idx, ri, r.plugin_id.c_str());
+                    fprintf(stderr, "[DIAG-CREATE] instance=null for plugin_id=%s\n", r.plugin_id.c_str());
                 }
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[DIAG-CREATE] create() threw std::exception: %s\n", e.what());
+            } catch (...) {
+                fprintf(stderr, "[DIAG-CREATE] create() threw unknown exception\n");
+            }
         }
     }
 }
