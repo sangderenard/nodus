@@ -52,12 +52,27 @@ static_assert(static_cast<int>(CanonicalOp::COUNT) == 66,
 int main() {
   // 1) Every lowerable op names a KernelIR opcode; every non-lowerable names none.
   //    This is the honesty invariant: an op cannot claim portability it lacks.
+  //    Tier discipline (docs/TIERS.md): lowerable means "expressible as ONE
+  //    Tier-0 instruction". An opaque op is not -- a reduction genuinely
+  //    cannot be one instruction (research/15, finding 6b) -- so it carries no
+  //    kernel_op and names its Tier-1 composition family instead. Keeping that
+  //    distinction is what stops an emitter from being handed a composite.
   for (size_t i = 0; i < kOpCount; ++i) {
     const OpDesc& o = kOps[i];
     check(o.lowerable == !o.kernel_op.empty(),
           std::string("lowerable/kernel_op disagree for '") + std::string(o.name) + "'");
-    check(!(o.op_class == OpClass::Opaque && o.lowerable),
-          std::string("opaque op '") + std::string(o.name) + "' must not be lowerable");
+    if (o.op_class == OpClass::Opaque) {
+      check(!o.lowerable,
+            std::string("opaque op '") + std::string(o.name) +
+                "' must not claim to be one Tier-0 instruction");
+      check(!o.tier1_class.empty(),
+            std::string("opaque op '") + std::string(o.name) +
+                "' must name its Tier-1 composition family");
+    } else {
+      check(o.tier1_class.empty(),
+            std::string("Tier-0 op '") + std::string(o.name) +
+                "' needs no Tier-1 family");
+    }
   }
 
   // 2) ct_values form a gapless, unique 0..N-1 block mirroring turing's CTensorOp.
@@ -68,8 +83,11 @@ int main() {
       check(seen.insert(kOps[i].ct_value).second,
             std::string("duplicate ct_value for '") + std::string(kOps[i].name) + "'");
     }
-    check(static_cast<int>(seen.size()) == 28,
-          "the current CTensorOp subset has 28 members");
+    // 40 = the 28 original members plus the vendored trig/hyperbolic family
+    // (sin..atanh). ops/verify_canonical_ops.py checks this count against
+    // turing's live CTensorOp header, so this constant tracks that verifier.
+    check(static_cast<int>(seen.size()) == 40,
+          "the current CTensorOp subset has 40 members");
     int32_t expected = 0;
     for (int32_t v : seen) {
       check(v == expected, "ct_values must be gapless from 0");
@@ -124,14 +142,26 @@ int main() {
     }
   }
 
-  // 7) Reductions and shape-changing ops are recorded as holes rather than forced into an
-  //    opcode. KernelIR has no cross-invocation cooperation primitive, so 'sum' genuinely
-  //    cannot be one instruction (research/15, finding 6b).
-  for (const char* name : {"matmul", "sum", "mean", "topk", "gather"}) {
-    const OpDesc* o = find_op(name);
-    if (check(o != nullptr, std::string("missing '") + name + "'")) {
-      check(!o->lowerable, std::string(name) + " must be marked not-lowerable");
-      check(o->ct_value < 0, std::string(name) + " must have no CTensorOp code");
+  // 7) Reductions, contractions, shape-changing, creation, and ordering ops are not
+  //    Tier-0 instructions. Each records HOW it composes (its Tier-1 family) without
+  //    pretending an emitter can execute it directly, and none carries a CTensorOp
+  //    code -- turing's dispatcher requires one equally-shaped slot per instruction.
+  {
+    const struct { const char* name; const char* family; } expected[] = {
+        {"matmul", "contract"}, {"sum", "reduce"}, {"mean", "reduce"},
+        {"log_softmax", "reduce"}, {"topk", "order"}, {"pad", "remap"},
+        {"stack", "remap"}, {"cat", "remap"}, {"gather", "remap"},
+        {"arange", "generate"},
+    };
+    for (const auto& e : expected) {
+      const OpDesc* o = find_op(e.name);
+      if (check(o != nullptr, std::string("missing '") + e.name + "'")) {
+        check(!o->lowerable, std::string(e.name) + " is not one Tier-0 instruction");
+        check(o->kernel_op.empty(), std::string(e.name) + " must carry no Tier-0 opcode");
+        check(o->tier1_class == std::string_view(e.family),
+              std::string(e.name) + " must name Tier-1 family " + e.family);
+        check(o->ct_value < 0, std::string(e.name) + " must have no CTensorOp code");
+      }
     }
   }
 

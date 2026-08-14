@@ -407,6 +407,48 @@ int main() {
         }
     }
 
+    // Negative control (the wasm_fidelity lesson): before trusting the PASS
+    // column, prove the comparator REJECTS a wrong witness. We re-run the
+    // inmemory 'add' tool's recorded result against 'sub''s reference -- a
+    // deliberately mismatched pairing that must fail. If it "passes", the
+    // harness cannot distinguish right from wrong and every PASS above is
+    // meaningless.
+    if (fail == 0) {
+        auto add_it = inmemory_results.find("add");
+        auto sub_ref = reference.find("sub");
+        if (add_it != inmemory_results.end() && sub_ref != reference.end()) {
+            const double wrong_want = sub_ref->second.fn(0.6, -0.3); // 0.9
+            const double got0 = add_it->second.empty() ? 0.0 : add_it->second[0]; // 0.3
+            const double tol = std::max(1e-4, std::fabs(wrong_want) * 1e-3);
+            if (std::fabs(got0 - wrong_want) <= tol) {
+                std::cout << "[VOCAB] NEGATIVE CONTROL FAILED: comparator "
+                             "accepted add-vs-sub mismatch\n";
+                ++fail;
+            } else {
+                std::cout << "[VOCAB] negative control ok (wrong witness rejected)\n";
+            }
+        }
+    }
+
+    // Substitution certificates: admission as stored, auditable facts, one
+    // record per (op, group), beside the manifest.
+    if (fail == 0) {
+        std::ofstream cert(test_root / "vocab_substitution_certificates.txt",
+                           std::ios::trunc);
+        cert << "SUBSTITUTION-CERTIFICATE-SET V1\n";
+        cert << "gate: vocab_tool_dll_test (reference: independent <cmath>; "
+                "cross-engine: eigen vs inmemory; negative control: add-vs-sub "
+                "mismatch rejected)\n";
+        cert << "battery: per-op domain-safe inputs, 4-element F32 tensors\n";
+        for (const auto* pe : ordered) {
+            const auto& e = *pe;
+            if (reference.find(e.op_name) == reference.end()) continue;
+            cert << "ADMITTED " << e.tool_id << " group=" << e.group
+                 << " source=\"" << e.source.generic_string() << "\"\n";
+        }
+        std::cout << "[VOCAB] certificates written\n";
+    }
+
     std::cout << "[VOCAB] summary: pass=" << pass << " fail=" << fail
               << " skip=" << skip << "\n";
     return fail == 0 ? 0 : 1;

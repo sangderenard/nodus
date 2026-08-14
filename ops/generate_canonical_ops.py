@@ -37,6 +37,12 @@ OP_CLASSES = ("unary", "binary", "compare", "cast", "opaque")
 
 # OpCode members of nodus::spirv::OpCode that entries may reference. A literal list, so a
 # typo in the JSON fails here rather than at C++ compile time.
+#
+# Tier-0 is deliberately small (see docs/TIERS.md): the op set every kernel emitter
+# understands directly. An operation that cannot be ONE Tier-0 instruction carries
+# kernel_op=null and names its composition family in tier1_class instead -- it is
+# defined by a Tier-1 recipe that emits Tier-0, never by an opcode the emitters must
+# each re-implement.
 KERNEL_OPS = {
     "MODULE_BEGIN", "KERNEL_ENTRY", "TYPE", "CONST", "SPEC_CONST", "VAR", "ADDR",
     "LOAD", "STORE", "MEMCPY", "UNARY", "BINARY", "TERNARY", "CMP", "SELECT",
@@ -44,9 +50,14 @@ KERNEL_OPS = {
     "AND", "OR", "NOT", "XOR",
 }
 
+# Tier-1 composition families: how an operation that is not one Tier-0 instruction is
+# built out of Tier-0. Recorded so the knowledge is data rather than folklore.
+TIER1_CLASSES = {"reduce", "contract", "remap", "generate", "order"}
+
 REQUIRED_FIELDS = {
     "name", "class", "ct_op", "ct_value", "arity", "returns", "kernel_op",
     "lowerable", "handler", "sympy", "reflectable", "c_fn", "notes",
+    "tier1_class",
 }
 
 BANNER = """// GENERATED FILE -- DO NOT EDIT.
@@ -144,8 +155,25 @@ def validate(ops: list[dict]) -> None:
             errors.append(f"{where}: lowerable=false must have kernel_op null")
         if kop is not None and kop not in KERNEL_OPS:
             errors.append(f"{where}: kernel_op '{kop}' is not a nodus::spirv::OpCode member")
+        # Tier discipline: an opaque operation is not one Tier-0 instruction, so it
+        # must carry no kernel_op and must instead name its Tier-1 composition family.
+        # (research/15 finding 6b: a reduction genuinely cannot be one instruction.)
         if op["class"] == "opaque" and low:
-            errors.append(f"{where}: class 'opaque' cannot be lowerable")
+            errors.append(f"{where}: class 'opaque' cannot be Tier-0 lowerable")
+        t1 = op["tier1_class"]
+        if t1 is not None and t1 not in TIER1_CLASSES:
+            errors.append(
+                f"{where}: tier1_class '{t1}' is not one of {sorted(TIER1_CLASSES)}"
+            )
+        if op["class"] == "opaque" and t1 is None:
+            errors.append(
+                f"{where}: class 'opaque' must name its Tier-1 composition family"
+            )
+        if op["class"] != "opaque" and t1 is not None:
+            errors.append(
+                f"{where}: '{op['class']}' is one Tier-0 instruction; it needs no "
+                f"tier1_class (found '{t1}')"
+            )
 
         if op["handler"] is not None:
             seen_handlers.setdefault(op["handler"], []).append(name)
@@ -218,11 +246,12 @@ def emit_cpp(data: dict) -> str:
         "    std::string_view ct_op;        // CTensorOp member name, or \"\"",
         "    uint8_t          arity;",
         "    bool             returns_bool;",
-        "    bool             lowerable;    // false => must stay native (CAP_BINARY)",
+        "    bool             lowerable;    // true => expressible as ONE Tier-0 instruction",
         "    bool             reflectable;  // has a distinct reversed-operand form",
         "    std::string_view kernel_op;    // nodus::spirv::OpCode name, or \"\"",
         "    std::string_view handler;      // turing Handler member, or \"\"",
         "    std::string_view c_fn;         // named C function outside the dispatcher, or \"\"",
+        "    std::string_view tier1_class;  // Tier-1 composition family, or \"\" if Tier-0",
         "};",
         "",
     ]
@@ -246,6 +275,7 @@ def emit_cpp(data: dict) -> str:
             cpp_str(o["kernel_op"]),
             cpp_str(o["handler"]),
             cpp_str(o["c_fn"]),
+            cpp_str(o["tier1_class"]),
         ]) + "},")
     out.append("};")
     out.append("")
@@ -314,6 +344,7 @@ def emit_python(data: dict) -> str:
         "    handler: str | None",
         "    sympy: tuple[str, ...]",
         "    c_fn: str | None",
+        "    tier1_class: str | None",
         "    notes: str | None",
         "",
         "",
@@ -330,6 +361,7 @@ def emit_python(data: dict) -> str:
             out.append(f"        {field}={o[key]!r},")
         out.append(f"        sympy={tuple(o['sympy'])!r},")
         out.append(f"        c_fn={o['c_fn']!r},")
+        out.append(f"        tier1_class={o['tier1_class']!r},")
         out.append(f"        notes={o['notes']!r},")
         out.append("    ),")
     out += [

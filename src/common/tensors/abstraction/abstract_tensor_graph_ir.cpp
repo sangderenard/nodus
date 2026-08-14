@@ -1,6 +1,7 @@
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
 
 #include "canonical_ops.h"
+#include "common/tensors/abstraction/in_memory_backend.h"
 #include "common/tensors/abstraction/tensor_math.h"
 #include "common/tensors/abstraction/graph_sparse.h"
 #include "tool_ir.h"
@@ -179,6 +180,73 @@ size_t register_abstract_tensor_tool_ir(ToolRegistry& registry) {
         delete static_cast<AbstractTensor*>(output_pointer);
     };
 
+    if (registry.register_tool(tool_ir::make_registry_entry(std::move(ir))))
+      ++registered;
+  }
+
+  // Reduction tools are thin bodies over tensor_math's own full-reduction
+  // executors (tensor_reduce_sum_all / tensor_reduce_mean_all), exactly as
+  // the elementwise tools are thin bodies over tensor_elementwise_*. The
+  // dtype POLICY lives here and follows NumPy: sum keeps the input dtype
+  // (bool -> I64); mean is F64 for integer/bool inputs and keeps float
+  // width. Unsupported operands are refused by pushing them back.
+  struct ReductionSpec {
+    const char* name;
+    bool divide_by_count;
+  };
+  static constexpr ReductionSpec kReductions[] = {
+      {"sum", false},
+      {"mean", true},
+  };
+  for (const auto& reduction : kReductions) {
+    auto ir = std::make_shared<ToolIR>();
+    ir->id = std::string("abstract_tensor.") + reduction.name;
+    ir->name = std::string("AbstractTensor ") + reduction.name;
+    ir->caps = ToolCaps::None;
+    ir->port_count = [] { return 2; };
+    ir->port_spec = [](int32_t index) {
+      if (index == 0)
+        return ToolPortSpec{ToolPortKind::Argument, 1};
+      if (index == 1)
+        return ToolPortSpec{ToolPortKind::Return, 1};
+      return ToolPortSpec{};
+    };
+    const bool divide = reduction.divide_by_count;
+    ir->execute_stack = [divide, pointer_type](ToolStackContext& ctx) {
+      if (!ctx.stack.raw || pointer_type == kInvalidValueTypeId) return;
+      RawStackFrame& frame = *ctx.stack.raw;
+      void* input_pointer = nullptr;
+      if (!raw_stack_pop_typed(frame, &input_pointer, pointer_type)) return;
+      auto* input = static_cast<AbstractTensor*>(input_pointer);
+      if (!input || !input->valid()) {
+        raw_stack_push_typed(frame, &input_pointer, pointer_type);
+        return;
+      }
+      const TensorDType in_dtype = input->desc().dtype;
+
+      TensorDesc out_desc;
+      out_desc.shape.dims = {1};
+      if (divide) {
+        out_desc.dtype = (in_dtype == TensorDType::F32) ? TensorDType::F32
+                                                        : TensorDType::F64;
+      } else if (in_dtype == TensorDType::Bool) {
+        out_desc.dtype = TensorDType::I64;
+      } else {
+        out_desc.dtype = in_dtype;
+      }
+
+      auto output = std::make_unique<AbstractTensor>(out_desc, input->backend());
+      const bool ok = output->valid() &&
+          (divide ? tensor_reduce_mean_all(*input, output.get())
+                  : tensor_reduce_sum_all(*input, output.get()));
+      if (!ok) {
+        raw_stack_push_typed(frame, &input_pointer, pointer_type);
+        return;
+      }
+      void* output_pointer = output.release();
+      if (!raw_stack_push_typed(frame, &output_pointer, pointer_type))
+        delete static_cast<AbstractTensor*>(output_pointer);
+    };
     if (registry.register_tool(tool_ir::make_registry_entry(std::move(ir))))
       ++registered;
   }

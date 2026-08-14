@@ -43,6 +43,10 @@ const std::unordered_map<std::string, OpCode>& opcode_names() {
         {"BARRIER", OpCode::BARRIER}, {"ATOMIC", OpCode::ATOMIC},
         {"AND", OpCode::AND}, {"OR", OpCode::OR},
         {"NOT", OpCode::NOT}, {"XOR", OpCode::XOR},
+        // Tier-0 iteration (kernel_isa.h): the primitive that lets Tier-1
+        // recipes DEFINE composites instead of each emitter re-implementing
+        // them.
+        {"LOOP_BEGIN", OpCode::LOOP_BEGIN}, {"LOOP_END", OpCode::LOOP_END},
     };
     return names;
 }

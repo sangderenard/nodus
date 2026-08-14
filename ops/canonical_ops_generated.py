@@ -95,6 +95,7 @@ class OpDesc(NamedTuple):
     handler: str | None
     sympy: tuple[str, ...]
     c_fn: str | None
+    tier1_class: str | None
     notes: str | None
 
 
@@ -113,6 +114,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Add',
         sympy=('add',),
         c_fn=None,
+        tier1_class=None,
         notes='Commutative, so the reverse flag is a no-op.',
     ),
     OpDesc(
@@ -129,6 +131,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Sub',
         sympy=('sub',),
         c_fn=None,
+        tier1_class=None,
         notes="numpy/torch _apply_operator__ return 'a - b' for BOTH 'sub' and 'rsub'; the C backend's explicit reverse flag is correct where those two are not.",
     ),
     OpDesc(
@@ -145,6 +148,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Mul',
         sympy=('mul',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -161,6 +165,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Div',
         sympy=('div',),
         c_fn=None,
+        tier1_class=None,
         notes='numpy guards via _safe_divide; C does not guard division by zero.',
     ),
     OpDesc(
@@ -177,6 +182,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Pow',
         sympy=('pow',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -193,6 +199,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Mod',
         sympy=('mod',),
         c_fn=None,
+        tier1_class=None,
         notes='C now computes a - floor(a/b)*b (floored, numpy/torch-compatible) rather than fmod. An emitter must not lower this to GLSL mod() for signed operands without checking.',
     ),
     OpDesc(
@@ -209,6 +216,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes="turing's Handler has no floor-division member; it would coarsen to Div + floor.",
     ),
     OpDesc(
@@ -225,6 +233,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('sqrt',),
         c_fn=None,
+        tier1_class=None,
         notes="turing's Handler coarsens every elementary function to the catch-all Call; that is a lossy widening, not an equivalence.",
     ),
     OpDesc(
@@ -241,6 +250,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('exp',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -257,6 +267,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('log',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -273,6 +284,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Neg',
         sympy=('neg',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -289,6 +301,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Abs',
         sympy=('abs',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -305,6 +318,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('round',),
         c_fn=None,
+        tier1_class=None,
         notes="TRAP: turing's binary path normalizes reflected ops via `op[1:] if op.startswith(('i','r'))`. 'round' starts with 'r'. It is safe today only because unary ops are dispatched before that line -- any future binary op named with a leading i or r would silently mis-normalize.",
     ),
     OpDesc(
@@ -321,6 +335,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes="COLLISION: this is C trunc() -- float round-toward-zero. It is NOT turing's Handler.Trunc, which is integer width truncation (see canonical op 'int_trunc'). A naive name-union merges these wrongly.",
     ),
     OpDesc(
@@ -337,6 +352,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('floor',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -353,6 +369,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('ceiling',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -369,6 +386,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes='Returns 1.0/0.0 in double storage; CTensor has no bool dtype (turing/docs/c_backend_status.md).',
     ),
     OpDesc(
@@ -385,6 +403,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -401,6 +420,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -417,6 +437,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='LNot',
         sympy=('not',),
         c_fn=None,
+        tier1_class=None,
         notes="Logical (x == 0), distinct from bitwise 'invert'. nodus has ONE NOT opcode for both, so an emitter must choose ! vs ~ from operand dtype.",
     ),
     OpDesc(
@@ -433,6 +454,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Lt',
         sympy=('lt', 'strictlessthan'),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -449,6 +471,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Le',
         sympy=('le', 'lessthanorequal'),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -465,6 +488,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Gt',
         sympy=('gt', 'strictgreaterthan'),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -481,6 +505,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Ge',
         sympy=('ge', 'greaterthanorequal'),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -497,6 +522,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Eq',
         sympy=('eq', 'equality'),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -513,6 +539,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Ne',
         sympy=('ne', 'unequality'),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -529,6 +556,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=('max',),
         c_fn=None,
+        tier1_class=None,
         notes='Binary arithmetic, not a predicate. It used to ride inside the old compare_value switch at case 6; the CTensorOp enum resolved that wart by giving it a first-class code.',
     ),
     OpDesc(
@@ -545,6 +573,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=('min',),
         c_fn=None,
+        tier1_class=None,
         notes="Same history as 'maximum' (formerly compare_value case 7).",
     ),
     OpDesc(
@@ -561,6 +590,7 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=('sign',),
         c_fn=None,
+        tier1_class=None,
         notes='HOLE: present on AbstractTensor, absent from CTensorOp.',
     ),
     OpDesc(
@@ -577,6 +607,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Not',
         sympy=('invert',),
         c_fn=None,
+        tier1_class=None,
         notes="Bitwise NOT (np.invert / torch.bitwise_not). HOLE in C. Shares nodus's NOT opcode with 'logical_not'.",
     ),
     OpDesc(
@@ -593,6 +624,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('sin',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -609,6 +641,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('cos',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -625,6 +658,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('tan',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -641,6 +675,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -657,6 +692,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -673,6 +709,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -689,6 +726,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -705,6 +743,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -721,6 +760,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -737,6 +777,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -753,6 +794,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -769,6 +811,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -785,6 +828,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='And',
         sympy=('bitwise_and',),
         c_fn=None,
+        tier1_class=None,
         notes="HOLE in C. Shares nodus's AND opcode with 'logical_and'.",
     ),
     OpDesc(
@@ -801,6 +845,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Or',
         sympy=('bitwise_or',),
         c_fn=None,
+        tier1_class=None,
         notes='HOLE in C.',
     ),
     OpDesc(
@@ -817,6 +862,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Xor',
         sympy=('bitwise_xor', 'xor'),
         c_fn=None,
+        tier1_class=None,
         notes='HOLE in C.',
     ),
     OpDesc(
@@ -833,6 +879,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Shl',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes='nodus has no top-level shift opcode, but GLSL/SPIR-V support <<; defining the BINARY sub-op space is what makes this lowerable at all.',
     ),
     OpDesc(
@@ -849,6 +896,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Shr',
         sympy=(),
         c_fn=None,
+        tier1_class=None,
         notes="See 'shl'.",
     ),
     OpDesc(
@@ -865,6 +913,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='LAnd',
         sympy=('and',),
         c_fn=None,
+        tier1_class=None,
         notes='HOLE in C.',
     ),
     OpDesc(
@@ -881,6 +930,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='LOr',
         sympy=('or',),
         c_fn=None,
+        tier1_class=None,
         notes='HOLE in C.',
     ),
     OpDesc(
@@ -897,6 +947,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='Trunc',
         sympy=('trunc',),
         c_fn=None,
+        tier1_class=None,
         notes='COLLISION: Handler.Trunc is integer width truncation, NOT the float trunc() at CT_OP_TRUNC. Deliberately renamed so the two cannot merge.',
     ),
     OpDesc(
@@ -913,6 +964,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='ZExt',
         sympy=('zext',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -929,6 +981,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='SExt',
         sympy=('sext',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -945,6 +998,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='FpToSi',
         sympy=('fptosi',),
         c_fn='cast_double_to_int_values',
+        tier1_class=None,
         notes='C quantizes in place and returns double storage; CTensor has no integer dtype yet.',
     ),
     OpDesc(
@@ -961,6 +1015,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='FpToUi',
         sympy=('fptoui',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -977,6 +1032,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='SiToFp',
         sympy=('sitofp',),
         c_fn='cast_double_to_float_values',
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -993,6 +1049,7 @@ OPS: tuple[OpDesc, ...] = (
         handler='UiToFp',
         sympy=('uitofp',),
         c_fn=None,
+        tier1_class=None,
         notes=None,
     ),
     OpDesc(
@@ -1009,7 +1066,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('matrix',),
         c_fn='matmul_double',
-        notes='Needs its own dispatch grid; not one elementwise instruction. Deliberately excluded from CTensorOp too -- their dispatcher asserts every instruction writes one equally-shaped slot.',
+        tier1_class='contract',
+        notes='Structured class CONTRACT: needs its own dispatch grid -- 2D invocation domain over (m, p) with an inner n-loop of multiply-accumulate, supplied by KernelIR.dispatch_grid. Never one elementwise instruction; that constraint stands. Still deliberately excluded from CTensorOp -- its dispatcher asserts every instruction writes one equally-shaped slot.',
     ),
     OpDesc(
         canonical_id=57,
@@ -1025,7 +1083,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=('sum',),
         c_fn='sum_double',
-        notes='REDUCTION. KernelIR has no cross-invocation cooperation primitive at all (no workgroup-shared-memory opcode; SHUFFLE is intra-invocation), so this cannot be one kernel instruction.',
+        tier1_class='reduce',
+        notes='Structured class REDUCE: cross-element combination along an axis; sub_op carries the combining operation (add). v1 SPIR-V realization is a single-invocation loop accumulating over the reduced extent; the cooperative form adds workgroup shared memory behind the already-reserved BARRIER opcode without changing the instruction.',
     ),
     OpDesc(
         canonical_id=58,
@@ -1041,7 +1100,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn='mean_dim',
-        notes="Reduction; see 'sum'.",
+        tier1_class='reduce',
+        notes='Reduction: REDUCE(add) followed by an ordinary elementwise 1/n scale.',
     ),
     OpDesc(
         canonical_id=59,
@@ -1057,7 +1117,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn='topk_double',
-        notes='Data-dependent ordering.',
+        tier1_class='order',
+        notes='Structured class ORDER: data-dependent ordering/selection. v1 realization contains the ordering entirely within one invocation (selection loop); cooperative forms are a later refinement behind the same class.',
     ),
     OpDesc(
         canonical_id=60,
@@ -1073,7 +1134,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn='log_softmax_dim',
-        notes='Composite with an embedded reduction.',
+        tier1_class='reduce',
+        notes='Composite expressible entirely with REDUCE plus the elementwise vocabulary: REDUCE(maximum), sub, exp, REDUCE(add), log, sub.',
     ),
     OpDesc(
         canonical_id=61,
@@ -1089,7 +1151,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn='pad_double_nd',
-        notes='Shape-changing; needs allocation.',
+        tier1_class='remap',
+        notes="Structured class REMAP: index-remapping copy with a fill scalar for out-of-source indices. Output allocation is the launcher's job -- shape is declared on the output value, never performed in-kernel.",
     ),
     OpDesc(
         canonical_id=62,
@@ -1105,7 +1168,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn='stack_double',
-        notes='Variadic, shape-changing.',
+        tier1_class='remap',
+        notes='REMAP with a leading-axis offset map.',
     ),
     OpDesc(
         canonical_id=63,
@@ -1121,7 +1185,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Call',
         sympy=(),
         c_fn='cat_double',
-        notes='Variadic, shape-changing.',
+        tier1_class='remap',
+        notes='REMAP with an axis offset map.',
     ),
     OpDesc(
         canonical_id=64,
@@ -1137,7 +1202,8 @@ OPS: tuple[OpDesc, ...] = (
         handler='Load',
         sympy=('indexed',),
         c_fn='gather_pairs_2d',
-        notes="Indirect addressing. nodus's own structured-spatial gather family in tensor_math (research/04) is deliberately outside this table.",
+        tier1_class='remap',
+        notes="REMAP's indirect form: an index tensor operand supplies f(gid). Indirect addressing stays explicit in the instruction, not hidden in ADDR.",
     ),
     OpDesc(
         canonical_id=65,
@@ -1153,7 +1219,8 @@ OPS: tuple[OpDesc, ...] = (
         handler=None,
         sympy=(),
         c_fn='create_arange',
-        notes="Creation op: allocates. Closer to KernelIR's VAR/CONST than to an arithmetic instruction.",
+        tier1_class='generate',
+        notes='Structured class GENERATE: output is a pure function of the invocation index (start + gid*step). Creation allocates at the launcher, like every shape-declaring output.',
     ),
 )
 

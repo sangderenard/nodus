@@ -257,6 +257,14 @@ bool tensor_byte_offset_from_gli(const TensorDesc& desc,
 // Reduce along axis: sums every value across `axis` and writes result to `out`.
 bool tensor_reduce_sum_axis_f32(const AbstractTensor& src, uint32_t axis, AbstractTensor* out);
 
+// Full reduction over every element (all axes) into a single-element `out`.
+// Covers every numeric dtype including Bool; the accumulated value is
+// converted into `out`'s dtype, which is the caller's choice (dtype policy --
+// e.g. NumPy's sum-keeps-dtype / mean-promotes -- lives with the caller).
+// Dense layouts only; anything else refuses rather than computing wrong.
+bool tensor_reduce_sum_all(const AbstractTensor& src, AbstractTensor* out);
+bool tensor_reduce_mean_all(const AbstractTensor& src, AbstractTensor* out);
+
 // Affine scatter-add: applies a [4,4] transform to points before scatter.
 bool tensor_scatter_add_2d_affine_f32(const AbstractTensor& base,
                                       const AbstractTensor& points,

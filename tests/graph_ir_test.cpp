@@ -90,6 +90,7 @@ int main() {
           descriptor.ct_value >= 0 &&
           (descriptor.arity == 1 || descriptor.arity == 2);
     }
+    expected_registered += 2;  // sum and mean: dedicated reduction bodies
     if (!require_or_report(
             registered == expected_registered,
             "register every native canonical elementwise tensor tool"))

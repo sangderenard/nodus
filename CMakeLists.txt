@@ -368,18 +368,43 @@ add_library(nodus_tensor_core SHARED
   src/spirv_translation.cpp
   src/kernels/kernel_spirv.cpp
   src/kernels/kernel_ir_text.cpp
+  # Device execution for assembled modules -- lives beside the assembler so a
+  # host that can produce a kernel can also run it.
+  src/kernels/kernel_vulkan.cpp
+  # CPU execution of the same KernelIR -- the reference the device result is
+  # checked against, and the only numeric check available without a device.
+  src/kernels/kernel_eigen.cpp
   # vocabulary_actualizer: canonical catalog -> per-op, backend-grouped tool
   # sources (the vocabulary side of the module-library reduction pipeline).
   # Lives here, not in canvas_tables, because generated tool DLLs and their
   # hosts link nodus_tensor_core for shared arena identity, and the
   # actualizer entry point rides the same export-all surface.
   src/vocabulary_actualizer.cpp
+  # artifact_importer: ingests turing-compiled artifacts (dll + api.yaml
+  # calling contract) and generates the ITool wrapper + NODUSPKG manifest --
+  # the programmatic-import seam. Same placement rationale as above.
+  src/artifact_importer.cpp
+  # generic_object: one C++ shell type any foreign class becomes, filled from
+  # a transportable schema -- no per-class codegen, no SSA class table.
+  src/generic_object.cpp
 )
 target_include_directories(nodus_tensor_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
+# Vulkan compute execution: lets nodus RUN the SPIR-V it assembles, so a
+# kernel's correctness becomes a measured result rather than spirv-val's
+# structural verdict alone. Optional -- without the SDK the runner reports
+# unavailability and dependent tests skip.
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+  target_link_libraries(nodus_tensor_core PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(nodus_tensor_core PUBLIC NODUS_HAVE_VULKAN=1)
+  message(STATUS "nodus: Vulkan found -- KernelIR modules are dispatchable")
+else()
+  message(STATUS "nodus: Vulkan not found -- SPIR-V kernels assemble but do not run")
+endif()
 set_target_properties(nodus_tensor_core PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_compile_features(nodus_tensor_core PUBLIC cxx_std_20)
 
@@ -987,6 +1012,68 @@ target_compile_definitions(test_vocab_tool_dll PRIVATE
 )
 target_compile_features(test_vocab_tool_dll PRIVATE cxx_std_20)
 add_test(NAME vocab_tool_dll_test COMMAND test_vocab_tool_dll)
+
+# Rung 2 of the boundary fluency campaign: import a turing-compiled artifact
+# (dll + api-v1 contract) through gp_artifact_import, build the generated
+# wrapper, execute against the reference, emit a substitution certificate.
+# Skips (exit 0) when the fixture has not been generated.
+add_executable(test_artifact_import
+  tests/artifact_import_test.cpp
+)
+target_link_libraries(test_artifact_import PRIVATE nodus_tensor_core)
+target_compile_definitions(test_artifact_import PRIVATE
+  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
+  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+)
+target_compile_features(test_artifact_import PRIVATE cxx_std_20)
+add_test(NAME artifact_import_test COMMAND test_artifact_import)
+
+# KernelIR -> SPIR-V -> real GPU. Skips when no device is present.
+add_executable(test_vulkan_dispatch
+  tests/vulkan_dispatch_test.cpp
+)
+target_link_libraries(test_vulkan_dispatch PRIVATE nodus_tensor_core)
+target_compile_features(test_vulkan_dispatch PRIVATE cxx_std_20)
+add_test(NAME vulkan_dispatch_test COMMAND test_vulkan_dispatch)
+
+# KernelIR -> CPU. The same two kernels vulkan_dispatch_test builds, run
+# through the interpreter, so opcode semantics are checked with no device.
+add_executable(test_eigen_kernel
+  tests/eigen_kernel_test.cpp
+)
+target_link_libraries(test_eigen_kernel PRIVATE nodus_tensor_core)
+target_compile_features(test_eigen_kernel PRIVATE cxx_std_20)
+add_test(NAME eigen_kernel_test COMMAND test_eigen_kernel)
+
+# A foreign class becomes a working C++ object from its schema alone.
+add_executable(test_generic_object
+  tests/generic_object_test.cpp
+)
+target_link_libraries(test_generic_object PRIVATE nodus_tensor_core)
+target_compile_features(test_generic_object PRIVATE cxx_std_20)
+add_test(NAME generic_object_test COMMAND test_generic_object)
+
+# A frontend-emitted GraphIR script executed through the registered
+# abstract_tensor tool vocabulary, checked against source-ecosystem values.
+add_executable(tensor_graph_execute
+  tests/tensor_graph_execute_test.cpp
+)
+target_link_libraries(tensor_graph_execute PRIVATE canvas_tables_static)
+target_compile_features(tensor_graph_execute PRIVATE cxx_std_20)
+
+# Python-emitted SCHEMA V1 parsed and instantiated by the C++ shell.
+add_executable(test_schema_crossing tests/schema_crossing_test.cpp)
+target_link_libraries(test_schema_crossing PRIVATE nodus_tensor_core)
+target_compile_features(test_schema_crossing PRIVATE cxx_std_20)
+
+# E13 alias-policy semantics (boundary error register): bare catalog ids ->
+# loaded versioned tools, with real-entry priority and drop-on-unregister.
+add_executable(test_registry_alias
+  tests/registry_alias_test.cpp
+)
+target_link_libraries(test_registry_alias PRIVATE canvas_tables_static)
+target_compile_features(test_registry_alias PRIVATE cxx_std_20)
+add_test(NAME registry_alias_test COMMAND test_registry_alias)
 
 add_executable(test_repo_package
   tests/repo_package_test.cpp

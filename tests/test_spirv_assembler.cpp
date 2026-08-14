@@ -14,6 +14,8 @@
 #include "translation_matrix.h"
 
 #include <cassert>
+#include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 

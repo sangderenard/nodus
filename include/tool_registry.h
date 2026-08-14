@@ -31,8 +31,28 @@ public:
 
     bool unregister_tool(const std::string& id);
 
+    // Alias layer (boundary error register, E13): canvas ROWS and definition
+    // modules name bare catalog ids ("abstract_tensor.tanh"), while
+    // PluginLoader registers versioned unique ids so multiple loads coexist.
+    // An alias makes a loaded tool answer to its bare id. Resolution policy,
+    // stated once and enforced here:
+    //   - find()/create() resolve exact real entries FIRST; an alias never
+    //     shadows a real entry (an in-image reference implementation keeps
+    //     priority over any loaded witness of the same id);
+    //   - registering an alias whose name collides with a real entry is
+    //     refused;
+    //   - re-registering an existing alias re-points it (latest load wins;
+    //     earlier versions stay reachable by their unique ids);
+    //   - unregister_tool() drops every alias that points at the removed id.
+    // Resolution is exactly one hop: aliases to aliases are refused.
+    bool register_alias(const std::string& alias, const std::string& target_id);
+    // The id find()/create() would act on for `id` (identity for real
+    // entries, target for aliases, empty if unknown).
+    std::string resolve(const std::string& id) const;
+
 private:
     std::unordered_map<std::string, Entry> entries_;
+    std::unordered_map<std::string, std::string> aliases_;
 };
 
 ToolRegistry& tool_registry_global();

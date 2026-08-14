@@ -82,7 +82,31 @@ enum class OpCode : uint16_t {
     AND,               // a, b
     OR,                // a, b
     NOT,               // x
-    XOR                // a, b
+    XOR,               // a, b
+
+    // Bounded iteration. THE missing Tier-0 primitive: without it nothing
+    // that walks a buffer -- no reduction, contraction, remap or scan -- can
+    // be DEFINED in KernelIR, which is why such operations were previously
+    // recorded as permanent holes. It is abundantly safe to add: every
+    // target has bounded iteration (SPIR-V structured OpLoopMerge, GLSL/C
+    // for-loops, a plain loop on CPU/Eigen), so a Tier-1 recipe built on it
+    // lowers everywhere rather than obliging each emitter to re-implement a
+    // composite.
+    //
+    // LOOP_BEGIN/LOOP_END bracket a body in the flat instruction list, in
+    // the same structured spirit as IF: no arbitrary branching, one entry,
+    // one exit, statically bounded trip count.
+    //   LOOP_BEGIN  inputs=[trip_count]  outputs=[index]
+    //   ... body instructions, which may read `index` ...
+    //   LOOP_END    (no inputs, no outputs)
+    //
+    // Cooperative yielding rides here: when KernelIR::budget_value_id names
+    // a buffer, the loop's condition also consults that budget so a kernel
+    // stops of its own accord before a watchdog (Windows TDR) stops it for
+    // us. Dressing the control primitive means every generated kernel is
+    // bounded by construction, with no caller obliged to remember.
+    LOOP_BEGIN,        // trip_count -> index
+    LOOP_END           //
 };
 
 // IR instruction
@@ -118,6 +142,13 @@ struct KernelIR {
     std::vector<Instruction> instrs;
     std::array<uint32_t, 3> suggested_local_size{16, 16, 1};
     uint32_t element_count = 0;
+    // Optional buffer holding a cooperative work budget. When set, LOOP
+    // conditions consult it so long-running kernels yield voluntarily
+    // instead of being killed by a driver watchdog; the host re-dispatches
+    // until the kernel reports completion. kInvalidValueId means "no budget
+    // declared", the behavior every existing kernel already has.
+    static constexpr uint32_t kNoBudget = 0xFFFFFFFFu;
+    uint32_t budget_value_id = kNoBudget;
 };
 
 } // namespace spirv

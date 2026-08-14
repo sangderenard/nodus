@@ -233,6 +233,15 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
         return {};
     }
     std::cerr << "DEBUG: PluginLoader registered tool id='" << unique_id << "' base='" << base_id << "' path='" << path << "'\n";
+    // E13 (boundary error register): canvas ROWS and definition modules name
+    // the BARE id ("abstract_tensor.tanh"); alias it to this load so those
+    // references instantiate. Policy lives in ToolRegistry::register_alias:
+    // a real in-image entry with the bare id keeps priority (alias refused),
+    // and a later load of the same base re-points the alias (latest wins)
+    // while earlier versions stay reachable by their unique ids.
+    if (base_id != unique_id) {
+        tool_registry_global().register_alias(base_id, unique_id);
+    }
 
     // call plugin_init if present
     if (info->plugin_init) {

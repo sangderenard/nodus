@@ -9517,6 +9517,179 @@ NODUS_TENSOR_APPLY_STENCIL_2D_INTO_WRAP(f64,
 #undef NODUS_TENSOR_APPLY_STENCIL_2D_WRAP
 #undef NODUS_TENSOR_APPLY_STENCIL_2D_INTO_WRAP
 
+namespace {
+
+// One pass over a dense buffer, accumulating exactly: doubles for floats,
+// int64/uint64 for signed/unsigned integers, trues counted for Bool.
+struct FullReduceTotal {
+    bool is_float = false, is_signed = false, is_unsigned = false;
+    double real = 0.0;
+    int64_t signed_value = 0;
+    uint64_t unsigned_value = 0;
+
+    double as_double() const {
+        return is_float ? real
+             : is_signed ? static_cast<double>(signed_value)
+                         : static_cast<double>(unsigned_value);
+    }
+};
+
+bool reduce_all_accumulate(const AbstractTensor& src, FullReduceTotal* total,
+                           uint64_t* out_count) {
+    if (!src.valid() || src.desc().layout != TensorLayout::Dense) return false;
+    auto* mem = dynamic_cast<InMemoryBackend*>(src.backend());
+    if (!mem) return false;
+    const uint64_t count = src.desc().shape.element_count();
+    if (count == 0) return false;
+
+    void* data = nullptr;
+    size_t bytes = 0;
+    if (!mem->map(src.handle(), &data, &bytes)) return false;
+    bool supported = true;
+    switch (src.desc().dtype) {
+    case TensorDType::F32: {
+        total->is_float = true;
+        const auto* v = static_cast<const float*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->real += v[i];
+        break;
+    }
+    case TensorDType::F64: {
+        total->is_float = true;
+        const auto* v = static_cast<const double*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->real += v[i];
+        break;
+    }
+    case TensorDType::I8: {
+        total->is_signed = true;
+        const auto* v = static_cast<const int8_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->signed_value += v[i];
+        break;
+    }
+    case TensorDType::I16: {
+        total->is_signed = true;
+        const auto* v = static_cast<const int16_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->signed_value += v[i];
+        break;
+    }
+    case TensorDType::I32: {
+        total->is_signed = true;
+        const auto* v = static_cast<const int32_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->signed_value += v[i];
+        break;
+    }
+    case TensorDType::I64: {
+        total->is_signed = true;
+        const auto* v = static_cast<const int64_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->signed_value += v[i];
+        break;
+    }
+    case TensorDType::U8: {
+        total->is_unsigned = true;
+        const auto* v = static_cast<const uint8_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->unsigned_value += v[i];
+        break;
+    }
+    case TensorDType::U16: {
+        total->is_unsigned = true;
+        const auto* v = static_cast<const uint16_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->unsigned_value += v[i];
+        break;
+    }
+    case TensorDType::U32: {
+        total->is_unsigned = true;
+        const auto* v = static_cast<const uint32_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->unsigned_value += v[i];
+        break;
+    }
+    case TensorDType::U64: {
+        total->is_unsigned = true;
+        const auto* v = static_cast<const uint64_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->unsigned_value += v[i];
+        break;
+    }
+    case TensorDType::Bool: {
+        total->is_signed = true;
+        const auto* v = static_cast<const uint8_t*>(data);
+        for (uint64_t i = 0; i < count; ++i) total->signed_value += (v[i] != 0);
+        break;
+    }
+    default:
+        supported = false;
+        break;
+    }
+    mem->unmap(src.handle());
+    if (supported) *out_count = count;
+    return supported;
+}
+
+bool reduce_all_write(const FullReduceTotal& total, bool divide,
+                      uint64_t count, AbstractTensor* out) {
+    if (!out || !out->valid() || out->desc().shape.element_count() != 1)
+        return false;
+    auto* mem = dynamic_cast<InMemoryBackend*>(out->backend());
+    if (!mem) return false;
+    void* data = nullptr;
+    size_t bytes = 0;
+    if (!mem->map(out->handle(), &data, &bytes)) return false;
+    const double real_value =
+        divide ? total.as_double() / static_cast<double>(count)
+               : total.as_double();
+    bool supported = true;
+    switch (out->desc().dtype) {
+    case TensorDType::F32:
+        *static_cast<float*>(data) = static_cast<float>(real_value);
+        break;
+    case TensorDType::F64:
+        *static_cast<double*>(data) = real_value;
+        break;
+    case TensorDType::I8:
+        *static_cast<int8_t*>(data) = static_cast<int8_t>(total.signed_value);
+        break;
+    case TensorDType::I16:
+        *static_cast<int16_t*>(data) = static_cast<int16_t>(total.signed_value);
+        break;
+    case TensorDType::I32:
+        *static_cast<int32_t*>(data) = static_cast<int32_t>(total.signed_value);
+        break;
+    case TensorDType::I64:
+        *static_cast<int64_t*>(data) = total.signed_value;
+        break;
+    case TensorDType::U8:
+        *static_cast<uint8_t*>(data) = static_cast<uint8_t>(total.unsigned_value);
+        break;
+    case TensorDType::U16:
+        *static_cast<uint16_t*>(data) = static_cast<uint16_t>(total.unsigned_value);
+        break;
+    case TensorDType::U32:
+        *static_cast<uint32_t*>(data) = static_cast<uint32_t>(total.unsigned_value);
+        break;
+    case TensorDType::U64:
+        *static_cast<uint64_t*>(data) = total.unsigned_value;
+        break;
+    default:
+        supported = false;
+        break;
+    }
+    mem->unmap(out->handle());
+    return supported;
+}
+
+} // namespace
+
+bool tensor_reduce_sum_all(const AbstractTensor& src, AbstractTensor* out) {
+    FullReduceTotal total;
+    uint64_t count = 0;
+    return reduce_all_accumulate(src, &total, &count) &&
+           reduce_all_write(total, /*divide=*/false, count, out);
+}
+
+bool tensor_reduce_mean_all(const AbstractTensor& src, AbstractTensor* out) {
+    FullReduceTotal total;
+    uint64_t count = 0;
+    return reduce_all_accumulate(src, &total, &count) &&
+           reduce_all_write(total, /*divide=*/true, count, out);
+}
+
 bool tensor_reduce_sum_axis_f32(const AbstractTensor& src, uint32_t axis, AbstractTensor* out) {
     if (!out || !out->valid() || !src.valid()) return false;
     if (src.backend() != out->backend()) return false;

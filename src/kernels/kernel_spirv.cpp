@@ -67,6 +67,7 @@ enum : u32 {
     kOpShiftLeftLogical = 196,
     kOpBitwiseOr = 197, kOpBitwiseXor = 198, kOpBitwiseAnd = 199,
     kOpNot = 200,
+    kOpPhi = 245, kOpLoopMerge = 246,
     kOpLabel = 248, kOpBranch = 249, kOpBranchConditional = 250,
     kOpSelectionMerge = 247, kOpReturn = 253,
 };
@@ -90,7 +91,7 @@ enum : u32 {
     kDecoNonWritable = 24, kDecoBinding = 33, kDecoDescriptorSet = 34,
     kDecoOffset = 35,
     kBuiltInGlobalInvocationId = 28,
-    kStorageInput = 1, kStorageStorageBuffer = 12,
+    kStorageFunction = 7, kStorageInput = 1, kStorageStorageBuffer = 12,
     kExecutionModelGLCompute = 5, kExecutionModeLocalSize = 17,
     kCapabilityShader = 1,
     kMemoryModelLogical = 0, kMemoryModelGLSL450 = 1,
@@ -275,6 +276,9 @@ private:
     void lower_addr(const spirv::Instruction& ins);
     void lower_load(const spirv::Instruction& ins);
     void lower_store(const spirv::Instruction& ins);
+    void lower_var(const spirv::Instruction& ins);
+    void lower_loop_begin(const spirv::Instruction& ins);
+    void lower_loop_end(const spirv::Instruction& ins);
 
     bool single_output(const spirv::Instruction& ins, const char* what) {
         if (ins.outputs.size() == 1) return true;
@@ -298,6 +302,23 @@ private:
     std::unordered_map<u32, ScalarType> pointer_scalars_;
     std::unordered_map<u32, u32> buffer_variables_; // value id -> OpVariable id
     std::unordered_map<u32, ScalarType> buffer_scalars_;
+    // Label of the block body_ is currently emitting into. Straight-line
+    // lowerings never touch it; block-opening lowerings (the loop pair)
+    // update it as they emit labels.
+    u32 current_label_ = 0;
+    // Open LOOP_BEGIN frames, so LOOP_END closes the innermost one and
+    // nesting works without any extra bookkeeping in callers.
+    struct LoopFrame {
+        u32 index_var = 0;   // Function-storage induction variable
+        u32 header = 0;
+        u32 continue_target = 0;
+        u32 merge = 0;
+    };
+    std::vector<LoopFrame> loop_stack_;
+    // Function-storage variables must be declared in the function's FIRST
+    // block per SPIR-V's rules, so they are collected here and emitted
+    // ahead of the body rather than where they appear.
+    Stream function_vars_;
     std::vector<std::string> shortfalls_;
 };
 
@@ -637,6 +658,138 @@ void ModuleAssembler::lower_store(const spirv::Instruction& ins) {
     body_.op(kOpStore, {pointer->second, value});
 }
 
+// VAR: a function-local mutable cell. Declared in the function's first
+// block (SPIR-V requires it), its result is a POINTER, so ordinary LOAD and
+// STORE work on it exactly as they do on an ADDR result. This is what lets a
+// Tier-1 recipe carry an accumulator across loop iterations without the IR
+// needing phi nodes at all.
+void ModuleAssembler::lower_var(const spirv::Instruction& ins) {
+    if (!single_output(ins, "VAR")) return;
+    const u32 out = ins.outputs[0].id;
+    const ScalarType s = value_scalar(out);
+    const u32 ptr_type = t_ptr("fn-" + scalar_name(s), kStorageFunction, t_scalar(s));
+    const u32 variable = fresh();
+    function_vars_.op(kOpVariable, {ptr_type, variable, kStorageFunction});
+    value_pointers_[out] = variable;
+    pointer_scalars_[out] = s;
+    // An initializer operand would have to be a constant; instead honor an
+    // optional initial-value input with a plain STORE, which also accepts a
+    // computed value.
+    if (!ins.inputs.empty()) {
+        bool ok = true;
+        const u32 initial = resolve(ins.inputs[0], s, ok);
+        if (!ok) return;
+        body_.op(kOpStore, {variable, initial});
+    }
+}
+
+// LOOP_BEGIN: open a structured, bounded loop and publish its index.
+//
+// The induction variable is a Function-storage VAR rather than a phi, which
+// keeps emission simple and is entirely ordinary SPIR-V -- drivers promote it
+// during optimization. Shape:
+//
+//     OpStore %i 0 ; OpBranch %header
+//   %header: OpLoopMerge %merge %continue None ; OpBranch %check
+//   %check:  %i0 = OpLoad %i
+//            %cond = %i0 < trip_count            [ && budget remains ]
+//            OpBranchConditional %cond %body %merge
+//   %body:   %index = OpLoad %i    <- the published index
+//            ... caller's body ...
+//
+// When the kernel declares a budget buffer, the condition also requires
+// budget[0] != 0, so the loop exits cooperatively rather than being killed
+// by a watchdog. The dressing lives on the control primitive itself, so
+// every kernel carrying a budget is bounded by construction.
+void ModuleAssembler::lower_loop_begin(const spirv::Instruction& ins) {
+    if (!single_output(ins, "LOOP_BEGIN")) return;
+    if (ins.inputs.size() != 1) {
+        shortfall("LOOP_BEGIN takes a trip count");
+        return;
+    }
+    const u32 index_value = ins.outputs[0].id;
+    bool ok = true;
+    const u32 trip = resolve(ins.inputs[0], ScalarType::U32, ok);
+    if (!ok) return;
+
+    const u32 index_var = fresh();
+    function_vars_.op(kOpVariable,
+                      {t_ptr("fn-u32", kStorageFunction, t_u32()), index_var,
+                       kStorageFunction});
+    body_.op(kOpStore, {index_var, const_u32(0u)});
+
+    LoopFrame frame;
+    frame.index_var = index_var;
+    frame.header = fresh();
+    frame.continue_target = fresh();
+    frame.merge = fresh();
+    const u32 check = fresh();
+    const u32 body_label = fresh();
+
+    body_.op(kOpBranch, {frame.header});
+    body_.op(kOpLabel, {frame.header});
+    current_label_ = frame.header;
+    body_.op(kOpLoopMerge, {frame.merge, frame.continue_target, 0u});
+    body_.op(kOpBranch, {check});
+    body_.op(kOpLabel, {check});
+    current_label_ = check;
+    const u32 current = fresh();
+    body_.op(kOpLoad, {t_u32(), current, index_var});
+    u32 condition = fresh();
+    body_.op(kOpULessThan, {t_bool(), condition, current, trip});
+    // Cooperative budget: stop early while work remains rather than risking a
+    // watchdog reset. budget[0] == 0 means "yield now".
+    if (k_.budget_value_id != spirv::KernelIR::kNoBudget) {
+        auto budget = buffer_variables_.find(k_.budget_value_id);
+        if (budget == buffer_variables_.end()) {
+            shortfall("budget_value_id is not a declared buffer");
+            return;
+        }
+        const ScalarType bs = buffer_scalars_.at(k_.budget_value_id);
+        const u32 slot = fresh();
+        body_.op(kOpAccessChain,
+                 {t_ptr("sb-elem-" + scalar_name(bs), kStorageStorageBuffer, t_scalar(bs)),
+                  slot, budget->second, const_u32(0u), const_u32(0u)});
+        const u32 remaining = fresh();
+        body_.op(kOpLoad, {t_scalar(bs), remaining, slot});
+        const u32 has_budget = fresh();
+        body_.op(kOpINotEqual, {t_bool(), has_budget, remaining, const_scalar(bs, 0u)});
+        const u32 both = fresh();
+        body_.op(kOpLogicalAnd, {t_bool(), both, condition, has_budget});
+        condition = both;
+    }
+    body_.op(kOpBranchConditional, {condition, body_label, frame.merge});
+    body_.op(kOpLabel, {body_label});
+    current_label_ = body_label;
+    const u32 published = fresh();
+    body_.op(kOpLoad, {t_u32(), published, index_var});
+    value_results_[index_value] = published;
+    loop_stack_.push_back(frame);
+}
+
+// LOOP_END: close the innermost loop -- continue block increments the index,
+// branches back to the header, and the merge block resumes straight-line
+// emission.
+void ModuleAssembler::lower_loop_end(const spirv::Instruction&) {
+    if (loop_stack_.empty()) {
+        shortfall("LOOP_END without a matching LOOP_BEGIN");
+        return;
+    }
+    const LoopFrame frame = loop_stack_.back();
+    loop_stack_.pop_back();
+    body_.op(kOpBranch, {frame.continue_target});
+    body_.op(kOpLabel, {frame.continue_target});
+    current_label_ = frame.continue_target;
+    const u32 current = fresh();
+    body_.op(kOpLoad, {t_u32(), current, frame.index_var});
+    const u32 next = fresh();
+    body_.op(kOpIAdd, {t_u32(), next, current, const_u32(1u)});
+    body_.op(kOpStore, {frame.index_var, next});
+    body_.op(kOpBranch, {frame.header});
+    body_.op(kOpLabel, {frame.merge});
+    current_label_ = frame.merge;
+}
+
 void ModuleAssembler::lower_instruction(const spirv::Instruction& ins) {
     using spirv::OpCode;
     switch (ins.op) {
@@ -656,6 +809,9 @@ void ModuleAssembler::lower_instruction(const spirv::Instruction& ins) {
         case OpCode::ADDR: lower_addr(ins); return;
         case OpCode::LOAD: lower_load(ins); return;
         case OpCode::STORE: lower_store(ins); return;
+        case OpCode::VAR: lower_var(ins); return;
+        case OpCode::LOOP_BEGIN: lower_loop_begin(ins); return;
+        case OpCode::LOOP_END: lower_loop_end(ins); return;
         default:
             shortfall("OpCode " + std::to_string(static_cast<int>(ins.op)) +
                       " has no direct SPIR-V lowering yet");
@@ -756,11 +912,42 @@ SpirvAssembly ModuleAssembler::run() {
         fn_stream.op(kOpSelectionMerge, {merge_label, 0u /*None*/});
         fn_stream.op(kOpBranchConditional, {in_range, body_label, merge_label});
         fn_stream.op(kOpLabel, {body_label});
+        // Structured-class lowerings that open blocks of their own (REDUCE's
+        // loop) need to know which block their phis' back-edges come from.
+        current_label_ = body_label;
     }
 
     for (const auto& ins : k_.instrs) lower_instruction(ins);
 
-    // Assemble function: prologue (+guard), body, close.
+    // Assemble function: prologue (+guard), body, close. SPIR-V requires all
+    // Function-storage OpVariables to appear in the entry block ahead of
+    // everything else, so they are spliced in before the guard/body rather
+    // than at their point of use.
+    if (!function_vars_.words.empty()) {
+        std::vector<u32> merged;
+        merged.reserve(fn_stream.words.size() + function_vars_.words.size());
+        // fn_stream currently holds: OpFunction, OpLabel, [guard...]. The
+        // variables belong immediately after that first OpLabel.
+        std::size_t insert_at = 0;
+        std::size_t cursor = 0;
+        int labels_seen = 0;
+        while (cursor < fn_stream.words.size()) {
+            const u32 head = fn_stream.words[cursor];
+            const u32 count = head >> 16;
+            const u32 opcode = head & 0xFFFFu;
+            cursor += count ? count : 1;
+            if (opcode == kOpLabel) { ++labels_seen; insert_at = cursor; break; }
+        }
+        if (labels_seen == 0) insert_at = fn_stream.words.size();
+        merged.insert(merged.end(), fn_stream.words.begin(),
+                      fn_stream.words.begin() + static_cast<long>(insert_at));
+        merged.insert(merged.end(), function_vars_.words.begin(),
+                      function_vars_.words.end());
+        merged.insert(merged.end(),
+                      fn_stream.words.begin() + static_cast<long>(insert_at),
+                      fn_stream.words.end());
+        fn_stream.words.swap(merged);
+    }
     for (u32 word : body_.words) fn_stream.words.push_back(word);
     if (guarded) {
         fn_stream.op(kOpBranch, {merge_label});

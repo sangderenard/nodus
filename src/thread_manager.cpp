@@ -949,11 +949,9 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         } else {
                             tctx.input = nullptr;
                         }
-                        fprintf(stderr, "[DIAG-EXEC] mod=%d row=%d inst=%p pre-execute_stack\n", mod_idx, row, (void*)inst);
                         try {
                             inst->execute_stack(tctx);
                         } catch (...) {}
-                        fprintf(stderr, "[DIAG-EXEC] mod=%d row=%d post-execute_stack\n", mod_idx, row);
                         continue; // plugin handled this row
                     }
                 }
