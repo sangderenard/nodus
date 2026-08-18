@@ -33,7 +33,18 @@ SOURCE = HERE / "canonical_ops.json"
 CPP_OUT = REPO / "include" / "canonical_ops.h"
 PY_OUT = HERE / "canonical_ops_generated.py"
 
-OP_CLASSES = ("unary", "binary", "compare", "cast", "opaque")
+# Computation classes describe how an operation lowers: the first four are one
+# Tier-0 instruction, "opaque" is a Tier-1 composition naming its family.
+#
+# The last three are not computations at all. They are the SSA program's own
+# structure -- control flow and closure boundaries, addressed storage, and
+# value introduction. They write no equally-shaped slot, so they never carry a
+# CTensorOp dispatcher target, and they compose from nothing, so they name no
+# Tier-1 family. They exist here so both languages reduce their spellings of
+# program structure to the same names, exactly as they already do for
+# arithmetic.
+STRUCTURAL_CLASSES = ("control", "memory", "value")
+OP_CLASSES = ("unary", "binary", "compare", "cast", "opaque") + STRUCTURAL_CLASSES
 
 # OpCode members of nodus::spirv::OpCode that entries may reference. A literal list, so a
 # typo in the JSON fails here rather than at C++ compile time.
@@ -134,14 +145,22 @@ def validate(ops: list[dict]) -> None:
                 )
             else:
                 seen_ct_values[ct_value] = name
-            if op["class"] == "opaque":
+            if op["class"] == "opaque" or op["class"] in STRUCTURAL_CLASSES:
                 errors.append(
-                    f"{where}: class 'opaque' must not have a ct_op -- turing's dispatcher "
-                    f"requires every instruction to write one equally-shaped slot"
+                    f"{where}: class '{op['class']}' must not have a ct_op -- turing's "
+                    f"dispatcher requires every instruction to write one "
+                    f"equally-shaped slot"
                 )
 
-        if op["returns"] not in ("value", "bool"):
-            errors.append(f"{where}: returns must be 'value' or 'bool'")
+        # "void" exists for structural operations that produce no SSA result at
+        # all (a branch, a store, a return). Modelling those as returning a
+        # value would be the same kind of lie this table exists to prevent.
+        if op["returns"] not in ("value", "bool", "void"):
+            errors.append(f"{where}: returns must be 'value', 'bool', or 'void'")
+        if op["returns"] == "void" and op["class"] not in STRUCTURAL_CLASSES:
+            errors.append(
+                f"{where}: only {list(STRUCTURAL_CLASSES)} operations may return 'void'"
+            )
         if not isinstance(op["arity"], int) or op["arity"] < 0:
             errors.append(f"{where}: arity must be a non-negative int")
         for flag in ("lowerable", "reflectable"):
@@ -168,6 +187,13 @@ def validate(ops: list[dict]) -> None:
         if op["class"] == "opaque" and t1 is None:
             errors.append(
                 f"{where}: class 'opaque' must name its Tier-1 composition family"
+            )
+        # A structural operation composes from nothing -- it is program shape,
+        # not a computation built out of Tier-0 instructions.
+        if op["class"] in STRUCTURAL_CLASSES and t1 is not None:
+            errors.append(
+                f"{where}: class '{op['class']}' is program structure and names no "
+                f"Tier-1 composition family (found '{t1}')"
             )
         if op["class"] != "opaque" and t1 is not None:
             errors.append(
@@ -236,7 +262,8 @@ def emit_cpp(data: dict) -> str:
     out.append("")
 
     out += [
-        "enum class OpClass : uint8_t { Unary, Binary, Compare, Cast, Opaque };",
+        "enum class OpClass : uint8_t { Unary, Binary, Compare, Cast, Opaque,",
+        "                               Control, Memory, Value };",
         "",
         "struct OpDesc {",
         "    std::string_view name;         // canonical name -- the one true key",
@@ -246,6 +273,7 @@ def emit_cpp(data: dict) -> str:
         "    std::string_view ct_op;        // CTensorOp member name, or \"\"",
         "    uint8_t          arity;",
         "    bool             returns_bool;",
+        "    bool             returns_void;  // true => publishes no SSA result at all",
         "    bool             lowerable;    // true => expressible as ONE Tier-0 instruction",
         "    bool             reflectable;  // has a distinct reversed-operand form",
         "    std::string_view kernel_op;    // nodus::spirv::OpCode name, or \"\"",
@@ -258,7 +286,8 @@ def emit_cpp(data: dict) -> str:
 
     cls_map = {"unary": "OpClass::Unary", "binary": "OpClass::Binary",
                "compare": "OpClass::Compare", "cast": "OpClass::Cast",
-               "opaque": "OpClass::Opaque"}
+               "opaque": "OpClass::Opaque", "control": "OpClass::Control",
+               "memory": "OpClass::Memory", "value": "OpClass::Value"}
 
     out.append("inline constexpr OpDesc kOps[] = {")
     for canonical_id, o in enumerate(ops):
@@ -270,6 +299,7 @@ def emit_cpp(data: dict) -> str:
             cpp_str(o["ct_op"]),
             str(o["arity"]),
             "true" if o["returns"] == "bool" else "false",
+            "true" if o["returns"] == "void" else "false",
             "true" if o["lowerable"] else "false",
             "true" if o["reflectable"] else "false",
             cpp_str(o["kernel_op"]),

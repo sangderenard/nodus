@@ -52,8 +52,8 @@ enum class CanonicalOp : uint16_t {
     NOT_EQUAL = 25,  // CT_OP_NE
     MAXIMUM = 26,  // CT_OP_MAXIMUM
     MINIMUM = 27,  // CT_OP_MINIMUM
-    SIGN = 28,
-    INVERT = 29,
+    SIGN = 28,  // CT_OP_SIGN
+    INVERT = 29,  // CT_OP_INVERT
     SIN = 30,  // CT_OP_SIN
     COS = 31,  // CT_OP_COS
     TAN = 32,  // CT_OP_TAN
@@ -66,13 +66,13 @@ enum class CanonicalOp : uint16_t {
     ASINH = 39,  // CT_OP_ASINH
     ACOSH = 40,  // CT_OP_ACOSH
     ATANH = 41,  // CT_OP_ATANH
-    BITAND = 42,
-    BITOR = 43,
-    BITXOR = 44,
-    SHL = 45,
-    SHR = 46,
-    LOGICAL_AND = 47,
-    LOGICAL_OR = 48,
+    BITAND = 42,  // CT_OP_BITAND
+    BITOR = 43,  // CT_OP_BITOR
+    BITXOR = 44,  // CT_OP_BITXOR
+    SHL = 45,  // CT_OP_SHL
+    SHR = 46,  // CT_OP_SHR
+    LOGICAL_AND = 47,  // CT_OP_LOGICAL_AND
+    LOGICAL_OR = 48,  // CT_OP_LOGICAL_OR
     INT_TRUNC = 49,
     ZEXT = 50,
     SEXT = 51,
@@ -90,10 +90,32 @@ enum class CanonicalOp : uint16_t {
     CAT = 63,
     GATHER = 64,
     ARANGE = 65,
-    COUNT = 66,
+    BR = 66,
+    CONDBR = 67,
+    INDIRECTBR = 68,
+    RET = 69,
+    TRAP = 70,
+    PHI = 71,
+    SELECT = 72,
+    DEPLOY = 73,
+    JOIN = 74,
+    ALLOCA = 75,
+    STORE = 76,
+    GETELEMENTPTR = 77,
+    GETATTR = 78,
+    INDEXED = 79,
+    INDEXEDSTORE = 80,
+    FILL = 81,
+    STRIDED_STORE_FILL = 82,
+    STRIDED_MEMORY_COPY = 83,
+    DEEPCOPY = 84,
+    CONST = 85,
+    STATIC_REF = 86,
+    COUNT = 87,
 };
 
-enum class OpClass : uint8_t { Unary, Binary, Compare, Cast, Opaque };
+enum class OpClass : uint8_t { Unary, Binary, Compare, Cast, Opaque,
+                               Control, Memory, Value };
 
 struct OpDesc {
     std::string_view name;         // canonical name -- the one true key
@@ -103,6 +125,7 @@ struct OpDesc {
     std::string_view ct_op;        // CTensorOp member name, or ""
     uint8_t          arity;
     bool             returns_bool;
+    bool             returns_void;  // true => publishes no SSA result at all
     bool             lowerable;    // true => expressible as ONE Tier-0 instruction
     bool             reflectable;  // has a distinct reversed-operand form
     std::string_view kernel_op;    // nodus::spirv::OpCode name, or ""
@@ -112,75 +135,96 @@ struct OpDesc {
 };
 
 inline constexpr OpDesc kOps[] = {
-    {"add", 0, OpClass::Binary, 0, "CT_OP_ADD", 2, false, true, false, "BINARY", "Add", "", ""},
-    {"sub", 1, OpClass::Binary, 1, "CT_OP_SUB", 2, false, true, true, "BINARY", "Sub", "", ""},
-    {"mul", 2, OpClass::Binary, 2, "CT_OP_MUL", 2, false, true, false, "BINARY", "Mul", "", ""},
-    {"truediv", 3, OpClass::Binary, 3, "CT_OP_DIV", 2, false, true, true, "BINARY", "Div", "", ""},
-    {"pow", 4, OpClass::Binary, 4, "CT_OP_POW", 2, false, true, true, "BINARY", "Pow", "", ""},
-    {"mod", 5, OpClass::Binary, 5, "CT_OP_MOD", 2, false, true, true, "BINARY", "Mod", "", ""},
-    {"floordiv", 6, OpClass::Binary, 6, "CT_OP_FLOORDIV", 2, false, true, true, "BINARY", "", "", ""},
-    {"sqrt", 7, OpClass::Unary, 7, "CT_OP_SQRT", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"exp", 8, OpClass::Unary, 8, "CT_OP_EXP", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"log", 9, OpClass::Unary, 9, "CT_OP_LOG", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"neg", 10, OpClass::Unary, 10, "CT_OP_NEG", 1, false, true, false, "UNARY", "Neg", "", ""},
-    {"abs", 11, OpClass::Unary, 11, "CT_OP_ABS", 1, false, true, false, "UNARY", "Abs", "", ""},
-    {"round", 12, OpClass::Unary, 12, "CT_OP_ROUND", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"trunc", 13, OpClass::Unary, 13, "CT_OP_TRUNC", 1, false, true, false, "UNARY", "", "", ""},
-    {"floor", 14, OpClass::Unary, 14, "CT_OP_FLOOR", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"ceil", 15, OpClass::Unary, 15, "CT_OP_CEIL", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"isfinite", 16, OpClass::Unary, 16, "CT_OP_ISFINITE", 1, true, true, false, "UNARY", "", "", ""},
-    {"isnan", 17, OpClass::Unary, 17, "CT_OP_ISNAN", 1, true, true, false, "UNARY", "", "", ""},
-    {"isinf", 18, OpClass::Unary, 18, "CT_OP_ISINF", 1, true, true, false, "UNARY", "", "", ""},
-    {"logical_not", 19, OpClass::Unary, 19, "CT_OP_LOGICAL_NOT", 1, true, true, false, "NOT", "LNot", "", ""},
-    {"less", 20, OpClass::Compare, 20, "CT_OP_LT", 2, true, true, false, "CMP", "Lt", "", ""},
-    {"less_equal", 21, OpClass::Compare, 21, "CT_OP_LE", 2, true, true, false, "CMP", "Le", "", ""},
-    {"greater", 22, OpClass::Compare, 22, "CT_OP_GT", 2, true, true, false, "CMP", "Gt", "", ""},
-    {"greater_equal", 23, OpClass::Compare, 23, "CT_OP_GE", 2, true, true, false, "CMP", "Ge", "", ""},
-    {"equal", 24, OpClass::Compare, 24, "CT_OP_EQ", 2, true, true, false, "CMP", "Eq", "", ""},
-    {"not_equal", 25, OpClass::Compare, 25, "CT_OP_NE", 2, true, true, false, "CMP", "Ne", "", ""},
-    {"maximum", 26, OpClass::Binary, 26, "CT_OP_MAXIMUM", 2, false, true, false, "BINARY", "", "", ""},
-    {"minimum", 27, OpClass::Binary, 27, "CT_OP_MINIMUM", 2, false, true, false, "BINARY", "", "", ""},
-    {"sign", 28, OpClass::Unary, -1, "", 1, false, true, false, "UNARY", "", "", ""},
-    {"invert", 29, OpClass::Unary, -1, "", 1, false, true, false, "NOT", "Not", "", ""},
-    {"sin", 30, OpClass::Unary, 29, "CT_OP_SIN", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"cos", 31, OpClass::Unary, 30, "CT_OP_COS", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"tan", 32, OpClass::Unary, 31, "CT_OP_TAN", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"asin", 33, OpClass::Unary, 32, "CT_OP_ASIN", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"acos", 34, OpClass::Unary, 33, "CT_OP_ACOS", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"atan", 35, OpClass::Unary, 34, "CT_OP_ATAN", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"sinh", 36, OpClass::Unary, 35, "CT_OP_SINH", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"cosh", 37, OpClass::Unary, 36, "CT_OP_COSH", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"tanh", 38, OpClass::Unary, 28, "CT_OP_TANH", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"asinh", 39, OpClass::Unary, 37, "CT_OP_ASINH", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"acosh", 40, OpClass::Unary, 38, "CT_OP_ACOSH", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"atanh", 41, OpClass::Unary, 39, "CT_OP_ATANH", 1, false, true, false, "UNARY", "Call", "", ""},
-    {"bitand", 42, OpClass::Binary, -1, "", 2, false, true, false, "AND", "And", "", ""},
-    {"bitor", 43, OpClass::Binary, -1, "", 2, false, true, false, "OR", "Or", "", ""},
-    {"bitxor", 44, OpClass::Binary, -1, "", 2, false, true, false, "XOR", "Xor", "", ""},
-    {"shl", 45, OpClass::Binary, -1, "", 2, false, true, true, "BINARY", "Shl", "", ""},
-    {"shr", 46, OpClass::Binary, -1, "", 2, false, true, true, "BINARY", "Shr", "", ""},
-    {"logical_and", 47, OpClass::Binary, -1, "", 2, true, true, false, "AND", "LAnd", "", ""},
-    {"logical_or", 48, OpClass::Binary, -1, "", 2, true, true, false, "OR", "LOr", "", ""},
-    {"int_trunc", 49, OpClass::Cast, -1, "", 1, false, true, false, "CAST", "Trunc", "", ""},
-    {"zext", 50, OpClass::Cast, -1, "", 1, false, true, false, "CAST", "ZExt", "", ""},
-    {"sext", 51, OpClass::Cast, -1, "", 1, false, true, false, "CAST", "SExt", "", ""},
-    {"fptosi", 52, OpClass::Cast, -1, "", 1, false, true, false, "CAST", "FpToSi", "cast_double_to_int_values", ""},
-    {"fptoui", 53, OpClass::Cast, -1, "", 1, false, true, false, "CAST", "FpToUi", "", ""},
-    {"sitofp", 54, OpClass::Cast, -1, "", 1, false, true, false, "CAST", "SiToFp", "cast_double_to_float_values", ""},
-    {"uitofp", 55, OpClass::Cast, -1, "", 1, false, true, false, "CAST", "UiToFp", "", ""},
-    {"matmul", 56, OpClass::Opaque, -1, "", 2, false, false, true, "", "Call", "matmul_double", "contract"},
-    {"sum", 57, OpClass::Opaque, -1, "", 1, false, false, false, "", "Call", "sum_double", "reduce"},
-    {"mean", 58, OpClass::Opaque, -1, "", 1, false, false, false, "", "Call", "mean_dim", "reduce"},
-    {"topk", 59, OpClass::Opaque, -1, "", 1, false, false, false, "", "Call", "topk_double", "order"},
-    {"log_softmax", 60, OpClass::Opaque, -1, "", 1, false, false, false, "", "Call", "log_softmax_dim", "reduce"},
-    {"pad", 61, OpClass::Opaque, -1, "", 1, false, false, false, "", "Call", "pad_double_nd", "remap"},
-    {"stack", 62, OpClass::Opaque, -1, "", 2, false, false, false, "", "Call", "stack_double", "remap"},
-    {"cat", 63, OpClass::Opaque, -1, "", 2, false, false, false, "", "Call", "cat_double", "remap"},
-    {"gather", 64, OpClass::Opaque, -1, "", 2, false, false, false, "", "Load", "gather_pairs_2d", "remap"},
-    {"arange", 65, OpClass::Opaque, -1, "", 0, false, false, false, "", "", "create_arange", "generate"},
+    {"add", 0, OpClass::Binary, 0, "CT_OP_ADD", 2, false, false, true, false, "BINARY", "Add", "", ""},
+    {"sub", 1, OpClass::Binary, 1, "CT_OP_SUB", 2, false, false, true, true, "BINARY", "Sub", "", ""},
+    {"mul", 2, OpClass::Binary, 2, "CT_OP_MUL", 2, false, false, true, false, "BINARY", "Mul", "", ""},
+    {"truediv", 3, OpClass::Binary, 3, "CT_OP_DIV", 2, false, false, true, true, "BINARY", "Div", "", ""},
+    {"pow", 4, OpClass::Binary, 4, "CT_OP_POW", 2, false, false, true, true, "BINARY", "Pow", "", ""},
+    {"mod", 5, OpClass::Binary, 5, "CT_OP_MOD", 2, false, false, true, true, "BINARY", "Mod", "", ""},
+    {"floordiv", 6, OpClass::Binary, 6, "CT_OP_FLOORDIV", 2, false, false, true, true, "BINARY", "", "", ""},
+    {"sqrt", 7, OpClass::Unary, 7, "CT_OP_SQRT", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"exp", 8, OpClass::Unary, 8, "CT_OP_EXP", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"log", 9, OpClass::Unary, 9, "CT_OP_LOG", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"neg", 10, OpClass::Unary, 10, "CT_OP_NEG", 1, false, false, true, false, "UNARY", "Neg", "", ""},
+    {"abs", 11, OpClass::Unary, 11, "CT_OP_ABS", 1, false, false, true, false, "UNARY", "Abs", "", ""},
+    {"round", 12, OpClass::Unary, 12, "CT_OP_ROUND", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"trunc", 13, OpClass::Unary, 13, "CT_OP_TRUNC", 1, false, false, true, false, "UNARY", "", "", ""},
+    {"floor", 14, OpClass::Unary, 14, "CT_OP_FLOOR", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"ceil", 15, OpClass::Unary, 15, "CT_OP_CEIL", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"isfinite", 16, OpClass::Unary, 16, "CT_OP_ISFINITE", 1, true, false, true, false, "UNARY", "", "", ""},
+    {"isnan", 17, OpClass::Unary, 17, "CT_OP_ISNAN", 1, true, false, true, false, "UNARY", "", "", ""},
+    {"isinf", 18, OpClass::Unary, 18, "CT_OP_ISINF", 1, true, false, true, false, "UNARY", "", "", ""},
+    {"logical_not", 19, OpClass::Unary, 19, "CT_OP_LOGICAL_NOT", 1, true, false, true, false, "NOT", "LNot", "", ""},
+    {"less", 20, OpClass::Compare, 20, "CT_OP_LT", 2, true, false, true, false, "CMP", "Lt", "", ""},
+    {"less_equal", 21, OpClass::Compare, 21, "CT_OP_LE", 2, true, false, true, false, "CMP", "Le", "", ""},
+    {"greater", 22, OpClass::Compare, 22, "CT_OP_GT", 2, true, false, true, false, "CMP", "Gt", "", ""},
+    {"greater_equal", 23, OpClass::Compare, 23, "CT_OP_GE", 2, true, false, true, false, "CMP", "Ge", "", ""},
+    {"equal", 24, OpClass::Compare, 24, "CT_OP_EQ", 2, true, false, true, false, "CMP", "Eq", "", ""},
+    {"not_equal", 25, OpClass::Compare, 25, "CT_OP_NE", 2, true, false, true, false, "CMP", "Ne", "", ""},
+    {"maximum", 26, OpClass::Binary, 26, "CT_OP_MAXIMUM", 2, false, false, true, false, "BINARY", "", "", ""},
+    {"minimum", 27, OpClass::Binary, 27, "CT_OP_MINIMUM", 2, false, false, true, false, "BINARY", "", "", ""},
+    {"sign", 28, OpClass::Unary, 40, "CT_OP_SIGN", 1, false, false, true, false, "UNARY", "", "", ""},
+    {"invert", 29, OpClass::Unary, 41, "CT_OP_INVERT", 1, false, false, true, false, "NOT", "Not", "", ""},
+    {"sin", 30, OpClass::Unary, 29, "CT_OP_SIN", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"cos", 31, OpClass::Unary, 30, "CT_OP_COS", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"tan", 32, OpClass::Unary, 31, "CT_OP_TAN", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"asin", 33, OpClass::Unary, 32, "CT_OP_ASIN", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"acos", 34, OpClass::Unary, 33, "CT_OP_ACOS", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"atan", 35, OpClass::Unary, 34, "CT_OP_ATAN", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"sinh", 36, OpClass::Unary, 35, "CT_OP_SINH", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"cosh", 37, OpClass::Unary, 36, "CT_OP_COSH", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"tanh", 38, OpClass::Unary, 28, "CT_OP_TANH", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"asinh", 39, OpClass::Unary, 37, "CT_OP_ASINH", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"acosh", 40, OpClass::Unary, 38, "CT_OP_ACOSH", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"atanh", 41, OpClass::Unary, 39, "CT_OP_ATANH", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"bitand", 42, OpClass::Binary, 42, "CT_OP_BITAND", 2, false, false, true, false, "AND", "And", "", ""},
+    {"bitor", 43, OpClass::Binary, 43, "CT_OP_BITOR", 2, false, false, true, false, "OR", "Or", "", ""},
+    {"bitxor", 44, OpClass::Binary, 44, "CT_OP_BITXOR", 2, false, false, true, false, "XOR", "Xor", "", ""},
+    {"shl", 45, OpClass::Binary, 45, "CT_OP_SHL", 2, false, false, true, true, "BINARY", "Shl", "", ""},
+    {"shr", 46, OpClass::Binary, 46, "CT_OP_SHR", 2, false, false, true, true, "BINARY", "Shr", "", ""},
+    {"logical_and", 47, OpClass::Binary, 47, "CT_OP_LOGICAL_AND", 2, true, false, true, false, "AND", "LAnd", "", ""},
+    {"logical_or", 48, OpClass::Binary, 48, "CT_OP_LOGICAL_OR", 2, true, false, true, false, "OR", "LOr", "", ""},
+    {"int_trunc", 49, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "Trunc", "", ""},
+    {"zext", 50, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "ZExt", "", ""},
+    {"sext", 51, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "SExt", "", ""},
+    {"fptosi", 52, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "FpToSi", "cast_double_to_int_values", ""},
+    {"fptoui", 53, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "FpToUi", "", ""},
+    {"sitofp", 54, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "SiToFp", "cast_double_to_float_values", ""},
+    {"uitofp", 55, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "UiToFp", "", ""},
+    {"matmul", 56, OpClass::Opaque, -1, "", 2, false, false, false, true, "", "Call", "matmul_double", "contract"},
+    {"sum", 57, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "sum_double", "reduce"},
+    {"mean", 58, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "mean_dim", "reduce"},
+    {"topk", 59, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "topk_double", "order"},
+    {"log_softmax", 60, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "log_softmax_dim", "reduce"},
+    {"pad", 61, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "pad_double_nd", "remap"},
+    {"stack", 62, OpClass::Opaque, -1, "", 2, false, false, false, false, "", "Call", "stack_double", "remap"},
+    {"cat", 63, OpClass::Opaque, -1, "", 2, false, false, false, false, "", "Call", "cat_double", "remap"},
+    {"gather", 64, OpClass::Opaque, -1, "", 2, false, false, false, false, "", "Load", "gather_pairs_2d", "remap"},
+    {"arange", 65, OpClass::Opaque, -1, "", 0, false, false, false, false, "", "", "create_arange", "generate"},
+    {"br", 66, OpClass::Control, -1, "", 0, false, true, false, false, "", "Br", "", ""},
+    {"condbr", 67, OpClass::Control, -1, "", 1, false, true, false, false, "", "CondBr", "", ""},
+    {"indirectbr", 68, OpClass::Control, -1, "", 1, false, true, false, false, "", "IndirectBr", "", ""},
+    {"ret", 69, OpClass::Control, -1, "", 1, false, true, false, false, "", "Ret", "", ""},
+    {"trap", 70, OpClass::Control, -1, "", 0, false, true, false, false, "", "Trap", "", ""},
+    {"phi", 71, OpClass::Control, -1, "", 0, false, false, false, false, "", "Phi", "", ""},
+    {"select", 72, OpClass::Control, -1, "", 3, false, false, true, false, "SELECT", "Select", "", ""},
+    {"deploy", 73, OpClass::Control, -1, "", 0, false, true, false, false, "", "Deploy", "", ""},
+    {"join", 74, OpClass::Control, -1, "", 0, false, true, false, false, "", "Join", "", ""},
+    {"alloca", 75, OpClass::Memory, -1, "", 1, false, false, false, false, "", "Alloca", "", ""},
+    {"store", 76, OpClass::Memory, -1, "", 2, false, true, false, false, "", "Store", "", ""},
+    {"getelementptr", 77, OpClass::Memory, -1, "", 2, false, false, false, false, "", "GetElementPtr", "", ""},
+    {"getattr", 78, OpClass::Memory, -1, "", 1, false, false, false, false, "", "GetAttr", "", ""},
+    {"indexed", 79, OpClass::Memory, -1, "", 2, false, false, false, false, "", "Indexed", "", ""},
+    {"indexedstore", 80, OpClass::Memory, -1, "", 3, false, true, false, false, "", "IndexedStore", "", ""},
+    {"fill", 81, OpClass::Memory, -1, "", 2, false, true, false, false, "", "Fill", "", ""},
+    {"strided_store_fill", 82, OpClass::Memory, -1, "", 3, false, true, false, false, "", "StridedStoreFill", "", ""},
+    {"strided_memory_copy", 83, OpClass::Memory, -1, "", 3, false, true, false, false, "", "StridedMemoryCopy", "", ""},
+    {"deepcopy", 84, OpClass::Memory, -1, "", 1, false, false, false, false, "", "Deepcopy", "", ""},
+    {"const", 85, OpClass::Value, -1, "", 0, false, false, false, false, "", "Const", "", ""},
+    {"static_ref", 86, OpClass::Value, -1, "", 0, false, false, false, false, "", "StaticRef", "", ""},
 };
 
-inline constexpr size_t kOpCount = 66;
+inline constexpr size_t kOpCount = 87;
 
 // Lookups return nullptr when unknown. A hard null beats a silent zero: research/06
 // and research/12 document what silently-defaulting lookups have already cost here.
