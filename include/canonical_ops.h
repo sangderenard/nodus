@@ -111,7 +111,12 @@ enum class CanonicalOp : uint16_t {
     DEEPCOPY = 84,
     CONST = 85,
     STATIC_REF = 86,
-    COUNT = 87,
+    SETATTR = 87,
+    CLASS_DEFINE = 88,
+    FIELD_DEFINE = 89,
+    METHOD_DEFINE = 90,
+    FUNCTION_DEFINE = 91,
+    COUNT = 92,
 };
 
 enum class OpClass : uint8_t { Unary, Binary, Compare, Cast, Opaque,
@@ -222,9 +227,14 @@ inline constexpr OpDesc kOps[] = {
     {"deepcopy", 84, OpClass::Memory, -1, "", 1, false, false, false, false, "", "Deepcopy", "", ""},
     {"const", 85, OpClass::Value, -1, "", 0, false, false, false, false, "", "Const", "", ""},
     {"static_ref", 86, OpClass::Value, -1, "", 0, false, false, false, false, "", "StaticRef", "", ""},
+    {"setattr", 87, OpClass::Memory, -1, "", 2, false, true, false, false, "", "SetAttr", "", ""},
+    {"class_define", 88, OpClass::Value, -1, "", 0, false, false, false, false, "", "ClassDefine", "", ""},
+    {"field_define", 89, OpClass::Value, -1, "", 0, false, false, false, false, "", "FieldDefine", "", ""},
+    {"method_define", 90, OpClass::Value, -1, "", 0, false, false, false, false, "", "MethodDefine", "", ""},
+    {"function_define", 91, OpClass::Value, -1, "", 0, false, false, false, false, "", "FunctionDefine", "", ""},
 };
 
-inline constexpr size_t kOpCount = 87;
+inline constexpr size_t kOpCount = 92;
 
 // Lookups return nullptr when unknown. A hard null beats a silent zero: research/06
 // and research/12 document what silently-defaulting lookups have already cost here.

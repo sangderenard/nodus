@@ -100,6 +100,11 @@ class CanonicalOp(IntEnum):
     DEEPCOPY = 84
     CONST = 85
     STATIC_REF = 86
+    SETATTR = 87
+    CLASS_DEFINE = 88
+    FIELD_DEFINE = 89
+    METHOD_DEFINE = 90
+    FUNCTION_DEFINE = 91
 
 
 class OpDesc(NamedTuple):
@@ -1599,6 +1604,91 @@ OPS: tuple[OpDesc, ...] = (
         c_fn=None,
         tier1_class=None,
         notes='Introduce a reference to a statically known entity resolved at compile time, never a runtime address.',
+    ),
+    OpDesc(
+        canonical_id=87,
+        name='setattr',
+        op_class='memory',
+        ct_op=None,
+        ct_value=None,
+        arity=2,
+        returns='void',
+        lowerable=False,
+        reflectable=False,
+        kernel_op=None,
+        handler='SetAttr',
+        sympy=(),
+        c_fn=None,
+        tier1_class=None,
+        notes="Write one named field of a record, resolved against the record descriptor. The storing half of the accessor pair: without it a field write is only a slot store and the field's name -- its meaning -- is lost in translation.",
+    ),
+    OpDesc(
+        canonical_id=88,
+        name='class_define',
+        op_class='value',
+        ct_op=None,
+        ct_value=None,
+        arity=0,
+        returns='value',
+        lowerable=False,
+        reflectable=False,
+        kernel_op=None,
+        handler='ClassDefine',
+        sympy=(),
+        c_fn=None,
+        tier1_class=None,
+        notes='State a class: its identity, instance-field layout and method bindings. The SSA module already holds this as a table; naming it here lets a definition cross a suite boundary as an operator instead of an out-of-band attachment.',
+    ),
+    OpDesc(
+        canonical_id=89,
+        name='field_define',
+        op_class='value',
+        ct_op=None,
+        ct_value=None,
+        arity=0,
+        returns='value',
+        lowerable=False,
+        reflectable=False,
+        kernel_op=None,
+        handler='FieldDefine',
+        sympy=(),
+        c_fn=None,
+        tier1_class=None,
+        notes="State one instance field's addressable slot within a class layout.",
+    ),
+    OpDesc(
+        canonical_id=90,
+        name='method_define',
+        op_class='value',
+        ct_op=None,
+        ct_value=None,
+        arity=0,
+        returns='value',
+        lowerable=False,
+        reflectable=False,
+        kernel_op=None,
+        handler='MethodDefine',
+        sympy=(),
+        c_fn=None,
+        tier1_class=None,
+        notes='Bind a method name on a class to the function that implements it, so the class/function relationship survives translation.',
+    ),
+    OpDesc(
+        canonical_id=91,
+        name='function_define',
+        op_class='value',
+        ct_op=None,
+        ct_value=None,
+        arity=0,
+        returns='value',
+        lowerable=False,
+        reflectable=False,
+        kernel_op=None,
+        handler='FunctionDefine',
+        sympy=(),
+        c_fn=None,
+        tier1_class=None,
+        notes='State a function or closure body as a definition rather than a call target, so an authored body -- and every constant inside it, such as a custom epsilon -- round-trips bit-exactly.',
     ),
 )
 
