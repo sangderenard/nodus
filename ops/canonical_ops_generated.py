@@ -105,6 +105,7 @@ class CanonicalOp(IntEnum):
     FIELD_DEFINE = 89
     METHOD_DEFINE = 90
     FUNCTION_DEFINE = 91
+    SIGMOID = 92  # CT_OP_SIGMOID
 
 
 class OpDesc(NamedTuple):
@@ -1689,6 +1690,23 @@ OPS: tuple[OpDesc, ...] = (
         c_fn=None,
         tier1_class=None,
         notes='State a function or closure body as a definition rather than a call target, so an authored body -- and every constant inside it, such as a custom epsilon -- round-trips bit-exactly.',
+    ),
+    OpDesc(
+        canonical_id=92,
+        name='sigmoid',
+        op_class='unary',
+        ct_op='CT_OP_SIGMOID',
+        ct_value=49,
+        arity=1,
+        returns='value',
+        lowerable=True,
+        reflectable=False,
+        kernel_op='UNARY',
+        handler='Call',
+        sympy=(),
+        c_fn=None,
+        tier1_class=None,
+        notes="Logistic activation as a primitive, not a composition. Assembled from comparisons, exp and a blend it recorded as one opaque op no backend had, so a model using it failed to lower. The stable branch lives once in C; abstract_nn's Sigmoid activation is the layer that wraps it.",
     ),
 )
 

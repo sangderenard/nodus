@@ -1598,6 +1598,22 @@
    "c_fn": null,
    "notes": "State a function or closure body as a definition rather than a call target, so an authored body -- and every constant inside it, such as a custom epsilon -- round-trips bit-exactly.",
    "tier1_class": null
+  },
+  {
+   "name": "sigmoid",
+   "class": "unary",
+   "ct_op": "CT_OP_SIGMOID",
+   "ct_value": 49,
+   "arity": 1,
+   "returns": "value",
+   "kernel_op": "UNARY",
+   "lowerable": true,
+   "handler": "Call",
+   "sympy": [],
+   "reflectable": false,
+   "c_fn": null,
+   "notes": "Logistic activation as a primitive, not a composition. Assembled from comparisons, exp and a blend it recorded as one opaque op no backend had, so a model using it failed to lower. The stable branch lives once in C; abstract_nn's Sigmoid activation is the layer that wraps it.",
+   "tier1_class": null
   }
  ]
 }

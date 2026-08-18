@@ -43,11 +43,19 @@ def parse_ctensor_enum(text: str) -> dict[str, int]:
     m = re.search(r"typedef\s+enum\s+CTensorOp\s*\{(.*?)\}", text, re.S)
     if not m:
         return {}
+    # Strip comments from the whole body BEFORE splitting on commas. Splitting
+    # first tears any block comment that contains a comma in half, so the
+    # `/* ... */` pattern can no longer match either piece -- and the enum
+    # member following that comment is then silently dropped. That is not
+    # hypothetical: the comment explaining why CT_OP_SIGMOID is appended last
+    # contains one, which made CT_OP_SIGMOID invisible here and blocked it
+    # from ever being registered in the catalog.
+    body = re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+    body = re.sub(r"//.*", "", body)
     values: dict[str, int] = {}
     nxt = 0
-    for raw in m.group(1).split(","):
-        item = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
-        item = re.sub(r"//.*", "", item).strip()
+    for raw in body.split(","):
+        item = raw.strip()
         if not item:
             continue
         em = re.match(r"^(CT_OP_\w+)\s*(?:=\s*(-?\d+))?$", item)
