@@ -151,11 +151,11 @@
    "returns": "value",
    "kernel_op": "BINARY",
    "lowerable": true,
-   "handler": null,
+   "handler": "FloorDiv",
    "sympy": [],
    "reflectable": true,
    "c_fn": null,
-   "notes": "turing's Handler has no floor-division member; it would coarsen to Div + floor.",
+   "notes": "turing's direct tensor SSA handler is FloorDiv (ssa_numeric_operators.py).",
    "tier1_class": null
   },
   {
@@ -1026,7 +1026,7 @@
    "returns": "value",
    "kernel_op": null,
    "lowerable": false,
-   "handler": "Call",
+   "handler": "MatMul",
    "sympy": [
     "matrix"
    ],

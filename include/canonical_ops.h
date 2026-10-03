@@ -147,7 +147,7 @@ inline constexpr OpDesc kOps[] = {
     {"truediv", 3, OpClass::Binary, 3, "CT_OP_DIV", 2, false, false, true, true, "BINARY", "Div", "", ""},
     {"pow", 4, OpClass::Binary, 4, "CT_OP_POW", 2, false, false, true, true, "BINARY", "Pow", "", ""},
     {"mod", 5, OpClass::Binary, 5, "CT_OP_MOD", 2, false, false, true, true, "BINARY", "Mod", "", ""},
-    {"floordiv", 6, OpClass::Binary, 6, "CT_OP_FLOORDIV", 2, false, false, true, true, "BINARY", "", "", ""},
+    {"floordiv", 6, OpClass::Binary, 6, "CT_OP_FLOORDIV", 2, false, false, true, true, "BINARY", "FloorDiv", "", ""},
     {"sqrt", 7, OpClass::Unary, 7, "CT_OP_SQRT", 1, false, false, true, false, "UNARY", "Call", "", ""},
     {"exp", 8, OpClass::Unary, 8, "CT_OP_EXP", 1, false, false, true, false, "UNARY", "Call", "", ""},
     {"log", 9, OpClass::Unary, 9, "CT_OP_LOG", 1, false, false, true, false, "UNARY", "Call", "", ""},
@@ -197,7 +197,7 @@ inline constexpr OpDesc kOps[] = {
     {"fptoui", 53, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "FpToUi", "", ""},
     {"sitofp", 54, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "SiToFp", "cast_double_to_float_values", ""},
     {"uitofp", 55, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "UiToFp", "", ""},
-    {"matmul", 56, OpClass::Opaque, -1, "", 2, false, false, false, true, "", "Call", "matmul_double", "contract"},
+    {"matmul", 56, OpClass::Opaque, -1, "", 2, false, false, false, true, "", "MatMul", "matmul_double", "contract"},
     {"sum", 57, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "sum_double", "reduce"},
     {"mean", 58, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "mean_dim", "reduce"},
     {"topk", 59, OpClass::Opaque, -1, "", 1, false, false, false, false, "", "Call", "topk_double", "order"},
@@ -254,15 +254,17 @@ inline constexpr const OpDesc* find_op(CanonicalOp op) {
     return nullptr;
 }
 
-// Resolve a turing Handler member. Handler::Call fans out across every elementary
-// function, so this returns the first match only and is unsuitable for Call --
-// prefer find_op(name). Present to make the correspondence expressible, not to
-// dispatch on.
+// Resolve only uniquely owned Handler members. Handler::Call fans out across
+// elementary functions and must be resolved by the declared operation name.
 inline constexpr const OpDesc* find_op_by_handler(std::string_view handler) {
+    const OpDesc* match = nullptr;
     for (size_t i = 0; i < kOpCount; ++i) {
-        if (!kOps[i].handler.empty() && kOps[i].handler == handler) return &kOps[i];
+        if (!kOps[i].handler.empty() && kOps[i].handler == handler) {
+            if (match) return nullptr;
+            match = &kOps[i];
+        }
     }
-    return nullptr;
+    return match;
 }
 
 } // namespace ops
