@@ -46,8 +46,10 @@ static_assert(find_op("add")->op_class == OpClass::Binary, "add is binary");
 static_assert(find_op("no_such_op") == nullptr, "unknown names must yield nullptr");
 static_assert(find_op(CanonicalOp::MUL)->name == std::string_view("mul"),
               "reverse lookup by enum must round-trip");
-static_assert(static_cast<int>(CanonicalOp::COUNT) == 66,
+static_assert(static_cast<size_t>(CanonicalOp::COUNT) == kOpCount,
               "every catalog operation must have a canonical ID");
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == kOpCount,
+              "the generated count must cover every descriptor");
 
 int main() {
   // 1) Every lowerable op names a KernelIR opcode; every non-lowerable names none.
@@ -83,11 +85,9 @@ int main() {
       check(seen.insert(kOps[i].ct_value).second,
             std::string("duplicate ct_value for '") + std::string(kOps[i].name) + "'");
     }
-    // 40 = the 28 original members plus the vendored trig/hyperbolic family
-    // (sin..atanh). ops/verify_canonical_ops.py checks this count against
-    // turing's live CTensorOp header, so this constant tracks that verifier.
-    check(static_cast<int>(seen.size()) == 40,
-          "the current CTensorOp subset has 40 members");
+    // The live-header verifier owns completeness against CT_OP_COUNT; do
+    // not duplicate that changing subset's size in this catalog consumer.
+    check(!seen.empty(), "the catalog must record its CTensorOp subset");
     int32_t expected = 0;
     for (int32_t v : seen) {
       check(v == expected, "ct_values must be gapless from 0");
@@ -178,6 +178,20 @@ int main() {
       if (kOps[i].handler == std::string_view("Call")) ++call_count;
     }
     check(call_count > 1, "Handler 'Call' is expected to fan out across many ops");
+    check(find_op_by_handler("Call") == nullptr,
+          "ambiguous Call must not silently select an elementary function");
+    for (const auto& op : kOps) {
+      check(find_op(op.name) == &op &&
+            find_op(static_cast<CanonicalOp>(op.canonical_id)) == &op,
+            std::string("catalog name/ID roundtrip failed for '") + std::string(op.name) + "'");
+      if (op.handler.empty()) continue;
+      size_t owners = 0;
+      for (const auto& candidate : kOps) {
+        if (candidate.handler == op.handler) ++owners;
+      }
+      check(find_op_by_handler(op.handler) == (owners == 1 ? &op : nullptr),
+            std::string("handler ownership mismatch for '") + std::string(op.handler) + "'");
+    }
   }
 
   // 9) The reason this table exists: KernelIR's UNARY/BINARY/CMP/CAST can now actually be
