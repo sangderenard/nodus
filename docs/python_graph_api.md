@@ -48,6 +48,23 @@ allows native old-reader advancement/drop behavior. Use `fifo=None` to represent
 an intentionally unconfigured edge. Execution refuses such an edge explicitly;
 it is never converted into a mandatory queue or a zero-capacity sentinel.
 
+CANVAS V4 does **not** serialize a configured edge's FIFO spec, subscriptions,
+reader positions, or samples. After `Graph.load`, attach every restored edge
+and make the transport choice again:
+
+```python
+producer = graph.module_by_id(producer_id, input_count=2, output_count=1)
+consumer = graph.module_by_id(consumer_id, input_count=2, output_count=1)
+graph.attach_edge(
+    producer.output(0), consumer.input(0),
+    fifo=FifoConfig.scalar_f32(slots=7, top_k=0),
+)
+```
+
+Execution fails while any restored edge remains unattached. Passing
+`fifo=None` to `attach_edge` records deliberate absence and continues to fail
+at execution; it never invents a persisted/default queue.
+
 Named input/output ports are real table edges with the same fixed token shape,
 dtype/layout fields, subscriptions, and first-token semantics. The initial
 surface exposes exact four-byte scalar tokens as `push_f32`/`pull_f32`; raw or
@@ -57,40 +74,89 @@ shape contract.
 ## Native interchange and boundaries
 
 `Graph.save(path)` and `Graph.load(path)` use native CANVAS V4 persistence.
-Nodus also persists full table/FIFO-side state in its existing `.gpmod`
-sidecars under `module_library`; the canvas text alone is not the whole native
-document. Headless creation disables interactive autosave and clears the
-default UI workspace so Python execution cannot mutate that active document.
-Host port bindings are process-local views and must be rebound after load.
+Nodus writes table topology sidecars under the shared `module_library` path;
+they are not per-canvas bundles, and their edge records do not contain FIFO
+configuration or live transport state. The canvas text alone is therefore not
+an independently portable native document. Host ports and edge FIFO choices
+are process-local views and must be rebound after load.
+
+Headless construction refuses to start while a native canvas singleton already
+exists, so it cannot replace the UI's process-global manager. The underlying
+interactive constructor still reads the default workspace before the headless
+layer disables autosave and clears it in memory; no-write isolation is
+enforced, but strict no-read isolation is not claimed.
 
 The following limits are deliberate and raise `UnsupportedNativeContract` or
 remain outside this initial surface:
 
-- Only one live graph per process: canvas contact lookup and the ThreadManager
-  global are still process-global.
+- Only one primary canvas/headless graph per process: canvas contact lookup and
+  table helpers are still process-global. A pre-existing UI/native canvas makes
+  headless creation fail; a second Python `Graph` is refused as well.
+- The row-stack surface is narrow: `Input`, `Output`, and enumerated ordinary
+  scalar tools with known stack effects. Arbitrary stack mutation, typed stack
+  slots, snapshots, clone ownership, and unresolved plugin execution are not
+  exposed.
+- FIFO support covers fixed-size tokens and native `slots`/`top_k`. Python's
+  executable helper is exactly four-byte `float32`. Raw/tensor ownership,
+  every native drop/slip policy, internal-edge start positions, reader
+  management, and live queue checkpointing are unsupported. `type_id`, layout,
+  and dtype are passed through rather than inferred.
 - Ordinary Canvas Input/Output rows carry scalar values. Registered
   `abstract_tensor.*` ToolIR consumes owned `AbstractTensor*`; Python refuses
   to mix those pointer and scalar currencies.
 - Canvas, ProcessGraph/GraphIR, SSA, and KernelIR retain different contracts.
   This API does not flatten them or claim that a native canvas save is a
-  lossless GraphIR/SSA translation.
+  lossless GraphIR/SSA translation. Native editor topology, labels, positions,
+  tool bindings, and UUIDs use native persistence; Python row metadata and host
+  bindings are not automatically reconstructed.
 - The Turing straight-line Canvas/SSA bridge still has its documented control
   flow and shape limits. Canonical operation IDs, Turing C-dispatch ordinals,
   handler IDs, and canvas/table contact IDs remain distinct namespaces.
 - `run_to_quiescence` reports unread work at its exposed black-box boundary;
   it is not proof that every internal cyclic or delayed graph has terminated.
+  Input reader identity varies by tool while undrained output remains externally
+  unread, so this is best-effort boundary state, not graph completion.
 - Native module skip cadence, slip readiness, effects, ownership, and
   transaction snapshots are not reimplemented here. Future Python properties
   must bind the existing native authority or reject unsupported use.
+- Configuration, save/load, row edits, and port declaration require no tick in
+  flight. `Graph.step()` waits through tool execution and manager snapshot
+  publication, but concurrent native mutation is not made safe.
+- Live runtime state is not persisted: queued requests, FIFO samples, reader
+  cursors, event queues, ledgers, and in-flight effects are lost. Old Python
+  `Module` handles become explicitly stale after a successful load.
 
 ## Verification
+
+On Windows this build links some test executables against LibTorch supplied by
+the existing Python package. The observed installation is PyTorch
+`2.5.1+cu124`; its DLLs live under Python's `site-packages/torch/lib` and the PE
+imports include `torch_cuda.dll`, `torch_cpu.dll`, and `c10.dll`. Headers and
+import libraries being found at configure/link time does not put those DLLs on
+the Windows runtime search path. CTest now prepends `${TORCH_INSTALL_PREFIX}/lib`
+and the target's build directory **for the test process only** for GraphIR,
+ThreadManager, and the headless tests. No user/system `PATH` change is needed.
+
+For an equivalent one-off PowerShell launch outside CTest:
+
+```powershell
+$torchLib = python -c "import pathlib, torch; print(pathlib.Path(torch.__file__).resolve().parent / 'lib')"
+$env:PATH = "$PWD\build\Release;$torchLib;$env:PATH"
+& .\build\Release\test_graph_ir.exe
+```
+
+That environment proves DLL resolution and the test's own assertions only. It
+is not evidence that every LibTorch/CUDA backend operation is numerically
+implemented or equivalent to Python Torch.
 
 ```powershell
 cmake --build build --config Release --target nodus_headless nodus_headless_runtime_test
 ctest --test-dir build -C Release -R "nodus_headless_runtime_test|nodus_headless_bridge_smoke|nodus_python_graph_test" --output-on-failure
 ```
 
-The acceptance test covers operand/stack order, first-token visibility,
-repeated ticks, two-module FIFO delivery, stable-identity save/fresh-load,
-pointer-contract refusal, optional/unconfigured FIFO errors, and the current
+The Python acceptance executable runs eight named cases covering operand/stack
+order, first-token visibility, repeated ticks, two-module FIFO delivery,
+stable-identity save/fresh-load, explicit restored-edge FIFO reattachment,
+failed-load preservation, stale handles, pointer-contract refusal,
+optional/unconfigured FIFO errors, duplicate UUID refusal, and the current
 single-live-canvas restriction.

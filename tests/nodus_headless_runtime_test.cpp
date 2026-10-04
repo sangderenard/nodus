@@ -124,9 +124,25 @@ static void test_overflow_event() {
     std::printf("test_overflow_event: OK\n");
 }
 
+static void test_duplicate_module_uuid_is_refused() {
+    NodusHeadlessGraph* graph = nodus_headless_create();
+    assert(graph);
+    GP_CanvasModuleDesc desc{};
+    std::strncpy(desc.label, "identity", sizeof(desc.label) - 1);
+    int32_t first = nodus_headless_add_module(graph, &desc);
+    int32_t second = nodus_headless_add_module(graph, &desc);
+    assert(first >= 0 && second >= 0);
+    assert(nodus_headless_set_module_uuid(graph, first, 0xD00D));
+    assert(!nodus_headless_set_module_uuid(graph, second, 0xD00D));
+    assert(nodus_headless_find_module_by_uuid(graph, 0xD00D) == first);
+    nodus_headless_destroy(graph);
+    std::printf("test_duplicate_module_uuid_is_refused: OK\n");
+}
+
 int main() {
     test_quiescence_and_event();
     test_save_load_round_trip();
     test_overflow_event();
+    test_duplicate_module_uuid_is_refused();
     return 0;
 }

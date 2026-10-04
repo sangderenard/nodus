@@ -96,6 +96,12 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
     NodusHeadlessGraph* g, int32_t module_idx,
     const GP_CanvasModuleRowDesc* rows, int32_t row_count);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
+// Reattach process-local FIFO configuration to an edge restored by native
+// canvas persistence. FIFO specs and live samples are intentionally not
+// serialized by CANVAS V4; callers must make that choice again after load.
+NODUS_HEADLESS_API int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_attach_edge(
+    NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc);
 NODUS_HEADLESS_API int32_t nodus_headless_configure_edge_fifo(
     NodusHeadlessGraph* g, int32_t canvas_edge_idx,
     const NodusHeadlessFifoConfig* config);

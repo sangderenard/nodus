@@ -349,16 +349,16 @@ void ThreadManager::submit_tick(TickRequest req, bool wait) {
         std::lock_guard<std::mutex> lk(mu_);
         req.tick_id = next_tick_id_++;
     }
-    uint64_t wait_for = req.tick_id;
+    uint64_t wait_for = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         queue_.push_back(std::move(req));
-        ++submitted_;
+        wait_for = ++submitted_;
     }
     cv_.notify_one();
     if (!wait) return;
     std::unique_lock<std::mutex> lk(mu_);
-    cv_done_.wait(lk, [&]() { return completed_ >= wait_for || !running_.load(std::memory_order_relaxed); });
+    cv_done_.wait(lk, [&]() { return processed_ >= wait_for || !running_.load(std::memory_order_relaxed); });
 }
 
 uint64_t ThreadManager::ticks_submitted() const {
@@ -371,12 +371,13 @@ uint64_t ThreadManager::ticks_completed() const {
     return completed_;
 }
 
-void ThreadManager::wait_for_submitted_ticks() {
+bool ThreadManager::wait_for_submitted_ticks() {
     std::unique_lock<std::mutex> lk(mu_);
     const uint64_t target = submitted_;
     cv_done_.wait(lk, [&]() {
-        return completed_ >= target || !running_.load(std::memory_order_relaxed);
+        return processed_ >= target || !running_.load(std::memory_order_relaxed);
     });
+    return processed_ >= target;
 }
 
 void ThreadManager::run_loop() {
@@ -426,6 +427,10 @@ void ThreadManager::run_loop() {
                 std::lock_guard<std::mutex> lk(mu_);
                 table_snapshots_[t] = snap;
             }
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            ++processed_;
         }
         cv_done_.notify_all();
     }

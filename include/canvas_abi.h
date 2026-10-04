@@ -75,6 +75,9 @@ int gp_canvas_move_module(GP_CanvasContext* ctx, int module_idx, int x, int y);
 
 // add edge, returns edge index or -1
 int gp_canvas_add_edge(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc* desc);
+// Inspect restored topology without inventing a second graph representation.
+int gp_canvas_get_edge_count(GP_CanvasContext* ctx);
+int gp_canvas_find_edge(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc* desc);
 
 // rasterize into RGBA buffer sized width*height*4; returns 1 on success
 int gp_canvas_raster_rgba(GP_CanvasContext* ctx, uint8_t* out_rgba, int32_t out_len_bytes);

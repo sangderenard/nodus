@@ -17,7 +17,8 @@
 
 extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     GP_CanvasContextImpl* c = new GP_CanvasContextImpl(width, height);
-    if (!g_canvas_context_singleton) g_canvas_context_singleton = c;
+    const bool is_primary_canvas = !g_canvas_context_singleton;
+    if (is_primary_canvas) g_canvas_context_singleton = c;
     canvas_init_subgroup_palette(c);
     canvas_ensure_root_table(c);
     // ensure a persistent canvas-root-reflection module is present
@@ -28,7 +29,7 @@ extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     c->thread_mgr->set_mode(ThreadManager::Mode::Scheduled);
     c->thread_mgr->start();
     // expose as global for table-layer integration
-    ThreadManager::set_global(c->thread_mgr.get());
+    if (is_primary_canvas) ThreadManager::set_global(c->thread_mgr.get());
     c->autosave_path = kCanvasDefaultWorkspacePath;
     c->autosave_interval_s = 2.0;
     c->autosave_accum_s = 0.0;
@@ -70,8 +71,8 @@ extern "C" void gp_canvas_destroy(GP_CanvasContext* ctx) {
     if (!c) return;
     if (c->thread_mgr) {
         c->thread_mgr->stop();
-        // clear global reference before destroying
-        ThreadManager::set_global(nullptr);
+        // A secondary canvas must not detach the primary canvas's manager.
+        if (ThreadManager::global() == c->thread_mgr.get()) ThreadManager::set_global(nullptr);
         c->thread_mgr.reset();
     }
     // destroy any owned attached tables

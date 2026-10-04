@@ -71,6 +71,12 @@ def _load(lib_path: Optional[str] = None):
     lib.nodus_headless_configure_edge_fifo.argtypes = (
         ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(_NativeFifoConfig),
     )
+    lib.nodus_headless_get_edge_count.restype = ctypes.c_int32
+    lib.nodus_headless_get_edge_count.argtypes = (ctypes.c_void_p,)
+    lib.nodus_headless_attach_edge.restype = ctypes.c_int32
+    lib.nodus_headless_attach_edge.argtypes = (
+        ctypes.c_void_p, ctypes.POINTER(CanvasEdgeDesc),
+    )
     lib.nodus_headless_declare_input_port_ex.restype = ctypes.c_int32
     lib.nodus_headless_declare_input_port_ex.argtypes = (
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32,
@@ -100,6 +106,7 @@ class Contact:
 
     @property
     def native_index(self) -> int:
+        self.module._assert_live()
         if self.direction == "input":
             return self.ordinal
         return self.module.input_count + self.ordinal
@@ -132,8 +139,14 @@ class Module:
         self.output_count = 0
         self.contract = ExecutionContract.OPAQUE
         self.rows: tuple[Row, ...] = ()
+        self._generation = graph._generation
+
+    def _assert_live(self) -> None:
+        if not self.graph._handle or self._generation != self.graph._generation:
+            raise UnsupportedNativeContract("module handle is stale after graph close/load")
 
     def set_rows(self, *rows: Row) -> "Module":
+        self._assert_live()
         stack_depth = 0
         input_count = 0
         output_count = 0
@@ -192,11 +205,13 @@ class Module:
         return self
 
     def input(self, ordinal: int) -> Contact:
+        self._assert_live()
         if not 0 <= ordinal < self.input_count:
             raise IndexError("input contact ordinal out of range")
         return Contact(self, "input", ordinal)
 
     def output(self, ordinal: int) -> Contact:
+        self._assert_live()
         if not 0 <= ordinal < self.output_count:
             raise IndexError("output contact ordinal out of range")
         return Contact(self, "output", ordinal)
@@ -215,8 +230,10 @@ class Graph:
         if not self._handle:
             raise RuntimeError("nodus_headless_create failed")
         Graph._active = True
+        self._generation = 0
         self.modules: list[Module] = []
         self.edges: list[Edge] = []
+        self._loaded_unattached_edges: set[int] = set()
         self._unsupported: list[str] = []
         if not self.lib.nodus_headless_set_scheduler_mode(self._handle, int(scheduler)):
             self.close()
@@ -243,6 +260,9 @@ class Graph:
     def add_module(self, label: str, *, x: int = 0, y: int = 0,
                    width: int = 420, height: int = 320,
                    stable_id: Optional[int] = None) -> Module:
+        identity = stable_id if stable_id is not None else (uuid.uuid4().int & ((1 << 64) - 1)) or 1
+        if int(self.lib.nodus_headless_find_module_by_uuid(self._handle, identity)) >= 0:
+            raise ValueError(f"stable module id {identity} is already in use")
         desc = CanvasModuleDesc()
         desc.x, desc.y, desc.w, desc.h = x, y, width, height
         encoded = label.encode("utf-8")[:63]
@@ -250,7 +270,6 @@ class Graph:
         index = self.lib.nodus_headless_add_module(self._handle, ctypes.byref(desc))
         if index < 0:
             raise RuntimeError("native add_module failed")
-        identity = stable_id if stable_id is not None else (uuid.uuid4().int & ((1 << 64) - 1)) or 1
         if not self.lib.nodus_headless_set_module_uuid(self._handle, index, identity):
             raise RuntimeError("native module UUID assignment failed")
         module = Module(self, index, identity)
@@ -302,6 +321,37 @@ class Graph:
         self.edges.append(edge)
         return edge
 
+    def attach_edge(self, source: Contact, target: Contact, *,
+                    fifo: Optional[FifoConfig] = FifoConfig.scalar_f32()) -> Edge:
+        """Reattach process-local FIFO semantics to a native-restored edge.
+
+        CANVAS V4 persists topology but not FIFO specs, reader positions, or
+        live samples. Every restored edge must therefore be named here before
+        execution; passing ``None`` preserves deliberate absence.
+        """
+        if source.direction != "output" or target.direction != "input":
+            raise ValueError("attach_edge requires an output contact followed by an input contact")
+        if source.module.graph is not self or target.module.graph is not self:
+            raise ValueError("both contacts must belong to this graph")
+        desc = CanvasEdgeDesc(
+            a_module=source.module.index,
+            a_contact_idx=source.native_index,
+            b_module=target.module.index,
+            b_contact_idx=target.native_index,
+        )
+        index = int(self.lib.nodus_headless_attach_edge(self._handle, ctypes.byref(desc)))
+        if index < 0:
+            raise KeyError("no restored native edge matches those contacts")
+        if fifo is not None:
+            native_fifo = _fifo(fifo)
+            if not self.lib.nodus_headless_configure_edge_fifo(self._handle, index, ctypes.byref(native_fifo)):
+                raise RuntimeError("native restored-edge FIFO configuration failed")
+        edge = Edge(self, index, source, target, fifo)
+        self.edges = [prior for prior in self.edges if prior.native_index != index]
+        self.edges.append(edge)
+        self._loaded_unattached_edges.discard(index)
+        return edge
+
     def bind_input(self, name: str, contact: Contact, *, fifo: FifoConfig = FifoConfig.scalar_f32()) -> None:
         if contact.direction != "input":
             raise ValueError("input port requires an input contact")
@@ -323,6 +373,12 @@ class Graph:
             raise RuntimeError(f"native output port declaration failed: {name}")
 
     def _ensure_scalar_execution(self) -> None:
+        if self._loaded_unattached_edges:
+            pending = sorted(self._loaded_unattached_edges)
+            raise UnsupportedNativeContract(
+                "native canvas persistence does not retain FIFO specs or live queue state; "
+                f"reattach loaded edges {pending} before execution"
+            )
         pointer_modules = [m.index for m in self.modules if m.contract == ExecutionContract.ABSTRACT_TENSOR_POINTER]
         if pointer_modules:
             raise UnsupportedNativeContract(
@@ -367,5 +423,10 @@ class Graph:
     def load(self, path: Union[str, pathlib.Path]) -> None:
         if not self.lib.nodus_headless_load_file(self._handle, str(path).encode()):
             raise RuntimeError(f"native load failed: {path}")
+        self._generation += 1
         self.modules.clear()
         self.edges.clear()
+        edge_count = int(self.lib.nodus_headless_get_edge_count(self._handle))
+        if edge_count < 0:
+            raise RuntimeError("native edge enumeration failed after load")
+        self._loaded_unattached_edges = set(range(edge_count))

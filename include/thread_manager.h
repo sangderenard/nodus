@@ -188,7 +188,7 @@ public:
     // Wait until every tick submitted before this call has completed.  This
     // preserves the canvas UI's asynchronous submit path while giving
     // headless/API callers an explicit observation barrier.
-    void wait_for_submitted_ticks();
+    bool wait_for_submitted_ticks();
 
     // Reader-table bridge API: register a reader for a given edge id (opaque),
     // returns a small integer slot >= 1 on success, or 0 on failure.
@@ -341,6 +341,7 @@ private:
     uint64_t next_tick_id_ = 1;
     uint64_t submitted_ = 0;
     uint64_t completed_ = 0;
+    uint64_t processed_ = 0;
 
     // "Safety deposit boxes": last-known network snapshot, plus some derived indexing.
     std::vector<ModuleContract> last_modules_;

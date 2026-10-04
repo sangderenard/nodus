@@ -600,8 +600,7 @@ extern "C" int gp_canvas_wait_for_thread_manager(GP_CanvasContext* ctx_) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (!c->thread_mgr) return 0;
-    c->thread_mgr->wait_for_submitted_ticks();
-    return 1;
+    return c->thread_mgr->wait_for_submitted_ticks() ? 1 : 0;
 }
 
 extern "C" int gp_canvas_get_thread_manager_paused(GP_CanvasContext* ctx_, int* out_paused) {
@@ -729,6 +728,25 @@ extern "C" int gp_canvas_set_module_table_alpha(GP_CanvasContext* ctx_, int modu
 extern "C" int gp_canvas_add_edge(GP_CanvasContext* ctx_, const GP_CanvasEdgeDesc* desc) {
     // legacy: add untyped edge (type_id == 0)
     return gp_canvas_add_edge_with_type(ctx_, desc, 0);
+}
+
+extern "C" int gp_canvas_get_edge_count(GP_CanvasContext* ctx_) {
+    if (!ctx_) return -1;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    return static_cast<int>(c->edges.size());
+}
+
+extern "C" int gp_canvas_find_edge(GP_CanvasContext* ctx_, const GP_CanvasEdgeDesc* desc) {
+    if (!ctx_ || !desc) return -1;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    for (size_t i = 0; i < c->edges.size(); ++i) {
+        const auto& edge = c->edges[i];
+        if (edge.desc.a_module == desc->a_module && edge.desc.a_contact_idx == desc->a_contact_idx &&
+            edge.desc.b_module == desc->b_module && edge.desc.b_contact_idx == desc->b_contact_idx) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 
 // add an edge with an explicit type id. type_id == 0 means untyped/wildcard.

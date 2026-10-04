@@ -177,9 +177,31 @@ int32_t configure_table_edge(GP_TableContext* table, int32_t edge_idx,
     return gp_table_edge_set_tensor_spec(table, edge_idx, &spec);
 }
 
+int32_t attach_edge_binding(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc& desc,
+                            int32_t canvas_edge_idx) {
+    if (!g || !g->table || canvas_edge_idx < 0) return -1;
+    gp_table_apply_pending_ops(g->table);
+    uint64_t ka = (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_module)) << 32) |
+                  (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_contact_idx)) << 16);
+    uint64_t kb = (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_module)) << 32) |
+                  (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_contact_idx)) << 16);
+    int32_t table_edge_idx = -1;
+    if (!gp_table_edge_index_for_pair(g->table, ka, kb, &table_edge_idx) || table_edge_idx < 0) {
+        return -1;
+    }
+    if (static_cast<size_t>(canvas_edge_idx) >= g->edges.size()) {
+        g->edges.resize(static_cast<size_t>(canvas_edge_idx) + 1);
+    }
+    g->edges[static_cast<size_t>(canvas_edge_idx)] = EdgeBinding{desc, table_edge_idx};
+    return canvas_edge_idx;
+}
+
 } // namespace
 
 extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
+    // The native canvas still owns process-global contact and table helpers.
+    // Refuse coexistence instead of perturbing an already-running UI/bridge.
+    if (gp_canvas_get_singleton() != nullptr) return nullptr;
     auto* g = new NodusHeadlessGraph();
     g->ctx = gp_canvas_create(1, 1);
     if (!g->ctx) {
@@ -192,8 +214,12 @@ extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
     // an isolated programmatic document, so use the existing native clear and
     // autosave APIs immediately.  This avoids importing or overwriting the
     // user's live canvas while retaining the same Canvas/ThreadManager.
-    gp_canvas_set_autosave(g->ctx, nullptr, 0.0);
-    gp_canvas_clear_meta_and_overlays(g->ctx);
+    if (!gp_canvas_set_autosave(g->ctx, nullptr, 0.0) ||
+        !gp_canvas_clear_meta_and_overlays(g->ctx)) {
+        gp_canvas_destroy(g->ctx);
+        delete g;
+        return nullptr;
+    }
     g->table = gp_canvas_get_container_table(g->ctx);
     // GP_CanvasContextImpl::thread_mgr_paused defaults to true (canvas_abi_
     // context.inl); gp_canvas_step's real tick submission is entirely gated
@@ -204,7 +230,11 @@ extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
     // quiescence silently never submits a single tick, for any graph,
     // regardless of topology -- this is the ABI's own contract ("drive
     // ThreadManager's real scheduler to quiescence"), not an optional mode.
-    gp_canvas_set_thread_manager_paused(g->ctx, 0);
+    if (!gp_canvas_set_thread_manager_paused(g->ctx, 0)) {
+        gp_canvas_destroy(g->ctx);
+        delete g;
+        return nullptr;
+    }
     return g;
 }
 
@@ -217,6 +247,7 @@ extern "C" void nodus_headless_destroy(NodusHeadlessGraph* g) {
 extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* path) {
     if (!g || !g->ctx || !path) return 0;
     int32_t rc = gp_canvas_load_from_file(g->ctx, path);
+    if (!rc) return 0;
     g->table = gp_canvas_get_container_table(g->ctx);
     // Port bindings are process-local host views, not canvas persistence.
     // Callers reattach them after load to the restored stable identities.
@@ -257,18 +288,20 @@ extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_Canva
     if (!g || !g->ctx || !desc) return -1;
     int32_t canvas_edge_idx = gp_canvas_add_edge_with_type(g->ctx, desc, type_id);
     if (canvas_edge_idx < 0) return -1;
-    gp_table_apply_pending_ops(g->table);
-    uint64_t ka = (static_cast<uint64_t>(static_cast<uint32_t>(desc->a_module)) << 32) |
-                  (static_cast<uint64_t>(static_cast<uint32_t>(desc->a_contact_idx)) << 16);
-    uint64_t kb = (static_cast<uint64_t>(static_cast<uint32_t>(desc->b_module)) << 32) |
-                  (static_cast<uint64_t>(static_cast<uint32_t>(desc->b_contact_idx)) << 16);
-    int32_t table_edge_idx = -1;
-    gp_table_edge_index_for_pair(g->table, ka, kb, &table_edge_idx);
-    if (static_cast<size_t>(canvas_edge_idx) >= g->edges.size()) {
-        g->edges.resize(static_cast<size_t>(canvas_edge_idx) + 1);
-    }
-    g->edges[static_cast<size_t>(canvas_edge_idx)] = EdgeBinding{*desc, table_edge_idx};
-    return canvas_edge_idx;
+    return attach_edge_binding(g, *desc, canvas_edge_idx);
+}
+
+extern "C" int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g) {
+    if (!g || !g->ctx) return -1;
+    return gp_canvas_get_edge_count(g->ctx);
+}
+
+extern "C" int32_t nodus_headless_attach_edge(
+    NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc) {
+    if (!g || !g->ctx || !desc) return -1;
+    const int32_t canvas_edge_idx = gp_canvas_find_edge(g->ctx, desc);
+    if (canvas_edge_idx < 0) return -1;
+    return attach_edge_binding(g, *desc, canvas_edge_idx);
 }
 
 
@@ -371,7 +404,7 @@ extern "C" int32_t nodus_headless_step(NodusHeadlessGraph* g, double dt) {
     // UI.  A headless step is an observation boundary: Python/native callers
     // must be able to pull values produced by this tick when it returns.
     if (rc) rc = gp_canvas_wait_for_thread_manager(g->ctx);
-    ++g->tick_id;
+    if (rc) ++g->tick_id;
     return rc;
 }
 
@@ -385,9 +418,10 @@ extern "C" int32_t nodus_headless_is_quiescent(const NodusHeadlessGraph* g) {
     }
     for (const auto& kv : g->input_ports) {
         int32_t unread = 0;
-        // Input ports have no host-side subscription (see declare_input_port);
-        // fall back to the host key, which reports 0/absent if never subscribed,
-        // so this is a best-effort check and never falsely reports pending work.
+        // Input consumption identity depends on the bound row/tool contract;
+        // the headless boundary does not have one generic reader key for all
+        // plugin and builtin tools. Keep this explicitly best-effort rather
+        // than misreporting scalar-row identity as universal.
         if (gp_table_edge_unread(g->table, kv.second.edge_idx, kHostKey, &unread) && unread > 0) {
             return 0;
         }
@@ -398,7 +432,7 @@ extern "C" int32_t nodus_headless_is_quiescent(const NodusHeadlessGraph* g) {
 extern "C" int32_t nodus_headless_run_to_quiescence(NodusHeadlessGraph* g, double dt, int32_t max_ticks) {
     if (!g || !g->ctx) return 0;
     for (int32_t i = 0; i < max_ticks; ++i) {
-        nodus_headless_step(g, dt);
+        if (!nodus_headless_step(g, dt)) return 0;
         if (nodus_headless_is_quiescent(g)) {
             push_event(g, NODUS_EVT_QUIESCENT, -1, -1);
             return 1;

@@ -475,6 +475,10 @@ extern "C" int gp_canvas_set_module_uuid(GP_CanvasContext* ctx, int module_idx, 
     GP_CanvasContextImpl* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
     if (module_idx >= static_cast<int>(c->modules.size())) return 0;
     if (static_cast<int>(c->module_uuids.size()) <= module_idx) c->module_uuids.resize(c->modules.size());
+    if (module_uuid != 0ull) {
+        auto owner = c->module_uuid_map.find(module_uuid);
+        if (owner != c->module_uuid_map.end() && owner->second != module_idx) return 0;
+    }
     // erase previous mapping if present
     uint64_t prev = c->module_uuids[static_cast<size_t>(module_idx)];
     if (prev != 0ull) c->module_uuid_map.erase(prev);
