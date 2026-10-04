@@ -330,6 +330,22 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                 int root_edge_idx = -1;
                 if (root_tbl) {
                     const auto &desc = c->edges[ei].desc;
+                    // Canvas edge creation stores ordinary endpoints under
+                    // this canonical composed pair.  Resolve that pair first:
+                    // per-table tool-row ids are distinct identities and may
+                    // also name boundary self-edges, so preferring them can
+                    // silently route an inter-module edge to the wrong FIFO.
+                    uint64_t canonical_ka =
+                        (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_module)) << 32) |
+                        (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_contact_idx)) << 16);
+                    uint64_t canonical_kb =
+                        (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_module)) << 32) |
+                        (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_contact_idx)) << 16);
+                    if (c->edges[ei].overlay_key_a == 0ull &&
+                        c->edges[ei].overlay_key_b == 0ull) {
+                        gp_table_edge_index_for_pair(root_tbl, canonical_ka,
+                                                     canonical_kb, &root_edge_idx);
+                    }
                     // Resolve root-table edge key using overlay sentinel or
                     // the per-tool-row id generated at bind time. If a tool-row
                     // id exists for the contact, prefer it; otherwise fall back
@@ -362,7 +378,8 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                     // Prefer direct pair lookup using the resolved keys. If that
                     // fails, fall back to single-key lookup (ka then kb) so
                     // canonical keys still resolve when present.
-                    if (!gp_table_edge_index_for_pair(root_tbl, ka, kb, &root_edge_idx)) {
+                    if (root_edge_idx < 0 &&
+                        !gp_table_edge_index_for_pair(root_tbl, ka, kb, &root_edge_idx)) {
                         if (!gp_table_edge_index_for_key(root_tbl, ka, &root_edge_idx)) {
                             // try reverse key as last resort
                             gp_table_edge_index_for_key(root_tbl, kb, &root_edge_idx);

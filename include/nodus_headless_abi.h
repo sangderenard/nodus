@@ -70,6 +70,15 @@ typedef struct NodusHeadlessEvent {
     int32_t code;        // reserved (drop reason, rejection reason, ...)
 } NodusHeadlessEvent;
 
+typedef struct NodusHeadlessFifoConfig {
+    int32_t token_bytes;
+    int32_t slots;
+    int32_t top_k;
+    int32_t type_id;
+    int32_t layout;
+    int32_t dtype;
+} NodusHeadlessFifoConfig;
+
 NODUS_HEADLESS_API NodusHeadlessGraph* nodus_headless_create(void);
 NODUS_HEADLESS_API void nodus_headless_destroy(NodusHeadlessGraph* g);
 
@@ -83,7 +92,21 @@ NODUS_HEADLESS_API int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const
 NODUS_HEADLESS_API int32_t nodus_headless_add_module(NodusHeadlessGraph* g, const GP_CanvasModuleDesc* desc);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_builtin_tool(NodusHeadlessGraph* g, int32_t module_idx, int32_t tool_kind);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_plugin_tool(NodusHeadlessGraph* g, int32_t module_idx, const char* plugin_id);
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
+    NodusHeadlessGraph* g, int32_t module_idx,
+    const GP_CanvasModuleRowDesc* rows, int32_t row_count);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
+NODUS_HEADLESS_API int32_t nodus_headless_configure_edge_fifo(
+    NodusHeadlessGraph* g, int32_t canvas_edge_idx,
+    const NodusHeadlessFifoConfig* config);
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_uuid(
+    NodusHeadlessGraph* g, int32_t module_idx, uint64_t module_uuid);
+NODUS_HEADLESS_API uint64_t nodus_headless_get_module_uuid(
+    NodusHeadlessGraph* g, int32_t module_idx);
+NODUS_HEADLESS_API int32_t nodus_headless_find_module_by_uuid(
+    NodusHeadlessGraph* g, uint64_t module_uuid);
+NODUS_HEADLESS_API int32_t nodus_headless_set_scheduler_mode(
+    NodusHeadlessGraph* g, int32_t mode);
 
 // Named external ports: the opaque black-box boundary. Each port is bound to
 // one module's tool row and rides the same table-edge transport
@@ -95,6 +118,13 @@ NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const 
 // as a reader/writer on it. Returns 1 on success.
 NODUS_HEADLESS_API int32_t nodus_headless_declare_input_port(NodusHeadlessGraph* g, const char* name, int32_t module_idx, int32_t row_idx, int32_t token_bytes);
 NODUS_HEADLESS_API int32_t nodus_headless_declare_output_port(NodusHeadlessGraph* g, const char* name, int32_t module_idx, int32_t row_idx, int32_t token_bytes);
+NODUS_HEADLESS_API int32_t nodus_headless_declare_input_port_ex(
+    NodusHeadlessGraph* g, const char* name, int32_t module_idx,
+    int32_t contact_idx, const NodusHeadlessFifoConfig* config);
+NODUS_HEADLESS_API int32_t nodus_headless_declare_output_port_ex(
+    NodusHeadlessGraph* g, const char* name, int32_t module_idx,
+    int32_t contact_idx, const NodusHeadlessFifoConfig* config,
+    int32_t start_at_head);
 NODUS_HEADLESS_API int32_t nodus_headless_push_token(NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len);
 NODUS_HEADLESS_API int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written);
 

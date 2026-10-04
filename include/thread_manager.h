@@ -185,6 +185,10 @@ public:
 
     uint64_t ticks_submitted() const;
     uint64_t ticks_completed() const;
+    // Wait until every tick submitted before this call has completed.  This
+    // preserves the canvas UI's asynchronous submit path while giving
+    // headless/API callers an explicit observation barrier.
+    void wait_for_submitted_ticks();
 
     // Reader-table bridge API: register a reader for a given edge id (opaque),
     // returns a small integer slot >= 1 on success, or 0 on failure.

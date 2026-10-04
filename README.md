@@ -27,6 +27,8 @@ Vcpkg is discovered through `VCPKG_ROOT`, `VCPKG_INSTALLATION_ROOT`, `vcpkg` on 
 
 - `python demo_canvas_tables.py --mode server --port 8000` runs the historical canvas/table demo.
 - `nodus_headless_bridge.py` exposes the headless runtime to Python.
+- [`docs/python_graph_api.md`](docs/python_graph_api.md) documents the typed,
+  row-and-stack-aware `nodus_graph` interface and its explicit translation limits.
 - [`docs/BUILD_YOUR_OWN_PLUGIN.md`](docs/BUILD_YOUR_OWN_PLUGIN.md) introduces the plugin boundary.
 - [`docs/module_library_build.md`](docs/module_library_build.md) covers generated module tools.
 

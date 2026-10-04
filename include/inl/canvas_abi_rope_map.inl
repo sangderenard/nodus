@@ -490,6 +490,13 @@ extern "C" uint64_t gp_canvas_get_module_uuid(GP_CanvasContext* ctx, int module_
     return c->module_uuids[static_cast<size_t>(module_idx)];
 }
 
+extern "C" int gp_canvas_find_module_by_uuid(GP_CanvasContext* ctx, uint64_t module_uuid) {
+    if (!ctx || module_uuid == 0ull) return -1;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
+    auto it = c->module_uuid_map.find(module_uuid);
+    return it == c->module_uuid_map.end() ? -1 : it->second;
+}
+
 extern "C" int gp_canvas_set_module_frame_port_uuid(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx, uint64_t port_uuid) {
     if (!ctx || module_idx < 0) return 0;
     GP_CanvasContextImpl* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
@@ -877,6 +884,7 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->canonical_to_overlay.clear();
     ctx->nodes.clear();
     ctx->module_node_id.clear();
+    ctx->module_uuids.clear();
     ctx->module_uuid_map.clear();
     ctx->module_port_uuid_map.clear();
     ctx->selected = {};
@@ -5629,6 +5637,42 @@ extern "C" int gp_canvas_bind_plugin_tool(GP_CanvasContext* ctx_, int module_idx
     auto &tools = ctx->module_tool_stack[module_idx];
     tools.clear();
     return new_row_idx;
+}
+
+extern "C" int gp_canvas_set_module_rows(GP_CanvasContext* ctx_, int module_idx,
+                                           const GP_CanvasModuleRowDesc* row_descs,
+                                           int row_count) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return 0;
+    if (row_count < 0 || (row_count > 0 && !row_descs)) return 0;
+
+    std::vector<ModuleIORow> rows;
+    rows.reserve(static_cast<size_t>(row_count));
+    for (int i = 0; i < row_count; ++i) {
+        const auto& src = row_descs[i];
+        if (src.kind < static_cast<int32_t>(ModuleRowKind::Input) ||
+            src.kind > static_cast<int32_t>(ModuleRowKind::Output)) return 0;
+        if (src.tool_origin < static_cast<int32_t>(ModuleToolOrigin::Builtin) ||
+            src.tool_origin > static_cast<int32_t>(ModuleToolOrigin::Plugin)) return 0;
+        ModuleIORow row{};
+        row.kind = static_cast<ModuleRowKind>(src.kind);
+        row.tool = static_cast<ModuleToolKind>(src.tool);
+        row.attachment_count = src.attachment_count;
+        row.tool_origin = static_cast<ModuleToolOrigin>(src.tool_origin);
+        if (row.kind == ModuleRowKind::Input || row.kind == ModuleRowKind::Output) {
+            if (row.attachment_count < 1 || row.attachment_count > 32) return 0;
+            row.tool = ModuleToolKind::None;
+            row.tool_origin = ModuleToolOrigin::Builtin;
+        } else if (row.tool_origin == ModuleToolOrigin::Plugin) {
+            if (!src.plugin_id || !*src.plugin_id) return 0;
+            row.tool = ModuleToolKind::None;
+            row.plugin_id = src.plugin_id;
+        }
+        rows.push_back(std::move(row));
+    }
+    canvas_apply_io_rows(ctx, module_idx, rows);
+    sync_module_table_io_layout(ctx, module_idx);
+    return 1;
 }
 
 static int canvas_handle_module_counter_hit(GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& found) {

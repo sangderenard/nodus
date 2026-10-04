@@ -244,6 +244,8 @@ uint64_t gp_canvas_generate_id(GP_CanvasContext* ctx, uint64_t hint);
 // Set/get a module's stable UUID. Returns 1 on success for setter.
 int gp_canvas_set_module_uuid(GP_CanvasContext* ctx, int module_idx, uint64_t module_uuid);
 uint64_t gp_canvas_get_module_uuid(GP_CanvasContext* ctx, int module_idx);
+// Resolve a stable UUID back to the current (load-local) module index.
+int gp_canvas_find_module_by_uuid(GP_CanvasContext* ctx, uint64_t module_uuid);
 // Set/get a module frame port's stable UUID. `is_send` selects send(1)/receive(0),
 // `col` selects left(0)/right(1) column pair, `led_idx` selects the LED index.
 int gp_canvas_set_module_frame_port_uuid(GP_CanvasContext* ctx, int module_idx, int is_send, int col, int led_idx, uint64_t port_uuid);
@@ -421,13 +423,29 @@ int gp_canvas_autobind_mouse_ports(GP_CanvasContext* ctx, int module_idx, int ma
 // is a ModuleToolKind (thread_manager.h) value.
 int gp_canvas_bind_builtin_tool(GP_CanvasContext* ctx, int module_idx, int tool_kind);
 int gp_canvas_bind_plugin_tool(GP_CanvasContext* ctx, int module_idx, const char* plugin_id);
+
+// Replace a module's complete ordered Input/Tool/Output row program.  This is
+// the programmatic counterpart of loading a CANVAS V4 ROWS record.  Contacts
+// remain one unified index space: inputs first, then outputs.  `plugin_id` is
+// read only for Plugin-origin Tool rows and is copied during the call.
+typedef struct GP_CanvasModuleRowDesc {
+    int32_t kind;              // ModuleRowKind
+    int32_t tool;              // ModuleToolKind
+    int32_t attachment_count;
+    int32_t tool_origin;       // ModuleToolOrigin
+    const char* plugin_id;
+} GP_CanvasModuleRowDesc;
+int gp_canvas_set_module_rows(GP_CanvasContext* ctx, int module_idx,
+                              const GP_CanvasModuleRowDesc* rows, int row_count);
 int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
 
 // Thread manager / scheduler mode (0 = free-spinning, 1 = scheduled).
-// Current behavior: gp_canvas_step always waits for scheduled ticks to finish
-// before returning, so raster/input can remain single-threaded and safe.
+// gp_canvas_step submits asynchronously for the interactive UI.  API callers
+// that need an observation barrier may wait for all ticks submitted before the
+// call to gp_canvas_wait_for_thread_manager.
 int gp_canvas_set_thread_manager_mode(GP_CanvasContext* ctx, int mode);
 int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx, int* out_mode);
+int gp_canvas_wait_for_thread_manager(GP_CanvasContext* ctx);
 int gp_canvas_get_thread_manager_paused(GP_CanvasContext* ctx, int* out_paused);
 int gp_canvas_set_thread_manager_paused(GP_CanvasContext* ctx, int paused);
 

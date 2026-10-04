@@ -596,6 +596,14 @@ extern "C" int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx_, int* ou
     return 1;
 }
 
+extern "C" int gp_canvas_wait_for_thread_manager(GP_CanvasContext* ctx_) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->thread_mgr) return 0;
+    c->thread_mgr->wait_for_submitted_ticks();
+    return 1;
+}
+
 extern "C" int gp_canvas_get_thread_manager_paused(GP_CanvasContext* ctx_, int* out_paused) {
     if (!ctx_ || !out_paused) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);

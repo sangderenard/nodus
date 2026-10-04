@@ -176,7 +176,11 @@ static uint64_t canvas_contact_key(int module_idx, int contact_idx) {
     // Only consider module frame contacts
     const int frame_base = kModuleFrameContactBase;
     const int frame_end = frame_base + kModuleExtraLedCount * kModuleExtraLedRows;
-    if (contact_idx < frame_base || contact_idx >= frame_end) return 0ull;
+    // Ordinary Input/Output row contacts use the canonical composed writer
+    // identity.  Returning zero here made terminal scalar outputs resolve the
+    // correct FIFO but then attempt publication with an invalid writer key;
+    // the old headless smoke never noticed because it did not assert a value.
+    if (contact_idx < frame_base || contact_idx >= frame_end) return composed;
     // Resolve the stable tool-row id only. Do NOT fall back to canonical
     // composed keys — the system now relies exclusively on the generated ids.
     uint64_t trid = gp_canvas_get_tool_row_id(cvs, module_idx, contact_idx);
@@ -365,6 +369,14 @@ uint64_t ThreadManager::ticks_submitted() const {
 uint64_t ThreadManager::ticks_completed() const {
     std::lock_guard<std::mutex> lk(mu_);
     return completed_;
+}
+
+void ThreadManager::wait_for_submitted_ticks() {
+    std::unique_lock<std::mutex> lk(mu_);
+    const uint64_t target = submitted_;
+    cv_done_.wait(lk, [&]() {
+        return completed_ >= target || !running_.load(std::memory_order_relaxed);
+    });
 }
 
 void ThreadManager::run_loop() {

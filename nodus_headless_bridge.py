@@ -29,9 +29,11 @@ import ctypes
 import os
 import pathlib
 import platform
+import sys
 from typing import Callable, Dict, List, Optional
 
 ROOT = pathlib.Path(__file__).resolve().parent
+_DLL_DIRECTORY_HANDLES = []
 
 # ModuleToolKind values (include/thread_manager.h) that don't require any
 # plugin DLL -- convenience constants for callers exercising the ABI.
@@ -112,6 +114,18 @@ def find_headless_library() -> pathlib.Path:
 
 def load_headless_lib(lib_path: Optional[str] = None):
     path = pathlib.Path(lib_path) if lib_path is not None else find_headless_library()
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        # Python 3.8+ no longer applies PATH to dependent-DLL resolution in
+        # the same way as CreateProcess.  Keep the directory handles alive
+        # for the lifetime of the process so ctypes can load nodus_tensor_core
+        # and the Torch libraries linked by this build.
+        candidates = [
+            path.resolve().parent,
+            pathlib.Path(sys.executable).resolve().parent / "Lib" / "site-packages" / "torch" / "lib",
+        ]
+        for directory in candidates:
+            if directory.is_dir():
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(directory)))
     lib = ctypes.CDLL(str(path))
 
     lib.nodus_headless_create.restype = ctypes.c_void_p

@@ -809,7 +809,21 @@ add_test(NAME nodus_headless_bridge_smoke
 )
 set_tests_properties(nodus_headless_bridge_smoke PROPERTIES
   ENVIRONMENT "NODUS_HEADLESS_TEST_DLL=$<TARGET_FILE:nodus_headless>"
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_headless>\;${TORCH_INSTALL_PREFIX}/lib"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
   DEPENDS nodus_headless_runtime_test
+)
+add_test(NAME nodus_python_graph_test
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/nodus_python_graph_test.py"
+)
+set_tests_properties(nodus_python_graph_test PROPERTIES
+  ENVIRONMENT "NODUS_HEADLESS_TEST_DLL=$<TARGET_FILE:nodus_headless>"
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_headless>\;${TORCH_INSTALL_PREFIX}/lib"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  DEPENDS nodus_headless_runtime_test
+)
+set_tests_properties(nodus_headless_runtime_test PROPERTIES
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_headless>\;${TORCH_INSTALL_PREFIX}/lib"
 )
 
 add_executable(test_edge_backend_coordination
