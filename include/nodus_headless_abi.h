@@ -79,6 +79,11 @@ typedef struct NodusHeadlessFifoConfig {
     int32_t dtype;
 } NodusHeadlessFifoConfig;
 
+typedef struct NodusHeadlessPublishResult {
+    int32_t accepted;
+    int32_t dropped;
+} NodusHeadlessPublishResult;
+
 NODUS_HEADLESS_API NodusHeadlessGraph* nodus_headless_create(void);
 NODUS_HEADLESS_API void nodus_headless_destroy(NodusHeadlessGraph* g);
 
@@ -105,6 +110,11 @@ NODUS_HEADLESS_API int32_t nodus_headless_attach_edge(
 NODUS_HEADLESS_API int32_t nodus_headless_configure_edge_fifo(
     NodusHeadlessGraph* g, int32_t canvas_edge_idx,
     const NodusHeadlessFifoConfig* config);
+NODUS_HEADLESS_API int32_t nodus_headless_get_edge_fifo_config(
+    NodusHeadlessGraph* g, int32_t canvas_edge_idx,
+    NodusHeadlessFifoConfig* out_config);
+NODUS_HEADLESS_API int32_t nodus_headless_get_edge_unread(
+    NodusHeadlessGraph* g, int32_t canvas_edge_idx, int32_t* out_unread);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_uuid(
     NodusHeadlessGraph* g, int32_t module_idx, uint64_t module_uuid);
 NODUS_HEADLESS_API uint64_t nodus_headless_get_module_uuid(
@@ -132,7 +142,30 @@ NODUS_HEADLESS_API int32_t nodus_headless_declare_output_port_ex(
     int32_t contact_idx, const NodusHeadlessFifoConfig* config,
     int32_t start_at_head);
 NODUS_HEADLESS_API int32_t nodus_headless_push_token(NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len);
+NODUS_HEADLESS_API int32_t nodus_headless_push_token_ex(
+    NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* out_result);
 NODUS_HEADLESS_API int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written);
+NODUS_HEADLESS_API int32_t nodus_headless_get_port_fifo_config(
+    NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
+    NodusHeadlessFifoConfig* out_config);
+NODUS_HEADLESS_API int32_t nodus_headless_get_port_unread(
+    NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
+    int32_t* out_unread);
+
+// Scheduler-produced scalar stack inspection. Snapshot rows exist for native
+// StackDisplay rows. These calls are read-only and must follow a completed
+// headless step; they do not persist or restore runtime stack state.
+NODUS_HEADLESS_API int32_t nodus_headless_get_stack_snapshot(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t row_idx,
+    float* out_values, int32_t capacity, int32_t* out_count);
+NODUS_HEADLESS_API int32_t nodus_headless_get_stack_snapshot_meta(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t row_idx,
+    int32_t* out_type_ids, int32_t* out_element_bytes,
+    int32_t capacity, int32_t* out_count);
+NODUS_HEADLESS_API int32_t nodus_headless_get_stack_tail(
+    NodusHeadlessGraph* g, int32_t module_idx,
+    float* out_values, int32_t capacity, int32_t* out_count);
 
 // Scheduling. Both drive the real ThreadManager frontier via gp_canvas_step
 // -- never a hand-written per-tool tick loop.

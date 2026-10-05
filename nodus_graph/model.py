@@ -77,6 +77,30 @@ class FifoConfig:
 
 
 @dataclass(frozen=True)
+class PublishResult:
+    accepted: bool
+    dropped: bool
+
+
+@dataclass(frozen=True)
+class FifoState:
+    config: FifoConfig | None
+    unread: int | None
+
+
+@dataclass(frozen=True)
+class StackItem:
+    type_id: int
+    element_bytes: int
+
+
+@dataclass(frozen=True)
+class StackSnapshot:
+    values: tuple[float, ...]
+    items: tuple[StackItem, ...]
+
+
+@dataclass(frozen=True)
 class Input:
     count: int = 1
 

@@ -42,7 +42,10 @@ int main() {
     const uint64_t samples[] = {1, 2, 3};
 
     const int32_t lossless = add_edge(table, 2, 0);
+    assert(!gp_table_edge_subscribe(table, lossless, 0));
     assert(gp_table_edge_subscribe(table, lossless, reader));
+    int32_t unread = -1;
+    assert(!gp_table_edge_unread(table, lossless, reader + 777, &unread));
     int32_t dropped = -1;
     assert(gp_table_edge_publish(
         table, lossless, writer, &samples[0], sizeof(uint64_t), &dropped

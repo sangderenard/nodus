@@ -20,6 +20,7 @@ from nodus_graph import (
     Input,
     Output,
     PluginTool,
+    PublishResult,
     Tool,
     UnsupportedNativeContract,
 )
@@ -85,6 +86,9 @@ def test_two_module_fifo() -> None:
             Input(2), Tool(BuiltinTool.MULTIPLY), Output(1),
         )
         graph.connect(producer.output(0), consumer.input(0))
+        state = graph.edge_fifo_state(graph.edges[0])
+        assert state.config == FifoConfig.scalar_f32()
+        assert state.unread == 0
         graph.bind_input("x", producer.input(0))
         graph.bind_input("y", producer.input(1))
         graph.bind_input("scale", consumer.input(1))
@@ -94,6 +98,85 @@ def test_two_module_fifo() -> None:
         graph.push_f32("scale", 4.0)
         graph.step()
         assert_close(graph.pull_f32("result"), 20.0)
+        assert graph.edge_fifo_state(graph.edges[0]).unread == 0
+
+
+def test_fifo_reject_drop_inspection_and_invalid_calls() -> None:
+    lossless = FifoConfig.scalar_f32(slots=2, top_k=0)
+    with Graph() as graph:
+        module = graph.add_module("lossless").set_rows(Input(), Output())
+        graph.bind_input("in", module.input(0), fifo=lossless)
+        assert graph.port_fifo_state("in").config == lossless
+        assert graph.port_fifo_state("in").unread == 0
+        assert graph.try_push_f32("in", 1.0) == PublishResult(True, False)
+        assert graph.try_push_f32("in", 2.0) == PublishResult(True, False)
+        assert graph.port_fifo_state("in").unread == 2
+        assert graph.try_push_f32("in", 3.0) == PublishResult(False, False)
+        assert graph.port_fifo_state("in").unread == 2
+        try:
+            graph.try_push_bytes("in", b"bad")
+        except RuntimeError as exc:
+            assert "invalid" in str(exc)
+        else:
+            raise AssertionError("wrong-sized FIFO token was accepted")
+        try:
+            graph.port_fifo_state("missing")
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("missing port inspection succeeded")
+
+    lossy = FifoConfig.scalar_f32(slots=2, top_k=1)
+    with Graph() as graph:
+        module = graph.add_module("lossy").set_rows(Input(), Output())
+        graph.bind_input("in", module.input(0), fifo=lossy)
+        assert graph.try_push_f32("in", 1.0) == PublishResult(True, False)
+        assert graph.try_push_f32("in", 2.0) == PublishResult(True, False)
+        assert graph.try_push_f32("in", 3.0) == PublishResult(True, True)
+        state = graph.port_fifo_state("in")
+        assert state.config == lossy
+        assert state.unread == 1
+
+
+def test_native_stack_display_snapshots() -> None:
+    with Graph() as graph:
+        module = graph.add_module("stack-inspection").set_rows(
+            Input(2),
+            Tool(BuiltinTool.STACK_DISPLAY),
+            Tool(BuiltinTool.SUBTRACT),
+            Tool(BuiltinTool.STACK_DISPLAY),
+            Input(1),
+            Tool(BuiltinTool.STACK_DISPLAY),
+            Tool(BuiltinTool.MULTIPLY),
+            Tool(BuiltinTool.STACK_DISPLAY),
+            Output(1),
+        )
+        graph.bind_input("a", module.input(0))
+        graph.bind_input("b", module.input(1))
+        graph.bind_input("c", module.input(2))
+        graph.bind_output("result", module.output(0))
+        push_case(graph, 9.0, 4.0, 3.0, 15.0)
+
+        expected = {
+            1: (9.0, 4.0),
+            3: (5.0,),
+            5: (5.0, 3.0),
+            7: (15.0,),
+        }
+        for row_index, values in expected.items():
+            snapshot = module.stack_snapshot(row_index)
+            assert snapshot.values == values
+            assert len(snapshot.items) == len(values)
+            assert all(item.element_bytes > 0 for item in snapshot.items)
+            assert len({item.type_id for item in snapshot.items}) == 1
+        assert module.stack_tail() == ()
+        assert module.stack_snapshot(0).values == ()
+        try:
+            module.stack_snapshot(99)
+        except IndexError:
+            pass
+        else:
+            raise AssertionError("invalid semantic row stack inspection succeeded")
 
 
 def test_two_module_fifo_reload_requires_explicit_reattachment() -> None:
@@ -210,6 +293,7 @@ def test_fifo_absence_and_invalid_capacity_are_explicit() -> None:
         producer = graph.add_module("producer").set_rows(Input(), Output())
         consumer = graph.add_module("consumer").set_rows(Input(), Output())
         graph.connect(producer.output(0), consumer.input(0), fifo=None)
+        assert graph.edge_fifo_state(graph.edges[0]).config is None
         try:
             graph.step()
         except UnsupportedNativeContract as exc:
@@ -233,6 +317,8 @@ def main() -> int:
     cases = [
         test_scalar_stack_and_native_roundtrip,
         test_two_module_fifo,
+        test_fifo_reject_drop_inspection_and_invalid_calls,
+        test_native_stack_display_snapshots,
         test_two_module_fifo_reload_requires_explicit_reattachment,
         test_failed_load_preserves_bindings_and_successful_load_invalidates_handles,
         test_pointer_contract_is_explicitly_refused,

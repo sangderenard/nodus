@@ -996,6 +996,9 @@ add_executable(test_edge_fifo_drop_contract
 )
 target_link_libraries(test_edge_fifo_drop_contract PRIVATE canvas_tables_static)
 add_test(NAME edge_fifo_drop_contract_test COMMAND test_edge_fifo_drop_contract)
+set_tests_properties(edge_fifo_drop_contract_test PROPERTIES
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:test_edge_fifo_drop_contract>\;${TORCH_INSTALL_PREFIX}/lib"
+)
 
 add_executable(test_tensor_ops_lowering
   tests/tensor_ops_lowering_test.cpp

@@ -48,6 +48,25 @@ allows native old-reader advancement/drop behavior. Use `fifo=None` to represent
 an intentionally unconfigured edge. Execution refuses such an edge explicitly;
 it is never converted into a mandatory queue or a zero-capacity sentinel.
 
+The native transport state is inspectable without inventing a Python queue:
+
+```python
+state = graph.port_fifo_state("input")
+assert state.config == FifoConfig.scalar_f32(slots=2, top_k=0)
+assert state.unread == 0
+
+first = graph.try_push_f32("input", 1.0)
+assert first.accepted and not first.dropped
+```
+
+`try_push_f32` and `try_push_bytes` report the native publish decision. A full
+lossless FIFO returns `PublishResult(accepted=False, dropped=False)`. A lossy
+FIFO may return `accepted=True, dropped=True` after advancing an old reader.
+`push_f32` remains the compatibility convenience and raises when a valid push
+is rejected. `edge_fifo_state` returns `FifoState(config=None, unread=None)`
+for a deliberately unconfigured edge; this preserves absence as distinct from
+any configured capacity.
+
 CANVAS V4 does **not** serialize a configured edge's FIFO spec, subscriptions,
 reader positions, or samples. After `Graph.load`, attach every restored edge
 and make the transport choice again:
@@ -66,10 +85,32 @@ Execution fails while any restored edge remains unattached. Passing
 at execution; it never invents a persisted/default queue.
 
 Named input/output ports are real table edges with the same fixed token shape,
-dtype/layout fields, subscriptions, and first-token semantics. The initial
-surface exposes exact four-byte scalar tokens as `push_f32`/`pull_f32`; raw or
-tensor-token helpers should only be added with an equally exact ownership and
-shape contract.
+dtype/layout fields, subscriptions, and first-token semantics. Exact fixed-size
+bytes can be published and consumed with `try_push_bytes`/`push_bytes` and
+`pull_bytes`; the native configured `token_bytes` remains authoritative.
+These helpers copy bytes across the C ABI and make no tensor ownership claim.
+`push_f32`/`pull_f32` are the exact four-byte scalar conveniences used by the
+current row executor.
+
+## Read-only native stack inspection
+
+The native scheduler already records stack snapshots at `StackDisplay` rows
+and publishes a final module stack tail. Python exposes those records directly:
+
+```python
+module.set_rows(Input(2), Tool(BuiltinTool.STACK_DISPLAY), Output(1))
+graph.push_f32("input", 4.0)
+graph.step()
+snapshot = module.stack_snapshot(1)
+assert snapshot.values == (4.0,)
+assert snapshot.items[0].element_bytes > 0
+assert module.stack_tail() == ()
+```
+
+Snapshots preserve native bottom-to-top value order and the recorded native
+type ID/element-byte metadata. A valid non-display row has no snapshot and
+returns empty tuples. This is observation after a completed headless step,
+not arbitrary stack mutation and not persisted runtime state.
 
 ## Native interchange and boundaries
 
@@ -93,12 +134,14 @@ remain outside this initial surface:
   table helpers are still process-global. A pre-existing UI/native canvas makes
   headless creation fail; a second Python `Graph` is refused as well.
 - The row-stack surface is narrow: `Input`, `Output`, and enumerated ordinary
-  scalar tools with known stack effects. Arbitrary stack mutation, typed stack
-  slots, snapshots, clone ownership, and unresolved plugin execution are not
-  exposed.
+  scalar tools with known stack effects. Scheduler-produced `StackDisplay`
+  snapshots and final scalar tails are read-only. Arbitrary stack mutation,
+  typed/pointer-valued stack access, clone ownership, and unresolved plugin
+  execution are not exposed.
 - FIFO support covers fixed-size tokens and native `slots`/`top_k`. Python's
-  executable helper is exactly four-byte `float32`. Raw/tensor ownership,
-  every native drop/slip policy, internal-edge start positions, reader
+  scalar executable helper is exactly four-byte `float32`; raw helpers copy an
+  exactly configured number of bytes. Tensor/pointer ownership, every native
+  delta/by-reference/drop/slip policy, internal-edge start positions, reader
   management, and live queue checkpointing are unsupported. `type_id`, layout,
   and dtype are passed through rather than inferred.
 - Ordinary Canvas Input/Output rows carry scalar values. Registered
@@ -150,12 +193,14 @@ is not evidence that every LibTorch/CUDA backend operation is numerically
 implemented or equivalent to Python Torch.
 
 ```powershell
-cmake --build build --config Release --target nodus_headless nodus_headless_runtime_test
-ctest --test-dir build -C Release -R "nodus_headless_runtime_test|nodus_headless_bridge_smoke|nodus_python_graph_test" --output-on-failure
+cmake --build build --config Release --target nodus_headless nodus_headless_runtime_test test_edge_fifo_drop_contract
+ctest --test-dir build -C Release -R "nodus_headless_runtime_test|nodus_headless_bridge_smoke|nodus_python_graph_test|edge_fifo_drop_contract_test" --output-on-failure
 ```
 
-The Python acceptance executable runs eight named cases covering operand/stack
+The Python acceptance executable runs ten named cases covering operand/stack
 order, first-token visibility, repeated ticks, two-module FIFO delivery,
+read-only native stack snapshots, lossless rejection versus lossy dropping,
+configured versus absent FIFO inspection, invalid calls,
 stable-identity save/fresh-load, explicit restored-edge FIFO reattachment,
 failed-load preservation, stale handles, pointer-contract refusal,
 optional/unconfigured FIFO errors, duplicate UUID refusal, and the current

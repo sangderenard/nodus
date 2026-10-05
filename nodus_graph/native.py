@@ -17,10 +17,14 @@ from .model import (
     BuiltinTool,
     ExecutionContract,
     FifoConfig,
+    FifoState,
     Input,
     Output,
     PluginTool,
+    PublishResult,
     SchedulerMode,
+    StackItem,
+    StackSnapshot,
     Tool,
 )
 
@@ -50,6 +54,10 @@ class _NativeRow(ctypes.Structure):
     ]
 
 
+class _NativePublishResult(ctypes.Structure):
+    _fields_ = [("accepted", ctypes.c_int32), ("dropped", ctypes.c_int32)]
+
+
 def _fifo(config: FifoConfig) -> _NativeFifoConfig:
     return _NativeFifoConfig(
         config.token_bytes,
@@ -58,6 +66,17 @@ def _fifo(config: FifoConfig) -> _NativeFifoConfig:
         config.type_id,
         config.layout,
         config.dtype,
+    )
+
+
+def _fifo_from_native(config: _NativeFifoConfig) -> FifoConfig:
+    return FifoConfig(
+        token_bytes=config.token_bytes,
+        slots=config.slots,
+        top_k=config.top_k,
+        type_id=config.type_id,
+        layout=config.layout,
+        dtype=config.dtype,
     )
 
 
@@ -76,6 +95,46 @@ def _load(lib_path: Optional[str] = None):
     lib.nodus_headless_attach_edge.restype = ctypes.c_int32
     lib.nodus_headless_attach_edge.argtypes = (
         ctypes.c_void_p, ctypes.POINTER(CanvasEdgeDesc),
+    )
+    lib.nodus_headless_get_edge_fifo_config.restype = ctypes.c_int32
+    lib.nodus_headless_get_edge_fifo_config.argtypes = (
+        ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(_NativeFifoConfig),
+    )
+    lib.nodus_headless_get_edge_unread.restype = ctypes.c_int32
+    lib.nodus_headless_get_edge_unread.argtypes = (
+        ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+    )
+    lib.nodus_headless_push_token_ex.restype = ctypes.c_int32
+    lib.nodus_headless_push_token_ex.argtypes = (
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+        ctypes.POINTER(_NativePublishResult),
+    )
+    lib.nodus_headless_get_port_fifo_config.restype = ctypes.c_int32
+    lib.nodus_headless_get_port_fifo_config.argtypes = (
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32,
+        ctypes.POINTER(_NativeFifoConfig),
+    )
+    lib.nodus_headless_get_port_unread.restype = ctypes.c_int32
+    lib.nodus_headless_get_port_unread.argtypes = (
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),
+    )
+    lib.nodus_headless_get_stack_snapshot.restype = ctypes.c_int32
+    lib.nodus_headless_get_stack_snapshot.argtypes = (
+        ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),
+    )
+    lib.nodus_headless_get_stack_snapshot_meta.restype = ctypes.c_int32
+    lib.nodus_headless_get_stack_snapshot_meta.argtypes = (
+        ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+    )
+    lib.nodus_headless_get_stack_tail.restype = ctypes.c_int32
+    lib.nodus_headless_get_stack_tail.argtypes = (
+        ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
     )
     lib.nodus_headless_declare_input_port_ex.restype = ctypes.c_int32
     lib.nodus_headless_declare_input_port_ex.argtypes = (
@@ -215,6 +274,21 @@ class Module:
         if not 0 <= ordinal < self.output_count:
             raise IndexError("output contact ordinal out of range")
         return Contact(self, "output", ordinal)
+
+    def stack_snapshot(self, row_index: int) -> StackSnapshot:
+        """Return the native snapshot captured by a StackDisplay row.
+
+        Other row kinds have no snapshot entry and return empty tuples. This is
+        live inspection after a completed step, not persisted graph state.
+        """
+        self._assert_live()
+        if not 0 <= row_index < len(self.rows):
+            raise IndexError("semantic row index out of range or row metadata unavailable")
+        return self.graph._stack_snapshot(self.index, row_index)
+
+    def stack_tail(self) -> tuple[float, ...]:
+        self._assert_live()
+        return self.graph._stack_tail(self.index)
 
 
 class Graph:
@@ -372,6 +446,35 @@ class Graph:
         ):
             raise RuntimeError(f"native output port declaration failed: {name}")
 
+    def edge_fifo_state(self, edge: Edge) -> FifoState:
+        if edge.graph is not self or edge not in self.edges:
+            raise ValueError("edge does not belong to this graph")
+        native = _NativeFifoConfig()
+        if not self.lib.nodus_headless_get_edge_fifo_config(
+            self._handle, edge.native_index, ctypes.byref(native),
+        ):
+            return FifoState(config=None, unread=None)
+        unread = ctypes.c_int32()
+        if not self.lib.nodus_headless_get_edge_unread(
+            self._handle, edge.native_index, ctypes.byref(unread),
+        ):
+            raise RuntimeError("native edge unread inspection failed")
+        return FifoState(config=_fifo_from_native(native), unread=unread.value)
+
+    def port_fifo_state(self, name: str, *, output: bool = False) -> FifoState:
+        native = _NativeFifoConfig()
+        encoded = name.encode()
+        if not self.lib.nodus_headless_get_port_fifo_config(
+            self._handle, encoded, int(output), ctypes.byref(native),
+        ):
+            raise KeyError(f"no native {'output' if output else 'input'} port {name!r}")
+        unread = ctypes.c_int32()
+        if not self.lib.nodus_headless_get_port_unread(
+            self._handle, encoded, int(output), ctypes.byref(unread),
+        ):
+            raise RuntimeError(f"native port unread inspection failed: {name}")
+        return FifoState(config=_fifo_from_native(native), unread=unread.value)
+
     def _ensure_scalar_execution(self) -> None:
         if self._loaded_unattached_edges:
             pending = sorted(self._loaded_unattached_edges)
@@ -391,25 +494,95 @@ class Graph:
                 f"native execution requires an explicit FIFO config on edges {missing}"
             )
 
-    def push_f32(self, name: str, value: float) -> None:
+    def try_push_bytes(self, name: str, data: bytes) -> PublishResult:
         self._ensure_scalar_execution()
-        data = struct.pack("f", value)
         buf = ctypes.create_string_buffer(data, len(data))
-        if not self.lib.nodus_headless_push_token(self._handle, name.encode(), buf, len(data)):
-            raise RuntimeError(f"native push failed: {name}")
+        result = _NativePublishResult()
+        if not self.lib.nodus_headless_push_token_ex(
+            self._handle, name.encode(), buf, len(data), ctypes.byref(result),
+        ):
+            raise RuntimeError(f"native push call invalid: {name}")
+        return PublishResult(bool(result.accepted), bool(result.dropped))
 
-    def pull_f32(self, name: str) -> Optional[float]:
+    def push_bytes(self, name: str, data: bytes) -> PublishResult:
+        result = self.try_push_bytes(name, data)
+        if not result.accepted:
+            raise RuntimeError(f"native FIFO rejected push: {name}")
+        return result
+
+    def try_push_f32(self, name: str, value: float) -> PublishResult:
+        return self.try_push_bytes(name, struct.pack("f", value))
+
+    def push_f32(self, name: str, value: float) -> None:
+        self.push_bytes(name, struct.pack("f", value))
+
+    def pull_bytes(self, name: str, capacity: int) -> Optional[bytes]:
         self._ensure_scalar_execution()
-        buf = ctypes.create_string_buffer(4)
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        buf = ctypes.create_string_buffer(capacity)
         written = ctypes.c_size_t()
         ok = self.lib.nodus_headless_pull_token(
-            self._handle, name.encode(), buf, 4, ctypes.byref(written),
+            self._handle, name.encode(), buf, capacity, ctypes.byref(written),
         )
         if not ok:
             return None
-        if written.value != 4:
-            raise RuntimeError(f"native output {name!r} wrote {written.value} bytes, expected 4")
-        return struct.unpack("f", buf.raw)[0]
+        return buf.raw[:written.value]
+
+    def pull_f32(self, name: str) -> Optional[float]:
+        data = self.pull_bytes(name, 4)
+        if data is None:
+            return None
+        if len(data) != 4:
+            raise RuntimeError(f"native output {name!r} wrote {len(data)} bytes, expected 4")
+        return struct.unpack("f", data)[0]
+
+    def _stack_snapshot(self, module_idx: int, row_idx: int) -> StackSnapshot:
+        value_count = ctypes.c_int32()
+        if not self.lib.nodus_headless_get_stack_snapshot(
+            self._handle, module_idx, row_idx, None, 0, ctypes.byref(value_count),
+        ):
+            raise RuntimeError("native stack snapshot size query failed")
+        values_buf = (ctypes.c_float * value_count.value)()
+        if value_count.value and not self.lib.nodus_headless_get_stack_snapshot(
+            self._handle, module_idx, row_idx, values_buf, value_count.value,
+            ctypes.byref(value_count),
+        ):
+            raise RuntimeError("native stack snapshot read failed")
+
+        item_count = ctypes.c_int32()
+        if not self.lib.nodus_headless_get_stack_snapshot_meta(
+            self._handle, module_idx, row_idx, None, None, 0,
+            ctypes.byref(item_count),
+        ):
+            raise RuntimeError("native stack metadata size query failed")
+        type_ids = (ctypes.c_int32 * item_count.value)()
+        element_bytes = (ctypes.c_int32 * item_count.value)()
+        if item_count.value and not self.lib.nodus_headless_get_stack_snapshot_meta(
+            self._handle, module_idx, row_idx, type_ids, element_bytes,
+            item_count.value, ctypes.byref(item_count),
+        ):
+            raise RuntimeError("native stack metadata read failed")
+        return StackSnapshot(
+            values=tuple(float(values_buf[i]) for i in range(value_count.value)),
+            items=tuple(
+                StackItem(int(type_ids[i]), int(element_bytes[i]))
+                for i in range(item_count.value)
+            ),
+        )
+
+    def _stack_tail(self, module_idx: int) -> tuple[float, ...]:
+        count = ctypes.c_int32()
+        if not self.lib.nodus_headless_get_stack_tail(
+            self._handle, module_idx, None, 0, ctypes.byref(count),
+        ):
+            raise RuntimeError("native stack tail size query failed")
+        values = (ctypes.c_float * count.value)()
+        if count.value and not self.lib.nodus_headless_get_stack_tail(
+            self._handle, module_idx, values, count.value, ctypes.byref(count),
+        ):
+            raise RuntimeError("native stack tail read failed")
+        return tuple(float(values[i]) for i in range(count.value))
 
     def step(self, dt: float = 1.0 / 60.0) -> None:
         self._ensure_scalar_execution()

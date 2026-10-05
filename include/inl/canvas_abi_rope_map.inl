@@ -2368,6 +2368,66 @@ static void module_stack_tail_read(const GP_CanvasContextImpl* ctx, int module_i
     }
 }
 
+extern "C" int gp_canvas_get_module_stack_snapshot(
+    GP_CanvasContext* ctx_, int module_idx, int row_idx,
+    float* out_values, int capacity, int* out_count) {
+    if (!ctx_ || !out_count || module_idx < 0 || row_idx < 0 || capacity < 0) return 0;
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx >= static_cast<int>(ctx->modules.size())) return 0;
+    *out_count = 0;
+    if (module_idx >= static_cast<int>(ctx->module_stack_snapshots.size())) return 1;
+    const auto& snapshots = ctx->module_stack_snapshots[static_cast<size_t>(module_idx)];
+    auto it = snapshots.find(row_idx);
+    if (it == snapshots.end()) return 1;
+    const int required = static_cast<int>(it->second.size());
+    *out_count = required;
+    if (required == 0) return 1;
+    if (!out_values && capacity == 0) return 1;
+    if (!out_values || capacity < required) return 0;
+    std::copy(it->second.begin(), it->second.end(), out_values);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_module_stack_snapshot_meta(
+    GP_CanvasContext* ctx_, int module_idx, int row_idx,
+    int* out_type_ids, int* out_element_bytes, int capacity, int* out_count) {
+    if (!ctx_ || !out_count || module_idx < 0 || row_idx < 0 || capacity < 0) return 0;
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx >= static_cast<int>(ctx->modules.size())) return 0;
+    *out_count = 0;
+    if (module_idx >= static_cast<int>(ctx->module_stack_snapshot_meta.size())) return 1;
+    const auto& metadata = ctx->module_stack_snapshot_meta[static_cast<size_t>(module_idx)];
+    auto it = metadata.find(row_idx);
+    if (it == metadata.end()) return 1;
+    const int required = static_cast<int>(it->second.size());
+    *out_count = required;
+    if (required == 0) return 1;
+    if (!out_type_ids && !out_element_bytes && capacity == 0) return 1;
+    if (!out_type_ids || !out_element_bytes || capacity < required) return 0;
+    for (int i = 0; i < required; ++i) {
+        out_type_ids[i] = it->second[static_cast<size_t>(i)].first;
+        out_element_bytes[i] = it->second[static_cast<size_t>(i)].second;
+    }
+    return 1;
+}
+
+extern "C" int gp_canvas_get_module_stack_tail(
+    GP_CanvasContext* ctx_, int module_idx,
+    float* out_values, int capacity, int* out_count) {
+    if (!ctx_ || !out_count || module_idx < 0 || capacity < 0) return 0;
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx >= static_cast<int>(ctx->modules.size())) return 0;
+    float values[64]{};
+    int required = 0;
+    module_stack_tail_read(ctx, module_idx, values, &required);
+    *out_count = required;
+    if (required == 0) return 1;
+    if (!out_values && capacity == 0) return 1;
+    if (!out_values || capacity < required) return 0;
+    std::copy(values, values + required, out_values);
+    return 1;
+}
+
 static void build_module_preview_input(const GP_CanvasContextImpl* ctx, int module_idx, GP_ModulePreviewInput &out) {
     std::memset(&out, 0, sizeof(out));
     if (!ctx) return;

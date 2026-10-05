@@ -32,6 +32,7 @@ struct PortBinding {
 struct EdgeBinding {
     GP_CanvasEdgeDesc desc{};
     int32_t table_edge_idx = -1;
+    int32_t configured = 0;
 };
 
 } // namespace
@@ -177,6 +178,23 @@ int32_t configure_table_edge(GP_TableContext* table, int32_t edge_idx,
     return gp_table_edge_set_tensor_spec(table, edge_idx, &spec);
 }
 
+int32_t read_table_edge_config(GP_TableContext* table, int32_t edge_idx,
+                               NodusHeadlessFifoConfig* out_config) {
+    if (!table || edge_idx < 0 || !out_config) return 0;
+    GP_TableEdgeTensorSpecTyped spec{};
+    if (!gp_table_edge_get_tensor_spec(table, edge_idx, &spec) ||
+        spec.dim_count != 1 || spec.dims[0] <= 0 || spec.elem_size <= 0) return 0;
+    const int64_t bytes = static_cast<int64_t>(spec.dims[0]) * spec.elem_size;
+    if (bytes <= 0 || bytes > INT32_MAX) return 0;
+    out_config->token_bytes = static_cast<int32_t>(bytes);
+    out_config->slots = spec.slots;
+    out_config->top_k = spec.top_k;
+    out_config->type_id = spec.type_id;
+    out_config->layout = spec.layout;
+    out_config->dtype = spec.dtype;
+    return 1;
+}
+
 int32_t attach_edge_binding(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc& desc,
                             int32_t canvas_edge_idx) {
     if (!g || !g->table || canvas_edge_idx < 0) return -1;
@@ -192,7 +210,7 @@ int32_t attach_edge_binding(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc& desc
     if (static_cast<size_t>(canvas_edge_idx) >= g->edges.size()) {
         g->edges.resize(static_cast<size_t>(canvas_edge_idx) + 1);
     }
-    g->edges[static_cast<size_t>(canvas_edge_idx)] = EdgeBinding{desc, table_edge_idx};
+    g->edges[static_cast<size_t>(canvas_edge_idx)] = EdgeBinding{desc, table_edge_idx, 0};
     return canvas_edge_idx;
 }
 
@@ -310,16 +328,39 @@ extern "C" int32_t nodus_headless_configure_edge_fifo(
     const NodusHeadlessFifoConfig* config) {
     if (!g || !g->table || !config || canvas_edge_idx < 0 ||
         static_cast<size_t>(canvas_edge_idx) >= g->edges.size()) return 0;
-    const auto& edge = g->edges[static_cast<size_t>(canvas_edge_idx)];
+    auto& edge = g->edges[static_cast<size_t>(canvas_edge_idx)];
     if (!configure_table_edge(g->table, edge.table_edge_idx, *config)) return 0;
     // Tensor-spec configuration rebuilds FIFO storage, so subscribe only
     // after it succeeds.  Otherwise the producer can publish in topological
     // order before the consumer's first-tick start-at-head subscription and
     // the first inter-module token is skipped.
-    return gp_table_edge_subscribe_ex(
+    const int32_t subscribed = gp_table_edge_subscribe_ex(
         g->table, edge.table_edge_idx,
         scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx),
         /*start_at_head=*/1);
+    if (subscribed) edge.configured = 1;
+    return subscribed;
+}
+
+extern "C" int32_t nodus_headless_get_edge_fifo_config(
+    NodusHeadlessGraph* g, int32_t canvas_edge_idx,
+    NodusHeadlessFifoConfig* out_config) {
+    if (!g || !g->table || !out_config || canvas_edge_idx < 0 ||
+        static_cast<size_t>(canvas_edge_idx) >= g->edges.size()) return 0;
+    const auto& edge = g->edges[static_cast<size_t>(canvas_edge_idx)];
+    if (!edge.configured) return 0;
+    return read_table_edge_config(g->table, edge.table_edge_idx, out_config);
+}
+
+extern "C" int32_t nodus_headless_get_edge_unread(
+    NodusHeadlessGraph* g, int32_t canvas_edge_idx, int32_t* out_unread) {
+    if (!g || !g->table || !out_unread || canvas_edge_idx < 0 ||
+        static_cast<size_t>(canvas_edge_idx) >= g->edges.size()) return 0;
+    const auto& edge = g->edges[static_cast<size_t>(canvas_edge_idx)];
+    if (!edge.configured) return 0;
+    return gp_table_edge_unread(
+        g->table, edge.table_edge_idx,
+        scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx), out_unread);
 }
 
 extern "C" int32_t nodus_headless_set_module_uuid(
@@ -375,16 +416,28 @@ extern "C" int32_t nodus_headless_declare_output_port_ex(
 }
 
 extern "C" int32_t nodus_headless_push_token(NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len) {
+    NodusHeadlessPublishResult result{};
+    return nodus_headless_push_token_ex(g, port_name, bytes, len, &result) && result.accepted;
+}
+
+extern "C" int32_t nodus_headless_push_token_ex(
+    NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* out_result) {
+    if (out_result) *out_result = NodusHeadlessPublishResult{};
     if (!g || !g->table || !port_name) return 0;
     auto it = g->input_ports.find(port_name);
     if (it == g->input_ports.end()) return 0;
     if (len != static_cast<size_t>(it->second.config.token_bytes)) return 0;
     int32_t dropped = 0;
     int32_t ok = gp_table_edge_publish(g->table, it->second.edge_idx, it->second.key, bytes, static_cast<int32_t>(len), &dropped);
+    if (out_result) {
+        out_result->accepted = ok ? 1 : 0;
+        out_result->dropped = dropped ? 1 : 0;
+    }
     if (dropped) {
         push_event(g, NODUS_EVT_OVERFLOW, it->second.module_idx, it->second.edge_idx);
     }
-    return ok;
+    return 1;
 }
 
 extern "C" int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written) {
@@ -395,6 +448,55 @@ extern "C" int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* 
     int32_t ok = gp_table_edge_consume(g->table, it->second.edge_idx, kHostKey, out_bytes, static_cast<int32_t>(cap), &written);
     if (out_written) *out_written = static_cast<size_t>(written);
     return ok;
+}
+
+extern "C" int32_t nodus_headless_get_port_fifo_config(
+    NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
+    NodusHeadlessFifoConfig* out_config) {
+    if (!g || !g->table || !port_name || !out_config) return 0;
+    const auto& ports = is_output ? g->output_ports : g->input_ports;
+    auto it = ports.find(port_name);
+    if (it == ports.end()) return 0;
+    return read_table_edge_config(g->table, it->second.edge_idx, out_config);
+}
+
+extern "C" int32_t nodus_headless_get_port_unread(
+    NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
+    int32_t* out_unread) {
+    if (!g || !g->table || !port_name || !out_unread) return 0;
+    const auto& ports = is_output ? g->output_ports : g->input_ports;
+    auto it = ports.find(port_name);
+    if (it == ports.end()) return 0;
+    const unsigned long long reader = is_output
+        ? kHostKey
+        : scalar_reader_key(it->second.module_idx, it->second.row_idx);
+    return gp_table_edge_unread(g->table, it->second.edge_idx, reader, out_unread);
+}
+
+extern "C" int32_t nodus_headless_get_stack_snapshot(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t row_idx,
+    float* out_values, int32_t capacity, int32_t* out_count) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_stack_snapshot(
+        g->ctx, module_idx, row_idx, out_values, capacity, out_count);
+}
+
+extern "C" int32_t nodus_headless_get_stack_snapshot_meta(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t row_idx,
+    int32_t* out_type_ids, int32_t* out_element_bytes,
+    int32_t capacity, int32_t* out_count) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_stack_snapshot_meta(
+        g->ctx, module_idx, row_idx, out_type_ids, out_element_bytes,
+        capacity, out_count);
+}
+
+extern "C" int32_t nodus_headless_get_stack_tail(
+    NodusHeadlessGraph* g, int32_t module_idx,
+    float* out_values, int32_t capacity, int32_t* out_count) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_stack_tail(
+        g->ctx, module_idx, out_values, capacity, out_count);
 }
 
 extern "C" int32_t nodus_headless_step(NodusHeadlessGraph* g, double dt) {

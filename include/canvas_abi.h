@@ -78,6 +78,18 @@ int gp_canvas_add_edge(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc* desc);
 // Inspect restored topology without inventing a second graph representation.
 int gp_canvas_get_edge_count(GP_CanvasContext* ctx);
 int gp_canvas_find_edge(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc* desc);
+// Read scheduler-produced stack inspection state after a completed tick.
+// A null output with capacity zero queries the required count. Snapshot rows
+// are populated by the native StackDisplay tool; the tail is the final stack.
+int gp_canvas_get_module_stack_snapshot(
+    GP_CanvasContext* ctx, int module_idx, int row_idx,
+    float* out_values, int capacity, int* out_count);
+int gp_canvas_get_module_stack_snapshot_meta(
+    GP_CanvasContext* ctx, int module_idx, int row_idx,
+    int* out_type_ids, int* out_element_bytes, int capacity, int* out_count);
+int gp_canvas_get_module_stack_tail(
+    GP_CanvasContext* ctx, int module_idx,
+    float* out_values, int capacity, int* out_count);
 
 // rasterize into RGBA buffer sized width*height*4; returns 1 on success
 int gp_canvas_raster_rgba(GP_CanvasContext* ctx, uint8_t* out_rgba, int32_t out_len_bytes);
