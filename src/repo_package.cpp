@@ -102,11 +102,35 @@ fs::path build_contract_dll(const fs::path& src, const fs::path& package_root) {
        << (nodus_root / "include").generic_string() << "\" \""
        << package_root.generic_string() << "\")\n";
     fs::path release_dir = nodus_root / "build" / "Release";
+    const std::vector<std::string> tensor_core_libs = {
+        (release_dir / "nodus_tensor_core.lib").generic_string(),
+        (release_dir / "libnodus_tensor_core.a").generic_string(),
+        (release_dir / "libnodus_tensor_core.so").generic_string(),
+        (release_dir / "libnodus_tensor_core.dylib").generic_string(),
+    };
+    for (const auto& lib : tensor_core_libs) {
+        if (fs::exists(lib)) {
+            cm << "target_link_libraries(" << name << " PRIVATE \"" << lib << "\")\n";
+            break;
+        }
+    }
     const std::vector<std::string> candidate_libs = {
         (release_dir / "canvas_tables.lib").generic_string(),
         (release_dir / "libcanvas_tables.a").generic_string(),
     };
     for (const auto& lib : candidate_libs) {
+        if (fs::exists(lib)) {
+            cm << "target_link_libraries(" << name << " PRIVATE \"" << lib << "\")\n";
+            break;
+        }
+    }
+    const std::vector<std::string> python_row_libs = {
+        (release_dir / "nodus_python_row.lib").generic_string(),
+        (release_dir / "libnodus_python_row.a").generic_string(),
+        (release_dir / "libnodus_python_row.so").generic_string(),
+        (release_dir / "libnodus_python_row.dylib").generic_string(),
+    };
+    for (const auto& lib : python_row_libs) {
         if (fs::exists(lib)) {
             cm << "target_link_libraries(" << name << " PRIVATE \"" << lib << "\")\n";
             break;

@@ -202,6 +202,21 @@ int gp_plugin_build_module_and_load(const char* module_src,
             std::filesystem::path abs_inc = abs_rr / "include";
             cm << "target_include_directories(" << module_name << " PRIVATE \"" << abs_rr.generic_string() << "\" \"" << abs_inc.generic_string() << "\")\n";
             std::filesystem::path release_dir = abs_rr / "build" / "Release";
+            // Generated row tools use the shared tensor transport directly.
+            // Linking only canvas_tables is insufficient on Windows because
+            // that DLL does not re-export nodus_tensor_core's C ABI.
+            const std::vector<std::string> tensor_core_libs = {
+                (release_dir / "nodus_tensor_core.lib").generic_string(),
+                (release_dir / "libnodus_tensor_core.a").generic_string(),
+                (release_dir / "libnodus_tensor_core.so").generic_string(),
+                (release_dir / "libnodus_tensor_core.dylib").generic_string()
+            };
+            for (const auto& lib_path : tensor_core_libs) {
+                if (std::filesystem::exists(lib_path)) {
+                    cm << "target_link_libraries(" << module_name << " PRIVATE \"" << lib_path << "\")\n";
+                    break;
+                }
+            }
             const std::vector<std::string> candidate_libs = {
                 (release_dir / "canvas_tables.lib").generic_string(),
                 (release_dir / "libcanvas_tables.a").generic_string(),
@@ -209,6 +224,18 @@ int gp_plugin_build_module_and_load(const char* module_src,
                 (release_dir / "canvas_tables.dylib").generic_string()
             };
             for (const auto& lib_path : candidate_libs) {
+                if (std::filesystem::exists(lib_path)) {
+                    cm << "target_link_libraries(" << module_name << " PRIVATE \"" << lib_path << "\")\n";
+                    break;
+                }
+            }
+            const std::vector<std::string> python_row_libs = {
+                (release_dir / "nodus_python_row.lib").generic_string(),
+                (release_dir / "libnodus_python_row.a").generic_string(),
+                (release_dir / "libnodus_python_row.so").generic_string(),
+                (release_dir / "libnodus_python_row.dylib").generic_string()
+            };
+            for (const auto& lib_path : python_row_libs) {
                 if (std::filesystem::exists(lib_path)) {
                     cm << "target_link_libraries(" << module_name << " PRIVATE \"" << lib_path << "\")\n";
                     break;

@@ -16,6 +16,11 @@ if(NODUS_CANVAS_SOURCES)
   # (nodus_headless) that links canvas_tables_static rather than being
   # folded back into the canvas amalgam itself.
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]headless[/\\\\]")
+  # Interpreted Python row support links the CPython development library and
+  # is built as its own shared plugin dependency below.  Folding it into the
+  # legacy canvas amalgam would duplicate its interpreter/GIL state and make
+  # every canvas consumer require Python headers.
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]python_row_tool\\.cpp$")
   # nodus_tensor_core sources: these hold the process's stateful tensor
   # singletons (backend registry, the InMemoryBackend instance, the default
   # tensor pool, GP_MemBackend handle maps). They must exist as exactly ONE

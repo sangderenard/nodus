@@ -51,6 +51,49 @@ int gp_artifact_import(const char* api_yaml_path,
                        char* out_package_path,
                        int32_t out_package_cap);
 
+// Import a C/LLVM artifact exposing the uniform buffer entry ABI
+//
+//     C:    void entry(void** buffers, int64_t* extents)
+//     LLVM: void entry(void** buffers, int32_t* extents)
+//
+// described by a strict, line-oriented descriptor:
+//
+//     NODUS BUFFER ABI V1
+//     BACKEND "c"                         # "c" or "llvm"
+//     EXTENT_DTYPE "i64"                  # C: i64, LLVM: i32
+//     TOOL "compiled.example.c" "Example"
+//     ENTRY "example_entry"
+//     VALUE INPUT  "ssa.input"  "f64" 1 8
+//     VALUE OUTPUT "ssa.output" "f64" 1 8
+//     VALUE WORKSPACE "ssa.tmp"  "f64" 1 8
+//     BUFFER "ssa.input"
+//     BUFFER "ssa.tmp"
+//     BUFFER "ssa.output"
+//     EXTENT "ssa.input" 0
+//
+// VALUE order is the row stack order. BUFFER and EXTENT records are passed
+// to the backend in their exact declared order. EXTENT_DTYPE is mandatory
+// and is checked against BACKEND rather than conflating C's i64 and LLVM's
+// i32 contracts.
+// Shapes must be fixed and
+// ranks must fit NODUS_TENSOR_MAX_RANK. The generated source is written
+// directly under output_root/source/tools with a backend-qualified filename,
+// ready for the existing source+same-stem-binary row-tool staging path.
+// Multiple outputs are supported and pushed in VALUE declaration order.
+// WORKSPACE tensors are zero-initialized, passed only through BUFFER order,
+// and destroyed after the call.
+//
+// Returns 1 on success and writes both a macro-composable ITool source and a
+// NODUSPKG V1 manifest. Optional output buffers receive their paths.
+int gp_artifact_import_buffer_abi(const char* descriptor_path,
+                                  const char* artifact_path,
+                                  const char* output_root,
+                                  GP_ArtifactImportReport* report,
+                                  char* out_wrapper_path,
+                                  int32_t out_wrapper_cap,
+                                  char* out_package_path,
+                                  int32_t out_package_cap);
+
 #ifdef __cplusplus
 }
 #endif

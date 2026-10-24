@@ -777,7 +777,23 @@ enable_testing()
 if(NODUS_PYTHON_EXECUTABLE)
   set(Python3_EXECUTABLE "${NODUS_PYTHON_EXECUTABLE}" CACHE FILEPATH "Python3 interpreter" FORCE)
 endif()
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+
+# Optional-language row execution stays behind the ordinary plugin/tool ABI.
+# This shared support library owns CPython interaction; generated row plugins
+# link it and remain normal ITool sources/binaries discoverable by the existing
+# module-library mechanism.
+add_library(nodus_python_row SHARED
+  src/python_row_tool.cpp
+)
+target_include_directories(nodus_python_row PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_definitions(nodus_python_row PRIVATE NODUS_PYTHON_ROW_BUILD=1)
+target_compile_features(nodus_python_row PUBLIC cxx_std_20)
+target_link_libraries(nodus_python_row PRIVATE Python3::Python nodus_tensor_core)
+set_target_properties(nodus_python_row PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 # Unit tests
 add_executable(test_thread_manager
@@ -821,6 +837,24 @@ set_tests_properties(nodus_headless_bridge_smoke PROPERTIES
 add_test(NAME nodus_python_graph_test
   COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/nodus_python_graph_test.py"
 )
+add_test(NAME turing_row_tool_compiler_test
+  COMMAND ${Python3_EXECUTABLE} -m pytest -q
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_turing_row_tool_compiler.py"
+)
+set_tests_properties(turing_row_tool_compiler_test PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+add_executable(python_row_tool_test
+  tests/python_row_tool_test.cpp
+)
+target_link_libraries(python_row_tool_test PRIVATE nodus_python_row nodus_tensor_core)
+target_compile_features(python_row_tool_test PRIVATE cxx_std_20)
+add_test(NAME python_row_tool_test COMMAND python_row_tool_test)
+if(WIN32)
+  set_tests_properties(python_row_tool_test PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_python_row>"
+  )
+endif()
 set_tests_properties(nodus_python_graph_test PROPERTIES
   ENVIRONMENT "NODUS_HEADLESS_TEST_DLL=$<TARGET_FILE:nodus_headless>"
   ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_headless>\;${TORCH_INSTALL_PREFIX}/lib"
@@ -1054,6 +1088,35 @@ target_compile_definitions(test_artifact_import PRIVATE
 )
 target_compile_features(test_artifact_import PRIVATE cxx_std_20)
 add_test(NAME artifact_import_test COMMAND test_artifact_import)
+
+# C/LLVM public-buffer ABI counterpart to the existing Fortran descriptor
+# importer.  Builds a tiny backend DLL, imports its descriptor into a normal
+# row-tool wrapper, and executes the wrapper through ITool::execute_stack.
+add_executable(test_artifact_buffer_import
+  tests/artifact_buffer_import_test.cpp
+)
+target_link_libraries(test_artifact_buffer_import PRIVATE nodus_tensor_core)
+target_compile_definitions(test_artifact_buffer_import PRIVATE
+  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
+  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+)
+target_compile_features(test_artifact_buffer_import PRIVATE cxx_std_20)
+add_test(NAME artifact_buffer_import_test COMMAND test_artifact_buffer_import)
+
+# Complete Turing-product adoption through the existing artifact importer and
+# ordinary plugin build/load path.  The fixture proves that the retained row
+# source and same-stem binary are discoverable while the loaded tool is also
+# registered in the current process and numerically executable.
+add_executable(test_turing_product_adopter
+  tests/turing_product_adopter_test.cpp
+)
+target_link_libraries(test_turing_product_adopter PRIVATE canvas_tables_static)
+target_compile_definitions(test_turing_product_adopter PRIVATE
+  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
+  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+)
+target_compile_features(test_turing_product_adopter PRIVATE cxx_std_20)
+add_test(NAME turing_product_adopter_test COMMAND test_turing_product_adopter)
 
 # KernelIR -> SPIR-V -> real GPU. Skips when no device is present.
 add_executable(test_vulkan_dispatch
