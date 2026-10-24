@@ -1,6 +1,6 @@
 # Turing delivery inventory after the 2026-10-24 pull
 
-Status: observed against canonical Turing `main` at `a8548ab6` and Nodus `nogodsnomasters` at `2e31027`. No Turing source was changed during this audit.
+Status: initially observed against canonical Turing `main` at `a8548ab6` and refreshed after a fast-forward to `05d9d2bd`; Nodus was at `d5e62bd` before this refresh. No Turing source was changed during either audit.
 
 ## Scope
 
@@ -29,6 +29,36 @@ Relevant merged commits:
 - `6df23cdd` — recorded shader gate result.
 
 The Turing checkout retained only its pre-existing untracked `.claude/` and `out/` paths.
+
+### Refresh after false-acceptance work
+
+Canonical Turing subsequently fast-forwarded from `a8548ab6` to `05d9d2bd`
+(PRs 834–836). The twelve commits add the whole-class
+`SSAReferenceEvaluator` trial, collection-parameter element typing, and the
+one-branch list-rebound repair. They also make a material false acceptance
+loud: the class compilation route previously reported success after lowering
+only `SSAReferenceEvaluator.__init__` and silently omitted the other requested
+methods. Current main adds every dependency seed to the activation roots and
+refuses library emission if any planned activation root has no lowered
+function.
+
+That is progress for Nodus even though it does not produce the requested
+single-row SSA interpreter yet. The current whole-class trial stops honestly
+at its first unresolved compiler contract (`typing.Any` treated as a record
+identity); its per-method catalogue records further named frontiers. Nodus
+must not package the earlier `__init__`-only library or treat a created shared
+library as proof that the interpreter surface exists. A future interpreter
+product must prove its complete requested method/export surface from retained
+source-function identities.
+
+The focused Windows refresh ran
+`test_whole_class_compile_trial.py`, `test_runtime_sized_spans.py`, and
+`test_shader_deployment.py`: **139 passed, 23 failed, 3 skipped**. The new
+whole-class false-acceptance guards passed. Twenty-two failures remain the
+known missing Windows exports for `turing_validation_error_reset`/take on the
+runtime-shaped C lane; the other remains the case/extension-sensitive
+`spirv-as.EXE` / `spirv-val.EXE` assertion. No new Nodus boundary regression
+was exposed by these commits.
 
 ## Versioning and platform evidence
 
@@ -152,7 +182,8 @@ Turing therefore supplied the compiler facts Nodus had requested: rank is indepe
 - Nodus Python producer tests: `23 passed, 3 skipped` across row-tool and shader-artifact suites.
 - Explicit real Turing public-boundary row compilation: C, LLVM, and Fortran scalar products all compiled and retained successfully: `3 passed`.
 - Nodus C++ buffer importer and product adopter: both focused CTest cases passed. The existing build target invocation itself named no MSBuild project after CMake regeneration, but the already generated CTest executables ran successfully: `2/2 passed`.
-- Turing combined runtime-span and shader suite on current main: `136 passed, 23 failed, 3 skipped`.
+- Initial Turing combined runtime-span and shader suite at `a8548ab6`: `136 passed, 23 failed, 3 skipped`.
+- Refreshed suite at `05d9d2bd`, including the new whole-class trial: `139 passed, 23 failed, 3 skipped`; all three added passing tests are the false-acceptance/whole-class coverage.
 
 ### Current runtime gaps
 
