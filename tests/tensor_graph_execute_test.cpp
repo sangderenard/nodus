@@ -20,6 +20,7 @@
 #include "common/tensors/abstraction/abstract_op_graph.h"
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/tensor_abi.h"
 #include "common/tensors/abstraction/graph_sparse.h"
 #include "tool_registry.h"
 
@@ -178,8 +179,6 @@ int main(int argc, char** argv) {
     auto& backend = in_memory_backend_singleton();
     const TensorDesc desc{TensorDType::F64,
                           {{static_cast<uint32_t>(length)}}};
-    const ValueTypeId pointer_type =
-        ValueTypeRegistry::global().builtin(VT_VOID_PTR);
 
     auto materialize = [&](const std::vector<double>& data) {
         auto* tensor = new AbstractTensor(desc, &backend);
@@ -246,20 +245,28 @@ int main(int argc, char** argv) {
         RawStackFrame raw{};
         if (!raw_stack_init_frame(raw, 1024)) { fail("stack init"); return 1; }
         for (AbstractTensor* argument : args) {
-            void* pointer = argument;
-            raw_stack_push_typed(raw, &pointer, pointer_type);
+            raw_stack_push_abstract_tensor(raw, argument->handle());
         }
         ToolStackContext context{};
         context.stack.raw = &raw;
         tool->execute_stack(context);
-        void* out_pointer = nullptr;
-        const bool popped = raw_stack_pop_typed(raw, &out_pointer, pointer_type) != 0;
+        AbstractTensorHandle out_handle{};
+        const bool popped = raw_stack_pop_abstract_tensor(raw, out_handle) != 0;
         raw_stack_free_mask(raw);
-        auto* output = static_cast<AbstractTensor*>(out_pointer);
-        if (!popped || !output || !output->valid()) {
+        NodusTensorDesc out_flat{};
+        if (!popped || !out_handle.id ||
+            nodus_tensor_describe(out_handle.id, &out_flat) != NODUS_OK) {
             fail("tool '" + node.kind + "' did not produce a result");
             return 1;
         }
+        TensorDesc out_desc;
+        out_desc.dtype = static_cast<TensorDType>(out_flat.dtype);
+        out_desc.shape.dims.reserve(out_flat.rank);
+        for (uint32_t axis = 0; axis < out_flat.rank; ++axis) {
+            out_desc.shape.dims.push_back(static_cast<uint32_t>(out_flat.shape[axis]));
+        }
+        auto* output = new AbstractTensor(AbstractTensor::wrap(
+            out_handle, out_desc, &backend, true));
         computed[node_id] = output;
     }
 

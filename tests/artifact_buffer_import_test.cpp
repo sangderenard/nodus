@@ -1,4 +1,4 @@
-// Standalone acceptance test for NODUS BUFFER ABI V1 import.
+// Standalone acceptance test for NODUS BUFFER ABI V1/V2 import.
 // This file is intentionally self-contained so it can be added to the normal
 // test manifest independently; it does not require a Turing checkout.
 #include "artifact_importer.h"
@@ -81,6 +81,38 @@ bool close(const std::vector<double>& got, const std::vector<double>& want) {
     return true;
 }
 
+bool execute_case(ITool& tool,
+                  const std::vector<double>& x_values,
+                  const std::vector<double>& y_values,
+                  const std::vector<double>& want_sum,
+                  const std::vector<double>& want_difference) {
+    uint64_t x = tensor_f64(x_values);
+    uint64_t y = tensor_f64(y_values);
+    RawStackFrame raw{};
+    bool ok = x && y && raw_stack_init_frame(raw, 4096);
+    nodus::tensors::AbstractTensorHandle handle{};
+    handle.id = x; ok = ok && raw_stack_push_abstract_tensor(raw, handle);
+    handle.id = y; ok = ok && raw_stack_push_abstract_tensor(raw, handle);
+    ToolStackContext stack{};
+    stack.stack.raw = &raw;
+    if (ok) tool.execute_stack(stack);
+
+    nodus::tensors::AbstractTensorHandle difference{}, sum{};
+    ok = ok && raw_stack_pop_abstract_tensor(raw, difference) &&
+         raw_stack_pop_abstract_tensor(raw, sum);
+    std::vector<double> got_sum, got_difference;
+    ok = ok && tensor_values(sum.id, &got_sum) &&
+         tensor_values(difference.id, &got_difference) &&
+         close(got_sum, want_sum) && close(got_difference, want_difference);
+    if (sum.id) nodus_tensor_destroy(sum.id);
+    if (difference.id) nodus_tensor_destroy(difference.id);
+    if (x) nodus_tensor_destroy(x);
+    if (y) nodus_tensor_destroy(y);
+    raw_stack_free_mask(raw);
+    if (raw.backend) gp_mem_backend_release(raw.backend);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -140,19 +172,23 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
 
     const fs::path descriptor = root / "fixture.buffer_abi";
     const std::string valid =
-        "NODUS BUFFER ABI V1\n"
+        "NODUS BUFFER ABI V2\n"
         "BACKEND \"c\"\n"
         "EXTENT_DTYPE \"i64\"\n"
         "TOOL \"imported.buffer_fixture.c\" \"Buffer Fixture C\"\n"
         "ENTRY \"buffer_entry\"\n"
-        "VALUE INPUT \"%x\" \"f64\" 1 4\n"
-        "VALUE INPUT \"%y\" \"f64\" 1 4\n"
-        "VALUE WORKSPACE \"%tmp\" \"f64\" 1 4\n"
-        "VALUE OUTPUT \"%sum\" \"f64\" 1 4\n"
-        "VALUE OUTPUT \"%difference\" \"f64\" 1 4\n"
+        "VALUE INPUT \"%x\" \"f64\" 1 ?\n"
+        "VALUE INPUT \"%y\" \"f64\" 1 ?\n"
+        "VALUE WORKSPACE \"%tmp\" \"f64\" 1 ?\n"
+        "VALUE OUTPUT \"%sum\" \"f64\" 1 ?\n"
+        "VALUE OUTPUT \"%difference\" \"f64\" 1 ?\n"
         "BUFFER \"%x\"\nBUFFER \"%y\"\nBUFFER \"%tmp\"\n"
         "BUFFER \"%sum\"\nBUFFER \"%difference\"\n"
-        "EXTENT \"%x\" 0\n";
+        "EXTENT \"%x\" 0\n"
+        "SHAPE \"%y\" 0 FROM \"%x\" 0\n"
+        "SHAPE \"%tmp\" 0 FROM \"%x\" 0\n"
+        "SHAPE \"%sum\" 0 FROM \"%x\" 0\n"
+        "SHAPE \"%difference\" 0 FROM \"%x\" 0\n";
     if (!write_text(descriptor, valid)) return 1;
 
     GP_ArtifactImportReport report{};
@@ -222,29 +258,14 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
     }
     tool->initialize(ToolInitContext{});
 
-    uint64_t x = tensor_f64({1.0, 2.0, 3.0, 4.0});
-    uint64_t y = tensor_f64({0.5, -1.0, 2.0, 8.0});
-    RawStackFrame raw{};
-    raw_stack_init_frame(raw, 4096);
-    nodus::tensors::AbstractTensorHandle handle{};
-    handle.id = x; raw_stack_push_abstract_tensor(raw, handle);
-    handle.id = y; raw_stack_push_abstract_tensor(raw, handle);
-    ToolStackContext stack{};
-    stack.stack.raw = &raw;
-    tool->execute_stack(stack);
-
-    nodus::tensors::AbstractTensorHandle difference{}, sum{};
-    bool ok = raw_stack_pop_abstract_tensor(raw, difference) &&
-              raw_stack_pop_abstract_tensor(raw, sum);
-    std::vector<double> got_sum, got_difference;
-    ok = ok && tensor_values(sum.id, &got_sum) && tensor_values(difference.id, &got_difference) &&
-         close(got_sum, {1.5, 1.0, 5.0, 12.0}) &&
-         close(got_difference, {0.5, 3.0, 1.0, -4.0});
-    if (sum.id) nodus_tensor_destroy(sum.id);
-    if (difference.id) nodus_tensor_destroy(difference.id);
-    if (x) nodus_tensor_destroy(x);
-    if (y) nodus_tensor_destroy(y);
-    raw_stack_free_mask(raw);
+    bool ok = execute_case(
+        *tool, {1.0, 2.0, 3.0, 4.0}, {0.5, -1.0, 2.0, 8.0},
+        {1.5, 1.0, 5.0, 12.0}, {0.5, 3.0, 1.0, -4.0});
+    ok = ok && execute_case(
+        *tool, {10.0, -2.0, 0.25, 8.0, 3.0, -7.0},
+        {1.0, 4.0, 0.75, -3.0, 2.0, 5.0},
+        {11.0, 2.0, 1.0, 5.0, 5.0, -2.0},
+        {9.0, -6.0, -0.5, 11.0, 1.0, -12.0});
     tool->shutdown();
     destroy(tool);
     FreeLibrary(module);
@@ -279,8 +300,16 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
                                                nullptr, 0, nullptr, 0) &&
                refused.shortfalls == 1 && refused.wrappers_written == 0;
     };
-    std::string dynamic = valid;
-    dynamic.replace(dynamic.find("1 4\n"), 3, "1 -1\n");
+    std::string invalid_extent = valid;
+    invalid_extent.replace(invalid_extent.find("1 ?\n"), 3, "1 -1\n");
+    std::string v1_dynamic = valid;
+    v1_dynamic.replace(v1_dynamic.find("NODUS BUFFER ABI V2"),
+                       std::string("NODUS BUFFER ABI V2").size(),
+                       "NODUS BUFFER ABI V1");
+    std::string missing_shape_source = valid;
+    missing_shape_source.erase(
+        missing_shape_source.find("SHAPE \"%sum\" 0 FROM \"%x\" 0\n"),
+        std::string("SHAPE \"%sum\" 0 FROM \"%x\" 0\n").size());
     std::string bad_dtype = valid;
     bad_dtype.replace(bad_dtype.find("\"f64\""), 5, "\"complex64\"");
     std::string missing_buffer = valid;
@@ -289,7 +318,9 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
     wrong_extent_dtype.replace(wrong_extent_dtype.find("EXTENT_DTYPE \"i64\""),
                                std::string("EXTENT_DTYPE \"i64\"").size(),
                                "EXTENT_DTYPE \"i32\"");
-    if (!expect_refusal("dynamic.buffer_abi", dynamic) ||
+    if (!expect_refusal("invalid_extent.buffer_abi", invalid_extent) ||
+        !expect_refusal("v1_dynamic.buffer_abi", v1_dynamic) ||
+        !expect_refusal("missing_shape_source.buffer_abi", missing_shape_source) ||
         !expect_refusal("dtype.buffer_abi", bad_dtype) ||
         !expect_refusal("missing_buffer.buffer_abi", missing_buffer) ||
         !expect_refusal("extent_dtype.buffer_abi", wrong_extent_dtype)) {
@@ -297,7 +328,7 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
         return 1;
     }
 
-    std::cout << "[BUFFER IMPORT] PASS: C numerical multi-output/workspace, LLVM i32 extents, refusals\n";
+    std::cout << "[BUFFER IMPORT] PASS: dynamic C multi-output/workspace, LLVM i32 extents, refusals\n";
     return 0;
 #endif
 }

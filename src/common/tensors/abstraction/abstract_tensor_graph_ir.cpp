@@ -2,6 +2,7 @@
 
 #include "canonical_ops.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/tensor_abi.h"
 #include "common/tensors/abstraction/tensor_math.h"
 #include "common/tensors/abstraction/graph_sparse.h"
 #include "tool_ir.h"
@@ -115,8 +116,6 @@ GraphIrOperatorSet make_abstract_tensor_graph_ir_ops() {
 
 size_t register_abstract_tensor_tool_ir(ToolRegistry& registry) {
   size_t registered = 0;
-  const ValueTypeId pointer_type =
-      ValueTypeRegistry::global().builtin(VT_VOID_PTR);
 
   for (const auto& descriptor : nodus::ops::kOps) {
     if (descriptor.ct_value < 0 ||
@@ -139,45 +138,43 @@ size_t register_abstract_tensor_tool_ir(ToolRegistry& registry) {
         return ToolPortSpec{ToolPortKind::Return, 1};
       return ToolPortSpec{};
     };
-    ir->execute_stack = [operation, arity, pointer_type](ToolStackContext& ctx) {
-      if (!ctx.stack.raw || pointer_type == kInvalidValueTypeId) return;
+    ir->execute_stack = [operation, arity](ToolStackContext& ctx) {
+      if (!ctx.stack.raw) return;
       RawStackFrame& frame = *ctx.stack.raw;
-      void* right_pointer = nullptr;
-      void* left_pointer = nullptr;
+      AbstractTensorHandle right{};
+      AbstractTensorHandle left{};
       if (arity == 2 &&
-          !raw_stack_pop_typed(frame, &right_pointer, pointer_type))
+          !raw_stack_pop_abstract_tensor(frame, right))
         return;
-      if (!raw_stack_pop_typed(frame, &left_pointer, pointer_type)) {
-        if (right_pointer)
-          raw_stack_push_typed(frame, &right_pointer, pointer_type);
-        return;
-      }
-      auto* left = static_cast<AbstractTensor*>(left_pointer);
-      auto* right = static_cast<AbstractTensor*>(right_pointer);
-      if (!left || !left->valid() ||
-          (arity == 2 && (!right || !right->valid()))) {
-        raw_stack_push_typed(frame, &left_pointer, pointer_type);
-        if (arity == 2)
-          raw_stack_push_typed(frame, &right_pointer, pointer_type);
+      if (!raw_stack_pop_abstract_tensor(frame, left)) {
+        if (right.id) raw_stack_push_abstract_tensor(frame, right);
         return;
       }
-
-      auto output = std::make_unique<AbstractTensor>(
-          left->desc(), left->backend());
-      const bool ok = output->valid() && (
+      auto restore = [&] {
+        raw_stack_push_abstract_tensor(frame, left);
+        if (arity == 2) raw_stack_push_abstract_tensor(frame, right);
+      };
+      NodusTensorDesc desc{};
+      if (nodus_tensor_describe(left.id, &desc) != NODUS_OK) {
+        restore();
+        return;
+      }
+      AbstractTensorHandle output{};
+      output.id = nodus_tensor_create(desc.dtype, desc.rank, desc.shape);
+      const bool ok = output.id && (
           arity == 1
-              ? tensor_elementwise_unary(operation, *left, output.get())
-              : tensor_elementwise_binary(
-                    operation, *left, *right, output.get()));
+              ? nodus_tensor_unary(
+                    static_cast<int32_t>(operation), left.id, output.id) == NODUS_OK
+              : nodus_tensor_binary(
+                    static_cast<int32_t>(operation), left.id, right.id,
+                    output.id) == NODUS_OK);
       if (!ok) {
-        raw_stack_push_typed(frame, &left_pointer, pointer_type);
-        if (arity == 2)
-          raw_stack_push_typed(frame, &right_pointer, pointer_type);
+        if (output.id) nodus_tensor_destroy(output.id);
+        restore();
         return;
       }
-      void* output_pointer = output.release();
-      if (!raw_stack_push_typed(frame, &output_pointer, pointer_type))
-        delete static_cast<AbstractTensor*>(output_pointer);
+      if (!raw_stack_push_abstract_tensor(frame, output))
+        nodus_tensor_destroy(output.id);
     };
 
     if (registry.register_tool(tool_ir::make_registry_entry(std::move(ir))))
@@ -212,40 +209,36 @@ size_t register_abstract_tensor_tool_ir(ToolRegistry& registry) {
       return ToolPortSpec{};
     };
     const bool divide = reduction.divide_by_count;
-    ir->execute_stack = [divide, pointer_type](ToolStackContext& ctx) {
-      if (!ctx.stack.raw || pointer_type == kInvalidValueTypeId) return;
+    ir->execute_stack = [divide](ToolStackContext& ctx) {
+      if (!ctx.stack.raw) return;
       RawStackFrame& frame = *ctx.stack.raw;
-      void* input_pointer = nullptr;
-      if (!raw_stack_pop_typed(frame, &input_pointer, pointer_type)) return;
-      auto* input = static_cast<AbstractTensor*>(input_pointer);
-      if (!input || !input->valid()) {
-        raw_stack_push_typed(frame, &input_pointer, pointer_type);
+      AbstractTensorHandle input{};
+      if (!raw_stack_pop_abstract_tensor(frame, input)) return;
+      NodusTensorDesc input_desc{};
+      if (nodus_tensor_describe(input.id, &input_desc) != NODUS_OK) {
+        raw_stack_push_abstract_tensor(frame, input);
         return;
       }
-      const TensorDType in_dtype = input->desc().dtype;
-
-      TensorDesc out_desc;
-      out_desc.shape.dims = {1};
+      int32_t output_dtype = input_desc.dtype;
       if (divide) {
-        out_desc.dtype = (in_dtype == TensorDType::F32) ? TensorDType::F32
-                                                        : TensorDType::F64;
-      } else if (in_dtype == TensorDType::Bool) {
-        out_desc.dtype = TensorDType::I64;
-      } else {
-        out_desc.dtype = in_dtype;
+        output_dtype = input_desc.dtype == NODUS_DTYPE_F32
+            ? NODUS_DTYPE_F32 : NODUS_DTYPE_F64;
+      } else if (input_desc.dtype == NODUS_DTYPE_BOOL) {
+        output_dtype = NODUS_DTYPE_I64;
       }
-
-      auto output = std::make_unique<AbstractTensor>(out_desc, input->backend());
-      const bool ok = output->valid() &&
-          (divide ? tensor_reduce_mean_all(*input, output.get())
-                  : tensor_reduce_sum_all(*input, output.get()));
+      const uint64_t scalar_shape[1] = {1};
+      AbstractTensorHandle output{};
+      output.id = nodus_tensor_create(output_dtype, 1, scalar_shape);
+      const bool ok = output.id &&
+          (divide ? nodus_tensor_reduce_mean_all(input.id, output.id)
+                  : nodus_tensor_reduce_sum_all(input.id, output.id)) == NODUS_OK;
       if (!ok) {
-        raw_stack_push_typed(frame, &input_pointer, pointer_type);
+        if (output.id) nodus_tensor_destroy(output.id);
+        raw_stack_push_abstract_tensor(frame, input);
         return;
       }
-      void* output_pointer = output.release();
-      if (!raw_stack_push_typed(frame, &output_pointer, pointer_type))
-        delete static_cast<AbstractTensor*>(output_pointer);
+      if (!raw_stack_push_abstract_tensor(frame, output))
+        nodus_tensor_destroy(output.id);
     };
     if (registry.register_tool(tool_ir::make_registry_entry(std::move(ir))))
       ++registered;

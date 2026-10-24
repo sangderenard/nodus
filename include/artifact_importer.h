@@ -56,27 +56,33 @@ int gp_artifact_import(const char* api_yaml_path,
 //     C:    void entry(void** buffers, int64_t* extents)
 //     LLVM: void entry(void** buffers, int32_t* extents)
 //
-// described by a strict, line-oriented descriptor:
+// described by a strict, line-oriented descriptor. V1 fixed-shape products
+// remain accepted; V2 additionally carries rank-known runtime extents and
+// names the input handle that supplies each dynamic output/workspace axis:
 //
-//     NODUS BUFFER ABI V1
+//     NODUS BUFFER ABI V2
 //     BACKEND "c"                         # "c" or "llvm"
 //     EXTENT_DTYPE "i64"                  # C: i64, LLVM: i32
 //     TOOL "compiled.example.c" "Example"
 //     ENTRY "example_entry"
-//     VALUE INPUT  "ssa.input"  "f64" 1 8
-//     VALUE OUTPUT "ssa.output" "f64" 1 8
-//     VALUE WORKSPACE "ssa.tmp"  "f64" 1 8
+//     VALUE INPUT  "ssa.input"  "f64" 1 ?
+//     VALUE OUTPUT "ssa.output" "f64" 1 ?
+//     VALUE WORKSPACE "ssa.tmp"  "f64" 1 ?
 //     BUFFER "ssa.input"
 //     BUFFER "ssa.tmp"
 //     BUFFER "ssa.output"
 //     EXTENT "ssa.input" 0
+//     SHAPE "ssa.output" 0 FROM "ssa.input" 0
+//     SHAPE "ssa.tmp" 0 FROM "ssa.input" 0
 //
 // VALUE order is the row stack order. BUFFER and EXTENT records are passed
 // to the backend in their exact declared order. EXTENT_DTYPE is mandatory
 // and is checked against BACKEND rather than conflating C's i64 and LLVM's
 // i32 contracts.
-// Shapes must be fixed and
-// ranks must fit NODUS_TENSOR_MAX_RANK. The generated source is written
+// Ranks must fit NODUS_TENSOR_MAX_RANK. A '?' input extent is read from its
+// Nodus AbstractTensorHandle; every '?' output/workspace extent must have one
+// SHAPE source so allocation is determined before entry invocation. The
+// generated source is written
 // directly under output_root/source/tools with a backend-qualified filename,
 // ready for the existing source+same-stem-binary row-tool staging path.
 // Multiple outputs are supported and pushed in VALUE declaration order.

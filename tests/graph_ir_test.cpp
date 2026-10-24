@@ -2,6 +2,7 @@
 #include "common/tensors/abstraction/abstract_op_graph.h"
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
 #include "common/tensors/abstraction/in_memory_backend.h"
+#include "common/tensors/abstraction/tensor_abi.h"
 #include "common/tensors/abstraction/kpath/kpath_relgeo_ir.h"
 #include "canonical_ops.h"
 #include "tool_registry.h"
@@ -117,28 +118,21 @@ int main() {
     RawStackFrame raw{};
     if (!require_or_report(raw_stack_init_frame(raw, 1024), "initialize tool stack"))
       return 1;
-    const ValueTypeId pointer_type =
-        ValueTypeRegistry::global().builtin(VT_VOID_PTR);
-    void* left_pointer = left;
-    void* right_pointer = right;
-    raw_stack_push_typed(raw, &left_pointer, pointer_type);
-    raw_stack_push_typed(raw, &right_pointer, pointer_type);
+    raw_stack_push_abstract_tensor(raw, left->handle());
+    raw_stack_push_abstract_tensor(raw, right->handle());
     ToolStackContext context{};
     context.stack.raw = &raw;
     add->execute_stack(context);
 
-    void* output_pointer = nullptr;
-    const bool popped =
-        raw_stack_pop_typed(raw, &output_pointer, pointer_type) != 0;
-    auto* output = static_cast<AbstractTensor*>(output_pointer);
-    bool correct = popped && output && output->valid() &&
-                   backend.map(output->handle(), &data, &bytes);
+    AbstractTensorHandle output{};
+    const bool popped = raw_stack_pop_abstract_tensor(raw, output) != 0;
+    bool correct = popped && output.id && backend.map(output, &data, &bytes);
     if (correct) {
       values = static_cast<double*>(data);
       correct = values[0] == 11.0 && values[1] == 22.0 && values[2] == 33.0;
-      backend.unmap(output->handle());
+      backend.unmap(output);
     }
-    delete output;
+    if (output.id) nodus_tensor_destroy(output.id);
     delete right;
     delete left;
     if (!require_or_report(correct, "execute tensor add through ToolIR stack"))
@@ -152,26 +146,44 @@ int main() {
     values = static_cast<double*>(data);
     values[0] = -1.0; values[1] = 0.0; values[2] = 1.0;
     backend.unmap(unary_input->handle());
-    void* unary_pointer = unary_input;
-    raw_stack_push_typed(raw, &unary_pointer, pointer_type);
+    raw_stack_push_abstract_tensor(raw, unary_input->handle());
     tanh->execute_stack(context);
-    output_pointer = nullptr;
-    const bool unary_popped =
-        raw_stack_pop_typed(raw, &output_pointer, pointer_type) != 0;
-    output = static_cast<AbstractTensor*>(output_pointer);
-    correct = unary_popped && output && output->valid() &&
-              backend.map(output->handle(), &data, &bytes);
+    output = {};
+    const bool unary_popped = raw_stack_pop_abstract_tensor(raw, output) != 0;
+    correct = unary_popped && output.id && backend.map(output, &data, &bytes);
     if (correct) {
       values = static_cast<double*>(data);
       correct = std::abs(values[0] + std::tanh(1.0)) < 1e-12 &&
                 values[1] == 0.0 &&
                 std::abs(values[2] - std::tanh(1.0)) < 1e-12;
-      backend.unmap(output->handle());
+      backend.unmap(output);
     }
-    delete output;
+    if (output.id) nodus_tensor_destroy(output.id);
     delete unary_input;
-    raw_stack_free_mask(raw);
     if (!require_or_report(correct, "execute tensor tanh through ToolIR stack"))
+      return 1;
+    auto sum = registry.create("abstract_tensor.sum");
+    if (!require_or_report(sum != nullptr, "create abstract_tensor.sum ToolIR"))
+      return 1;
+    auto* reduction_input = new AbstractTensor(desc, &backend);
+    backend.map(reduction_input->handle(), &data, &bytes);
+    values = static_cast<double*>(data);
+    values[0] = 2.0; values[1] = -1.0; values[2] = 4.0;
+    backend.unmap(reduction_input->handle());
+    raw_stack_push_abstract_tensor(raw, reduction_input->handle());
+    sum->execute_stack(context);
+    output = {};
+    const bool sum_popped = raw_stack_pop_abstract_tensor(raw, output) != 0;
+    correct = sum_popped && output.id && backend.map(output, &data, &bytes);
+    if (correct) {
+      values = static_cast<double*>(data);
+      correct = values[0] == 5.0;
+      backend.unmap(output);
+    }
+    if (output.id) nodus_tensor_destroy(output.id);
+    delete reduction_input;
+    raw_stack_free_mask(raw);
+    if (!require_or_report(correct, "execute tensor sum through ToolIR stack"))
       return 1;
   }
 

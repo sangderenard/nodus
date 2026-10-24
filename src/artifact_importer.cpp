@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,9 @@ struct BufferValue {
     std::string dtype;
     int32_t nodus_dtype = 0;
     std::vector<uint64_t> shape;
+    std::vector<bool> dynamic_shape;
+    std::vector<std::string> shape_source;
+    std::vector<uint32_t> shape_source_axis;
 };
 
 struct BufferExtent {
@@ -72,6 +76,7 @@ struct BufferExtent {
 };
 
 struct BufferAbiDoc {
+    int version = 1;
     std::string backend;
     std::string extent_dtype;
     std::string tool_id;
@@ -112,6 +117,20 @@ const BufferValue* find_buffer_value(const BufferAbiDoc& doc, const std::string&
     return nullptr;
 }
 
+BufferValue* find_buffer_value(BufferAbiDoc& doc, const std::string& ssa_id) {
+    for (auto& value : doc.values) {
+        if (value.ssa_id == ssa_id) return &value;
+    }
+    return nullptr;
+}
+
+size_t buffer_value_index(const BufferAbiDoc& doc, const std::string& ssa_id) {
+    for (size_t i = 0; i < doc.values.size(); ++i) {
+        if (doc.values[i].ssa_id == ssa_id) return i;
+    }
+    return doc.values.size();
+}
+
 bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err) {
     std::ifstream ifs(path);
     if (!ifs.good()) {
@@ -119,11 +138,13 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
         return false;
     }
     std::string line;
-    if (!std::getline(ifs, line) || line != "NODUS BUFFER ABI V1") {
-        *err = "not a NODUS BUFFER ABI V1 descriptor";
+    if (!std::getline(ifs, line) ||
+        (line != "NODUS BUFFER ABI V1" && line != "NODUS BUFFER ABI V2")) {
+        *err = "not a NODUS BUFFER ABI V1/V2 descriptor";
         return false;
     }
     BufferAbiDoc doc;
+    doc.version = line == "NODUS BUFFER ABI V2" ? 2 : 1;
     size_t line_no = 1;
     while (std::getline(ifs, line)) {
         ++line_no;
@@ -165,12 +186,31 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
                 return false;
             }
             for (int64_t i = 0; i < rank; ++i) {
-                int64_t dim = 0;
-                if (!(ss >> dim) || dim <= 0) {
-                    *err = "line " + std::to_string(line_no) + ": dynamic or invalid extent refused";
+                std::string dim;
+                if (!(ss >> dim)) {
+                    *err = "line " + std::to_string(line_no) + ": missing VALUE extent";
                     return false;
                 }
-                value.shape.push_back(static_cast<uint64_t>(dim));
+                if (dim == "?") {
+                    if (doc.version < 2) {
+                        *err = "line " + std::to_string(line_no) + ": dynamic extent requires V2";
+                        return false;
+                    }
+                    value.shape.push_back(0);
+                    value.dynamic_shape.push_back(true);
+                } else {
+                    try {
+                        const auto parsed = std::stoll(dim);
+                        if (parsed <= 0) throw std::out_of_range("extent");
+                        value.shape.push_back(static_cast<uint64_t>(parsed));
+                        value.dynamic_shape.push_back(false);
+                    } catch (...) {
+                        *err = "line " + std::to_string(line_no) + ": invalid VALUE extent '" + dim + "'";
+                        return false;
+                    }
+                }
+                value.shape_source.emplace_back();
+                value.shape_source_axis.push_back(0);
             }
             std::string trailing;
             if (ss >> trailing) {
@@ -200,6 +240,35 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
             }
             extent.axis = static_cast<uint32_t>(axis);
             doc.extent_order.push_back(std::move(extent));
+        } else if (tag == "SHAPE") {
+            if (doc.version < 2) {
+                *err = "line " + std::to_string(line_no) + ": SHAPE requires V2";
+                return false;
+            }
+            std::string target;
+            std::string from;
+            std::string source;
+            int64_t target_axis = -1;
+            int64_t source_axis = -1;
+            ss >> std::quoted(target) >> target_axis >> from
+               >> std::quoted(source) >> source_axis;
+            BufferValue* value = find_buffer_value(doc, target);
+            if (!ss || from != "FROM" || !value || target_axis < 0 ||
+                static_cast<size_t>(target_axis) >= value->shape.size() ||
+                source.empty() || source_axis < 0 ||
+                !value->dynamic_shape[static_cast<size_t>(target_axis)] ||
+                !value->shape_source[static_cast<size_t>(target_axis)].empty()) {
+                *err = "line " + std::to_string(line_no) + ": malformed SHAPE";
+                return false;
+            }
+            std::string trailing;
+            if (ss >> trailing) {
+                *err = "line " + std::to_string(line_no) + ": trailing SHAPE fields";
+                return false;
+            }
+            value->shape_source[static_cast<size_t>(target_axis)] = source;
+            value->shape_source_axis[static_cast<size_t>(target_axis)] =
+                static_cast<uint32_t>(source_axis);
         } else {
             *err = "line " + std::to_string(line_no) + ": unknown record '" + tag + "'";
             return false;
@@ -257,6 +326,23 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
         if (!value || extent.axis >= value->shape.size()) {
             *err = "EXTENT references unknown value or invalid axis for '" + extent.ssa_id + "'";
             return false;
+        }
+    }
+    for (auto& value : doc.values) {
+        for (size_t axis = 0; axis < value.shape.size(); ++axis) {
+            if (!value.dynamic_shape[axis]) continue;
+            if (value.role == BufferValue::Role::Input &&
+                value.shape_source[axis].empty()) {
+                value.shape_source[axis] = value.ssa_id;
+                value.shape_source_axis[axis] = static_cast<uint32_t>(axis);
+            }
+            const BufferValue* source = find_buffer_value(doc, value.shape_source[axis]);
+            if (!source || source->role != BufferValue::Role::Input ||
+                value.shape_source_axis[axis] >= source->shape.size()) {
+                *err = "dynamic shape for '" + value.ssa_id + "' axis " +
+                       std::to_string(axis) + " lacks a valid input extent source";
+                return false;
+            }
         }
     }
     (void)input_count;
@@ -678,9 +764,8 @@ std::string generate_wrapper_source(const ApiDoc& doc,
         }
     }
     ss << ");\n";
-    ss << "        const uint64_t shape1[1] = {1};\n";
     ss << "        nodus::tensors::AbstractTensorHandle out{};\n";
-    ss << "        out.id = nodus_tensor_create(NODUS_DTYPE_F64, 1, shape1);\n";
+    ss << "        out.id = nodus_tensor_create(NODUS_DTYPE_F64, 0, nullptr);\n";
     ss << "        if (out.id == 0 ||\n";
     ss << "            nodus_tensor_write(out.id, 0, &out_val, sizeof(double)) !=\n";
     ss << "                static_cast<int64_t>(sizeof(double)) ||\n";
@@ -812,6 +897,7 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
           "            return;\n        }\n";
     ss << "        std::array<void*, " << doc.values.size() << "> data{};\n";
     ss << "        std::array<bool, " << doc.values.size() << "> mapped{};\n";
+    ss << "        std::array<NodusTensorDesc, " << doc.values.size() << "> descs{};\n";
     ss << "        auto fail = [&]() {\n"
           "            for (size_t i = 0; i < handles.size(); ++i) if (mapped[i]) nodus_tensor_unmap(handles[i].id);\n"
           "            for (int idx : kOutputs) if (handles[static_cast<size_t>(idx)].id) nodus_tensor_destroy(handles[static_cast<size_t>(idx)].id);\n"
@@ -819,33 +905,66 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
           "            restore_inputs();\n"
           "        };\n";
 
+    // Describe every input before allocating outputs. Dynamic result shapes
+    // may cite any input regardless of buffer order.
     for (size_t i = 0; i < doc.values.size(); ++i) {
         const auto& value = doc.values[i];
         if (value.role == BufferValue::Role::Input) {
-            ss << "        { NodusTensorDesc d{};\n";
-            ss << "          if (nodus_tensor_describe(handles[" << i << "].id, &d) != NODUS_OK || d.dtype != "
-               << value.nodus_dtype << " || d.rank != " << value.shape.size();
+            ss << "        if (nodus_tensor_describe(handles[" << i << "].id, &descs[" << i
+               << "]) != NODUS_OK || descs[" << i << "].dtype != "
+               << value.nodus_dtype << " || descs[" << i << "].rank != " << value.shape.size();
             for (size_t axis = 0; axis < value.shape.size(); ++axis) {
-                ss << " || d.shape[" << axis << "] != " << value.shape[axis] << "ull";
+                if (!value.dynamic_shape[axis]) {
+                    ss << " || descs[" << i << "].shape[" << axis << "] != "
+                       << value.shape[axis] << "ull";
+                }
             }
-            ss << ") { fail(); return; } }\n";
-        } else {
+            ss << ") { fail(); return; }\n";
+        }
+    }
+    for (size_t i = 0; i < doc.values.size(); ++i) {
+        const auto& value = doc.values[i];
+        if (value.role != BufferValue::Role::Input) continue;
+        for (size_t axis = 0; axis < value.shape.size(); ++axis) {
+            if (!value.dynamic_shape[axis] ||
+                value.shape_source[axis] == value.ssa_id) continue;
+            const size_t source_index = buffer_value_index(
+                doc, value.shape_source[axis]);
+            ss << "        if (descs[" << i << "].shape[" << axis << "] != descs["
+               << source_index << "].shape[" << value.shape_source_axis[axis]
+               << "]) { fail(); return; }\n";
+        }
+    }
+    for (size_t i = 0; i < doc.values.size(); ++i) {
+        const auto& value = doc.values[i];
+        if (value.role != BufferValue::Role::Input) {
             if (value.shape.empty()) {
                 ss << "        handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype << ", 0, nullptr);\n";
             } else {
-                ss << "        { static constexpr uint64_t shape[] = {";
+                ss << "        { const std::array<uint64_t, " << value.shape.size() << "> shape = {";
                 for (size_t axis = 0; axis < value.shape.size(); ++axis) {
                     if (axis) ss << ", ";
-                    ss << value.shape[axis] << "ull";
+                    if (value.dynamic_shape[axis]) {
+                        const size_t source_index = buffer_value_index(
+                            doc, value.shape_source[axis]);
+                        ss << "descs[" << source_index << "].shape["
+                           << value.shape_source_axis[axis] << "]";
+                    } else {
+                        ss << value.shape[axis] << "ull";
+                    }
                 }
                 ss << "}; handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype << ", "
-                   << value.shape.size() << ", shape); }\n";
+                   << value.shape.size() << ", shape.data()); }\n";
             }
             ss << "        if (!handles[" << i << "].id) { fail(); return; }\n";
+            ss << "        if (nodus_tensor_describe(handles[" << i << "].id, &descs[" << i
+               << "]) != NODUS_OK) { fail(); return; }\n";
             if (value.role == BufferValue::Role::Workspace) {
                 ss << "        if (nodus_tensor_zero(handles[" << i << "].id, 0, 0) != NODUS_OK) { fail(); return; }\n";
             }
         }
+    }
+    for (size_t i = 0; i < doc.values.size(); ++i) {
         ss << "        { uint64_t bytes = 0; if (nodus_tensor_map(handles[" << i
            << "].id, &data[" << i << "], &bytes) != NODUS_OK) { fail(); return; } mapped["
            << i << "] = true; }\n";
@@ -860,8 +979,9 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "        std::array<Extent, " << doc.extent_order.size() << "> extents = {";
     for (size_t i = 0; i < doc.extent_order.size(); ++i) {
         if (i) ss << ", ";
-        const auto* value = find_buffer_value(doc, doc.extent_order[i].ssa_id);
-        ss << "static_cast<Extent>(" << value->shape[doc.extent_order[i].axis] << "ull)";
+        const size_t value_index = buffer_value_index(doc, doc.extent_order[i].ssa_id);
+        ss << "static_cast<Extent>(descs[" << value_index << "].shape["
+           << doc.extent_order[i].axis << "])";
     }
     ss << "};\n";
     ss << "        entry_(buffers.data(), extents.empty() ? nullptr : extents.data());\n";

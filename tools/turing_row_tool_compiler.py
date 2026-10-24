@@ -13,6 +13,9 @@ The request is JSON.  It must contain ``row_entry``, ``columns``, ``backend``
 (``c``, ``llvm`` or ``fortran``), ``output_dir``, ``extraction_contract``, and
 exactly one of ``source_path`` or ``source_text``.  The extraction contract is
 the caller-selected Turing contract; this adapter never synthesizes one.
+Columns distinguish ``shape: []`` (scalar), a concrete extent list, and
+``rank: N, shape: null`` (runtime-sized tensor).  A dynamic output names an
+input/inout ``shape_from`` column whose handle supplies its allocation shape.
 ``global_scope: true`` wraps the submitted body in the named row function using
 the input/inout columns as parameters; both the authored text and that
 deterministic submitted source are retained.
@@ -42,7 +45,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 
 PRODUCT_SCHEMA = "nodus-turing-row-tool-product-v1"
-BUFFER_ABI_SCHEMA = "nodus-turing-buffer-abi-v1"
+BUFFER_ABI_SCHEMA = "nodus-turing-buffer-abi-v2"
 REQUEST_SCHEMA = "nodus-turing-row-tool-request-v1"
 ADOPTION_RECEIPT_NAME = "nodus-row-tool-product.receipt"
 _BACKENDS = {"c", "llvm", "fortran"}
@@ -59,29 +62,74 @@ class Column:
     name: str
     role: str
     dtype: str
-    shape: tuple[Any, ...] = ()
+    rank: int = 0
+    # ``()`` is a scalar, a concrete tuple is a fixed tensor, and ``None`` is
+    # a rank-known tensor whose extents arrive with the Nodus handle.
+    shape: tuple[int, ...] | None = ()
+    # Dynamic outputs/workspaces need an allocation authority before the
+    # compiled entry can run.  The named input/inout column supplies the
+    # extents axis-for-axis; Turing remains unaware of the Nodus handle.
+    shape_from: str | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "Column":
         name = str(value.get("name") or "")
         role = str(value.get("role") or "")
         dtype = str(value.get("dtype") or "")
-        shape = tuple(value.get("shape") or ())
+        raw_rank = value.get("rank")
+        raw_shape = value.get("shape") if "shape" in value else ()
+        if raw_shape is None:
+            rank = int(raw_rank or 0)
+            shape = None if rank else ()
+        else:
+            shape = tuple(int(item) for item in raw_shape)
+            rank = len(shape) if raw_rank is None else int(raw_rank)
+        shape_from = (
+            None if value.get("shape_from") is None
+            else str(value.get("shape_from"))
+        )
         if not _IDENTIFIER.fullmatch(name):
             raise ValueError(f"invalid column name {name!r}")
         if role not in _COLUMN_ROLES:
             raise ValueError(f"column {name!r} has unsupported role {role!r}")
         if not dtype:
             raise ValueError(f"column {name!r} requires a dtype")
-        return cls(name=name, role=role, dtype=dtype, shape=shape)
+        if rank < 0:
+            raise ValueError(f"column {name!r} has invalid rank {rank}")
+        if shape is not None:
+            if len(shape) != rank:
+                raise ValueError(
+                    f"column {name!r} rank {rank} disagrees with shape {shape!r}"
+                )
+            if any(extent <= 0 for extent in shape):
+                raise ValueError(f"column {name!r} has invalid shape {shape!r}")
+        elif rank == 0:
+            raise ValueError(f"column {name!r} cannot have an unknown scalar shape")
+        if shape_from is not None:
+            if not _IDENTIFIER.fullmatch(shape_from):
+                raise ValueError(
+                    f"column {name!r} has invalid shape_from {shape_from!r}"
+                )
+            if shape is not None:
+                raise ValueError(
+                    f"column {name!r} may use shape_from only with shape null"
+                )
+        return cls(
+            name=name, role=role, dtype=dtype, rank=rank,
+            shape=shape, shape_from=shape_from,
+        )
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
+        result = {
             "name": self.name,
             "role": self.role,
             "dtype": self.dtype,
-            "shape": list(self.shape),
+            "rank": self.rank,
+            "shape": None if self.shape is None else list(self.shape),
         }
+        if self.shape_from is not None:
+            result["shape_from"] = self.shape_from
+        return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,6 +168,25 @@ class RowToolRequest:
         names = [column.name for column in columns]
         if len(names) != len(set(names)):
             raise ValueError("column names must be unique")
+        columns_by_name = {column.name: column for column in columns}
+        for column in columns:
+            if column.shape is None and column.role in {"output", "inout"}:
+                if column.shape_from is None and column.role == "output":
+                    raise ValueError(
+                        f"dynamic output column {column.name!r} requires shape_from"
+                    )
+            if column.shape_from is None:
+                continue
+            source = columns_by_name.get(column.shape_from)
+            if source is None or source.role not in {"input", "inout"}:
+                raise ValueError(
+                    f"column {column.name!r} shape_from must name an input/inout column"
+                )
+            if source.rank != column.rank:
+                raise ValueError(
+                    f"column {column.name!r} rank does not match shape source "
+                    f"{source.name!r}"
+                )
         output_dir = value.get("output_dir")
         if not output_dir:
             raise ValueError("request requires output_dir")
@@ -303,8 +370,8 @@ def _render_textual_ssa(module: Any, exports: Sequence[str]) -> str | None:
     return "\n".join(lines) + "\n"
 
 
-def _normalize_shape(shape: Any) -> list[Any]:
-    return [int(item) if isinstance(item, int) else str(item) for item in tuple(shape or ())]
+def _normalize_shape(shape: Any) -> list[int]:
+    return [int(item) for item in tuple(shape or ())]
 
 
 def _ssa_spelling(value_id: int) -> str:
@@ -325,7 +392,7 @@ def _nodus_dtype(dtype: Any) -> str:
     try:
         return aliases[spelling]
     except KeyError as error:
-        raise ProductError(f"NODUS BUFFER ABI V1 cannot spell dtype {dtype!r}") from error
+        raise ProductError(f"NODUS BUFFER ABI V2 cannot spell dtype {dtype!r}") from error
 
 
 def _quoted(value: Any) -> str:
@@ -370,6 +437,11 @@ def _buffer_abi(
         for index, value_id in enumerate(output_ids)
         if index < len(output_columns)
     }
+    columns_by_name = {column.name: column for column in request.columns}
+    input_ids_by_name = {
+        input_columns[index].name: value_id
+        for index, value_id in enumerate(argument_ids)
+    }
     order = tuple(int(item) for item in getattr(artifact, "buffer_order", ()) or ())
     dtypes = tuple(getattr(artifact, "buffer_dtypes", ()) or ())
     shapes = tuple(getattr(artifact, "buffer_shapes", ()) or ())
@@ -390,32 +462,102 @@ def _buffer_abi(
             else "output" if value_id in output_names
             else "workspace"
         )
-        shape = _normalize_shape(shapes[index]) if shapes else []
-        if any(not isinstance(extent, int) or extent < 0 for extent in shape):
-            raise ProductError(
-                f"buffer {value_id} has a dynamic or invalid shape {shape!r}"
-            )
+        artifact_shape = _normalize_shape(shapes[index]) if shapes else []
+        column_name = output_names.get(value_id, input_names.get(value_id))
+        column = columns_by_name.get(column_name) if column_name else None
+        shape_sources: list[dict[str, int] | None] = []
+        if column is None:
+            if any(extent <= 0 for extent in artifact_shape):
+                raise ProductError(
+                    f"workspace buffer {value_id} has an invalid shape {artifact_shape!r}"
+                )
+            rank = len(artifact_shape)
+            shape: list[int | None] = list(artifact_shape)
+            shape_sources = [None] * rank
+        elif column.shape is not None:
+            shape = list(column.shape)
+            rank = column.rank
+            if artifact_shape and artifact_shape != shape:
+                raise ProductError(
+                    f"backend shape {artifact_shape!r} disagrees with column "
+                    f"{column.name!r} shape {shape!r}"
+                )
+            shape_sources = [None] * rank
+        else:
+            # A nonempty backend shape means the emitted program was
+            # specialized despite the caller asking for a runtime-sized row.
+            # Advertising it as dynamic would make the wrapper unsound.
+            if artifact_shape:
+                raise ProductError(
+                    f"backend specialized dynamic column {column.name!r} to "
+                    f"shape {artifact_shape!r}"
+                )
+            rank = column.rank
+            shape = [None] * rank
+            source_name = column.shape_from
+            if role == "output" and column.role == "inout" and source_name is None:
+                source_name = column.name
+            if role in {"output", "workspace"}:
+                if source_name is None:
+                    raise ProductError(
+                        f"dynamic {role} column {column.name!r} requires shape_from"
+                    )
+                source_id = input_ids_by_name.get(source_name)
+                if source_id is None:
+                    raise ProductError(
+                        f"dynamic column {column.name!r} names unavailable shape source "
+                        f"{source_name!r}"
+                    )
+                shape_sources = [
+                    {"ssa_value_id": int(source_id), "axis": axis}
+                    for axis in range(rank)
+                ]
+            else:
+                source_id = (
+                    int(value_id)
+                    if source_name is None
+                    else input_ids_by_name.get(source_name)
+                )
+                if source_id is None:
+                    raise ProductError(
+                        f"dynamic column {column.name!r} names unavailable shape source "
+                        f"{source_name!r}"
+                    )
+                shape_sources = [
+                    {"ssa_value_id": int(source_id), "axis": axis}
+                    for axis in range(rank)
+                ]
         buffers.append({
             "position": index,
             "ssa_value_id": value_id,
             "role": role,
-            "column": output_names.get(value_id, input_names.get(value_id)),
+            "column": column_name,
             "dtype": _nodus_dtype(dtypes[index] if dtypes else "float64"),
+            "rank": rank,
             "shape": shape,
+            "shape_sources": shape_sources,
         })
     extent_order = [list(item) for item in tuple(
         getattr(artifact, "extent_order", ()) or ()
     )]
     for extent in extent_order:
-        if len(extent) != 3 or str(extent[1]) != "shape" or extent[2] is None:
+        if (
+            len(extent) != 3
+            or str(extent[1]) not in {"shape", "dim"}
+            or extent[2] is None
+        ):
             raise ProductError(
-                "NODUS BUFFER ABI V1 supports only axis-addressed shape extents; "
+                "NODUS BUFFER ABI V2 supports only axis-addressed shape extents; "
                 f"got {extent!r}"
             )
         value_id, _kind, axis = extent
-        if int(value_id) not in set(order):
+        try:
+            extent_buffer = next(
+                item for item in buffers if item["ssa_value_id"] == int(value_id)
+            )
+        except StopIteration:
             raise ProductError(f"extent names unknown buffer {value_id!r}")
-        if int(axis) < 0:
+        if int(axis) < 0 or int(axis) >= int(extent_buffer["rank"]):
             raise ProductError(f"extent has invalid axis {axis!r}")
     tool_id = f"imported.{_safe_name(request.product_name or request.row_entry)}.{request.backend}"
     descriptor = {
@@ -440,7 +582,7 @@ def _buffer_abi(
     extent_dtype = "i64" if request.backend == "c" else "i32"
     descriptor["extent_dtype"] = extent_dtype
     lines = [
-        "NODUS BUFFER ABI V1",
+        "NODUS BUFFER ABI V2",
         f"BACKEND {_quoted(request.backend)}",
         f"TOOL {_quoted(tool_id)} {_quoted(descriptor['tool_name'])}",
         f"ENTRY {_quoted(descriptor['symbol'])}",
@@ -451,13 +593,25 @@ def _buffer_abi(
         lines.append(
             "VALUE "
             f"{str(buffer['role']).upper()} {_quoted(_ssa_spelling(buffer['ssa_value_id']))} "
-            f"{_quoted(buffer['dtype'])} {len(shape)}"
-            + (" " + " ".join(map(str, shape)) if shape else "")
+            f"{_quoted(buffer['dtype'])} {buffer['rank']}"
+            + (
+                " " + " ".join("?" if extent is None else str(extent) for extent in shape)
+                if shape else ""
+            )
         )
     for value_id in order:
         lines.append(f"BUFFER {_quoted(_ssa_spelling(value_id))}")
     for value_id, _kind, axis in descriptor["extent_order"]:
         lines.append(f"EXTENT {_quoted(_ssa_spelling(value_id))} {int(axis)}")
+    for buffer in buffers:
+        for axis, source in enumerate(buffer["shape_sources"]):
+            if source is None or source["ssa_value_id"] == buffer["ssa_value_id"]:
+                continue
+            lines.append(
+                f"SHAPE {_quoted(_ssa_spelling(buffer['ssa_value_id']))} {axis} "
+                f"FROM {_quoted(_ssa_spelling(source['ssa_value_id']))} "
+                f"{source['axis']}"
+            )
     return descriptor, "\n".join(lines) + "\n"
 
 
@@ -600,6 +754,13 @@ def compile_row_tool(
         request = RowToolRequest.from_mapping(request)
     if request.extraction_contract is None:
         raise ValueError("request requires an explicit extraction_contract")
+    if request.backend == "fortran" and any(
+        column.shape is None for column in request.columns
+    ):
+        raise ProductError(
+            "runtime-sized columns require the C/LLVM buffer ABI; the Fortran "
+            "compiled-program importer does not yet carry dynamic output shape sources"
+        )
     output = request.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     # A rerun that does not produce a loadable product must not leave an older

@@ -61,8 +61,11 @@ bool execute_compiled(ITool& tool) {
     context.stack.raw = &raw;
     if (ok) tool.execute_stack(context);
     nodus::tensors::AbstractTensorHandle output{};
+    NodusTensorDesc output_desc{};
     double value = 0.0;
     ok = ok && raw_stack_pop_abstract_tensor(raw, output) &&
+         nodus_tensor_describe(output.id, &output_desc) == NODUS_OK &&
+         output_desc.dtype == NODUS_DTYPE_F64 && output_desc.rank == 0 &&
          nodus_tensor_read(output.id, 0, &value, sizeof(value)) ==
              static_cast<int64_t>(sizeof(value)) &&
          std::abs(value - 13.5) < 1.0e-12;

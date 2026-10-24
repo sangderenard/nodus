@@ -188,7 +188,7 @@ def test_c_product_uses_public_composer_and_retains_complete_buffer_abi(tmp_path
     ]
 
     descriptor = (tmp_path / "product" / "backend" / "row_c.nodus_buffer_abi.txt").read_text()
-    assert descriptor.startswith("NODUS BUFFER ABI V1\n")
+    assert descriptor.startswith("NODUS BUFFER ABI V2\n")
     assert 'TOOL "imported.combine.c" "compiled combine (c)"' in descriptor
     assert 'EXTENT_DTYPE "i64"' in descriptor
     assert 'VALUE WORKSPACE "%t99" "i64" 1 4' in descriptor
@@ -282,6 +282,63 @@ def test_non_shape_extent_is_refused_instead_of_mistranslated(tmp_path):
     compiler.emit_c = emit_c
     with pytest.raises(ProductError, match="axis-addressed shape extents"):
         compile_row_tool(request(tmp_path), compiler=compiler)
+
+
+def test_dynamic_rank_and_shape_sources_survive_into_buffer_abi(tmp_path):
+    compiler = FakeCompiler()
+    original = compiler.emit_c
+
+    def emit_c(*args, **kwargs):
+        artifact = original(*args, **kwargs)
+        artifact.extent_order = ((1, "dim", 0),)
+        return artifact
+
+    compiler.emit_c = emit_c
+    dynamic = request(tmp_path)
+    dynamic["columns"] = [
+        {"name": "left", "role": "input", "dtype": "f64",
+         "rank": 1, "shape": None},
+        {"name": "right", "role": "input", "dtype": "f64",
+         "rank": 1, "shape": None, "shape_from": "left"},
+        {"name": "total", "role": "output", "dtype": "f64",
+         "rank": 1, "shape": None, "shape_from": "left"},
+    ]
+
+    manifest = compile_row_tool(dynamic, compiler=compiler)
+    descriptor = (
+        tmp_path / "product" / "backend" / "row_c.nodus_buffer_abi.txt"
+    ).read_text()
+    assert manifest["buffer_abi"]["columns"] == dynamic["columns"]
+    assert 'VALUE INPUT "%t1" "f64" 1 ?' in descriptor
+    assert 'VALUE INPUT "%t2" "f64" 1 ?' in descriptor
+    assert 'VALUE OUTPUT "%t3" "f64" 1 ?' in descriptor
+    assert 'EXTENT "%t1" 0' in descriptor
+    assert 'SHAPE "%t2" 0 FROM "%t1" 0' in descriptor
+    assert 'SHAPE "%t3" 0 FROM "%t1" 0' in descriptor
+
+
+def test_dynamic_output_requires_explicit_shape_source(tmp_path):
+    malformed = request(tmp_path)
+    malformed["columns"][-1] = {
+        "name": "total", "role": "output", "dtype": "f64",
+        "rank": 1, "shape": None,
+    }
+    with pytest.raises(ValueError, match="requires shape_from"):
+        compile_row_tool(malformed, compiler=FakeCompiler())
+
+
+def test_dynamic_fortran_refuses_before_legacy_importer_can_narrow_it(tmp_path):
+    dynamic = request(tmp_path, "fortran")
+    dynamic["columns"] = [
+        {"name": "left", "role": "input", "dtype": "f64",
+         "rank": 1, "shape": None},
+        {"name": "right", "role": "input", "dtype": "f64",
+         "rank": 1, "shape": None, "shape_from": "left"},
+        {"name": "total", "role": "output", "dtype": "f64",
+         "rank": 1, "shape": None, "shape_from": "left"},
+    ]
+    with pytest.raises(ProductError, match="C/LLVM buffer ABI"):
+        compile_row_tool(dynamic, compiler=FakeCompiler())
 
 
 def test_declared_input_count_must_equal_root_argument_count(tmp_path):

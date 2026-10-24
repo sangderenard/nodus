@@ -19,8 +19,9 @@
 // source both builds standalone into a tool DLL and inlines into generated
 // composite tools. Every emitted source implements the same typed-stack
 // contract as the vocabulary functors in abstract_tensor_graph_ir.cpp:
-// operands are AbstractTensor* values (VT_VOID_PTR) popped right-then-left,
-// restored on failure, with one output tensor pointer pushed on success.
+// operands are AbstractTensorHandle values (VT_ABSTRACT_TENSOR) popped
+// right-then-left, restored on failure, with one output handle pushed on
+// success. The in-process registry uses the same cross-image-safe currency.
 //
 // Backend groups differ only in the compute engine inside that contract:
 //   - "inmemory": dispatches through tensor_elementwise_unary/binary

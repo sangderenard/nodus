@@ -163,6 +163,8 @@ int32_t nodus_tensor_binary(int32_t op, uint64_t left, uint64_t right,
 // for a commutative op it makes no difference and may be 0.
 int32_t nodus_tensor_scalar(int32_t op, uint64_t tensor, double scalar,
                             int32_t scalar_on_left, uint64_t output);
+int32_t nodus_tensor_reduce_sum_all(uint64_t input, uint64_t output);
+int32_t nodus_tensor_reduce_mean_all(uint64_t input, uint64_t output);
 
 // Matrix multiply, which is not elementwise and so is not a CanonicalOp: it
 // calls tensor_matmul_f32/f64 in tensor_math.h, the same "in-memory backend

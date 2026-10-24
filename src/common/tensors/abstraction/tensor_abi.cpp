@@ -398,6 +398,32 @@ int32_t nodus_tensor_scalar(int32_t op, uint64_t tensor, double scalar,
                : NODUS_ERR_UNSUPPORTED;
 }
 
+int32_t nodus_tensor_reduce_sum_all(uint64_t input, uint64_t output) {
+    if (!input || !output) return NODUS_ERR_INVALID_ARG;
+    Wrapped in_wrap;
+    Wrapped out_wrap;
+    if (!wrap_handle(input, &in_wrap) || !wrap_handle(output, &out_wrap)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    return nodus::tensors::tensor_reduce_sum_all(
+               in_wrap.tensor, &out_wrap.tensor)
+               ? NODUS_OK
+               : NODUS_ERR_UNSUPPORTED;
+}
+
+int32_t nodus_tensor_reduce_mean_all(uint64_t input, uint64_t output) {
+    if (!input || !output) return NODUS_ERR_INVALID_ARG;
+    Wrapped in_wrap;
+    Wrapped out_wrap;
+    if (!wrap_handle(input, &in_wrap) || !wrap_handle(output, &out_wrap)) {
+        return NODUS_ERR_UNKNOWN_HANDLE;
+    }
+    return nodus::tensors::tensor_reduce_mean_all(
+               in_wrap.tensor, &out_wrap.tensor)
+               ? NODUS_OK
+               : NODUS_ERR_UNSUPPORTED;
+}
+
 int32_t nodus_tensor_matmul(uint64_t left, uint64_t right, uint64_t output) {
     if (!left || !right || !output) {
         return NODUS_ERR_INVALID_ARG;
