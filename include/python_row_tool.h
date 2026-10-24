@@ -95,6 +95,12 @@ public:
 
     bool initialize(std::string* error = nullptr);
     void shutdown() noexcept;
+    // Ordinary Nodus row plugins exchange AbstractTensor handles.  This
+    // scalar bridge preserves that transport so an interpreted row and its
+    // Turing-translated replacement have the same stack ABI.
+    bool execute_tensor_stack(RawStackFrame& stack, std::string* error = nullptr);
+    // Primitive execution remains available for embedding and focused ABI
+    // tests; generated ITool plugins use execute_tensor_stack().
     bool execute(RawStackFrame& stack, std::string* error = nullptr);
     const Descriptor& descriptor() const noexcept;
 

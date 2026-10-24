@@ -2,6 +2,9 @@
 #include "python_row_tool.h"
 #include "tool_registry.h"
 
+#include "common/tensors/abstraction/abstract_tensor_handle.h"
+#include "common/tensors/abstraction/tensor_abi.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -25,15 +28,14 @@ bool write_text(const fs::path& path, const std::string& text) {
 }
 
 template <typename T>
-bool push(RawStackFrame& stack, ValueTypeBuiltin builtin, const T& value) {
-    return raw_stack_push_typed(
-        stack, &value, ValueTypeRegistry::global().builtin(builtin));
-}
-
-template <typename T>
-bool pop(RawStackFrame& stack, ValueTypeBuiltin builtin, T* value) {
-    return raw_stack_pop_typed(
-        stack, value, ValueTypeRegistry::global().builtin(builtin));
+uint64_t scalar_tensor(int32_t dtype, const T& value) {
+    const uint64_t handle = nodus_tensor_create(dtype, 0, nullptr);
+    if (!handle || nodus_tensor_write(handle, 0, &value, sizeof(value)) !=
+                       static_cast<int64_t>(sizeof(value))) {
+        if (handle) nodus_tensor_destroy(handle);
+        return 0;
+    }
+    return handle;
 }
 
 } // namespace
@@ -127,7 +129,13 @@ int main() {
     }
     const double left = 9.5;
     const int32_t right = 4;
-    if (!push(raw, VT_FLOAT64, left) || !push(raw, VT_INT32, right)) {
+    const uint64_t left_tensor = scalar_tensor(NODUS_DTYPE_F64, left);
+    const uint64_t right_tensor = scalar_tensor(NODUS_DTYPE_I32, right);
+    nodus::tensors::AbstractTensorHandle left_handle{left_tensor};
+    nodus::tensors::AbstractTensorHandle right_handle{right_tensor};
+    if (!left_tensor || !right_tensor ||
+        !raw_stack_push_abstract_tensor(raw, left_handle) ||
+        !raw_stack_push_abstract_tensor(raw, right_handle)) {
         std::cerr << "could not push interpreted row inputs\n";
         return 1;
     }
@@ -135,13 +143,26 @@ int main() {
     stack.stack.raw = &raw;
     tool->execute_stack(stack);
 
+    nodus::tensors::AbstractTensorHandle difference_handle{};
+    nodus::tensors::AbstractTensorHandle combined_handle{};
     int64_t difference = 0;
     double combined = 0.0;
-    const bool executed = pop(raw, VT_INT64, &difference) &&
-                          pop(raw, VT_FLOAT64, &combined) &&
+    const bool executed =
+                          raw_stack_pop_abstract_tensor(raw, difference_handle) &&
+                          raw_stack_pop_abstract_tensor(raw, combined_handle) &&
+                          nodus_tensor_read(difference_handle.id, 0, &difference,
+                                            sizeof(difference)) ==
+                              static_cast<int64_t>(sizeof(difference)) &&
+                          nodus_tensor_read(combined_handle.id, 0, &combined,
+                                            sizeof(combined)) ==
+                              static_cast<int64_t>(sizeof(combined)) &&
                           raw.byte_count == 0 &&
                           difference == 5 &&
                           std::abs(combined - 23.0) < 1.0e-12;
+    if (difference_handle.id) nodus_tensor_destroy(difference_handle.id);
+    if (combined_handle.id) nodus_tensor_destroy(combined_handle.id);
+    if (left_tensor) nodus_tensor_destroy(left_tensor);
+    if (right_tensor) nodus_tensor_destroy(right_tensor);
     raw_stack_free_mask(raw);
     if (raw.backend) {
         gp_mem_backend_release(raw.backend);

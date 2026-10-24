@@ -179,6 +179,7 @@ EXPORTS
     gp_plugin_load_from_path
     gp_plugin_load_from_path_with_host
     gp_plugin_unload
+    gp_python_row_deploy_and_load
     gp_turing_product_adopt_and_load
     gp_turing_row_tool_compile_and_load
     gp_raw_stack_frame_pop_into_backend

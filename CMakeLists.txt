@@ -794,6 +794,8 @@ target_compile_definitions(nodus_python_row PRIVATE NODUS_PYTHON_ROW_BUILD=1)
 target_compile_features(nodus_python_row PUBLIC cxx_std_20)
 target_link_libraries(nodus_python_row PRIVATE Python3::Python nodus_tensor_core)
 set_target_properties(nodus_python_row PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+target_link_libraries(canvas_tables PRIVATE nodus_python_row)
+target_link_libraries(canvas_tables_static PUBLIC nodus_python_row)
 
 # Unit tests
 add_executable(test_thread_manager
@@ -871,6 +873,25 @@ add_test(NAME python_row_plugin_integration_test
 )
 if(WIN32)
   set_tests_properties(python_row_plugin_integration_test PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_python_row>"
+  )
+endif()
+add_executable(python_row_workflow_test
+  tests/python_row_workflow_test.cpp
+)
+target_link_libraries(python_row_workflow_test PRIVATE
+  canvas_tables_static
+  nodus_python_row
+)
+target_compile_definitions(python_row_workflow_test PRIVATE
+  NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+  TURING_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../turing"
+  PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+)
+target_compile_features(python_row_workflow_test PRIVATE cxx_std_20)
+add_test(NAME python_row_workflow_test COMMAND python_row_workflow_test)
+if(WIN32)
+  set_tests_properties(python_row_workflow_test PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_python_row>"
   )
 endif()
