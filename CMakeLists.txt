@@ -1203,6 +1203,15 @@ add_executable(tensor_graph_execute
 )
 target_link_libraries(tensor_graph_execute PRIVATE canvas_tables_static)
 target_compile_features(tensor_graph_execute PRIVATE cxx_std_20)
+add_test(NAME turing_process_graph_intake_test
+  COMMAND ${Python3_EXECUTABLE} -m pytest -q
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_turing_process_graph_intake.py"
+)
+set_tests_properties(turing_process_graph_intake_test PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  ENVIRONMENT "NODUS_PROCESS_GRAPH_RUNNER=$<TARGET_FILE:tensor_graph_execute>;NODUS_TURING_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/../turing"
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:tensor_graph_execute>\;${TORCH_INSTALL_PREFIX}/lib"
+)
 
 # Python-emitted SCHEMA V1 parsed and instantiated by the C++ shell.
 add_executable(test_schema_crossing tests/schema_crossing_test.cpp)
