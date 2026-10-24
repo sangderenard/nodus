@@ -16,6 +16,11 @@
 #include <cstdint>
 #include <string_view>
 
+// Platform headers define CONST as a macro; keep the scoped enum token intact.
+#ifdef CONST
+#undef CONST
+#endif
+
 namespace nodus {
 namespace ops {
 

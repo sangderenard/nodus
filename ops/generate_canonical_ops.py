@@ -61,6 +61,13 @@ KERNEL_OPS = {
     "AND", "OR", "NOT", "XOR",
 }
 
+# Platform headers may expose object-like macros whose spelling is also a
+# legitimate canonical enum member.  A scoped enum does not protect its member
+# token from the preprocessor, so the generated C++ authority must remove these
+# macros before declaring or consuming CanonicalOp.  Do not restore them: doing
+# so would make later expressions such as CanonicalOp::CONST ill-formed again.
+CXX_ENUM_MACRO_COLLISIONS = {"CONST"}
+
 # Tier-1 composition families: how an operation that is not one Tier-0 instruction is
 # built out of Tier-0. Recorded so the knowledge is data rather than folklore.
 TIER1_CLASSES = {"reduce", "contract", "remap", "generate", "order"}
@@ -244,8 +251,19 @@ def enumerator(name: str) -> str:
 
 def emit_cpp(data: dict) -> str:
     ops = data["ops"]
-    out = [BANNER, "#pragma once", "", "#include <cstdint>", "#include <string_view>", "",
-           "namespace nodus {", "namespace ops {", ""]
+    out = [BANNER, "#pragma once", "", "#include <cstdint>", "#include <string_view>", ""]
+
+    emitted_enumerators = {enumerator(o["name"]) for o in ops}
+    for macro in sorted(CXX_ENUM_MACRO_COLLISIONS & emitted_enumerators):
+        out += [
+            f"// Platform headers define {macro} as a macro; keep the scoped enum token intact.",
+            f"#ifdef {macro}",
+            f"#undef {macro}",
+            "#endif",
+            "",
+        ]
+
+    out += ["namespace nodus {", "namespace ops {", ""]
 
     out += [
         "// Sub-opcode carried by KernelIR's UNARY / BINARY / CMP / CAST instructions,",

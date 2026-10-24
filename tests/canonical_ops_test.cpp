@@ -9,8 +9,25 @@
 //
 // Rationale for the table itself: research/15_the_missing_function_table.md.
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifndef CONST
+#error "Windows macro-collision regression requires windows.h to define CONST"
+#endif
+#endif
+
 #include "canonical_ops.h"
 #include "../src/kernel_isa.h"
+
+#ifdef CONST
+#error "canonical_ops.h must remove the platform CONST macro"
+#endif
 
 #include <cstring>
 #include <iostream>
