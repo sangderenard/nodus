@@ -436,6 +436,11 @@ bool write_descriptor(const Descriptor& descriptor, const std::string& output_pa
     out << "CALLABLE " << std::quoted(descriptor.callable_name) << "\n";
     for (const Port& port : descriptor.inputs) {
         out << "INPUT " << std::quoted(port.name) << " " << primitive_type_name(port.type) << "\n";
+        if (!port.label.empty() || !port.form_control.empty() || !port.form_required) {
+            out << "INPUT_UI " << std::quoted(port.name) << " "
+                << std::quoted(port.label) << " " << std::quoted(port.form_control)
+                << " " << (port.form_required ? "REQUIRED" : "OPTIONAL") << "\n";
+        }
     }
     for (const Port& port : descriptor.outputs) {
         out << "OUTPUT " << std::quoted(port.name) << " " << primitive_type_name(port.type) << "\n";
@@ -504,6 +509,25 @@ bool read_descriptor(const std::string& input_path, Descriptor* descriptor, std:
                 return false;
             }
             (tag == "INPUT" ? parsed.inputs : parsed.outputs).push_back(std::move(port));
+        } else if (tag == "INPUT_UI") {
+            std::string port_name;
+            std::string required;
+            row >> std::quoted(port_name);
+            auto it = std::find_if(parsed.inputs.begin(), parsed.inputs.end(),
+                                   [&](const Port& port) { return port.name == port_name; });
+            if (it == parsed.inputs.end()) {
+                set_error(error, "INPUT_UI names an input that has not been declared: " + port_name);
+                return false;
+            }
+            row >> std::quoted(it->label) >> std::quoted(it->form_control) >> required;
+            if (required == "REQUIRED") {
+                it->form_required = true;
+            } else if (required == "OPTIONAL") {
+                it->form_required = false;
+            } else {
+                set_error(error, "INPUT_UI requirement must be REQUIRED or OPTIONAL");
+                return false;
+            }
         } else {
             set_error(error, "unknown Python row ABI descriptor record: " + tag);
             return false;
@@ -543,7 +567,9 @@ bool generate_plugin_source(const Descriptor& descriptor, std::string* source, s
     for (const Port& port : descriptor.inputs) {
         out << "    d.inputs.push_back({\"" << cpp_escape(port.name)
             << "\", nodus::python_row::PrimitiveType::";
-        out << primitive_enum_name(port.type) << "});\n";
+        out << primitive_enum_name(port.type) << ", \"" << cpp_escape(port.label)
+            << "\", \"" << cpp_escape(port.form_control) << "\", "
+            << (port.form_required ? "true" : "false") << "});\n";
     }
     for (const Port& port : descriptor.outputs) {
         out << "    d.outputs.push_back({\"" << cpp_escape(port.name)

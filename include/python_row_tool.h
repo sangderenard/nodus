@@ -48,6 +48,12 @@ enum class PrimitiveType : uint32_t {
 struct Port {
     std::string name;
     PrimitiveType type = PrimitiveType::Float64;
+    // Optional presentation metadata.  Empty values mean that a future UI
+    // derives the label and control from name/type.  These fields do not
+    // participate in execution or change the row stack ABI.
+    std::string label;
+    std::string form_control;
+    bool form_required = true;
 };
 
 struct Descriptor {

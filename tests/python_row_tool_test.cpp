@@ -26,6 +26,11 @@ Descriptor descriptor_for(const fs::path& source, const char* callable) {
     descriptor.module_name = std::string("nodus_python_row_test_") + callable;
     descriptor.callable_name = callable;
     descriptor.inputs = {Port{"left", PrimitiveType::Float64}, Port{"right", PrimitiveType::Int32}};
+    descriptor.inputs[0].label = "Left operand";
+    descriptor.inputs[0].form_control = "number";
+    descriptor.inputs[1].label = "Whole-number offset";
+    descriptor.inputs[1].form_control = "integer";
+    descriptor.inputs[1].form_required = false;
     descriptor.outputs = {Port{"difference", PrimitiveType::Float64}, Port{"sum", PrimitiveType::Int64}};
     return descriptor;
 }
@@ -79,6 +84,7 @@ void test_descriptor_and_generation(const fs::path& source_path) {
     assert(generated.find(source_path.generic_string()) != std::string::npos);
     assert(generated.find("PrimitiveType::Int32") != std::string::npos);
     assert(generated.find("PrimitiveType::Int64") != std::string::npos);
+    assert(generated.find("Left operand") != std::string::npos);
     const fs::path wrapper_path = source_path.parent_path() / "python_test_ordered.cpp";
     assert(nodus::python_row::write_plugin_source(descriptor, wrapper_path.generic_string(), &error));
     assert(fs::exists(wrapper_path));
@@ -91,6 +97,12 @@ void test_descriptor_and_generation(const fs::path& source_path) {
     assert(restored.tool_id == descriptor.tool_id);
     assert(restored.source_path == descriptor.source_path);
     assert(restored.inputs.size() == 2 && restored.inputs[1].type == PrimitiveType::Int32);
+    assert(restored.inputs[0].label == "Left operand");
+    assert(restored.inputs[0].form_control == "number");
+    assert(restored.inputs[0].form_required);
+    assert(restored.inputs[1].label == "Whole-number offset");
+    assert(restored.inputs[1].form_control == "integer");
+    assert(!restored.inputs[1].form_required);
     assert(restored.outputs.size() == 2 && restored.outputs[1].type == PrimitiveType::Int64);
 
     descriptor.mode = ExecutionMode::CompiledSsa;

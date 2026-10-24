@@ -106,6 +106,10 @@ int main() {
         Port{"left", PrimitiveType::Float64},
         Port{"right", PrimitiveType::Float64},
     };
+    descriptor.inputs[0].label = "Left operand";
+    descriptor.inputs[0].form_control = "number";
+    descriptor.inputs[1].label = "Right operand";
+    descriptor.inputs[1].form_control = "number";
     descriptor.outputs = {Port{"result", PrimitiveType::Float64}};
     std::string error;
     if (!nodus::python_row::write_descriptor(
@@ -146,6 +150,18 @@ int main() {
         if (read_text(retained_python) != authored ||
             !fs::is_regular_file(wrapper)) {
             std::cerr << "source or wrapper was not retained for " << target << '\n';
+            return 1;
+        }
+        Descriptor retained_descriptor;
+        const fs::path retained_abi = module_library / "source" / "tools" /
+                                      "upgradable_arithmetic.pyabi";
+        if (!nodus::python_row::read_descriptor(
+                retained_abi.generic_string(), &retained_descriptor, &error) ||
+            retained_descriptor.inputs.size() != 2 ||
+            retained_descriptor.inputs[0].label != "Left operand" ||
+            retained_descriptor.inputs[1].form_control != "number") {
+            std::cerr << "input presentation metadata was not retained for "
+                      << target << '\n';
             return 1;
         }
         if (!interpreted &&
