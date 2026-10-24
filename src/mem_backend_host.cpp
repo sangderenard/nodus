@@ -1,5 +1,6 @@
 // mem_backend_host.cpp -- host/CPU MemoryBackend adapted to new vtable
 #include "mem_backend.h"
+#include "mem_backend_registry_internal.h"
 #include <cstdlib>
 #include <cstring>
 #include "spirv_translation.h"
@@ -103,7 +104,39 @@ static std::unordered_map<uintptr_t, uintptr_t> g_gl_ctx_registry;
 static std::mutex g_vt_mu;
 static std::unordered_map<gp_mem_backend_handle_t, const gp_mem_backend_vtable_t*> g_handle_vtables;
 static std::unordered_map<gp_mem_backend_handle_t, int> g_handle_types;
+static std::unordered_map<gp_mem_backend_handle_t, size_t> g_handle_sizes;
+static std::unordered_map<gp_mem_backend_handle_t, uint64_t> g_handle_capabilities;
 static std::unordered_set<gp_mem_backend_handle_t> g_backend_contexts;
+
+void nodus::mem_backend_internal::register_external_handle(
+    gp_mem_backend_handle_t handle,
+    GP_MemBackendType type,
+    const gp_mem_backend_vtable_t* vtable,
+    size_t bytes,
+    uint64_t capabilities) {
+    if (!handle || !vtable) return;
+    std::lock_guard<std::mutex> lk(g_vt_mu);
+    g_handle_vtables[handle] = vtable;
+    g_handle_types[handle] = static_cast<int>(type);
+    g_handle_sizes[handle] = bytes;
+    g_handle_capabilities[handle] = capabilities;
+}
+
+void nodus::mem_backend_internal::update_external_size(
+    gp_mem_backend_handle_t handle, size_t bytes) {
+    std::lock_guard<std::mutex> lk(g_vt_mu);
+    auto found = g_handle_sizes.find(handle);
+    if (found != g_handle_sizes.end()) found->second = bytes;
+}
+
+void nodus::mem_backend_internal::unregister_external_handle(
+    gp_mem_backend_handle_t handle) {
+    std::lock_guard<std::mutex> lk(g_vt_mu);
+    g_handle_vtables.erase(handle);
+    g_handle_types.erase(handle);
+    g_handle_sizes.erase(handle);
+    g_handle_capabilities.erase(handle);
+}
 
 // map/unmap
 static void* cpu_map(gp_mem_backend_handle_t h) {
@@ -352,6 +385,39 @@ extern "C" gp_mem_backend_handle_t gp_mem_backend_create_host(size_t initial_byt
     return gp_mem_backend_create_cpu(initial_bytes);
 }
 
+extern "C" gp_mem_backend_handle_t gp_mem_backend_create_from_params(
+    GP_MemBackendType type, const void* params, size_t params_size) {
+    if (type == GP_MEM_BACKEND_CPU) {
+        size_t bytes = 0;
+        if (params && params_size >= sizeof(gp_mem_backend_cpu_params_t)) {
+            bytes = static_cast<const gp_mem_backend_cpu_params_t*>(params)->initial_bytes;
+        }
+        return gp_mem_backend_create_cpu(bytes);
+    }
+    if (type == GP_MEM_BACKEND_VULKAN) {
+        if (params && params_size < sizeof(gp_mem_backend_vulkan_params_t)) return nullptr;
+        return gp_mem_backend_create_vulkan(
+            params ? static_cast<const gp_mem_backend_vulkan_params_t*>(params) : nullptr);
+    }
+    GenericBackend* backend = new (std::nothrow) GenericBackend(type);
+    if (!backend) return nullptr;
+    if (params && params_size) {
+        backend->params_blob = std::malloc(params_size);
+        if (!backend->params_blob) { delete backend; return nullptr; }
+        std::memcpy(backend->params_blob, params, params_size);
+        backend->params_size = params_size;
+    }
+    gp_mem_backend_handle_t handle = reinterpret_cast<gp_mem_backend_handle_t>(backend);
+    {
+        std::lock_guard<std::mutex> lk(g_vt_mu);
+        g_handle_vtables[handle] = &g_generic_vtable;
+        g_handle_types[handle] = static_cast<int>(type);
+        g_handle_sizes[handle] = 0;
+        g_handle_capabilities[handle] = backend->caps;
+    }
+    return handle;
+}
+
 // Filesystem-backed buffer implementation.
 struct FileBuffer {
     std::mutex mu;
@@ -540,29 +606,42 @@ extern "C" gp_mem_backend_handle_t gp_mem_backend_create_filesystem(const char* 
 
 extern "C" void gp_mem_backend_release(gp_mem_backend_handle_t h) {
     if (!h) return;
+    const gp_mem_backend_vtable_t* registered_vtable = nullptr;
+    int t = -1;
+    bool is_backend_context = false;
     {
         std::lock_guard<std::mutex> lk(g_vt_mu);
-        auto it = g_handle_vtables.find(h);
-        if (it != g_handle_vtables.end()) g_handle_vtables.erase(it);
+        auto it_vtable = g_handle_vtables.find(h);
+        if (it_vtable != g_handle_vtables.end()) {
+            registered_vtable = it_vtable->second;
+            g_handle_vtables.erase(it_vtable);
+        }
+        auto it_type = g_handle_types.find(h);
+        if (it_type != g_handle_types.end()) {
+            t = it_type->second;
+            g_handle_types.erase(it_type);
+        }
+        g_handle_sizes.erase(h);
+        g_handle_capabilities.erase(h);
+        is_backend_context = g_backend_contexts.erase(h) != 0;
     }
     // Determine handle type and perform type-correct release. Prefer the
     // self-describing CPU/host tag so a handle created by another module copy
     // (whose map never saw it) is still released type-correctly rather than
     // falling through to the generic path (see gp_mem_backend_get_vtable).
-    std::lock_guard<std::mutex> lk(g_vt_mu);
-    auto it_type = g_handle_types.find(h);
-    int t = (it_type != g_handle_types.end()) ? it_type->second : -1;
-    if (it_type != g_handle_types.end()) g_handle_types.erase(it_type);
     if (t < 0 && reinterpret_cast<const CpuBackend*>(h)->magic == kCpuBackendMagic) {
         t = (int)GP_MEM_BACKEND_CPU;
     }
     // If this handle is a registered backend context, treat it accordingly
-    if (g_backend_contexts.find(h) != g_backend_contexts.end()) {
+    if (is_backend_context) {
         // filesystem backend context
         FsBackendCtx* ctx = reinterpret_cast<FsBackendCtx*>(h);
         std::fprintf(stderr, "[mem_backend] gp_mem_backend_release: deleting backend ctx=%p base_dir=%s\n", (void*)ctx, ctx->base_dir.c_str());
-        g_backend_contexts.erase(h);
         delete ctx;
+        return;
+    }
+    if (t == (int)GP_MEM_BACKEND_VULKAN) {
+        if (registered_vtable && registered_vtable->free) registered_vtable->free(h);
         return;
     }
     std::fprintf(stderr, "[mem_backend] gp_mem_backend_release: handle=%p type=%d\n", (void*)h, t);
@@ -593,12 +672,19 @@ extern "C" void gp_mem_backend_release(gp_mem_backend_handle_t h) {
 }
 
 extern "C" void* gp_mem_backend_map(gp_mem_backend_handle_t h) {
-    return cpu_map(h);
+    const gp_mem_backend_vtable_t* vtable = gp_mem_backend_get_vtable(h);
+    return (vtable && vtable->map) ? vtable->map(h) : nullptr;
 }
 
-extern "C" void gp_mem_backend_unmap(gp_mem_backend_handle_t h) { cpu_unmap(h); }
+extern "C" void gp_mem_backend_unmap(gp_mem_backend_handle_t h) {
+    const gp_mem_backend_vtable_t* vtable = gp_mem_backend_get_vtable(h);
+    if (vtable && vtable->unmap) vtable->unmap(h);
+}
 
-extern "C" int gp_mem_backend_resize(gp_mem_backend_handle_t h, size_t bytes) { return cpu_resize(h, bytes); }
+extern "C" int gp_mem_backend_resize(gp_mem_backend_handle_t h, size_t bytes) {
+    const gp_mem_backend_vtable_t* vtable = gp_mem_backend_get_vtable(h);
+    return (vtable && vtable->resize) ? vtable->resize(h, bytes) : 0;
+}
 
 extern "C" size_t gp_mem_backend_size(gp_mem_backend_handle_t h) {
     if (!h) return 0;
@@ -615,6 +701,8 @@ extern "C" size_t gp_mem_backend_size(gp_mem_backend_handle_t h) {
         std::lock_guard<std::mutex> lk2(fb->mu);
         return fb->size;
     }
+    auto external = g_handle_sizes.find(h);
+    if (external != g_handle_sizes.end()) return external->second;
     // fallback: try generic backend
     GenericBackend* gb = reinterpret_cast<GenericBackend*>(h);
     std::lock_guard<std::mutex> lk2(gb->mu);
@@ -631,6 +719,11 @@ extern "C" uint64_t gp_mem_backend_get_capabilities(gp_mem_backend_handle_t h) {
         caps |= (uint64_t)GP_MEM_CAP_ZERO_COPY;
         caps |= (uint64_t)GP_MEM_CAP_BYREF_SAFE;
         return caps;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_vt_mu);
+        auto found = g_handle_capabilities.find(h);
+        if (found != g_handle_capabilities.end()) return found->second;
     }
     GenericBackend* gb = reinterpret_cast<GenericBackend*>(h);
     std::lock_guard<std::mutex> lk(gb->mu);
@@ -678,9 +771,20 @@ extern "C" int gp_mem_backend_transfer(gp_mem_backend_handle_t src, gp_mem_backe
     if (!src && !dst) return 0;
     const gp_mem_backend_vtable_t* src_vt = gp_mem_backend_get_vtable(src);
     const gp_mem_backend_vtable_t* dst_vt = gp_mem_backend_get_vtable(dst);
-    if (src_vt && dst_vt && src_vt->copy_between_backends) {
+    const bool native_d2d_required =
+        (gp_mem_backend_get_capabilities(src) & GP_MEM_CAP_D2D_NATIVE) &&
+        (gp_mem_backend_get_capabilities(dst) & GP_MEM_CAP_D2D_NATIVE);
+    // A backend's native copy callback owns only handles of its own concrete
+    // type.  Calling CPU's callback with a Vulkan destination (or vice versa)
+    // reinterprets an unrelated object. Cross-backend transfers stage through
+    // the two public copy hooks; same-backend transfers keep the native path.
+    if (src_vt && dst_vt && src_vt == dst_vt && src_vt->copy_between_backends) {
         if (src_vt->copy_between_backends(src, dst, src_offset, dst_offset, bytes)) return 1;
     }
+    // Device-native FIFO traffic must never silently become a host-staged
+    // transfer.  In particular, Vulkan RawStackFrame <-> EdgeTensorFifo
+    // movement either completes through vkCmdCopyBuffer or fails intact.
+    if (native_d2d_required) return 0;
     // fallback to staged copy
     size_t max_chunk = 4 * 1024 * 1024;
     size_t remaining = bytes;

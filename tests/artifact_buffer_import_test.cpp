@@ -113,6 +113,30 @@ bool execute_case(ITool& tool,
     return ok;
 }
 
+bool execute_validation_failure(ITool& tool) {
+    uint64_t x = tensor_f64({-999.0, 2.0});
+    uint64_t y = tensor_f64({1.0, 3.0});
+    RawStackFrame raw{};
+    bool ok = x && y && raw_stack_init_frame(raw, 4096);
+    nodus::tensors::AbstractTensorHandle handle{};
+    handle.id = x; ok = ok && raw_stack_push_abstract_tensor(raw, handle);
+    handle.id = y; ok = ok && raw_stack_push_abstract_tensor(raw, handle);
+    const size_t before = raw.byte_count;
+    ToolStackContext stack{};
+    stack.stack.raw = &raw;
+    if (ok) tool.execute_stack(stack);
+    ok = ok && !stack.succeeded && raw.byte_count == before;
+    nodus::tensors::AbstractTensorHandle restored_y{}, restored_x{};
+    ok = ok && raw_stack_pop_abstract_tensor(raw, restored_y) &&
+         raw_stack_pop_abstract_tensor(raw, restored_x) &&
+         restored_x.id == x && restored_y.id == y;
+    if (x) nodus_tensor_destroy(x);
+    if (y) nodus_tensor_destroy(y);
+    raw_stack_free_mask(raw);
+    if (raw.backend) gp_mem_backend_release(raw.backend);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -132,6 +156,15 @@ int main() {
     const fs::path backend_src = root / "fake_backend.cpp";
     if (!write_text(backend_src, R"CPP(
 #include <cstdint>
+static uint32_t validation_error = 0;
+extern "C" __declspec(dllexport) void turing_validation_error_reset() {
+    validation_error = 0;
+}
+extern "C" __declspec(dllexport) uint32_t turing_validation_error_take() {
+    const uint32_t value = validation_error;
+    validation_error = 0;
+    return value;
+}
 extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* extents) {
     auto* x = static_cast<double*>(buffers[0]);
     auto* y = static_cast<double*>(buffers[1]);
@@ -139,6 +172,10 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
     auto* sum = static_cast<double*>(buffers[3]);
     auto* difference = static_cast<double*>(buffers[4]);
     const int64_t n = extents[0];
+    if (n > 0 && x[0] == -999.0) {
+        validation_error = 77;
+        return;
+    }
     for (int64_t i = 0; i < n; ++i) {
         const double dirty = workspace[i];
         workspace[i] = x[i] + y[i];
@@ -184,7 +221,7 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
         "VALUE OUTPUT \"%difference\" \"f64\" 1 ?\n"
         "BUFFER \"%x\"\nBUFFER \"%y\"\nBUFFER \"%tmp\"\n"
         "BUFFER \"%sum\"\nBUFFER \"%difference\"\n"
-        "EXTENT \"%x\" 0\n"
+        "EXTENT \"%x\" ELEMENT_COUNT\n"
         "SHAPE \"%y\" 0 FROM \"%x\" 0\n"
         "SHAPE \"%tmp\" 0 FROM \"%x\" 0\n"
         "SHAPE \"%sum\" 0 FROM \"%x\" 0\n"
@@ -212,7 +249,10 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
     const std::string generated = read_text(wrapper_src);
     if (generated.find("using Extent = int64_t") == std::string::npos ||
         generated.find("NODUS_PLUGIN_FACTORY_NAME") == std::string::npos ||
-        generated.find("kWorkspaces") == std::string::npos) {
+        generated.find("kWorkspaces") == std::string::npos ||
+        generated.find("descs[0].element_count") == std::string::npos ||
+        generated.find("ctx.succeeded = false") == std::string::npos ||
+        generated.find("turing_validation_error_take") == std::string::npos) {
         std::cerr << "generated C wrapper lost ABI or compositing declarations\n";
         return 1;
     }
@@ -266,6 +306,7 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
         {1.0, 4.0, 0.75, -3.0, 2.0, 5.0},
         {11.0, 2.0, 1.0, 5.0, 5.0, -2.0},
         {9.0, -6.0, -0.5, 11.0, 1.0, -12.0});
+    ok = ok && execute_validation_failure(*tool);
     tool->shutdown();
     destroy(tool);
     FreeLibrary(module);
@@ -318,12 +359,17 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
     wrong_extent_dtype.replace(wrong_extent_dtype.find("EXTENT_DTYPE \"i64\""),
                                std::string("EXTENT_DTYPE \"i64\"").size(),
                                "EXTENT_DTYPE \"i32\"");
+    std::string missing_entry = valid;
+    missing_entry.replace(missing_entry.find("ENTRY \"buffer_entry\""),
+                          std::string("ENTRY \"buffer_entry\"").size(),
+                          "ENTRY \"not_exported\"");
     if (!expect_refusal("invalid_extent.buffer_abi", invalid_extent) ||
         !expect_refusal("v1_dynamic.buffer_abi", v1_dynamic) ||
         !expect_refusal("missing_shape_source.buffer_abi", missing_shape_source) ||
         !expect_refusal("dtype.buffer_abi", bad_dtype) ||
         !expect_refusal("missing_buffer.buffer_abi", missing_buffer) ||
-        !expect_refusal("extent_dtype.buffer_abi", wrong_extent_dtype)) {
+        !expect_refusal("extent_dtype.buffer_abi", wrong_extent_dtype) ||
+        !expect_refusal("missing_entry.buffer_abi", missing_entry)) {
         std::cerr << "one or more required refusal cases were admitted\n";
         return 1;
     }

@@ -541,23 +541,29 @@ def _buffer_abi(
         getattr(artifact, "extent_order", ()) or ()
     )]
     for extent in extent_order:
-        if (
-            len(extent) != 3
-            or str(extent[1]) not in {"shape", "dim"}
-            or extent[2] is None
-        ):
+        if len(extent) != 3:
             raise ProductError(
-                "NODUS BUFFER ABI V2 supports only axis-addressed shape extents; "
-                f"got {extent!r}"
+                f"NODUS BUFFER ABI V2 extent must have value, kind, and axis; got {extent!r}"
             )
-        value_id, _kind, axis = extent
+        value_id, kind, axis = extent
+        kind = str(kind).lower()
+        if kind in {"shape", "dim"}:
+            if axis is None:
+                raise ProductError(f"axis-addressed extent lacks an axis: {extent!r}")
+        elif kind in {"element_count", "numel", "rank"}:
+            if axis is not None:
+                raise ProductError(f"whole-descriptor extent unexpectedly names an axis: {extent!r}")
+        else:
+            raise ProductError(f"unsupported NODUS BUFFER ABI V2 extent kind: {extent!r}")
         try:
             extent_buffer = next(
                 item for item in buffers if item["ssa_value_id"] == int(value_id)
             )
         except StopIteration:
             raise ProductError(f"extent names unknown buffer {value_id!r}")
-        if int(axis) < 0 or int(axis) >= int(extent_buffer["rank"]):
+        if kind in {"shape", "dim"} and (
+            int(axis) < 0 or int(axis) >= int(extent_buffer["rank"])
+        ):
             raise ProductError(f"extent has invalid axis {axis!r}")
     tool_id = f"imported.{_safe_name(request.product_name or request.row_entry)}.{request.backend}"
     descriptor = {
@@ -601,8 +607,15 @@ def _buffer_abi(
         )
     for value_id in order:
         lines.append(f"BUFFER {_quoted(_ssa_spelling(value_id))}")
-    for value_id, _kind, axis in descriptor["extent_order"]:
-        lines.append(f"EXTENT {_quoted(_ssa_spelling(value_id))} {int(axis)}")
+    for value_id, kind, axis in descriptor["extent_order"]:
+        normalized_kind = str(kind).lower()
+        if normalized_kind in {"shape", "dim"}:
+            selector = str(int(axis))
+        elif normalized_kind in {"element_count", "numel"}:
+            selector = "ELEMENT_COUNT"
+        else:
+            selector = "RANK"
+        lines.append(f"EXTENT {_quoted(_ssa_spelling(value_id))} {selector}")
     for buffer in buffers:
         for axis, source in enumerate(buffer["shape_sources"]):
             if source is None or source["ssa_value_id"] == buffer["ssa_value_id"]:

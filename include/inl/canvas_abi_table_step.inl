@@ -295,6 +295,10 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                 mod.table = (mi >= 0 && mi < static_cast<int>(c->module_tables.size())) ? c->module_tables[mi] : nullptr;
                 mod.in_count = (mi >= 0 && mi < static_cast<int>(c->module_io_in_count.size())) ? c->module_io_in_count[mi] : 0;
                 mod.out_count = (mi >= 0 && mi < static_cast<int>(c->module_io_out_count.size())) ? c->module_io_out_count[mi] : 0;
+                mod.stack_contract =
+                    (mi >= 0 && mi < static_cast<int>(c->graph->module_stack_contract.size()))
+                    ? c->graph->module_stack_contract[static_cast<size_t>(mi)]
+                    : ModuleStackContract::Opaque;
                         // propagate per-module sim-enabled flag (default to enabled)
                         if (mi >= 0 && mi < static_cast<int>(c->module_sim_enabled.size())) mod.sim_enabled = c->module_sim_enabled[mi];
                         else mod.sim_enabled = 1;

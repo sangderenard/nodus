@@ -110,6 +110,12 @@ struct ToolStackFrame {
 struct ToolStackContext {
     ToolStackFrame stack{};
     const ToolInputState* input = nullptr;
+    // Tools that restore their inputs after refusing an execution must clear
+    // this flag.  The scheduler then leaves the restored stack available for
+    // inspection without mistaking its tail for declared return values.
+    // Kept as a trailing, default-true field so existing tools retain their
+    // successful void execute_stack contract until they opt into refusal.
+    bool succeeded = true;
 };
 
 inline float tool_stack_pop(ToolStackFrame& frame) {

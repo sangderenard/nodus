@@ -24,6 +24,7 @@ typedef void* gp_mem_backend_handle_t;
 // ABI translation unit. These are convenient for consumers (e.g., ThreadManager)
 // to query backend capabilities without depending on table internals.
 gp_mem_backend_handle_t gp_table_edge_get_backend(GP_TableContext* ctx, int32_t edge_idx);
+gp_mem_backend_handle_t gp_table_edge_get_storage_backend(GP_TableContext* ctx, int32_t edge_idx);
 int32_t gp_table_edge_set_backend(GP_TableContext* ctx, int32_t edge_idx, gp_mem_backend_handle_t h);
 
 // Storage backend types (future-proofed list)
@@ -153,6 +154,14 @@ typedef struct {
     uintptr_t gl_context_id;
 } gp_mem_backend_gl_params_t;
 
+// Vulkan backend params. device_index selects the compute-capable physical
+// device in enumeration order; UINT32_MAX selects the first such device.
+// Flags are reserved and must currently be zero.
+typedef struct {
+    uint32_t device_index;
+    uint32_t flags;
+} gp_mem_backend_vulkan_params_t;
+
 // Python backend params - opaque Python object that supports buffer protocol.
 typedef struct {
     // opaque pointer to a Python object (PyObject*) if embedding Python; caller owns reference
@@ -182,6 +191,9 @@ gp_mem_backend_handle_t gp_mem_backend_create_cpu(size_t initial_bytes);
 // New alias for host-backed memory creation (preferred name). Deprecated
 // wrapper around `gp_mem_backend_create_cpu` for clarity.
 gp_mem_backend_handle_t gp_mem_backend_create_host(size_t initial_bytes);
+// Create a persistent Vulkan device/context backend. Allocations made through
+// its vtable are storage-buffer-capable and remain valid across dispatches.
+gp_mem_backend_handle_t gp_mem_backend_create_vulkan(const gp_mem_backend_vulkan_params_t* params);
 gp_mem_backend_handle_t gp_mem_backend_create_from_params(GP_MemBackendType type, const void* params, size_t params_size);
 // Filesystem-backed backend: stores buffers as files under `base_dir`.
 gp_mem_backend_handle_t gp_mem_backend_create_filesystem(const char* base_dir, size_t initial_bytes);

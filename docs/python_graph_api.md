@@ -114,6 +114,51 @@ not arbitrary stack mutation and not persisted runtime state.
 
 ## Native interchange and boundaries
 
+### Complete Python/Turing graph definitions
+
+`Graph.definition()` returns an immutable `nodus.graph-definition.v1`
+description of every property installed through this headless Python surface:
+
+- persistent module identity, label, position, size, ordered rows, tool/plugin
+  identity, stack effects, and value contract;
+- connectors named by `(module stable id, input/output, ordinal)` rather than
+  load-local native indices;
+- edge endpoints, native type id, and the explicit optional FIFO contract,
+  including `storage="host"` or `storage="vulkan"`;
+- scheduler mode; and
+- named input/output bindings, their FIFO contracts, and output reader start
+  policy.
+
+The definition is the communication object for Turing/Python. It does not
+contain a ProcessGraph and does not execute anything itself:
+
+```python
+from nodus_graph import Graph, GraphDefinition
+
+wire_value = graph.definition().to_mapping()  # plain Python transport value
+received = GraphDefinition.from_mapping(wire_value)
+
+with Graph(scheduler=received.scheduler) as native_graph:
+    native_graph.apply_definition(received)
+    assert native_graph.definition() == received
+```
+
+Applying a definition invokes the existing native module, row, edge, FIFO, and
+port APIs. Nodus remains the execution authority. Unknown schemas, duplicate
+module identities, missing modules, out-of-range connector ordinals, reversed
+edges, mismatched port directions, and row-contract disagreement are refused.
+
+`module.export_to_root(path)` exposes the existing native per-module table
+serializer at `<path>/serialized/module_<index>.gpmod`. It is useful for
+materialization and provenance checks and does not invent a second persistence
+format.
+
+This V1 contract is complete for the executable headless surface exposed by
+`nodus_graph`. Interactive-only overlays, lasso/meta-rope presentation,
+in-flight FIFO samples, reader cursors, GUI actions, and table simulation state
+are outside it and are not silently represented. Native CANVAS V4 persistence
+still has the separate limitations below.
+
 `Graph.save(path)` and `Graph.load(path)` use native CANVAS V4 persistence.
 Nodus writes table topology sidecars under the shared `module_library` path;
 they are not per-canvas bundles, and their edge records do not contain FIFO
@@ -133,20 +178,36 @@ remain outside this initial surface:
 - Only one primary canvas/headless graph per process: canvas contact lookup and
   table helpers are still process-global. A pre-existing UI/native canvas makes
   headless creation fail; a second Python `Graph` is refused as well.
-- The row-stack surface is narrow: `Input`, `Output`, and enumerated ordinary
-  scalar tools with known stack effects. Scheduler-produced `StackDisplay`
-  snapshots and final scalar tails are read-only. Arbitrary stack mutation,
-  typed/pointer-valued stack access, clone ownership, and unresolved plugin
-  execution are not exposed.
-- FIFO support covers fixed-size tokens and native `slots`/`top_k`. Python's
+- The row-stack surface includes scalar values and registered typed values.
+  FIFO payload typing and module row-stack currency are independent choices.
+  `AbstractTensorHandle` crosses ordinary Input/Output rows when the module's
+  explicit `abstract_tensor_pointer` execution contract selects typed
+  FIFO-to-`RawStackFrame` transfer; a registered FIFO `type_id` alone never
+  selects that path, and the handle is never coerced through `float`.
+  Scheduler-produced
+  `StackDisplay` snapshots and final scalar tails remain read-only. Arbitrary
+  stack mutation, clone ownership, and unresolved plugin execution are not
+  exposed.
+- FIFO support covers fixed-size transport tokens, native `slots`/`top_k`, and
+  an explicit host or Vulkan storage backend. Setting the backend rehomes the
+  actual ring allocation; Vulkan graph adoption shares one device context and
+  native readback reports the effective storage. This property does not by
+  itself change a generated shader row from handle-token transport to direct
+  payload-SSBO binding.
+  Logical tensor rank/shape can still be runtime-defined through connector
+  `TensorContract.shape_sources`. Python's
   scalar executable helper is exactly four-byte `float32`; raw helpers copy an
-  exactly configured number of bytes. Tensor/pointer ownership, every native
+  exactly configured number of bytes. Tensor handles retain explicit caller
+  ownership; every native
   delta/by-reference/drop/slip policy, internal-edge start positions, reader
   management, and live queue checkpointing are unsupported. `type_id`, layout,
   and dtype are passed through rather than inferred.
-- Ordinary Canvas Input/Output rows carry scalar values. Registered
-  `abstract_tensor.*` ToolIR consumes owned `AbstractTensor*`; Python refuses
-  to mix those pointer and scalar currencies.
+- When typed stack transfer is selected explicitly, a FIFO sample must exactly
+  match its registered `ValueType` byte width. The scheduler advances the
+  reader only after the complete element reaches the module's `RawStackFrame`,
+  and advances the writer only after the typed result leaves it. Typed FIFOs
+  remain valid with scalar or opaque module contracts and do not imply this
+  transfer mode.
 - Canvas, ProcessGraph/GraphIR, SSA, and KernelIR retain different contracts.
   This API does not flatten them or claim that a native canvas save is a
   lossless GraphIR/SSA translation. Native editor topology, labels, positions,
@@ -197,11 +258,15 @@ cmake --build build --config Release --target nodus_headless nodus_headless_runt
 ctest --test-dir build -C Release -R "nodus_headless_runtime_test|nodus_headless_bridge_smoke|nodus_python_graph_test|edge_fifo_drop_contract_test" --output-on-failure
 ```
 
-The Python acceptance executable runs ten named cases covering operand/stack
+The Python acceptance executable runs thirteen named cases covering operand/stack
 order, first-token visibility, repeated ticks, two-module FIFO delivery,
 read-only native stack snapshots, lossless rejection versus lossy dropping,
 configured versus absent FIFO inspection, invalid calls,
 stable-identity save/fresh-load, explicit restored-edge FIFO reattachment,
-failed-load preservation, stale handles, pointer-contract refusal,
+failed-load preservation, stale handles, typed-contract scheduler admission,
 optional/unconfigured FIFO errors, duplicate UUID refusal, and the current
-single-live-canvas restriction.
+single-live-canvas restriction, plus runtime-shape source mapping.
+
+`turing_nodus_graph_crossing_test` additionally compiles a real row through
+Turing, derives its connector contracts from the retained buffer ABI, proves
+mapping/native concordance, and executes tensor handles through the scheduler.

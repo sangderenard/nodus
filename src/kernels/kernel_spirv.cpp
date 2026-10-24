@@ -52,8 +52,11 @@ enum : u32 {
     kOpSNegate = 126, kOpFNegate = 127,
     kOpIAdd = 128, kOpFAdd = 129, kOpISub = 130, kOpFSub = 131,
     kOpIMul = 132, kOpFMul = 133, kOpUDiv = 134, kOpSDiv = 135,
-    kOpFDiv = 136, kOpUMod = 137, kOpSMod = 139, kOpFRem = 140,
-    kOpLogicalOr = 166, kOpLogicalAnd = 167, kOpLogicalNot = 168,
+    kOpFDiv = 136, kOpUMod = 137, kOpSRem = 138, kOpSMod = 139,
+    kOpFRem = 140, kOpFMod = 141,
+    kOpIsNan = 156, kOpIsInf = 157,
+    kOpLogicalNotEqual = 165, kOpLogicalOr = 166,
+    kOpLogicalAnd = 167, kOpLogicalNot = 168,
     kOpSelect = 169,
     kOpIEqual = 170, kOpINotEqual = 171,
     kOpUGreaterThan = 172, kOpSGreaterThan = 173,
@@ -199,6 +202,10 @@ private:
 
     // --- value handling ---
     ScalarType value_scalar(u32 value_id) const {
+        // The invocation index is a reserved KernelIR value, not an entry in
+        // the ordinary value table.  It is published from
+        // gl_GlobalInvocationID.x and is always u32.
+        if (value_id == kGlobalIndexValue) return ScalarType::U32;
         return k_.values.at(value_id).type.scalar;
     }
 
@@ -326,15 +333,35 @@ void ModuleAssembler::lower_logical(const spirv::Instruction& ins, u32 bit_opcod
     if (!single_output(ins, "logical op")) return;
     const u32 out = ins.outputs[0].id;
     const ScalarType s = value_scalar(out);
-    if (s == ScalarType::F32) {
-        shortfall("bitwise op on f32 value %" + std::to_string(out));
-        return;
-    }
+    const auto sub = static_cast<CanonicalOp>(ins.sub_op);
     bool ok = true;
     std::vector<u32> args;
     for (const Operand& operand : ins.inputs) {
         args.push_back(resolve(operand, s, ok));
         if (!ok) return;
+    }
+
+    const bool logical = sub == CanonicalOp::LOGICAL_AND ||
+                         sub == CanonicalOp::LOGICAL_OR ||
+                         sub == CanonicalOp::LOGICAL_NOT;
+    if (logical) {
+        if (sub == CanonicalOp::LOGICAL_NOT) {
+            if (args.size() != 1) { shortfall("LOGICAL_NOT takes one input"); return; }
+            const u32 result = fresh();
+            body_.op(kOpLogicalNot, {t_bool(), result, to_bool(args[0], s)});
+            value_results_[out] = from_bool(result, s);
+            return;
+        }
+        if (args.size() != 2) { shortfall("logical binary op takes two inputs"); return; }
+        const u32 result = fresh();
+        body_.op(sub == CanonicalOp::LOGICAL_AND ? kOpLogicalAnd : kOpLogicalOr,
+                 {t_bool(), result, to_bool(args[0], s), to_bool(args[1], s)});
+        value_results_[out] = from_bool(result, s);
+        return;
+    }
+    if (s == ScalarType::F32) {
+        shortfall("bitwise op on f32 value %" + std::to_string(out));
+        return;
     }
     const u32 result = fresh();
     if (bit_opcode == kOpNot) {
@@ -369,7 +396,51 @@ void ModuleAssembler::lower_binary(const spirv::Instruction& ins) {
         case CanonicalOp::TRUEDIV:
             opcode = f ? kOpFDiv : (sign ? kOpSDiv : kOpUDiv); break;
         case CanonicalOp::MOD:
-            opcode = f ? kOpFRem : (sign ? kOpSMod : kOpUMod); break;
+            // Canonical mod is the floored Python/numpy remainder. OpFRem is
+            // truncating and therefore disagrees for mixed signs; OpFMod is
+            // the operation whose result takes the divisor's sign.
+            opcode = f ? kOpFMod : (sign ? kOpSMod : kOpUMod); break;
+        case CanonicalOp::FLOORDIV:
+            if (f) {
+                const u32 quotient = fresh();
+                body_.op(kOpFDiv, {t_scalar(s), quotient, a, b});
+                value_results_[out] = ext_inst(kGlslFloor, s, {quotient});
+                return;
+            }
+            if (!sign) {
+                opcode = kOpUDiv;
+                break;
+            } else {
+                // OpSDiv truncates toward zero. Correct it by one exactly
+                // when a non-zero remainder accompanies unlike signs.
+                const u32 quotient = fresh();
+                const u32 remainder = fresh();
+                const u32 remainder_nonzero = fresh();
+                const u32 a_negative = fresh();
+                const u32 b_negative = fresh();
+                const u32 signs_differ = fresh();
+                const u32 adjust = fresh();
+                const u32 adjusted = fresh();
+                const u32 result = fresh();
+                body_.op(kOpSDiv, {t_scalar(s), quotient, a, b});
+                body_.op(kOpSRem, {t_scalar(s), remainder, a, b});
+                body_.op(kOpINotEqual,
+                         {t_bool(), remainder_nonzero, remainder, const_i32(0)});
+                body_.op(kOpSLessThan,
+                         {t_bool(), a_negative, a, const_i32(0)});
+                body_.op(kOpSLessThan,
+                         {t_bool(), b_negative, b, const_i32(0)});
+                body_.op(kOpLogicalNotEqual,
+                         {t_bool(), signs_differ, a_negative, b_negative});
+                body_.op(kOpLogicalAnd,
+                         {t_bool(), adjust, remainder_nonzero, signs_differ});
+                body_.op(kOpISub,
+                         {t_scalar(s), adjusted, quotient, const_i32(1)});
+                body_.op(kOpSelect,
+                         {t_scalar(s), result, adjust, adjusted, quotient});
+                value_results_[out] = result;
+                return;
+            }
         case CanonicalOp::BITAND: opcode = kOpBitwiseAnd; break;
         case CanonicalOp::BITOR: opcode = kOpBitwiseOr; break;
         case CanonicalOp::BITXOR: opcode = kOpBitwiseXor; break;
@@ -430,6 +501,77 @@ void ModuleAssembler::lower_unary(const spirv::Instruction& ins) {
             if (f) { shortfall("INVERT on f32 value %" + std::to_string(out)); return; }
             const u32 result = fresh();
             body_.op(kOpNot, {t_scalar(s), result, x});
+            value_results_[out] = result;
+            return;
+        }
+        case CanonicalOp::ISFINITE:
+        case CanonicalOp::ISNAN:
+        case CanonicalOp::ISINF: {
+            if (!f) {
+                shortfall("floating classification sub_op " +
+                          std::to_string(ins.sub_op) + " requires f32");
+                return;
+            }
+            const u32 result = fresh();
+            if (sub == CanonicalOp::ISFINITE) {
+                // OpIsFinite requires the Kernel capability and is not legal
+                // in Vulkan's Shader environment. The equivalent predicate
+                // below uses the Shader-legal OpIsNan/OpIsInf pair.
+                const u32 is_nan = fresh();
+                const u32 is_inf = fresh();
+                const u32 exceptional = fresh();
+                body_.op(kOpIsNan, {t_bool(), is_nan, x});
+                body_.op(kOpIsInf, {t_bool(), is_inf, x});
+                body_.op(kOpLogicalOr,
+                         {t_bool(), exceptional, is_nan, is_inf});
+                body_.op(kOpLogicalNot, {t_bool(), result, exceptional});
+            } else {
+                body_.op(sub == CanonicalOp::ISNAN ? kOpIsNan : kOpIsInf,
+                         {t_bool(), result, x});
+            }
+            value_results_[out] = from_bool(result, s);
+            return;
+        }
+        case CanonicalOp::SIGN: {
+            const u32 positive = fresh();
+            const u32 result = fresh();
+            const u32 zero = f ? const_f32(0.0f) : const_scalar(s, 0u);
+            const u32 one = f ? const_f32(1.0f) : const_scalar(s, 1u);
+            if (s == ScalarType::U32) {
+                body_.op(kOpUGreaterThan, {t_bool(), positive, x, zero});
+                body_.op(kOpSelect,
+                         {t_scalar(s), result, positive, one, zero});
+                value_results_[out] = result;
+                return;
+            }
+            const u32 negative = fresh();
+            const u32 selected_negative = fresh();
+            const u32 minus_one = f ? const_f32(-1.0f) : const_i32(-1);
+            if (f) {
+                body_.op(kOpFOrdGreaterThan, {t_bool(), positive, x, zero});
+                body_.op(kOpFOrdLessThan, {t_bool(), negative, x, zero});
+            } else {
+                body_.op(kOpSGreaterThan, {t_bool(), positive, x, zero});
+                body_.op(kOpSLessThan, {t_bool(), negative, x, zero});
+            }
+            body_.op(kOpSelect,
+                     {t_scalar(s), selected_negative, negative, minus_one, zero});
+            body_.op(kOpSelect,
+                     {t_scalar(s), result, positive, one, selected_negative});
+            value_results_[out] = result;
+            return;
+        }
+        case CanonicalOp::SIGMOID: {
+            if (!f) { shortfall("SIGMOID is lowered for f32 only"); return; }
+            const u32 negated = fresh();
+            body_.op(kOpFNegate, {t_f32(), negated, x});
+            const u32 exponential = ext_inst(kGlslExp, s, {negated});
+            const u32 denominator = fresh();
+            body_.op(kOpFAdd,
+                     {t_f32(), denominator, const_f32(1.0f), exponential});
+            const u32 result = fresh();
+            body_.op(kOpFDiv,
+                     {t_f32(), result, const_f32(1.0f), denominator});
             value_results_[out] = result;
             return;
         }

@@ -67,13 +67,7 @@ struct EdgeTensorFifo {
 
         void release_storage() noexcept {
             if (!storage_handle) return;
-            const gp_mem_backend_vtable_t* vt =
-                gp_mem_backend_get_vtable(storage_handle);
-            if (vt && vt->free) {
-                vt->free(storage_handle);
-            } else {
-                gp_mem_backend_release(storage_handle);
-            }
+            gp_mem_backend_release(storage_handle);
             storage_handle = nullptr;
         }
 
@@ -278,9 +272,56 @@ struct EdgeTensorFifo {
         if (!impl) return;
         impl->backend = h;
     }
+    // Re-home the FIFO's actual ring allocation on a backend.  This is the
+    // runtime form used by table edges after their tensor spec has already
+    // configured storage; merely changing `backend` would leave the ring in
+    // its old host allocation and falsely advertise a device-backed edge.
+    bool rebind_backend(gp_mem_backend_handle_t h, bool copy_over) {
+        if (!impl) return false;
+        if (!impl->configured) {
+            impl->backend = h;
+            return true;
+        }
+        const size_t total_bytes = impl->stride * impl->slots * impl->elem_size;
+        gp_mem_backend_handle_t replacement = nullptr;
+        if (h) {
+            const gp_mem_backend_vtable_t* vtable = gp_mem_backend_get_vtable(h);
+            if (!vtable || !vtable->alloc) return false;
+            replacement = vtable->alloc(h, total_bytes, 0);
+        } else {
+            replacement = gp_mem_backend_create_host(total_bytes);
+        }
+        if (!replacement) return false;
+        bool initialized = true;
+        if (copy_over && impl->storage_handle && total_bytes) {
+            initialized = gp_mem_backend_transfer(
+                impl->storage_handle, replacement, 0, 0, total_bytes) != 0;
+        } else if (total_bytes) {
+            std::vector<uint8_t> zeros;
+            try { zeros.resize(total_bytes); } catch (...) { initialized = false; }
+            const gp_mem_backend_vtable_t* vtable =
+                gp_mem_backend_get_vtable(replacement);
+            if (initialized && (!vtable || !vtable->copy_to_backend ||
+                                !vtable->copy_to_backend(
+                                    replacement, 0, zeros.data(), total_bytes))) {
+                initialized = false;
+            }
+        }
+        if (!initialized) {
+            gp_mem_backend_release(replacement);
+            return false;
+        }
+        impl->release_storage();
+        impl->storage_handle = replacement;
+        impl->backend = h;
+        return true;
+    }
     gp_mem_backend_handle_t get_backend() const {
         if (!impl) return nullptr;
         return impl->backend;
+    }
+    gp_mem_backend_handle_t get_storage_backend() const {
+        return impl ? impl->storage_handle : nullptr;
     }
 
     size_t elem_count() const { return impl ? impl->stride : 0; }
@@ -1003,6 +1044,8 @@ public:
                 if (out_dropped) *out_dropped = dropped ? 1 : 0;
                 return true;
             }
+            if ((gp_mem_backend_get_capabilities(src_frame->backend) & GP_MEM_CAP_D2D_NATIVE) &&
+                (gp_mem_backend_get_capabilities(impl->storage_handle) & GP_MEM_CAP_D2D_NATIVE)) return false;
         }
 
         // Fallback host-mediated path: read element bytes into host tmp,
@@ -1180,6 +1223,34 @@ public:
         note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
         impl->cv.notify_all();
         out_written_bytes = impl->stride * impl->elem_size;
+        return true;
+    }
+
+    // Consume one FIFO sample directly into a typed RawStackFrame element.
+    // This is the receive-side mirror of push_from_frame: the FIFO's schema
+    // and byte width are authoritative, and the reader advances only after
+    // the complete typed element has reached the destination frame.
+    bool pop_to_frame(uint64_t reader_id, RawStackFrame* dst_frame, int32_t type_id) {
+        if (!impl || !impl->configured || !dst_frame || !impl->storage_handle) return false;
+        if (impl->type_id < 0 || impl->type_id != type_id) return false;
+        const ValueType* vt = ValueTypeRegistry::global().get(type_id);
+        if (!vt || vt->size == 0) return false;
+        const size_t bytes = impl->stride * impl->elem_size;
+        if (vt->size != bytes) return false;
+
+        ReaderEntry* r = find_reader(reader_id);
+        if (!r) return false;
+        const uint64_t rseq = r->seq.load(std::memory_order_relaxed);
+        const size_t slot = static_cast<size_t>(rseq % static_cast<uint64_t>(impl->slots));
+        const uint64_t observed = impl->slot_seq[slot].load(std::memory_order_acquire);
+        if (observed != (rseq + 1)) return false;
+
+        const size_t src_offset = slot * bytes;
+        if (!gp_raw_stack_frame_push_from_backend(dst_frame, impl->storage_handle, src_offset, type_id)) return false;
+
+        r->seq.store(rseq + 1, std::memory_order_relaxed);
+        note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
+        impl->cv.notify_all();
         return true;
     }
 

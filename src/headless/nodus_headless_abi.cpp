@@ -2,10 +2,14 @@
 
 #include "canvas_abi.h"
 #include "table_abi.h"
+#include "value_types.h"
+#include "plugin_manager.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -27,6 +31,7 @@ struct PortBinding {
     int32_t edge_idx = -1;
     NodusHeadlessFifoConfig config{};
     int32_t start_at_head = 1;
+    uint64_t declaration_order = 0;
 };
 
 struct EdgeBinding {
@@ -44,11 +49,13 @@ struct NodusHeadlessGraph {
     std::unordered_map<std::string, PortBinding> input_ports;
     std::unordered_map<std::string, PortBinding> output_ports;
     std::vector<EdgeBinding> edges;
+    gp_mem_backend_handle_t vulkan_backend = nullptr;
 
     std::mutex events_mu;
     std::deque<NodusHeadlessEvent> events;
 
     uint64_t tick_id = 0;
+    uint64_t next_port_declaration_order = 0;
 };
 
 namespace {
@@ -99,6 +106,7 @@ int32_t declare_port(NodusHeadlessGraph* g, std::unordered_map<std::string, Port
     pb.key = resolve_row_key(g, module_idx, contact_idx);
     pb.config = config;
     pb.start_at_head = start_at_head ? 1 : 0;
+    pb.declaration_order = g->next_port_declaration_order++;
 
     int32_t edge_idx = -1;
     if (!gp_table_edge_index_for_key(g->table, pb.key, &edge_idx) || edge_idx < 0) {
@@ -134,6 +142,13 @@ int32_t declare_port(NodusHeadlessGraph* g, std::unordered_map<std::string, Port
     spec.layout = config.layout;
     spec.dtype = config.dtype;
     if (!gp_table_edge_set_tensor_spec(g->table, edge_idx, &spec)) return 0;
+    if (config.backend_type == GP_MEM_BACKEND_VULKAN) {
+        if (!g->vulkan_backend) g->vulkan_backend = gp_mem_backend_create_vulkan(nullptr);
+        if (!g->vulkan_backend ||
+            !gp_table_edge_set_backend(g->table, edge_idx, g->vulkan_backend)) return 0;
+    } else if (config.backend_type != GP_MEM_BACKEND_CPU) {
+        return 0;
+    }
 
     if (as_reader) {
         if (!gp_table_edge_subscribe_ex(g->table, edge_idx, kHostKey, pb.start_at_head)) return 0;
@@ -159,12 +174,13 @@ NodusHeadlessFifoConfig default_fifo_config(int32_t token_bytes) {
     config.type_id = -1;
     config.layout = 2;  // TensorLayout::Opaque
     config.dtype = 0;   // TensorDType::Unknown
+    config.backend_type = GP_MEM_BACKEND_CPU;
     return config;
 }
 
-int32_t configure_table_edge(GP_TableContext* table, int32_t edge_idx,
+int32_t configure_table_edge(NodusHeadlessGraph* g, int32_t edge_idx,
                              const NodusHeadlessFifoConfig& config) {
-    if (!table || edge_idx < 0 || config.token_bytes <= 0 || config.slots <= 0 ||
+    if (!g || !g->table || edge_idx < 0 || config.token_bytes <= 0 || config.slots <= 0 ||
         config.top_k < 0 || config.top_k > config.slots) return 0;
     GP_TableEdgeTensorSpecTyped spec{};
     spec.dims[0] = config.token_bytes;
@@ -175,7 +191,12 @@ int32_t configure_table_edge(GP_TableContext* table, int32_t edge_idx,
     spec.type_id = config.type_id;
     spec.layout = config.layout;
     spec.dtype = config.dtype;
-    return gp_table_edge_set_tensor_spec(table, edge_idx, &spec);
+    if (!gp_table_edge_set_tensor_spec(g->table, edge_idx, &spec)) return 0;
+    if (config.backend_type == GP_MEM_BACKEND_CPU) return 1;
+    if (config.backend_type != GP_MEM_BACKEND_VULKAN) return 0;
+    if (!g->vulkan_backend) g->vulkan_backend = gp_mem_backend_create_vulkan(nullptr);
+    return g->vulkan_backend &&
+           gp_table_edge_set_backend(g->table, edge_idx, g->vulkan_backend);
 }
 
 int32_t read_table_edge_config(GP_TableContext* table, int32_t edge_idx,
@@ -192,6 +213,10 @@ int32_t read_table_edge_config(GP_TableContext* table, int32_t edge_idx,
     out_config->type_id = spec.type_id;
     out_config->layout = spec.layout;
     out_config->dtype = spec.dtype;
+    const int backend_type = gp_mem_backend_get_type(
+        gp_table_edge_get_storage_backend(table, edge_idx));
+    out_config->backend_type = backend_type == GP_MEM_BACKEND_VULKAN
+        ? GP_MEM_BACKEND_VULKAN : GP_MEM_BACKEND_CPU;
     return 1;
 }
 
@@ -256,9 +281,91 @@ extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
     return g;
 }
 
+extern "C" int32_t nodus_headless_abstract_tensor_type_id(void) {
+    return static_cast<int32_t>(
+        ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR));
+}
+
+extern "C" int32_t nodus_headless_deploy_python_row(
+    const char* descriptor_path, const char* target,
+    const char* python_executable, const char* turing_root,
+    const char* extraction_contract, const char* product_dir,
+    const char* nodus_root, const char* module_library_root,
+    GP_PythonRowDeploymentReport* report,
+    char* out_tool_id, int32_t out_tool_id_cap,
+    char* out_retained_python, int32_t out_retained_python_cap,
+    char* out_staged_wrapper, int32_t out_staged_wrapper_cap) {
+    return gp_python_row_deploy_and_load(
+        descriptor_path, target, python_executable, turing_root,
+        extraction_contract, product_dir, nodus_root, module_library_root,
+        report, out_tool_id, out_tool_id_cap,
+        out_retained_python, out_retained_python_cap,
+        out_staged_wrapper, out_staged_wrapper_cap);
+}
+
+extern "C" int32_t nodus_headless_unload_plugin(const char* tool_id) {
+    return gp_plugin_unload(tool_id);
+}
+
+extern "C" int32_t nodus_headless_build_plugin_source(
+    const char* source_path, const char* nodus_root,
+    const char* module_library_root,
+    char* out_tool_id, int32_t out_tool_id_cap) {
+    if (!source_path || !nodus_root || !module_library_root ||
+        !out_tool_id || out_tool_id_cap <= 0) return 0;
+    std::filesystem::path bin =
+        std::filesystem::path(module_library_root) / "bin";
+    std::error_code error;
+    std::filesystem::create_directories(bin, error);
+    if (error) return 0;
+    return gp_plugin_build_module_and_load(
+        source_path, nodus_root, bin.string().c_str(), nullptr,
+        out_tool_id, out_tool_id_cap);
+}
+
+extern "C" int32_t nodus_headless_compile_turing_row(
+    const char* python_executable, const char* request_json,
+    const char* turing_root, const char* product_dir,
+    const char* nodus_root, const char* module_library_root,
+    GP_TuringProductAdoptionReport* report,
+    char* out_tool_id, int32_t out_tool_id_cap,
+    char* out_staged_source, int32_t out_staged_source_cap) {
+    return gp_turing_row_tool_compile_and_load(
+        python_executable, request_json, turing_root, product_dir,
+        nodus_root, module_library_root, report, out_tool_id,
+        out_tool_id_cap, out_staged_source, out_staged_source_cap);
+}
+
+extern "C" uint64_t nodus_headless_tensor_create(
+    int32_t dtype, int32_t rank, const uint64_t* shape) {
+    return nodus_tensor_create(dtype, rank, shape);
+}
+
+extern "C" int64_t nodus_headless_tensor_write(
+    uint64_t handle, uint64_t byte_offset, const void* src,
+    uint64_t byte_count) {
+    return nodus_tensor_write(handle, byte_offset, src, byte_count);
+}
+
+extern "C" int64_t nodus_headless_tensor_read(
+    uint64_t handle, uint64_t byte_offset, void* dst,
+    uint64_t byte_count) {
+    return nodus_tensor_read(handle, byte_offset, dst, byte_count);
+}
+
+extern "C" int32_t nodus_headless_tensor_describe(
+    uint64_t handle, NodusTensorDesc* out_desc) {
+    return nodus_tensor_describe(handle, out_desc);
+}
+
+extern "C" void nodus_headless_tensor_destroy(uint64_t handle) {
+    nodus_tensor_destroy(handle);
+}
+
 extern "C" void nodus_headless_destroy(NodusHeadlessGraph* g) {
     if (!g) return;
     if (g->ctx) gp_canvas_destroy(g->ctx);
+    if (g->vulkan_backend) gp_mem_backend_release(g->vulkan_backend);
     delete g;
 }
 
@@ -280,9 +387,32 @@ extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* p
     return gp_canvas_save_to_file(g->ctx, path);
 }
 
+extern "C" int32_t nodus_headless_export_module_to_root(
+    NodusHeadlessGraph* g, int32_t module_idx, const char* output_root) {
+    if (!g || !g->ctx || !output_root || !*output_root) return 0;
+    return gp_canvas_export_module_to_root(g->ctx, module_idx, output_root);
+}
+
 extern "C" int32_t nodus_headless_add_module(NodusHeadlessGraph* g, const GP_CanvasModuleDesc* desc) {
     if (!g || !g->ctx || !desc) return -1;
     return gp_canvas_add_module(g->ctx, desc);
+}
+
+extern "C" int32_t nodus_headless_get_module_count(NodusHeadlessGraph* g) {
+    if (!g || !g->ctx) return -1;
+    return gp_canvas_get_module_count(g->ctx);
+}
+
+extern "C" int32_t nodus_headless_get_module_desc(
+    NodusHeadlessGraph* g, int32_t module_idx, GP_CanvasModuleDesc* out_desc) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_desc(g->ctx, module_idx, out_desc);
+}
+
+extern "C" int32_t nodus_headless_set_module_desc(
+    NodusHeadlessGraph* g, int32_t module_idx, const GP_CanvasModuleDesc* desc) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_set_module_desc(g->ctx, module_idx, desc);
 }
 
 extern "C" int32_t nodus_headless_bind_builtin_tool(NodusHeadlessGraph* g, int32_t module_idx, int32_t tool_kind) {
@@ -302,6 +432,33 @@ extern "C" int32_t nodus_headless_set_module_rows(
     return gp_canvas_set_module_rows(g->ctx, module_idx, rows, row_count);
 }
 
+extern "C" int32_t nodus_headless_get_module_row_count(
+    NodusHeadlessGraph* g, int32_t module_idx) {
+    if (!g || !g->ctx) return -1;
+    return gp_canvas_get_module_row_count(g->ctx, module_idx);
+}
+
+extern "C" int32_t nodus_headless_get_module_row(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t row_idx,
+    GP_CanvasModuleRowInfo* out_info, char* plugin_id,
+    int32_t plugin_id_capacity) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_row(
+        g->ctx, module_idx, row_idx, out_info, plugin_id, plugin_id_capacity);
+}
+
+extern "C" int32_t nodus_headless_set_module_stack_contract(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t contract) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_set_module_stack_contract(g->ctx, module_idx, contract);
+}
+
+extern "C" int32_t nodus_headless_get_module_stack_contract(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_stack_contract(g->ctx, module_idx, out_contract);
+}
+
 extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id) {
     if (!g || !g->ctx || !desc) return -1;
     int32_t canvas_edge_idx = gp_canvas_add_edge_with_type(g->ctx, desc, type_id);
@@ -312,6 +469,13 @@ extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_Canva
 extern "C" int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g) {
     if (!g || !g->ctx) return -1;
     return gp_canvas_get_edge_count(g->ctx);
+}
+
+extern "C" int32_t nodus_headless_get_edge(
+    NodusHeadlessGraph* g, int32_t edge_idx,
+    GP_CanvasEdgeDesc* out_desc, int32_t* out_type_id) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_edge(g->ctx, edge_idx, out_desc, out_type_id);
 }
 
 extern "C" int32_t nodus_headless_attach_edge(
@@ -329,7 +493,7 @@ extern "C" int32_t nodus_headless_configure_edge_fifo(
     if (!g || !g->table || !config || canvas_edge_idx < 0 ||
         static_cast<size_t>(canvas_edge_idx) >= g->edges.size()) return 0;
     auto& edge = g->edges[static_cast<size_t>(canvas_edge_idx)];
-    if (!configure_table_edge(g->table, edge.table_edge_idx, *config)) return 0;
+    if (!configure_table_edge(g, edge.table_edge_idx, *config)) return 0;
     // Tensor-spec configuration rebuilds FIFO storage, so subscribe only
     // after it succeeds.  Otherwise the producer can publish in topological
     // order before the consumer's first-tick start-at-head subscription and
@@ -385,6 +549,12 @@ extern "C" int32_t nodus_headless_set_scheduler_mode(
     NodusHeadlessGraph* g, int32_t mode) {
     if (!g || !g->ctx || (mode != 0 && mode != 1)) return 0;
     return gp_canvas_set_thread_manager_mode(g->ctx, mode);
+}
+
+extern "C" int32_t nodus_headless_get_scheduler_mode(
+    NodusHeadlessGraph* g, int32_t* out_mode) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_thread_manager_mode(g->ctx, out_mode);
 }
 
 extern "C" int32_t nodus_headless_declare_input_port(NodusHeadlessGraph* g, const char* name, int32_t module_idx, int32_t row_idx, int32_t token_bytes) {
@@ -458,6 +628,42 @@ extern "C" int32_t nodus_headless_get_port_fifo_config(
     auto it = ports.find(port_name);
     if (it == ports.end()) return 0;
     return read_table_edge_config(g->table, it->second.edge_idx, out_config);
+}
+
+extern "C" int32_t nodus_headless_get_port_count(
+    NodusHeadlessGraph* g, int32_t is_output) {
+    if (!g) return -1;
+    const auto& ports = is_output ? g->output_ports : g->input_ports;
+    return static_cast<int32_t>(ports.size());
+}
+
+extern "C" int32_t nodus_headless_get_port_at(
+    NodusHeadlessGraph* g, int32_t is_output, int32_t ordinal,
+    char* out_name, int32_t out_name_capacity,
+    int32_t* out_module_idx, int32_t* out_contact_idx,
+    int32_t* out_start_at_head, NodusHeadlessFifoConfig* out_config) {
+    if (!g || !g->table || ordinal < 0 || !out_name || out_name_capacity <= 0 ||
+        !out_module_idx || !out_contact_idx || !out_start_at_head || !out_config) return 0;
+    const auto& ports = is_output ? g->output_ports : g->input_ports;
+    if (ordinal >= static_cast<int32_t>(ports.size())) return 0;
+    std::vector<const std::pair<const std::string, PortBinding>*> ordered;
+    ordered.reserve(ports.size());
+    for (const auto& item : ports) ordered.push_back(&item);
+    std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+        return left->second.declaration_order < right->second.declaration_order;
+    });
+    const std::string& name = ordered[static_cast<size_t>(ordinal)]->first;
+    const auto found = ports.find(name);
+    if (found == ports.end()) return 0;
+    const PortBinding& port = found->second;
+    if (!read_table_edge_config(g->table, port.edge_idx, out_config)) return 0;
+    const size_t n = std::min(name.size(), static_cast<size_t>(out_name_capacity - 1));
+    std::memcpy(out_name, name.data(), n);
+    out_name[n] = '\0';
+    *out_module_idx = port.module_idx;
+    *out_contact_idx = port.row_idx;
+    *out_start_at_head = port.start_at_head;
+    return 1;
 }
 
 extern "C" int32_t nodus_headless_get_port_unread(

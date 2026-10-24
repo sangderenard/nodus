@@ -324,22 +324,38 @@ private:
         u32 out = 0;
         ScalarType s{};
         if (!single_output(ins, "logical op", &out, &s)) return false;
-        if (s == ScalarType::F32) {
-            return fail("bitwise op on f32 value %" + std::to_string(out));
-        }
-        const std::size_t arity = which == CanonicalOp::INVERT ? 1u : 2u;
+        const auto sub = static_cast<CanonicalOp>(ins.sub_op);
+        const bool logical = sub == CanonicalOp::LOGICAL_AND ||
+                             sub == CanonicalOp::LOGICAL_OR ||
+                             sub == CanonicalOp::LOGICAL_NOT;
+        const std::size_t arity =
+            (which == CanonicalOp::INVERT || sub == CanonicalOp::LOGICAL_NOT) ? 1u : 2u;
         if (ins.inputs.size() != arity) {
             return fail(arity == 1 ? "NOT takes one input"
                                    : "bitwise op takes two inputs");
         }
         Value a;
         if (!operand_as(ins, 0, s, "logical op", &a)) return false;
+        if (logical && arity == 1) {
+            values_[out] = from_bool(!to_bool(a), s);
+            return true;
+        }
+        if (s == ScalarType::F32 && !logical) {
+            return fail("bitwise op on f32 value %" + std::to_string(out));
+        }
         if (arity == 1) {
             values_[out] = Value{s, ~a.u()};
             return true;
         }
         Value b;
         if (!operand_as(ins, 1, s, "logical op", &b)) return false;
+        if (logical) {
+            const bool result = sub == CanonicalOp::LOGICAL_AND
+                ? to_bool(a) && to_bool(b)
+                : to_bool(a) || to_bool(b);
+            values_[out] = from_bool(result, s);
+            return true;
+        }
         switch (which) {
             case CanonicalOp::BITAND: values_[out] = Value{s, a.u() & b.u()}; break;
             case CanonicalOp::BITOR: values_[out] = Value{s, a.u() | b.u()}; break;
@@ -396,7 +412,8 @@ private:
                 // OpFRem takes the sign of operand 1 (C fmod); OpSMod takes the
                 // sign of operand 2, which C's % does not, hence the fixup.
                 if (f) {
-                    values_[out] = Value::from_f32(std::fmod(a.f(), b.f()));
+                    values_[out] = Value::from_f32(
+                        a.f() - std::floor(a.f() / b.f()) * b.f());
                     return true;
                 }
                 if (b.u() == 0) return fail("integer modulo by zero in BINARY");
@@ -410,6 +427,25 @@ private:
                 } else {
                     values_[out] = Value::from_u32(a.u() % b.u());
                 }
+                return true;
+            }
+            case CanonicalOp::FLOORDIV: {
+                if (f) {
+                    values_[out] = Value::from_f32(std::floor(a.f() / b.f()));
+                    return true;
+                }
+                if (b.u() == 0) return fail("integer floor division by zero in BINARY");
+                if (!sign) {
+                    values_[out] = Value::from_u32(a.u() / b.u());
+                    return true;
+                }
+                if (a.i() == INT32_MIN && b.i() == -1) {
+                    return fail("integer floor division overflow (INT32_MIN / -1)");
+                }
+                i32 q = a.i() / b.i();
+                const i32 r = a.i() % b.i();
+                if (r != 0 && ((a.i() < 0) != (b.i() < 0))) --q;
+                values_[out] = Value::from_i32(q);
                 return true;
             }
             case CanonicalOp::BITAND:
@@ -496,6 +532,34 @@ private:
             case CanonicalOp::INVERT:
                 if (f) return fail("INVERT on f32 value %" + std::to_string(out));
                 values_[out] = Value{s, ~x.u()};
+                return true;
+            case CanonicalOp::ISFINITE:
+                if (!f) return fail("ISFINITE is defined for f32 only");
+                values_[out] = from_bool(std::isfinite(x.f()), s);
+                return true;
+            case CanonicalOp::ISNAN:
+                if (!f) return fail("ISNAN is defined for f32 only");
+                values_[out] = from_bool(std::isnan(x.f()), s);
+                return true;
+            case CanonicalOp::ISINF:
+                if (!f) return fail("ISINF is defined for f32 only");
+                values_[out] = from_bool(std::isinf(x.f()), s);
+                return true;
+            case CanonicalOp::SIGN:
+                if (f) {
+                    values_[out] = Value::from_f32(
+                        (x.f() > 0.0f) ? 1.0f : ((x.f() < 0.0f) ? -1.0f : 0.0f));
+                } else if (s == ScalarType::I32) {
+                    values_[out] = Value::from_i32(
+                        (x.i() > 0) ? 1 : ((x.i() < 0) ? -1 : 0));
+                } else {
+                    values_[out] = Value::from_u32(x.u() == 0 ? 0u : 1u);
+                }
+                return true;
+            case CanonicalOp::SIGMOID:
+                if (!f) return fail("SIGMOID is defined for f32 only");
+                values_[out] = Value::from_f32(
+                    1.0f / (1.0f + std::exp(-x.f())));
                 return true;
             default:
                 break;

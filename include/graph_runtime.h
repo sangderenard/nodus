@@ -69,6 +69,9 @@ public:
     std::vector<int> module_skip;
     std::vector<int> module_exec_skip_count;
     std::vector<int> module_exec_mode;
+    // Explicit row-stack/FIFO transfer policy. FIFO type metadata never
+    // selects this policy implicitly.
+    std::vector<ModuleStackContract> module_stack_contract;
 
     // Graph node/contract representation.
     struct NodeContract {

@@ -481,6 +481,8 @@ extern "C" inline int gp_raw_stack_frame_push_from_backend(RawStackFrame* frame,
             frame->byte_count += needed;
             return 1;
         }
+        if ((gp_mem_backend_get_capabilities(src_h) & GP_MEM_CAP_D2D_NATIVE) &&
+            (gp_mem_backend_get_capabilities(frame->backend) & GP_MEM_CAP_D2D_NATIVE)) return 0;
         // fallthrough to host-mediated path
     }
 
@@ -551,6 +553,8 @@ extern "C" inline int gp_raw_stack_frame_pop_into_backend(RawStackFrame* frame, 
                 return 1;
             }
         }
+        if ((gp_mem_backend_get_capabilities(frame->backend) & GP_MEM_CAP_D2D_NATIVE) &&
+            (gp_mem_backend_get_capabilities(dst_h) & GP_MEM_CAP_D2D_NATIVE)) return 0;
         // fallthrough to host-mediated
     }
 

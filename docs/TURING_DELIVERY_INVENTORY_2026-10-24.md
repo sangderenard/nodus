@@ -2,6 +2,36 @@
 
 Status: initially observed against canonical Turing `main` at `a8548ab6` and refreshed after a fast-forward to `05d9d2bd`; Nodus was at `d5e62bd` before this refresh. No Turing source was changed during either audit.
 
+## Nodus completion update
+
+The consumer work described as open in the historical audit below is now
+implemented and measured in the current Nodus working tree based on
+`e4fbcd7`; canonical Turing was observed at `a6fdb31a`. A focused tracked
+Turing repair now makes the Windows LLVM linker retain the declared row entry.
+
+- `nodus.graph-definition.v1` communicates Nodus modules, ordered rows,
+  stable connectors, tensor properties and runtime shape sources, edges,
+  explicit FIFO contracts, scheduler mode, and named ports bidirectionally.
+- Real Turing SSA-backed C and LLVM products execute through definitions for
+  runtime-rank-1 and runtime-rank-2 cases. A mismatched LLVM rank-2 execution
+  returns validation code 77 and publishes no result token.
+- `turing.spirv-product.v1` and its narrow physical deployment record are now
+  strictly consumed. A real Turing product executes as an ordinary Nodus row
+  through Vulkan for 1000 f32 elements, with numerical and padded-dispatch
+  guard checks.
+- Explicit tensor-handle stack currency takes precedence over legacy row
+  markers; FIFO schema remains orthogonal. Tensor arena mapping is validated
+  as capacity-at-least-logical-size.
+- Programmatic row definitions now materialize attached native tables without
+  UI focus. The headless boundary exports a module's concrete table blob for
+  automated verification, and a retained web-render proof shows populated
+  rows plus the graph edge.
+
+Focused result: **7/7 passed** for Python graph, scalar C crossing,
+runtime-shaped C crossing, SPIR-V publication/adoption crossing, translation,
+and Vulkan dispatch. The programmatic table-materialization assertion is part
+of the green Python graph test.
+
 ## Scope
 
 This reconciles the two Turing request sets made for Nodus:
@@ -185,11 +215,11 @@ Turing therefore supplied the compiler facts Nodus had requested: rank is indepe
 - Initial Turing combined runtime-span and shader suite at `a8548ab6`: `136 passed, 23 failed, 3 skipped`.
 - Refreshed suite at `05d9d2bd`, including the new whole-class trial: `139 passed, 23 failed, 3 skipped`; all three added passing tests are the false-acceptance/whole-class coverage.
 
-### Current runtime gaps
+### Current runtime gaps and completed crossings
 
-1. **Current-main C execution is red on this Windows host.** Every runtime-shaped C test reaches the compiled DLL and then fails because `CModuleArtifact.reset_validation_error()` requests `turing_validation_error_reset`, which the linked DLL does not export. The validation runtime source defines `turing_validation_error`, `turing_validation_error_reset`, and `turing_validation_error_take` as ordinary external C functions but supplies no Windows `__declspec(dllexport)` decoration. Default ELF visibility can expose the same spelling on Linux; a Windows DLL does not receive that guarantee. LLVM and Fortran cases in the same matrix were not the source of those failures. This is a platform-specific Turing shared-library export defect, not a Nodus shape-contract mismatch.
+1. **The C and LLVM Windows exports are repaired.** Real runtime-rank-1 and runtime-rank-2 products execute through Nodus with correct shapes and values for both backends. LLVM shared builds now pass a focused `.def` file naming the declared row entry, so linking the explicitly exported validation runtime no longer suppresses that entry.
 
-2. **Real dynamic-shape Nodus adoption is not yet an end-to-end test.** Nodus's dynamic tests exercise its descriptor generation and C++ importer with controlled artifacts. Its opt-in real-Turing test is scalar. A final crossing test must compile a real runtime-rank-1 or rank-2 C/LLVM row, adopt it, push Nodus tensor handles, execute the row, and verify result shape and values.
+2. **Real dynamic-shape Nodus adoption is crossed end to end.** The crossing compiles real C and LLVM rank-1/rank-2 rows, adopts them, pushes Nodus tensor handles, and verifies result shape and values. The LLVM mismatch case additionally proves producer validation code 77 reaches the scheduler and suppresses FIFO publication while preserving raw-stack rollback.
 
 3. **Dynamic Fortran is intentionally refused by Nodus.** Turing now lowers runtime-sized Fortran tensors, but `turing_row_tool_compiler.py` refuses a dynamic Fortran request before the legacy YAML importer can narrow it. Nodus needs a Fortran dynamic-extent adoption contract or a common buffer ABI before this lane is usable as a runtime-shaped row.
 
@@ -200,8 +230,8 @@ Turing therefore supplied the compiler facts Nodus had requested: rank is indepe
 | Path | Judgment |
 |---|---|
 | Fixed/scalar C, LLVM, Fortran product generation | Available and crossed at compile/product level |
-| Runtime-shaped LLVM product contract | Provided and structurally consumed; final real Nodus execute test still needed |
-| Runtime-shaped C product contract | Provided and structurally consumed; current Turing DLL execution is blocked by missing validation-runtime exports |
+| Runtime-shaped LLVM product contract | Rank-1 and rank-2 graph crossings execute; mismatched extents are refused with code 77 and no output publication |
+| Runtime-shaped C product contract | Rank-1 and rank-2 graph crossings execute with correct dynamic output shape and values |
 | Runtime-shaped Fortran product | Compiler provided; Nodus consumer deliberately refuses it |
 | Full AbstractTensor operator set | Not provided by this delivery |
 
@@ -288,16 +318,25 @@ The focused Nodus shader tests passed in this audit. Real tool tests run when th
 | WebGL graphics product | Produced with companion stage; no Nodus pipeline adopter |
 | Extracted shader | Provenance retained; no component ABI, so not runnable in Nodus |
 
-## Nodus work now unlocked
+## Nodus work now unlocked — 2026-10-24 status
 
 The Turing workers supplied enough contract to proceed without more compiler design for these Nodus tasks:
 
-1. Add a strict `turing.spirv-product.v1` adopter that validates hashes, `product_kind == deployable-shader`, `complete`, target environment, component identity, and API/deployment agreement before loading the existing `.spv`.
-2. Parse `turing.shader-deployment.v1` into a Nodus-owned immutable deployment description. Refuse unknown required resource kinds and every published shortfall that the selected runtime cannot satisfy.
-3. Map the narrow deployable-SPIR-V profile—compute stage, set 0, contiguous storage buffers, one storage control, declared local size/group rule—onto Nodus's existing Vulkan dispatch facilities.
-4. Wrap that dispatch as a registered row tool whose `AbstractTensorHandle` inputs/outputs are checked against the logical component ports and physical resource dtypes/shapes.
-5. Add one true crossing test: Turing publishes a scalar/vector-safe deployable SPIR-V product; Nodus adopts it, dispatches it, and verifies output and past-end guard behavior from the published record only.
-6. Add one true runtime-shaped CPU crossing test for C and LLVM after the C validation-export issue is resolved; retain the explicit Fortran refusal until Nodus has a dynamic Fortran ABI.
+Items 1–5 below are complete: strict adoption, immutable deployment parsing,
+Vulkan resource/launch mapping, ordinary row registration, and the numerical
+crossing with a past-end guard. The C/LLVM gates in item 6 remain green.
+
+The follow-on persistent-storage work is also partly complete. Nodus now has a
+concrete persistent Vulkan memory backend, direct binding of compatible backend
+buffers as SSBOs, native-D2D `EdgeTensorFifo` transfer, explicit barriers, and
+an additive graph-definition `storage="vulkan"` property with native readback.
+A direct two-shader test proves a 256-byte FIFO packet remains device-local.
+
+The remaining consumer task is narrower: generated ordinary SPIR-V graph rows
+still communicate an eight-byte `AbstractTensorHandle` token. Their scheduler
+binding must use the compatible edge FIFO payload slot itself as the shader
+data SSBO, while retaining host-token and raw-stack options. That path then
+needs wrap/full/order and host-backed control coverage.
 
 These are Nodus consumer tasks. They do not require changing Turing's compiler internals or adding graph-edge types.
 
@@ -305,4 +344,8 @@ These are Nodus consumer tasks. They do not require changing Turing's compiler i
 
 Both requested producer contracts are now substantially present in Turing. Runtime-shaped C/LLVM metadata aligns with Nodus Buffer ABI V2, and shader products now include the source, logical ABI, physical launch contract, provenance, hashes, and separate deployable SPIR-V product that were requested.
 
-The remaining boundary is measurable rather than conceptual: Nodus must consume the richer shader/SPIR-V records and prove real dispatch; dynamic Fortran remains unsupported in Nodus; and current Turing main must restore Windows-visible C validation-runtime exports before the runtime-shaped C execution matrix is green on this host.
+The remaining boundary is measurable rather than conceptual: persistent Vulkan
+buffers and SSBO FIFO transport are now present and proved below the ordinary
+row wrapper. The next Nodus work is to bind that wrapper to the graph edge's
+payload storage instead of transporting only a tensor handle. Dynamic Fortran
+remains unsupported in Nodus; the runtime-shaped C and LLVM lanes are green.

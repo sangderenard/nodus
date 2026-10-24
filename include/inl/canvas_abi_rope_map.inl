@@ -866,6 +866,7 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->module_input_layout.clear();
     ctx->module_output_layout.clear();
     ctx->module_io_rows.clear();
+    ctx->graph->module_stack_contract.clear();
     ctx->module_table_rows.clear();
     ctx->module_frame_leds.clear();
     ctx->module_frame_links.clear();
@@ -1075,6 +1076,7 @@ static void canvas_destroy_module(GP_CanvasContextImpl* ctx, int module_idx) {
     erase_at(ctx->module_input_layout);
     erase_at(ctx->module_output_layout);
     erase_at(ctx->module_io_rows);
+    erase_at(ctx->graph->module_stack_contract);
     erase_at(ctx->module_table_rows);
     erase_at(ctx->module_frame_leds);
     erase_at(ctx->module_frame_links);
@@ -5735,7 +5737,95 @@ extern "C" int gp_canvas_set_module_rows(GP_CanvasContext* ctx_, int module_idx,
         rows.push_back(std::move(row));
     }
     canvas_apply_io_rows(ctx, module_idx, rows);
+    // This is an explicit host/programmatic row replacement, not a passive
+    // UI refresh.  The layout synchronizer normally protects non-focused
+    // interactive tables from incidental rebuilds, but a headless caller has
+    // no focused module.  Temporarily focus the addressed module so the rows
+    // communicated through this API become concrete table rows immediately.
+    int previous_focused_module = ctx->focused_module;
+    ctx->focused_module = module_idx;
     sync_module_table_io_layout(ctx, module_idx);
+    ctx->focused_module = previous_focused_module;
+    return 1;
+}
+
+extern "C" int gp_canvas_get_module_row_count(GP_CanvasContext* ctx_, int module_idx) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || module_idx < 0 ||
+        module_idx >= static_cast<int>(ctx->module_io_rows.size())) return -1;
+    return static_cast<int>(ctx->module_io_rows[static_cast<size_t>(module_idx)].size());
+}
+
+extern "C" int gp_canvas_get_module_row(GP_CanvasContext* ctx_, int module_idx,
+                                            int row_idx, GP_CanvasModuleRowInfo* out_info,
+                                            char* plugin_id, int plugin_id_capacity) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || !out_info || module_idx < 0 ||
+        module_idx >= static_cast<int>(ctx->module_io_rows.size())) return 0;
+    const auto& rows = ctx->module_io_rows[static_cast<size_t>(module_idx)];
+    if (row_idx < 0 || row_idx >= static_cast<int>(rows.size())) return 0;
+    const auto& row = rows[static_cast<size_t>(row_idx)];
+
+    GP_CanvasModuleRowInfo info{};
+    info.kind = static_cast<int32_t>(row.kind);
+    info.tool = static_cast<int32_t>(row.tool);
+    info.attachment_count = row.attachment_count;
+    info.tool_origin = static_cast<int32_t>(row.tool_origin);
+    info.contact_idx = row.contact_idx;
+    if (row.kind == ModuleRowKind::Input) {
+        info.produces = row.attachment_count;
+    } else if (row.kind == ModuleRowKind::Output) {
+        info.consumes = row.attachment_count;
+    } else if (row.tool_origin == ModuleToolOrigin::Builtin) {
+        const ToolStackSpec spec = module_tool_stack_spec(row.tool);
+        info.consumes = spec.consumes;
+        info.produces = spec.produces;
+    } else {
+        if (module_idx >= static_cast<int>(ctx->module_plugin_instances.size()) ||
+            row_idx >= static_cast<int>(ctx->module_plugin_instances[static_cast<size_t>(module_idx)].size())) {
+            return 0;
+        }
+        const auto& instance =
+            ctx->module_plugin_instances[static_cast<size_t>(module_idx)][static_cast<size_t>(row_idx)];
+        if (!instance) return 0;
+        const int32_t port_count = instance->port_count();
+        for (int32_t i = 0; i < port_count; ++i) {
+            const ToolPortSpec spec = instance->port_spec(i);
+            if (spec.kind == ToolPortKind::Argument) info.consumes += std::max(0, spec.count);
+            else if (spec.kind == ToolPortKind::Return) info.produces += std::max(0, spec.count);
+        }
+    }
+    if (plugin_id && plugin_id_capacity > 0) {
+        const size_t n = std::min(row.plugin_id.size(), static_cast<size_t>(plugin_id_capacity - 1));
+        std::memcpy(plugin_id, row.plugin_id.data(), n);
+        plugin_id[n] = '\0';
+    }
+    *out_info = info;
+    return 1;
+}
+
+extern "C" int gp_canvas_set_module_stack_contract(GP_CanvasContext* ctx_, int module_idx,
+                                                       int contract) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return 0;
+    if (contract < static_cast<int>(ModuleStackContract::ScalarF32) ||
+        contract > static_cast<int>(ModuleStackContract::Opaque)) return 0;
+    if (module_idx >= static_cast<int>(ctx->graph->module_stack_contract.size())) {
+        ctx->graph->module_stack_contract.resize(
+            static_cast<size_t>(module_idx) + 1, ModuleStackContract::Opaque);
+    }
+    ctx->graph->module_stack_contract[static_cast<size_t>(module_idx)] =
+        static_cast<ModuleStackContract>(contract);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_module_stack_contract(GP_CanvasContext* ctx_, int module_idx,
+                                                       int* out_contract) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || !out_contract || module_idx < 0 ||
+        module_idx >= static_cast<int>(ctx->graph->module_stack_contract.size())) return 0;
+    *out_contract = static_cast<int>(
+        ctx->graph->module_stack_contract[static_cast<size_t>(module_idx)]);
     return 1;
 }
 

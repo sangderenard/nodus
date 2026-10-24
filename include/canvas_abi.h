@@ -70,6 +70,13 @@ void gp_canvas_destroy(GP_CanvasContext* ctx);
 
 // add module, returns module index or -1
 int gp_canvas_add_module(GP_CanvasContext* ctx, const GP_CanvasModuleDesc* desc);
+// Read the concrete module records owned by the canvas.  These are inspection
+// calls over the existing canvas storage, not a parallel graph model.
+int gp_canvas_get_module_count(GP_CanvasContext* ctx);
+int gp_canvas_get_module_desc(GP_CanvasContext* ctx, int module_idx,
+                              GP_CanvasModuleDesc* out_desc);
+int gp_canvas_set_module_desc(GP_CanvasContext* ctx, int module_idx,
+                              const GP_CanvasModuleDesc* desc);
 // move module
 int gp_canvas_move_module(GP_CanvasContext* ctx, int module_idx, int x, int y);
 
@@ -78,6 +85,8 @@ int gp_canvas_add_edge(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc* desc);
 // Inspect restored topology without inventing a second graph representation.
 int gp_canvas_get_edge_count(GP_CanvasContext* ctx);
 int gp_canvas_find_edge(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc* desc);
+int gp_canvas_get_edge(GP_CanvasContext* ctx, int edge_idx,
+                       GP_CanvasEdgeDesc* out_desc, int* out_type_id);
 // Read scheduler-produced stack inspection state after a completed tick.
 // A null output with capacity zero queries the required count. Snapshot rows
 // are populated by the native StackDisplay tool; the tail is the final stack.
@@ -452,6 +461,27 @@ typedef struct GP_CanvasModuleRowDesc {
 } GP_CanvasModuleRowDesc;
 int gp_canvas_set_module_rows(GP_CanvasContext* ctx, int module_idx,
                               const GP_CanvasModuleRowDesc* rows, int row_count);
+// Read one materialized semantic row.  Plugin stack effects are obtained from
+// the live ITool port contract, so callers do not have to reconstruct them
+// from a separately maintained manifest.  `plugin_id` may be NULL when its
+// capacity is zero; the function then still returns all scalar fields.
+typedef struct GP_CanvasModuleRowInfo {
+    int32_t kind;
+    int32_t tool;
+    int32_t attachment_count;
+    int32_t tool_origin;
+    int32_t contact_idx;
+    int32_t consumes;
+    int32_t produces;
+} GP_CanvasModuleRowInfo;
+int gp_canvas_get_module_row_count(GP_CanvasContext* ctx, int module_idx);
+int gp_canvas_get_module_row(GP_CanvasContext* ctx, int module_idx, int row_idx,
+                             GP_CanvasModuleRowInfo* out_info,
+                             char* plugin_id, int plugin_id_capacity);
+// Select the module row-stack currency independently of edge FIFO type ids.
+// `contract` is ModuleStackContract (thread_manager.h).
+int gp_canvas_set_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int contract);
+int gp_canvas_get_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int* out_contract);
 int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
 
 // Thread manager / scheduler mode (0 = free-spinning, 1 = scheduled).

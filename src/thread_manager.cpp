@@ -843,6 +843,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                 int attachments = std::max(1, meta.attachment_count);
                 for (int ai = 0; ai < attachments; ++ai) {
                     float val = 0.0f;
+                    bool typed_input = false;
                     int contact_idx = meta.contact_idx + ai;
                     // Find the edge index for this input (mod_idx is the consumer)
                     int edge_idx = -1;
@@ -880,54 +881,68 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
                         gp_table_edge_unread(fifo_table, edge_idx, reader_key, &unread);
                         if (unread > 0) {
-                            // Check for pointer-mode marker on this row: reserved0>0
-                            GP_TableRow tbl_row{};
-                            bool tried_row = false;
-                            if (fifo_table && gp_table_get_row(fifo_table, row, &tbl_row)) {
-                                tried_row = true;
-                            }
-                            if (tried_row && tbl_row.reserved0 > 0) {
-                                // Pointer mode: consume opaque EventPayload when the FIFO stride can safely hold a pointer.
-                                if (edge_stride_allows_pointer(fifo_table, edge_idx)) {
-                                    // Consume all available pointer-mode EventPayloads for bulk handling.
-                                    while (true) {
-                                        void* maybe_p = nullptr;
-                                        if (!(gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p))) break;
-                                        EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
-                                        void* pa = ep->pending;
-                                        GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-                                        if (canvas_single && pa) {
-                                            // If this pending action encodes a text/tensor action
-                                            // deliver its payload into the module frame port and
-                                            // stash it for the tool to consume and free.
-                                            struct MinimalPending { int32_t action_id; };
-                                            auto *ptest = reinterpret_cast<MinimalPending*>(pa);
-                                            if (ptest && (ptest->action_id == CANVAS_ACT_TEXT_RENDER || ptest->action_id == CANVAS_ACT_TENSOR_ALLOC)) {
-                                                // set module receive frame ptr to pending payload
-                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, pa);
-                                                // stash under managed map so tool can pop and free
-                                                gp_canvas_stash_managed_event_payload(canvas_single, ep->src_module, ep->frame_idx, pa);
-                                                // do not invoke or free here; tool will handle
-                                            } else {
-                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
-                                                gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
-                                                gp_canvas_invoke_pending_action(canvas_single, pa);
-                                                gp_canvas_free_pending_action(canvas_single, pa);
-                                            }
-                                        }
-                                        delete ep;
-                                    }
-                                }
+                            GP_TableEdgeTensorSpecTyped edge_spec{};
+                            const bool typed_contract =
+                                mod.stack_contract == ModuleStackContract::AbstractTensorPointer &&
+                                gp_table_edge_get_tensor_spec(fifo_table, edge_idx, &edge_spec) &&
+                                edge_spec.type_id >= 0 &&
+                                ValueTypeRegistry::global().get(edge_spec.type_id);
+                            if (typed_contract) {
+                                // The module execution contract owns stack currency. Do not let the
+                                // legacy row marker reinterpret an explicitly typed tensor token.
+                                typed_input = true;
+                                (void)gp_table_edge_consume_into_frame(
+                                    fifo_table, edge_idx, reader_key, module_stack, edge_spec.type_id);
                             } else {
-                                float sample[1] = {0.0f};
-                                int32_t written = 0;
-                                if (gp_table_edge_consume(fifo_table, edge_idx, reader_key, sample, static_cast<int32_t>(sizeof(float)), &written) && written > 0) {
-                                    val = sample[0];
+                                // Legacy pointer-mode marker for EventPayload delivery.
+                                GP_TableRow tbl_row{};
+                                bool tried_row = false;
+                                if (fifo_table && gp_table_get_row(fifo_table, row, &tbl_row)) {
+                                    tried_row = true;
+                                }
+                                if (tried_row && tbl_row.reserved0 > 0) {
+                                    // Pointer mode: consume opaque EventPayload when the FIFO stride can safely hold a pointer.
+                                    if (edge_stride_allows_pointer(fifo_table, edge_idx)) {
+                                        // Consume all available pointer-mode EventPayloads for bulk handling.
+                                        while (true) {
+                                            void* maybe_p = nullptr;
+                                            if (!(gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p))) break;
+                                            EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                            void* pa = ep->pending;
+                                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                                            if (canvas_single && pa) {
+                                                // If this pending action encodes a text/tensor action
+                                                // deliver its payload into the module frame port and
+                                                // stash it for the tool to consume and free.
+                                                struct MinimalPending { int32_t action_id; };
+                                                auto *ptest = reinterpret_cast<MinimalPending*>(pa);
+                                                if (ptest && (ptest->action_id == CANVAS_ACT_TEXT_RENDER || ptest->action_id == CANVAS_ACT_TENSOR_ALLOC)) {
+                                                    // set module receive frame ptr to pending payload
+                                                    gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, pa);
+                                                    // stash under managed map so tool can pop and free
+                                                    gp_canvas_stash_managed_event_payload(canvas_single, ep->src_module, ep->frame_idx, pa);
+                                                    // do not invoke or free here; tool will handle
+                                                } else {
+                                                    gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                                    gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                                    gp_canvas_invoke_pending_action(canvas_single, pa);
+                                                    gp_canvas_free_pending_action(canvas_single, pa);
+                                                }
+                                            }
+                                            delete ep;
+                                        }
+                                    }
+                                } else {
+                                    float sample[1] = {0.0f};
+                                    int32_t written = 0;
+                                    if (gp_table_edge_consume(fifo_table, edge_idx, reader_key, sample, static_cast<int32_t>(sizeof(float)), &written) && written > 0) {
+                                        val = sample[0];
+                                    }
                                 }
                             }
                         }
                     }
-                    push_value(val);
+                    if (!typed_input) push_value(val);
                 }
             }
             // Tool row: pass stack through (no-op for now)
@@ -968,7 +983,15 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                         }
                         try {
                             inst->execute_stack(tctx);
-                        } catch (...) {}
+                        } catch (...) {
+                            tctx.succeeded = false;
+                        }
+                        if (!tctx.succeeded) {
+                            // Refusing tools restore their inputs by contract.
+                            // Do not let following output rows reinterpret that
+                            // rolled-back stack tail as successful return values.
+                            break;
+                        }
                         continue; // plugin handled this row
                     }
                 }
@@ -1362,7 +1385,6 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                 // Output row: publish from stack to FIFO
                 int attachments = std::max(1, meta.attachment_count);
                 for (int ai = 0; ai < attachments; ++ai) {
-                    float val = pop_value();
                     int contact_idx = meta.contact_idx + ai;
                     int edge_idx = -1;
                     uint64_t writer_key = canvas_contact_key(mod_idx, contact_idx);
@@ -1391,8 +1413,25 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                             }
                         }
                     }
+                    if (edge_idx < 0 || !fifo_table) {
+                        (void)pop_value();
+                        continue;
+                    }
                     if (edge_idx >= 0 && fifo_table) {
                         int dropped = 0;
+                        GP_TableEdgeTensorSpecTyped edge_spec{};
+                        const bool typed_output =
+                            mod.stack_contract == ModuleStackContract::AbstractTensorPointer &&
+                            gp_table_edge_get_tensor_spec(fifo_table, edge_idx, &edge_spec) &&
+                            edge_spec.type_id >= 0 &&
+                            ValueTypeRegistry::global().get(edge_spec.type_id);
+                        if (typed_output) {
+                            (void)gp_table_edge_publish_from_frame(
+                                fifo_table, edge_idx, writer_key, module_stack,
+                                edge_spec.type_id, &dropped);
+                            continue;
+                        }
+                        float val = pop_value();
                         // If this output contact maps to a module-frame contact, publish the bound pointer instead of a float.
                         const int frame_base = kModuleFrameContactBase;
                         const int frame_end = frame_base + kModuleExtraLedCount * kModuleExtraLedRows;

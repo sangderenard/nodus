@@ -1044,6 +1044,28 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     return 1;
 }
 
+int32_t gp_table_edge_consume_into_frame(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, struct RawStackFrame* dst_frame, int32_t type_id) {
+    if (!ctx || !dst_frame) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!fifo.pop_to_frame(subscriber_key, dst_frame, type_id)) return 0;
+
+    ThreadManager* tm = ThreadManager::global();
+    if (tm) {
+        auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
+        auto it = m.find(subscriber_key);
+        if (it != m.end()) {
+            int slot = it->second;
+            auto *reader = fifo.find_reader(subscriber_key);
+            if (reader && slot > 0) {
+                tm->update_reader_seq(slot, reader->seq.load(std::memory_order_relaxed));
+            }
+        }
+    }
+    return 1;
+}
+
 int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written) {
     if (out_written) *out_written = 0;
     if (!ctx || !out_sample_bytes || out_len_bytes < 0) return 0;
@@ -1156,8 +1178,7 @@ int32_t gp_table_edge_set_backend(GP_TableContext* ctx, int32_t edge_idx, gp_mem
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
-    fifo.set_backend(h);
-    return 1;
+    return fifo.rebind_backend(h, true) ? 1 : 0;
 }
 
 extern "C" int32_t gp_table_edge_set_tensor_storage(GP_TableContext* ctx,
@@ -1183,90 +1204,7 @@ extern "C" int32_t gp_table_edge_swap_backend(GP_TableContext* ctx, int32_t edge
     if (!fifo.impl) { fifo.set_backend(new_h); return 1; }
     gp_mem_backend_handle_t old_h = fifo.get_backend();
     if (old_h == new_h) return 1; // fast-path
-
-    if (!copy_over) {
-        fifo.set_backend(new_h);
-        return 1;
-    }
-
-    // Compute total storage size for the FIFO (host layout)
-    size_t total_bytes = fifo.impl->stride * fifo.impl->slots * fifo.impl->elem_size;
-    if (total_bytes == 0) { fifo.set_backend(new_h); return 1; }
-
-    std::vector<uint8_t> tmp;
-    try { tmp.resize(total_bytes); } catch (...) { return 0; }
-
-    // Read from old backend if possible
-    bool read_ok = false;
-    if (old_h) {
-        const gp_mem_backend_vtable_t* old_vt = gp_mem_backend_get_vtable(old_h);
-        if (old_vt && old_vt->copy_from_backend) {
-            if (old_vt->copy_from_backend(old_h, 0, tmp.data(), total_bytes)) read_ok = true;
-        }
-        if (!read_ok) {
-            void* m = gp_mem_backend_map_or_null(old_h);
-            if (m) {
-                std::memcpy(tmp.data(), m, total_bytes);
-                gp_mem_backend_unmap(old_h);
-                read_ok = true;
-            }
-        }
-    }
-    // Fallback to FIFO's internal storage handle
-    if (!read_ok && fifo.impl->storage_handle) {
-        const gp_mem_backend_vtable_t* sh_vt = gp_mem_backend_get_vtable(fifo.impl->storage_handle);
-        if (sh_vt && sh_vt->copy_from_backend) {
-            if (sh_vt->copy_from_backend(fifo.impl->storage_handle, 0, tmp.data(), total_bytes)) read_ok = true;
-        }
-        if (!read_ok) {
-            void* m = gp_mem_backend_map_or_null(fifo.impl->storage_handle);
-            if (m) {
-                std::memcpy(tmp.data(), m, total_bytes);
-                gp_mem_backend_unmap(fifo.impl->storage_handle);
-                read_ok = true;
-            }
-        }
-    }
-    if (!read_ok) return 0;
-
-    // Attach new backend and attempt to write into it
-    fifo.set_backend(new_h);
-    if (new_h) {
-        const gp_mem_backend_vtable_t* new_vt = gp_mem_backend_get_vtable(new_h);
-        bool write_ok = false;
-        if (new_vt && new_vt->copy_to_backend) {
-            if (new_vt->copy_to_backend(new_h, 0, tmp.data(), total_bytes)) write_ok = true;
-        }
-        if (!write_ok) {
-            // Try mapping
-            void* m = gp_mem_backend_map_or_null(new_h);
-            if (m) {
-                std::memcpy(m, tmp.data(), total_bytes);
-                gp_mem_backend_unmap(new_h);
-                write_ok = true;
-            }
-        }
-        if (!write_ok) {
-            // Could not transfer into new backend; revert backend pointer and fail.
-            fifo.set_backend(old_h);
-            return 0;
-        }
-    }
-
-    // Keep the FIFO internal storage in sync with the copied buffer.
-    if (fifo.impl->storage_handle) {
-        const gp_mem_backend_vtable_t* sh_vt = gp_mem_backend_get_vtable(fifo.impl->storage_handle);
-        if (sh_vt && sh_vt->copy_to_backend) {
-            sh_vt->copy_to_backend(fifo.impl->storage_handle, 0, tmp.data(), total_bytes);
-        } else {
-            void* m = gp_mem_backend_map_or_null(fifo.impl->storage_handle);
-            if (m) {
-                std::memcpy(m, tmp.data(), total_bytes);
-                gp_mem_backend_unmap(fifo.impl->storage_handle);
-            }
-        }
-    }
-    return 1;
+    return fifo.rebind_backend(new_h, copy_over != 0) ? 1 : 0;
 }
 
 gp_mem_backend_handle_t gp_table_edge_get_backend(GP_TableContext* ctx, int32_t edge_idx) {
@@ -1275,6 +1213,14 @@ gp_mem_backend_handle_t gp_table_edge_get_backend(GP_TableContext* ctx, int32_t 
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return nullptr;
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     return fifo.get_backend();
+}
+
+gp_mem_backend_handle_t gp_table_edge_get_storage_backend(
+    GP_TableContext* ctx, int32_t edge_idx) {
+    if (!ctx) return nullptr;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return nullptr;
+    return ctx->edge_fifos[static_cast<size_t>(edge_idx)].get_storage_backend();
 }
 
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count) {

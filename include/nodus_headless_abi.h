@@ -27,6 +27,9 @@
 #include <stdint.h>
 
 #include "canvas_abi.h"
+#include "python_row_workflow.h"
+#include "turing_product_adopter.h"
+#include "common/tensors/abstraction/tensor_abi.h"
 
 #if defined(_WIN32)
 #  if defined(NODUS_HEADLESS_BUILD)
@@ -77,6 +80,7 @@ typedef struct NodusHeadlessFifoConfig {
     int32_t type_id;
     int32_t layout;
     int32_t dtype;
+    int32_t backend_type; // GP_MemBackendType; CPU or Vulkan in graph-definition v1
 } NodusHeadlessFifoConfig;
 
 typedef struct NodusHeadlessPublishResult {
@@ -91,20 +95,42 @@ NODUS_HEADLESS_API void nodus_headless_destroy(NodusHeadlessGraph* g);
 // using nodus's existing canvas save format -- no new format is introduced.
 NODUS_HEADLESS_API int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* path);
 NODUS_HEADLESS_API int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* path);
+// Export one module's concrete table serialization under
+// <output_root>/serialized/module_<index>.gpmod.
+NODUS_HEADLESS_API int32_t nodus_headless_export_module_to_root(
+    NodusHeadlessGraph* g, int32_t module_idx, const char* output_root);
 
 // Programmatic graph construction, for building a graph in-process instead
 // of authoring a save file. Returns the new index, or -1 on failure.
 NODUS_HEADLESS_API int32_t nodus_headless_add_module(NodusHeadlessGraph* g, const GP_CanvasModuleDesc* desc);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_desc(
+    NodusHeadlessGraph* g, int32_t module_idx, GP_CanvasModuleDesc* out_desc);
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_desc(
+    NodusHeadlessGraph* g, int32_t module_idx, const GP_CanvasModuleDesc* desc);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_builtin_tool(NodusHeadlessGraph* g, int32_t module_idx, int32_t tool_kind);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_plugin_tool(NodusHeadlessGraph* g, int32_t module_idx, const char* plugin_id);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
     NodusHeadlessGraph* g, int32_t module_idx,
     const GP_CanvasModuleRowDesc* rows, int32_t row_count);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_row_count(
+    NodusHeadlessGraph* g, int32_t module_idx);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_row(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t row_idx,
+    GP_CanvasModuleRowInfo* out_info, char* plugin_id,
+    int32_t plugin_id_capacity);
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_contract(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t contract);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_contract(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
 // Reattach process-local FIFO configuration to an edge restored by native
 // canvas persistence. FIFO specs and live samples are intentionally not
 // serialized by CANVAS V4; callers must make that choice again after load.
 NODUS_HEADLESS_API int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_get_edge(
+    NodusHeadlessGraph* g, int32_t edge_idx,
+    GP_CanvasEdgeDesc* out_desc, int32_t* out_type_id);
 NODUS_HEADLESS_API int32_t nodus_headless_attach_edge(
     NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc);
 NODUS_HEADLESS_API int32_t nodus_headless_configure_edge_fifo(
@@ -123,6 +149,48 @@ NODUS_HEADLESS_API int32_t nodus_headless_find_module_by_uuid(
     NodusHeadlessGraph* g, uint64_t module_uuid);
 NODUS_HEADLESS_API int32_t nodus_headless_set_scheduler_mode(
     NodusHeadlessGraph* g, int32_t mode);
+NODUS_HEADLESS_API int32_t nodus_headless_get_scheduler_mode(
+    NodusHeadlessGraph* g, int32_t* out_mode);
+
+// Compiler/tool and tensor services exposed by this same runtime image. This
+// keeps plugin registration and ValueType ids in the registry instance used
+// by the graph scheduler rather than asking a foreign caller to load another
+// copy of those process-local authorities.
+NODUS_HEADLESS_API int32_t nodus_headless_abstract_tensor_type_id(void);
+NODUS_HEADLESS_API int32_t nodus_headless_deploy_python_row(
+    const char* descriptor_path, const char* target,
+    const char* python_executable, const char* turing_root,
+    const char* extraction_contract, const char* product_dir,
+    const char* nodus_root, const char* module_library_root,
+    GP_PythonRowDeploymentReport* report,
+    char* out_tool_id, int32_t out_tool_id_cap,
+    char* out_retained_python, int32_t out_retained_python_cap,
+    char* out_staged_wrapper, int32_t out_staged_wrapper_cap);
+NODUS_HEADLESS_API int32_t nodus_headless_unload_plugin(const char* tool_id);
+// Build and load one already-generated ordinary Nodus plugin source.  This is
+// the narrow native half used by strict product adopters: product validation
+// and source generation happen before this call; registration still goes
+// through the same PluginLoader/ToolRegistry authority as every other row.
+NODUS_HEADLESS_API int32_t nodus_headless_build_plugin_source(
+    const char* source_path, const char* nodus_root,
+    const char* module_library_root,
+    char* out_tool_id, int32_t out_tool_id_cap);
+NODUS_HEADLESS_API int32_t nodus_headless_compile_turing_row(
+    const char* python_executable, const char* request_json,
+    const char* turing_root, const char* product_dir,
+    const char* nodus_root, const char* module_library_root,
+    GP_TuringProductAdoptionReport* report,
+    char* out_tool_id, int32_t out_tool_id_cap,
+    char* out_staged_source, int32_t out_staged_source_cap);
+NODUS_HEADLESS_API uint64_t nodus_headless_tensor_create(
+    int32_t dtype, int32_t rank, const uint64_t* shape);
+NODUS_HEADLESS_API int64_t nodus_headless_tensor_write(
+    uint64_t handle, uint64_t byte_offset, const void* src, uint64_t byte_count);
+NODUS_HEADLESS_API int64_t nodus_headless_tensor_read(
+    uint64_t handle, uint64_t byte_offset, void* dst, uint64_t byte_count);
+NODUS_HEADLESS_API int32_t nodus_headless_tensor_describe(
+    uint64_t handle, NodusTensorDesc* out_desc);
+NODUS_HEADLESS_API void nodus_headless_tensor_destroy(uint64_t handle);
 
 // Named external ports: the opaque black-box boundary. Each port is bound to
 // one module's tool row and rides the same table-edge transport
@@ -149,6 +217,16 @@ NODUS_HEADLESS_API int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, cons
 NODUS_HEADLESS_API int32_t nodus_headless_get_port_fifo_config(
     NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
     NodusHeadlessFifoConfig* out_config);
+// Deterministic name-sorted enumeration of process-local named ports. The
+// endpoint and start policy come from the same binding used for transport;
+// FIFO values are read from the live table edge.
+NODUS_HEADLESS_API int32_t nodus_headless_get_port_count(
+    NodusHeadlessGraph* g, int32_t is_output);
+NODUS_HEADLESS_API int32_t nodus_headless_get_port_at(
+    NodusHeadlessGraph* g, int32_t is_output, int32_t ordinal,
+    char* out_name, int32_t out_name_capacity,
+    int32_t* out_module_idx, int32_t* out_contact_idx,
+    int32_t* out_start_at_head, NodusHeadlessFifoConfig* out_config);
 NODUS_HEADLESS_API int32_t nodus_headless_get_port_unread(
     NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
     int32_t* out_unread);

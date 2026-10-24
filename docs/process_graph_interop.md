@@ -1,15 +1,21 @@
-# Turing ProcessGraph interoperability
+# Turing ProcessGraph interoperability (historical experiment)
 
-Nodus receives Turing computation through two complementary paths:
+The direct ProcessGraph-to-Nodus route is not a production integration target.
+It proved canonical operation correlation and exposed unresolved structural
+nodes, but it conflated Turing's compiler input graph with Nodus's editable
+runtime graph. Turing owns ProcessGraph-to-SSA lowering and should execute the
+resulting SSA product through an ordinary Nodus row tool.
+
+The supported boundary is now:
 
 ```text
-ProcessGraph -> GraphIR -> registered AbstractTensor ToolIR nodes and ports
-SSA / FusedProgram -> KernelIR or Nodus in-memory calculator execution
+Turing source -> ProcessGraph -> SSA -> deployable row tool
+Nodus graph definition -> native Canvas/Table modules, connectors, properties, and ports
 ```
 
-They are deliberately separate. The graph/tool route preserves composition
-and UI structure. The KernelIR/calculator route is an execution packet suitable
-for fusion.
+Nodus graph composition and UI structure travel through
+`nodus.graph-definition.v1`; compiler computation does not travel by turning a
+ProcessGraph into Nodus modules.
 
 ## Canonical operation identity
 
@@ -72,25 +78,10 @@ registered tools, and verifies the numerical result. It also proves that an
 unresolved two-input call remains a visible structural node and is refused
 rather than guessed.
 
-## Remaining production intake boundary
+## No production ProcessGraph intake
 
-The test proves the wire grammar, canonical tool resolution, handle ABI, and
-numerical execution together. It does not turn the test executable into a UI
-or runtime importer. A production intake product still needs:
-
-- a versioned manifest retaining the GraphIR text, Turing provenance, ordered
-  named inputs, and explicitly named outputs;
-- dtype, rank, fixed/runtime extent, and ownership contracts for each boundary
-  value, using the same tensor ABI metadata as compiled row products;
-- explicit result identities rather than selecting the last unconsumed node;
-- multi-output and constant-tensor representation instead of the current
-  scalar-constant test materialization;
-- an adopter that applies the emitted `GraphEdit` records to Nodus's existing
-  editable graph surface and binds canonical nodes to registered tools; and
-- persistence of that adopted source/artifact relationship so a saved table
-  can show where its graph and tools came from.
-
-Control flow, unresolved calls, stateful/structural nodes, dimensional
-reductions, and operations outside the registered canonical subset remain
-named refusal boundaries. They must not be treated as elementwise pass-through
-nodes merely to make a graph load.
+`turing_process_graph_intake_test` remains useful regression evidence for the
+old GraphIR vocabulary and canonical operator IDs. It is not a roadmap for a
+manifest, adopter, or broader ProcessGraph importer. Control flow, unresolved
+calls, stateful nodes, reductions, and compiler value identity stay in Turing's
+SSA lowering rather than acquiring parallel Nodus graph semantics.

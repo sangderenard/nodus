@@ -11,9 +11,11 @@
 // Skips (exit 0) when no Vulkan device is present, so the suite stays green
 // on machines without one.
 #include "bitops_lowering.h"
+#include "canonical_ops.h"
 #include "kernel_spirv_assembler.h"
 #include "kernel_vulkan_runner.h"
 
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -81,6 +83,59 @@ spirv::KernelIR build_gray_kernel() {
     return k;
 }
 
+spirv::KernelIR build_scalar_concordance_kernel() {
+    spirv::KernelIR k;
+    k.name = "canonical_scalar_concordance";
+    k.element_count = 1;
+    k.suggested_local_size = {1, 1, 1};
+
+    const struct Probe {
+        OpCode opcode;
+        ops::CanonicalOp sub_op;
+        std::vector<Operand> inputs;
+    } probes[] = {
+        {OpCode::BINARY, ops::CanonicalOp::MOD,
+         {Operand::f(-5.5f), Operand::f(2.0f)}},
+        {OpCode::BINARY, ops::CanonicalOp::FLOORDIV,
+         {Operand::f(-5.5f), Operand::f(2.0f)}},
+        {OpCode::AND, ops::CanonicalOp::LOGICAL_AND,
+         {Operand::f(-2.0f), Operand::f(0.0f)}},
+        {OpCode::OR, ops::CanonicalOp::LOGICAL_OR,
+         {Operand::f(0.0f), Operand::f(-2.0f)}},
+        {OpCode::NOT, ops::CanonicalOp::LOGICAL_NOT,
+         {Operand::f(0.0f)}},
+        {OpCode::UNARY, ops::CanonicalOp::SIGN,
+         {Operand::f(-2.0f)}},
+        {OpCode::UNARY, ops::CanonicalOp::SIGMOID,
+         {Operand::f(0.0f)}},
+        {OpCode::UNARY, ops::CanonicalOp::ISFINITE,
+         {Operand::f(-2.0f)}},
+        {OpCode::UNARY, ops::CanonicalOp::ISNAN,
+         {Operand::f(NAN)}},
+        {OpCode::UNARY, ops::CanonicalOp::ISINF,
+         {Operand::f(INFINITY)}},
+    };
+
+    for (const auto& probe : probes) {
+        const std::uint32_t result = static_cast<std::uint32_t>(k.values.size());
+        k.values.push_back({{ScalarType::F32, {}, false, false}, "probe"});
+        k.instrs.push_back({probe.opcode, static_cast<std::int32_t>(probe.sub_op),
+                            probe.inputs, {{result}}});
+        const std::uint32_t output = static_cast<std::uint32_t>(k.values.size());
+        k.values.push_back({{ScalarType::F32, {}, true, false}, "probe_out"});
+        k.buffer_value_ids.push_back(output);
+        const std::uint32_t pointer = static_cast<std::uint32_t>(k.values.size());
+        k.values.push_back({{ScalarType::F32, {}, false, false}, "probe_ptr"});
+        k.instrs.push_back({OpCode::ADDR, -1,
+                            {Operand::ref({output}),
+                             Operand::ref({kernels::kGlobalIndexValue})},
+                            {{pointer}}});
+        k.instrs.push_back({OpCode::STORE, -1,
+                            {Operand::ref({pointer}), Operand::ref({result})}, {}});
+    }
+    return k;
+}
+
 } // namespace
 
 int main() {
@@ -137,6 +192,38 @@ int main() {
     std::cout << "[VK] PASS: " << kElements
               << " elements gray-encoded on device, all match the host reference"
               << " (e.g. in[7]=7 -> out[7]=" << output[7] << ")\n";
+
+    const spirv::KernelIR concordance = build_scalar_concordance_kernel();
+    const kernels::SpirvAssembly concordance_assembly =
+        kernels::assemble_kernel_ir_to_spirv(concordance);
+    if (!concordance_assembly.complete()) {
+        for (const auto& reason : concordance_assembly.shortfalls) {
+            std::cerr << "[VK] scalar concordance shortfall: " << reason << "\n";
+        }
+        return 1;
+    }
+    std::array<float, 10> observed{};
+    std::vector<kernels::VulkanBufferBinding> concordance_buffers;
+    for (float& value : observed) {
+        concordance_buffers.push_back({&value, sizeof(value), true});
+    }
+    if (!kernels::dispatch_spirv(
+            concordance_assembly.binary.words, concordance.name.c_str(),
+            concordance_buffers, 1, &error)) {
+        std::cerr << "[VK] scalar concordance dispatch failed: " << error << "\n";
+        return 1;
+    }
+    const std::array<float, 10> expected{
+        0.5f, -3.0f, 0.0f, 1.0f, 1.0f, -1.0f, 0.5f, 1.0f, 1.0f, 1.0f,
+    };
+    for (std::size_t i = 0; i < observed.size(); ++i) {
+        if (std::fabs(observed[i] - expected[i]) > 1e-6f) {
+            std::cerr << "[VK] scalar concordance mismatch " << i << ": got "
+                      << observed[i] << " want " << expected[i] << "\n";
+            return 1;
+        }
+    }
+    std::cout << "[VK] PASS: canonical scalar semantics agree on device\n";
 
     return 0;
 }

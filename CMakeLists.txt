@@ -839,6 +839,12 @@ set_tests_properties(nodus_headless_bridge_smoke PROPERTIES
 add_test(NAME nodus_python_graph_test
   COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/nodus_python_graph_test.py"
 )
+add_test(NAME turing_nodus_graph_crossing_test
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/turing_nodus_graph_crossing_test.py"
+)
+add_test(NAME turing_nodus_runtime_shape_crossing_test
+  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/turing_nodus_runtime_shape_crossing_test.py"
+)
 add_test(NAME turing_row_tool_compiler_test
   COMMAND ${Python3_EXECUTABLE} -m pytest -q
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_turing_row_tool_compiler.py"
@@ -851,6 +857,20 @@ add_test(NAME turing_shader_artifact_test
           "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_turing_shader_artifact.py"
 )
 set_tests_properties(turing_shader_artifact_test PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+add_test(NAME turing_spirv_product_test
+  COMMAND ${Python3_EXECUTABLE} -m pytest -q
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_turing_spirv_product.py"
+)
+set_tests_properties(turing_spirv_product_test PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+add_test(NAME turing_nodus_spirv_crossing_test
+  COMMAND ${Python3_EXECUTABLE}
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/turing_nodus_spirv_crossing_test.py"
+)
+set_tests_properties(turing_nodus_spirv_crossing_test PROPERTIES
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 add_executable(spirv_translation_stage_test
@@ -1148,6 +1168,20 @@ add_test(NAME artifact_import_test COMMAND test_artifact_import)
 add_executable(test_artifact_buffer_import
   tests/artifact_buffer_import_test.cpp
 )
+set_tests_properties(turing_nodus_graph_crossing_test PROPERTIES
+  ENVIRONMENT "NODUS_HEADLESS_TEST_DLL=$<TARGET_FILE:nodus_headless>"
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_headless>\;${TORCH_INSTALL_PREFIX}/lib"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  DEPENDS nodus_headless_runtime_test
+  TIMEOUT 180
+)
+set_tests_properties(turing_nodus_runtime_shape_crossing_test PROPERTIES
+  ENVIRONMENT "NODUS_HEADLESS_TEST_DLL=$<TARGET_FILE:nodus_headless>"
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_headless>\;${TORCH_INSTALL_PREFIX}/lib"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  DEPENDS nodus_headless_runtime_test
+  TIMEOUT 240
+)
 target_link_libraries(test_artifact_buffer_import PRIVATE nodus_tensor_core)
 target_compile_definitions(test_artifact_buffer_import PRIVATE
   NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
@@ -1178,6 +1212,14 @@ add_executable(test_vulkan_dispatch
 target_link_libraries(test_vulkan_dispatch PRIVATE nodus_tensor_core)
 target_compile_features(test_vulkan_dispatch PRIVATE cxx_std_20)
 add_test(NAME vulkan_dispatch_test COMMAND test_vulkan_dispatch)
+
+# Persistent Vulkan shader rows communicating through the ordinary FIFO ABI.
+add_executable(test_vulkan_ssbo_fifo
+  tests/vulkan_ssbo_fifo_test.cpp
+)
+target_link_libraries(test_vulkan_ssbo_fifo PRIVATE canvas_tables_static)
+target_compile_features(test_vulkan_ssbo_fifo PRIVATE cxx_std_20)
+add_test(NAME vulkan_ssbo_fifo_test COMMAND test_vulkan_ssbo_fifo)
 
 # KernelIR -> CPU. The same two kernels vulkan_dispatch_test builds, run
 # through the interpreter, so opcode semantics are checked with no device.

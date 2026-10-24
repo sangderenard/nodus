@@ -479,6 +479,9 @@ int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, u
 // large enough to hold the sample; `out_written` is set to the number of
 // bytes written.
 int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written);
+// Consume one typed element directly into a RawStackFrame. The edge's
+// configured type and byte width must exactly match `type_id`.
+int32_t gp_table_edge_consume_into_frame(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, struct RawStackFrame* dst_frame, int32_t type_id);
 int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written);
 
 // Pointer-oriented edge publish/consume helpers.

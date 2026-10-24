@@ -6,10 +6,21 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -71,7 +82,9 @@ struct BufferValue {
 };
 
 struct BufferExtent {
+    enum class Kind { Axis, ElementCount, Rank };
     std::string ssa_id;
+    Kind kind = Kind::Axis;
     uint32_t axis = 0;
 };
 
@@ -232,13 +245,39 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
             doc.buffer_order.push_back(std::move(id));
         } else if (tag == "EXTENT") {
             BufferExtent extent;
-            int64_t axis = -1;
-            ss >> std::quoted(extent.ssa_id) >> axis;
-            if (!ss || extent.ssa_id.empty() || axis < 0) {
+            std::string selector;
+            ss >> std::quoted(extent.ssa_id) >> selector;
+            if (!ss || extent.ssa_id.empty() || selector.empty()) {
                 *err = "line " + std::to_string(line_no) + ": malformed EXTENT";
                 return false;
             }
-            extent.axis = static_cast<uint32_t>(axis);
+            const std::string normalized = lowercase(selector);
+            if (normalized == "element_count" || normalized == "numel") {
+                extent.kind = BufferExtent::Kind::ElementCount;
+            } else if (normalized == "rank") {
+                extent.kind = BufferExtent::Kind::Rank;
+            } else {
+                try {
+                    size_t consumed = 0;
+                    const long long axis = std::stoll(selector, &consumed, 10);
+                    if (consumed != selector.size() || axis < 0 ||
+                        static_cast<unsigned long long>(axis) >
+                            std::numeric_limits<uint32_t>::max()) {
+                        throw std::out_of_range("extent axis");
+                    }
+                    extent.kind = BufferExtent::Kind::Axis;
+                    extent.axis = static_cast<uint32_t>(axis);
+                } catch (const std::exception&) {
+                    *err = "line " + std::to_string(line_no) +
+                           ": unknown EXTENT selector '" + selector + "'";
+                    return false;
+                }
+            }
+            std::string trailing;
+            if (ss >> trailing) {
+                *err = "line " + std::to_string(line_no) + ": trailing EXTENT fields";
+                return false;
+            }
             doc.extent_order.push_back(std::move(extent));
         } else if (tag == "SHAPE") {
             if (doc.version < 2) {
@@ -323,8 +362,10 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
     }
     for (const auto& extent : doc.extent_order) {
         const BufferValue* value = find_buffer_value(doc, extent.ssa_id);
-        if (!value || extent.axis >= value->shape.size()) {
-            *err = "EXTENT references unknown value or invalid axis for '" + extent.ssa_id + "'";
+        if (!value || (extent.kind == BufferExtent::Kind::Axis &&
+                       extent.axis >= value->shape.size())) {
+            *err = "EXTENT references unknown value or invalid selector for '" +
+                   extent.ssa_id + "'";
             return false;
         }
     }
@@ -833,6 +874,8 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     const char* extent_type = doc.extent_dtype == "i32" ? "int32_t" : "int64_t";
     ss << "using Extent = " << extent_type << ";\n";
     ss << "using EntryFn = void (*)(void**, Extent*);\n";
+    ss << "using ValidationResetFn = void (*)();\n";
+    ss << "using ValidationTakeFn = uint32_t (*)();\n";
     ss << "class ImportedBufferTool_" << sym << " final : public ITool {\npublic:\n";
     ss << "    const char* id_cstr() const noexcept override { return \""
        << escape_cpp_string(doc.tool_id) << "\"; }\n";
@@ -851,10 +894,17 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
        << escape_cpp_string(doc.entry) << "\"));\n";
     ss << "                if (!entry_) fprintf(stderr, \"[imported-buffer:" << sym
        << "] entry symbol not found: " << escape_cpp_string(doc.entry) << "\\n\");\n";
+    ss << "                validation_reset_ = reinterpret_cast<ValidationResetFn>(GetProcAddress(static_cast<HMODULE>(module_), \"turing_validation_error_reset\"));\n";
+    ss << "                validation_take_ = reinterpret_cast<ValidationTakeFn>(GetProcAddress(static_cast<HMODULE>(module_), \"turing_validation_error_take\"));\n";
+    ss << "                if ((validation_reset_ == nullptr) != (validation_take_ == nullptr)) {\n"
+          "                    fprintf(stderr, \"[imported-buffer:" << sym
+       << "] incomplete validation-error ABI; disabling it\\n\");\n"
+          "                    validation_reset_ = nullptr; validation_take_ = nullptr;\n"
+          "                }\n";
     ss << "            }\n        }\n#endif\n    }\n";
     ss << "    void shutdown() override {\n#ifdef _WIN32\n"
           "        if (module_) { FreeLibrary(static_cast<HMODULE>(module_)); module_ = nullptr; }\n"
-          "#endif\n        entry_ = nullptr;\n    }\n";
+          "#endif\n        entry_ = nullptr; validation_reset_ = nullptr; validation_take_ = nullptr;\n    }\n";
     ss << "    void tick(double, HostAPI&) override {}\n";
     ss << "    void render(RenderContext&) override {}\n";
     ss << "    int32_t port_count() const override { return 2; }\n";
@@ -899,6 +949,7 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "        std::array<bool, " << doc.values.size() << "> mapped{};\n";
     ss << "        std::array<NodusTensorDesc, " << doc.values.size() << "> descs{};\n";
     ss << "        auto fail = [&]() {\n"
+          "            ctx.succeeded = false;\n"
           "            for (size_t i = 0; i < handles.size(); ++i) if (mapped[i]) nodus_tensor_unmap(handles[i].id);\n"
           "            for (int idx : kOutputs) if (handles[static_cast<size_t>(idx)].id) nodus_tensor_destroy(handles[static_cast<size_t>(idx)].id);\n"
           "            for (int idx : kWorkspaces) if (handles[static_cast<size_t>(idx)].id) nodus_tensor_destroy(handles[static_cast<size_t>(idx)].id);\n"
@@ -980,11 +1031,22 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     for (size_t i = 0; i < doc.extent_order.size(); ++i) {
         if (i) ss << ", ";
         const size_t value_index = buffer_value_index(doc, doc.extent_order[i].ssa_id);
-        ss << "static_cast<Extent>(descs[" << value_index << "].shape["
-           << doc.extent_order[i].axis << "])";
+        const auto& extent = doc.extent_order[i];
+        ss << "static_cast<Extent>(descs[" << value_index << "].";
+        if (extent.kind == BufferExtent::Kind::Axis) {
+            ss << "shape[" << extent.axis << "]";
+        } else if (extent.kind == BufferExtent::Kind::ElementCount) {
+            ss << "element_count";
+        } else {
+            ss << "rank";
+        }
+        ss << ")";
     }
     ss << "};\n";
+    ss << "        if (validation_reset_) validation_reset_();\n";
     ss << "        entry_(buffers.data(), extents.empty() ? nullptr : extents.data());\n";
+    ss << "        if (validation_take_) { const uint32_t validation_code = validation_take_(); if (validation_code != 0) { fprintf(stderr, \"[imported-buffer:"
+       << sym << "] runtime validation failed with code %u\\n\", validation_code); fail(); return; } }\n";
     ss << "        for (size_t i = 0; i < handles.size(); ++i) { if (mapped[i]) { nodus_tensor_unmap(handles[i].id); mapped[i] = false; } }\n";
     ss << "        for (int idx : kWorkspaces) { nodus_tensor_destroy(handles[static_cast<size_t>(idx)].id); handles[static_cast<size_t>(idx)].id = 0; }\n";
     ss << "        int pushed = 0;\n"
@@ -997,7 +1059,9 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
           "            ++pushed;\n"
           "        }\n"
           "    }\n";
-    ss << "private:\n    void* module_ = nullptr;\n    EntryFn entry_ = nullptr;\n};\n} // namespace\n\n";
+    ss << "private:\n    void* module_ = nullptr;\n    EntryFn entry_ = nullptr;\n"
+          "    ValidationResetFn validation_reset_ = nullptr;\n"
+          "    ValidationTakeFn validation_take_ = nullptr;\n};\n} // namespace\n\n";
     ss << "extern \"C\" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new ImportedBufferTool_"
        << sym << "(); }\n";
     ss << "extern \"C\" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* t) { delete t; }\n";
@@ -1027,6 +1091,38 @@ void copy_path_out(const fs::path& path, char* out, int32_t cap) {
     const std::string value = path.generic_string();
     std::strncpy(out, value.c_str(), static_cast<size_t>(cap) - 1);
     out[cap - 1] = '\0';
+}
+
+bool validate_buffer_entry_symbol(const fs::path& artifact_path,
+                                  const std::string& entry,
+                                  std::string* err) {
+    if (!fs::is_regular_file(artifact_path)) {
+        *err = "artifact is not a regular file: " + artifact_path.generic_string();
+        return false;
+    }
+#ifdef _WIN32
+    const fs::path absolute = fs::absolute(artifact_path);
+    HMODULE module = LoadLibraryExA(
+        absolute.string().c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!module) {
+        *err = "artifact cannot be loaded (Windows error " +
+               std::to_string(GetLastError()) + "): " + absolute.generic_string();
+        return false;
+    }
+    const bool found = GetProcAddress(module, entry.c_str()) != nullptr;
+    FreeLibrary(module);
+    if (!found) {
+        *err = "artifact does not export declared buffer entry '" + entry + "'";
+        return false;
+    }
+#else
+    // Buffer row wrappers are currently a Windows loading surface. Keep the
+    // descriptor validation portable without pretending to preflight a
+    // loader that the generated non-Windows wrapper does not yet implement.
+    (void)entry;
+#endif
+    return true;
 }
 
 } // namespace
@@ -1120,6 +1216,12 @@ extern "C" int gp_artifact_import_buffer_abi(const char* descriptor_path,
     std::string err;
     if (!parse_buffer_abi(descriptor_path, &doc, &err)) {
         std::cerr << "artifact_importer: buffer ABI refusal: " << err << "\n";
+        local.shortfalls = 1;
+        if (report) *report = local;
+        return 0;
+    }
+    if (!validate_buffer_entry_symbol(artifact_path, doc.entry, &err)) {
+        std::cerr << "artifact_importer: buffer artifact refusal: " << err << "\n";
         local.shortfalls = 1;
         if (report) *report = local;
         return 0;

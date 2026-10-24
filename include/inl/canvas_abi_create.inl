@@ -131,6 +131,7 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_input_layout.emplace_back();
     c->module_output_layout.emplace_back();
     c->module_io_rows.emplace_back();
+    c->graph->module_stack_contract.push_back(ModuleStackContract::Opaque);
     c->module_table_rows.emplace_back();
     c->module_frame_leds.push_back(make_module_frame_led_group());
     c->module_frame_links.emplace_back();
@@ -154,6 +155,30 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     sync_module_table_io_layout(c, new_idx);
     update_canvas_scroll_state(c, /*pull_from_container=*/false);
     return new_idx;
+}
+
+extern "C" int gp_canvas_get_module_count(GP_CanvasContext* ctx_) {
+    if (!ctx_) return -1;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    return static_cast<int>(c->modules.size());
+}
+
+extern "C" int gp_canvas_get_module_desc(GP_CanvasContext* ctx_, int module_idx,
+                                             GP_CanvasModuleDesc* out_desc) {
+    if (!ctx_ || !out_desc) return 0;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return 0;
+    *out_desc = c->modules[static_cast<size_t>(module_idx)];
+    return 1;
+}
+
+extern "C" int gp_canvas_set_module_desc(GP_CanvasContext* ctx_, int module_idx,
+                                             const GP_CanvasModuleDesc* desc) {
+    if (!ctx_ || !desc || desc->w <= 0 || desc->h <= 0) return 0;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return 0;
+    c->modules[static_cast<size_t>(module_idx)] = *desc;
+    return 1;
 }
 
 extern "C" int gp_canvas_move_module(GP_CanvasContext* ctx_, int module_idx, int x, int y) {

@@ -31,9 +31,10 @@ Adding an opcode taxes every current and future backend, forever. Adding a
 
 Anything that is not primitive is **defined as a recipe that emits Tier-0**,
 never as an opcode. `include/bitops_lowering.h` is the original example
-(gray-code as AND/XOR/shift); `include/tier1_lowering.h` holds the tensor
-composites (reduce, affine generate). A composite expressed here lowers to
-every backend that implements Tier-0 — one definition, N emitters.
+(gray-code as AND/XOR/shift); `include/tier1_lowering.h` is the tensor-recipe
+authority and currently defines reduction, row-major contraction, and affine
+generation. A composite expressed here lowers to every backend that implements
+Tier-0 — one definition, N emitters.
 
 The catalog records which family a composite belongs to
 (`OpDesc::tier1_class` in `include/canonical_ops.h`: `reduce`, `contract`,
@@ -96,6 +97,25 @@ missing:
 With those two, `sum` became a Tier-1 recipe
 (`tier1::lower_reduce`) and ran correctly on an NVIDIA GTX 1660 SUPER:
 `spirv-val`-clean, 16320 on device against 16320 on host.
+
+## Capability receipt (2026-10-24)
+
+The catalog and concrete backends are now checked together rather than trusted
+independently. `tests/eigen_kernel_test.cpp` constructs every operation marked
+`lowerable` in `ops/canonical_ops.json` and requires both the CPU interpreter
+and direct SPIR-V assembler to accept it. The emitted modules are also suitable
+for batch validation with `spirv-val --target-env vulkan1.1`.
+
+That reconciliation repaired semantic mismatches in `mod`, `floordiv`, logical
+operations, `isfinite`/`isnan`/`isinf`, `sign`, and `sigmoid`. It also established
+executable Tier-1 proofs for:
+
+- reduction: `sum(1..64) == 2080`;
+- contraction: a `2x3 @ 3x2` row-major product;
+- generation: `start + index * step`.
+
+All three recipes execute through the CPU authority and assemble through the
+same direct SPIR-V authority. They introduce no composite opcode.
 
 ## Cooperative execution (design, in progress)
 

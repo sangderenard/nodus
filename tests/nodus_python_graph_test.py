@@ -10,6 +10,8 @@ import pathlib
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from nodus_graph import (
@@ -17,12 +19,16 @@ from nodus_graph import (
     ExecutionContract,
     FifoConfig,
     Graph,
+    GraphDefinition,
     Input,
+    ModuleDefinition,
     Output,
     PluginTool,
     PublishResult,
+    SchedulerMode,
     Tool,
     UnsupportedNativeContract,
+    graph_definition_from_row_product,
 )
 
 
@@ -60,6 +66,10 @@ def test_scalar_stack_and_native_roundtrip() -> None:
         path = pathlib.Path(tmp) / "scalar.canvas"
         with Graph() as graph:
             module = build_scalar_graph(graph)
+            serialized = module.export_to_root(pathlib.Path(tmp) / "materialized")
+            blob = serialized.read_bytes()
+            assert b"INPUT" in blob and b"Subtract" in blob
+            assert b"Multiply" in blob and b"OUTPUT" in blob
             # First-token visibility, stack operand order, and a later tick.
             push_case(graph, 9.0, 4.0, 3.0, 15.0)
             push_case(graph, 10.0, 2.0, 4.0, 32.0)
@@ -99,6 +109,21 @@ def test_two_module_fifo() -> None:
         graph.step()
         assert_close(graph.pull_f32("result"), 20.0)
         assert graph.edge_fifo_state(graph.edges[0]).unread == 0
+
+
+def test_vulkan_fifo_storage_is_communicated_and_read_back() -> None:
+    fifo = FifoConfig(token_bytes=256, slots=2, top_k=0, type_id=91,
+                      layout=0, dtype=14, storage="vulkan")
+    try:
+        with Graph() as graph:
+            producer = graph.add_module("shader A").set_rows(Input(), Output())
+            consumer = graph.add_module("shader B").set_rows(Input(), Output())
+            edge = graph.connect(producer.output(0), consumer.input(0), fifo=fifo)
+            assert graph.edge_fifo_state(edge).config == fifo
+    except RuntimeError as error:
+        if "FIFO configuration failed" in str(error):
+            pytest.skip("no Vulkan compute backend available")
+        raise
 
 
 def test_fifo_reject_drop_inspection_and_invalid_calls() -> None:
@@ -252,7 +277,7 @@ def test_failed_load_preserves_bindings_and_successful_load_invalidates_handles(
                 raise AssertionError("pre-load module handle remained usable")
 
 
-def test_pointer_contract_is_explicitly_refused() -> None:
+def test_pointer_contract_reaches_native_scheduler() -> None:
     with Graph() as graph:
         module = graph.add_module("tensor")
         module.set_rows(
@@ -263,12 +288,28 @@ def test_pointer_contract_is_explicitly_refused() -> None:
             ),
             Output(1),
         )
-        try:
-            graph.step()
-        except UnsupportedNativeContract as exc:
-            assert "AbstractTensor pointers" in str(exc)
-        else:
-            raise AssertionError("pointer/scalar contract mismatch was not refused")
+        assert module.native_contract is ExecutionContract.ABSTRACT_TENSOR_POINTER
+        # Typed connector transport now owns this contract. A missing plugin
+        # produces no value, but the graph is no longer rejected merely for
+        # carrying AbstractTensorHandle values.
+        graph.step()
+
+
+def test_typed_fifo_does_not_select_stack_transfer() -> None:
+    """FIFO schema and module stack currency remain independent choices."""
+    typed_f32 = FifoConfig(token_bytes=4, slots=4, top_k=1, type_id=0)
+    with Graph() as graph:
+        module = graph.add_module("typed-fifo-scalar-stack").set_rows(
+            Input(2), Tool(BuiltinTool.ADD), Output(1),
+        )
+        assert module.native_contract is ExecutionContract.SCALAR_F32
+        graph.bind_input("left", module.input(0), fifo=typed_f32)
+        graph.bind_input("right", module.input(1), fifo=typed_f32)
+        graph.bind_output("sum", module.output(0), fifo=typed_f32)
+        graph.push_f32("left", 6.25)
+        graph.push_f32("right", 1.75)
+        graph.step()
+        assert_close(graph.pull_f32("sum"), 8.0)
 
 
 def test_simultaneous_graphs_are_refused() -> None:
@@ -313,6 +354,107 @@ def test_duplicate_stable_identity_is_refused() -> None:
             raise AssertionError("duplicate stable identity was accepted")
 
 
+def test_complete_definition_roundtrip_and_execution() -> None:
+    edge_fifo = FifoConfig.scalar_f32(slots=7, top_k=0)
+    port_fifo = FifoConfig.scalar_f32(slots=5, top_k=1)
+    with Graph() as source:
+        producer = source.add_module(
+            "producer", x=10, y=20, width=300, height=180, stable_id=0xB001,
+        ).set_rows(Input(2), Tool(BuiltinTool.ADD), Output(1))
+        consumer = source.add_module(
+            "consumer", x=400, y=20, width=320, height=200, stable_id=0xB002,
+        ).set_rows(Input(2), Tool(BuiltinTool.MULTIPLY), Output(1))
+        source.connect(producer.output(0), consumer.input(0), fifo=edge_fifo)
+        source.bind_input("x", producer.input(0), fifo=port_fifo)
+        source.bind_input("y", producer.input(1), fifo=port_fifo)
+        source.bind_input("scale", consumer.input(1), fifo=port_fifo)
+        source.bind_output("result", consumer.output(0), fifo=port_fifo, start_at_head=False)
+        definition = source.definition()
+
+    wire = definition.to_mapping()
+    received = GraphDefinition.from_mapping(wire)
+    assert received == definition
+    assert received.edges[0].source.module_id == 0xB001
+    assert received.edges[0].target.module_id == 0xB002
+    assert received.edges[0].fifo == edge_fifo
+
+    with Graph(scheduler=received.scheduler) as restored:
+        restored.apply_definition(received)
+        assert restored.definition() == received
+        # Negative control: corrupt every executable Python-side cache that
+        # the former implementation used to echo.  Definition readback must
+        # still come from Canvas/Table and the native named-port bindings.
+        restored.scheduler = SchedulerMode.FREE_SPINNING
+        restored.modules[0].label = "poisoned Python cache"
+        restored.modules[0].x = -999
+        restored.modules[0].rows = ()
+        restored.modules[0].contract = ExecutionContract.OPAQUE
+        restored.edges.clear()
+        restored._input_ports.clear()
+        restored._output_ports.clear()
+        assert restored.definition() == received
+        restored.push_f32("x", 2.0)
+        restored.push_f32("y", 3.0)
+        restored.push_f32("scale", 4.0)
+        restored.step()
+        assert_close(restored.pull_f32("result"), 20.0)
+
+
+def test_definition_refuses_contract_disagreement_before_native_adoption() -> None:
+    try:
+        GraphDefinition(modules=(ModuleDefinition(
+            stable_id=1,
+            label="wrong-contract",
+            rows=(Input(2), Tool(BuiltinTool.ADD), Output(1)),
+            contract=ExecutionContract.OPAQUE,
+        ),))
+    except ValueError as exc:
+        assert "does not match declared" in str(exc)
+    else:
+        raise AssertionError("graph definition accepted a row-contract disagreement")
+
+
+def test_runtime_shape_sources_are_communicable() -> None:
+    product = {
+        "buffer_abi": {
+            "schema": "nodus-turing-buffer-abi-v2",
+            "tool_id": "imported.dynamic.c",
+            "tool_name": "dynamic tensor row",
+            "arguments": [10],
+            "outputs": [20],
+            "buffers": [
+                {
+                    "ssa_value_id": 10, "column": "source", "dtype": "f64",
+                    "shape": [None, None],
+                    "shape_sources": [
+                        {"ssa_value_id": 10, "axis": 0},
+                        {"ssa_value_id": 10, "axis": 1},
+                    ],
+                },
+                {
+                    "ssa_value_id": 20, "column": "result", "dtype": "f64",
+                    "shape": [None, None],
+                    "shape_sources": [
+                        {"ssa_value_id": 10, "axis": 0},
+                        {"ssa_value_id": 10, "axis": 1},
+                    ],
+                },
+            ],
+        },
+    }
+    definition = graph_definition_from_row_product(
+        product, stable_id=0xD1A6, abstract_tensor_type_id=17,
+    )
+    source, result = definition.connectors
+    assert source.tensor.shape == (None, None)
+    assert tuple(item.connector for item in source.tensor.shape_sources) == (
+        source.reference, source.reference,
+    )
+    assert tuple(item.axis for item in result.tensor.shape_sources) == (0, 1)
+    assert all(item.connector == source.reference for item in result.tensor.shape_sources)
+    assert GraphDefinition.from_mapping(definition.to_mapping()) == definition
+
+
 def main() -> int:
     cases = [
         test_scalar_stack_and_native_roundtrip,
@@ -321,10 +463,14 @@ def main() -> int:
         test_native_stack_display_snapshots,
         test_two_module_fifo_reload_requires_explicit_reattachment,
         test_failed_load_preserves_bindings_and_successful_load_invalidates_handles,
-        test_pointer_contract_is_explicitly_refused,
+        test_pointer_contract_reaches_native_scheduler,
+        test_typed_fifo_does_not_select_stack_transfer,
         test_simultaneous_graphs_are_refused,
         test_fifo_absence_and_invalid_capacity_are_explicit,
         test_duplicate_stable_identity_is_refused,
+        test_complete_definition_roundtrip_and_execution,
+        test_definition_refuses_contract_disagreement_before_native_adoption,
+        test_runtime_shape_sources_are_communicable,
     ]
     for case in cases:
         case()

@@ -71,12 +71,15 @@ int gp_artifact_import(const char* api_yaml_path,
 //     BUFFER "ssa.input"
 //     BUFFER "ssa.tmp"
 //     BUFFER "ssa.output"
-//     EXTENT "ssa.input" 0
+//     EXTENT "ssa.input" 0              # one shape axis
+//     EXTENT "ssa.input" ELEMENT_COUNT  # complete logical element count
+//     EXTENT "ssa.input" RANK           # tensor rank
 //     SHAPE "ssa.output" 0 FROM "ssa.input" 0
 //     SHAPE "ssa.tmp" 0 FROM "ssa.input" 0
 //
 // VALUE order is the row stack order. BUFFER and EXTENT records are passed
-// to the backend in their exact declared order. EXTENT_DTYPE is mandatory
+// to the backend in their exact declared order. An EXTENT selector is either
+// a zero-based shape axis, ELEMENT_COUNT, or RANK. EXTENT_DTYPE is mandatory
 // and is checked against BACKEND rather than conflating C's i64 and LLVM's
 // i32 contracts.
 // Ranks must fit NODUS_TENSOR_MAX_RANK. A '?' input extent is read from its

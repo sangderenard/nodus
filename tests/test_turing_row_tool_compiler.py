@@ -270,7 +270,7 @@ def test_fortran_product_retains_turing_api_descriptor(tmp_path):
     )
 
 
-def test_non_shape_extent_is_refused_instead_of_mistranslated(tmp_path):
+def test_element_count_extent_is_preserved_instead_of_mistranslated(tmp_path):
     compiler = FakeCompiler()
     original = compiler.emit_c
 
@@ -280,7 +280,25 @@ def test_non_shape_extent_is_refused_instead_of_mistranslated(tmp_path):
         return artifact
 
     compiler.emit_c = emit_c
-    with pytest.raises(ProductError, match="axis-addressed shape extents"):
+    manifest = compile_row_tool(request(tmp_path), compiler=compiler)
+    descriptor = (
+        tmp_path / "product" / "backend" / "row_c.nodus_buffer_abi.txt"
+    ).read_text()
+    assert manifest["buffer_abi"]["extent_order"] == [[1, "numel", None]]
+    assert 'EXTENT "%t1" ELEMENT_COUNT' in descriptor
+
+
+def test_unknown_extent_kind_is_refused(tmp_path):
+    compiler = FakeCompiler()
+    original = compiler.emit_c
+
+    def emit_c(*args, **kwargs):
+        artifact = original(*args, **kwargs)
+        artifact.extent_order = ((1, "mystery", None),)
+        return artifact
+
+    compiler.emit_c = emit_c
+    with pytest.raises(ProductError, match="unsupported .* extent kind"):
         compile_row_tool(request(tmp_path), compiler=compiler)
 
 

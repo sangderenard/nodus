@@ -46,6 +46,16 @@ enum class ModuleToolOrigin : int8_t {
     Plugin = 1,
 };
 
+// How a module's Input/Output rows exchange values with edge FIFOs.  This is
+// deliberately independent of the FIFO's type_id: a typed FIFO describes its
+// payload, while this contract selects whether row I/O uses the ordinary f32
+// path or transfers a typed element through the module RawStackFrame.
+enum class ModuleStackContract : int8_t {
+    ScalarF32 = 0,
+    AbstractTensorPointer = 1,
+    Opaque = 2,
+};
+
 struct ModuleIORow {
     ModuleRowKind kind = ModuleRowKind::Tool;
     int contact_idx = 0;
@@ -134,6 +144,7 @@ public:
             int32_t module_skip = 0; // 1 = skip entire module (no tool/table work)
             int32_t exec_skip_count = 0; // number of frames to skip between executions (0 = every frame)
             ExecMode exec_mode = ExecMode::Pooled;
+            ModuleStackContract stack_contract = ModuleStackContract::Opaque;
         };
 
     struct EdgeContract {

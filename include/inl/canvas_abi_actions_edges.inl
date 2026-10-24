@@ -749,6 +749,17 @@ extern "C" int gp_canvas_find_edge(GP_CanvasContext* ctx_, const GP_CanvasEdgeDe
     return -1;
 }
 
+extern "C" int gp_canvas_get_edge(GP_CanvasContext* ctx_, int edge_idx,
+                                      GP_CanvasEdgeDesc* out_desc, int* out_type_id) {
+    if (!ctx_ || !out_desc || !out_type_id) return 0;
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (edge_idx < 0 || edge_idx >= static_cast<int>(c->edges.size())) return 0;
+    const auto& edge = c->edges[static_cast<size_t>(edge_idx)];
+    *out_desc = edge.desc;
+    *out_type_id = edge.type_id;
+    return 1;
+}
+
 // add an edge with an explicit type id. type_id == 0 means untyped/wildcard.
 extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_CanvasEdgeDesc* desc, int type_id) {
     if (!ctx_ || !desc) return -1;

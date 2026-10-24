@@ -125,12 +125,16 @@ def load_canvas_lib():
     lib.gp_canvas_create.argtypes = (ctypes.c_int, ctypes.c_int)
     lib.gp_canvas_destroy.restype = None
     lib.gp_canvas_destroy.argtypes = (ctypes.c_void_p,)
+    lib.gp_canvas_set_size.restype = ctypes.c_int
+    lib.gp_canvas_set_size.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
     lib.gp_canvas_add_module.restype = ctypes.c_int
     lib.gp_canvas_add_module.argtypes = (ctypes.c_void_p, ctypes.POINTER(CanvasModuleDesc))
     lib.gp_canvas_move_module.restype = ctypes.c_int
     lib.gp_canvas_move_module.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int)
     lib.gp_canvas_add_edge.restype = ctypes.c_int
     lib.gp_canvas_add_edge.argtypes = (ctypes.c_void_p, ctypes.POINTER(CanvasEdgeDesc))
+    lib.gp_canvas_load_from_file.restype = ctypes.c_int
+    lib.gp_canvas_load_from_file.argtypes = (ctypes.c_void_p, ctypes.c_char_p)
     lib.gp_canvas_set_cable_style.restype = ctypes.c_int
     lib.gp_canvas_set_cable_style.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
     lib.gp_canvas_set_edge_hues.restype = ctypes.c_int
@@ -188,6 +192,12 @@ def load_canvas_lib():
     lib.gp_canvas_set_container_table.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
     lib.gp_canvas_get_container_table.restype = ctypes.c_void_p
     lib.gp_canvas_get_container_table.argtypes = (ctypes.c_void_p,)
+    lib.gp_plugin_load_from_path.restype = ctypes.c_int
+    lib.gp_plugin_load_from_path.argtypes = (
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
+    )
+    lib.gp_plugin_unload.restype = ctypes.c_int
+    lib.gp_plugin_unload.argtypes = (ctypes.c_char_p,)
     return lib
 
 
@@ -206,14 +216,38 @@ def make_module(x, y, w, h, left, right, label: str) -> CanvasModuleDesc:
 class CanvasBackend:
     """Owns the native canvas context and exposes raster/event helpers."""
 
-    def __init__(self, width: int, height: int, step_dt: float = 1.0 / 60.0):
+    def __init__(self, width: int, height: int, step_dt: float = 1.0 / 60.0,
+                 canvas_path: Optional[pathlib.Path] = None,
+                 plugin_paths: tuple[pathlib.Path, ...] = ()):
         self.width = width
         self.height = height
         self.step_dt = step_dt
         self.lib = load_canvas_lib()
+        self.plugin_paths = plugin_paths
+        self.loaded_plugins: list[str] = []
+        for plugin_path in plugin_paths:
+            loaded_id = ctypes.create_string_buffer(1024)
+            if not self.lib.gp_plugin_load_from_path(
+                os.fsencode(plugin_path), loaded_id, len(loaded_id),
+            ):
+                raise RuntimeError(f"failed to load graph plugin: {plugin_path}")
+            self.loaded_plugins.append(loaded_id.value.decode())
         self.ctx = self.lib.gp_canvas_create(width, height)
         if not self.ctx:
             raise RuntimeError("gp_canvas_create failed")
+        self.canvas_path = None if canvas_path is None else canvas_path.resolve()
+        if self.canvas_path is not None:
+            if not self.lib.gp_canvas_load_from_file(
+                self.ctx, os.fsencode(self.canvas_path)
+            ):
+                self.lib.gp_canvas_destroy(self.ctx)
+                raise RuntimeError(f"gp_canvas_load_from_file failed: {self.canvas_path}")
+            # Headless graph saves intentionally carry a 1x1 logical canvas.
+            # The web surface owns its viewport, so restore that size after the
+            # graph has been loaded rather than rasterizing only the first pixel.
+            if not self.lib.gp_canvas_set_size(self.ctx, width, height):
+                self.lib.gp_canvas_destroy(self.ctx)
+                raise RuntimeError("gp_canvas_set_size failed after canvas load")
 
         self.buf_len = width * height * 4
         self.buf = (ctypes.c_ubyte * self.buf_len)()
@@ -241,6 +275,9 @@ class CanvasBackend:
         self._step_thread.join(timeout=1.0)
         with self.lock:
             self.lib.gp_canvas_destroy(self.ctx)
+            for plugin_id in reversed(self.loaded_plugins):
+                self.lib.gp_plugin_unload(plugin_id.encode())
+            self.loaded_plugins.clear()
 
     def handle_mouse(self, kind: str, x: int, y: int, dx: float = 0.0, dy: float = 0.0, button: int = 0, scroll: float = 0.0) -> bool:
         with self.lock:
@@ -337,7 +374,9 @@ def _server_reload_backend(server: "CanvasHTTPServer") -> None:
     _build_project()
 
     # replace backend with a newly-loaded one
-    new = CanvasBackend(width, height, step_dt)
+    new = CanvasBackend(
+        width, height, step_dt, old.canvas_path, old.plugin_paths,
+    )
     server.backend = new
     server.rendered_html = HTML_TEMPLATE.format(w=width, h=height)
 
@@ -558,7 +597,7 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
                         w, h, step_dt = self.server.last_backend_size
                     else:
                         w, h, step_dt = 1000, 360, 1.0 / 60.0
-                    new = CanvasBackend(w, h, step_dt)
+                    new = CanvasBackend(w, h, step_dt, None)
                     self.server.backend = new
                     self.server.rendered_html = HTML_TEMPLATE.format(w=w, h=h)
             except Exception as exc:
@@ -634,8 +673,13 @@ class CanvasHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
             self.last_backend_size = None
 
 
-def run_server(host: str, port: int, width: int, height: int, step_dt: float) -> int:
-    backend = CanvasBackend(width, height, step_dt=step_dt)
+def run_server(host: str, port: int, width: int, height: int, step_dt: float,
+               canvas_path: Optional[pathlib.Path] = None,
+               plugin_paths: tuple[pathlib.Path, ...] = ()) -> int:
+    backend = CanvasBackend(
+        width, height, step_dt=step_dt, canvas_path=canvas_path,
+        plugin_paths=plugin_paths,
+    )
     server = CanvasHTTPServer((host, port), CanvasRequestHandler, backend)
     print(f"Serving canvas frames on http://{host}:{port}")
     try:
@@ -779,13 +823,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1000, help="Canvas width in pixels")
     parser.add_argument("--height", type=int, default=720, help="Canvas height in pixels")
     parser.add_argument("--step-dt", type=float, default=1.0 / 60.0, help="Simulation step size in seconds")
+    parser.add_argument(
+        "--canvas", type=pathlib.Path,
+        help="Load an existing native CANVAS graph before serving frames",
+    )
+    parser.add_argument(
+        "--plugin", action="append", type=pathlib.Path, default=[],
+        help="Load a plugin DLL before restoring the canvas (repeatable)",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     if args.mode == "server":
-        return run_server(args.host, args.port, args.width, args.height, args.step_dt)
+        return run_server(
+            args.host, args.port, args.width, args.height, args.step_dt,
+            args.canvas, tuple(path.resolve() for path in args.plugin),
+        )
     return run_pygame_demo(args.width, args.height)
 
 

@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "mem_backend.h"
+
 namespace nodus {
 namespace kernels {
 
@@ -29,6 +31,15 @@ struct VulkanBufferBinding {
     void* data = nullptr;      // host memory: uploaded before, read back after
     std::size_t bytes = 0;
     bool readback = false;     // copy device contents back into `data` after
+};
+
+// Persistent backend binding. `backend` must be a buffer allocated from a
+// GP_MEM_BACKEND_VULKAN context. Offsets make FIFO ring slots bindable without
+// copying them into a temporary Vulkan allocation.
+struct VulkanBackendBinding {
+    gp_mem_backend_handle_t backend = nullptr;
+    std::size_t offset = 0;
+    std::size_t bytes = 0;
 };
 
 // True when a Vulkan instance and a compute-capable physical device exist.
@@ -47,6 +58,15 @@ bool dispatch_spirv(const std::vector<std::uint32_t>& spirv,
                     std::vector<VulkanBufferBinding>& buffers,
                     std::uint32_t group_count_x,
                     std::string* error);
+
+// Dispatch directly against persistent Vulkan backend buffers. All bindings
+// must originate from one compatible Vulkan context.
+bool dispatch_spirv_backends(
+    const std::vector<std::uint32_t>& spirv,
+    const char* entry_name,
+    const std::vector<VulkanBackendBinding>& buffers,
+    std::uint32_t group_count_x,
+    std::string* error);
 
 } // namespace kernels
 } // namespace nodus
