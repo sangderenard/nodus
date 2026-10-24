@@ -846,6 +846,19 @@ add_test(NAME turing_row_tool_compiler_test
 set_tests_properties(turing_row_tool_compiler_test PROPERTIES
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
+add_test(NAME turing_shader_artifact_test
+  COMMAND ${Python3_EXECUTABLE} -m pytest -q
+          "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_turing_shader_artifact.py"
+)
+set_tests_properties(turing_shader_artifact_test PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+add_executable(spirv_translation_stage_test
+  tests/spirv_translation_stage_test.cpp
+)
+target_link_libraries(spirv_translation_stage_test PRIVATE nodus_tensor_core)
+target_compile_features(spirv_translation_stage_test PRIVATE cxx_std_20)
+add_test(NAME spirv_translation_stage_test COMMAND spirv_translation_stage_test)
 add_executable(python_row_tool_test
   tests/python_row_tool_test.cpp
 )

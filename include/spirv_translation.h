@@ -29,6 +29,27 @@ enum class TargetEnv : uint8_t {
     Vulkan_1_3,
 };
 
+// Shader stage is part of the compilation contract.  Do not infer it from a
+// file extension: deployed shader source may be retained under an arbitrary
+// source identity before Nodus translates it to another shader language.
+enum class ShaderStage : uint8_t {
+    Vertex,
+    TessellationControl,
+    TessellationEvaluation,
+    Geometry,
+    Fragment,
+    Compute,
+};
+
+struct GlslCompileRequest {
+    std::string source;
+    ShaderStage stage = ShaderStage::Compute;
+    std::string entry_point = "main";
+    TargetEnv target_env = TargetEnv::Vulkan_1_2;
+    std::string source_identity = "shader.comp";
+    std::vector<std::pair<std::string, std::string>> defines;
+};
+
 struct SpirvCompileOptions {
     TargetEnv env = TargetEnv::Vulkan_1_2;
     std::filesystem::path glslang_validator_path; // empty => rely on PATH lookup
@@ -55,12 +76,20 @@ public:
     virtual SpirvBinary compile_glsl_compute(const std::string& glsl, const SpirvCompileOptions& opt,
                                             const std::filesystem::path& spv_file,
                                             const std::filesystem::path& glsl_file) = 0;
+    // General GLSL source seam.  The default adapter deliberately supports
+    // compute/main only so existing injected compilers remain source
+    // compatible while failing closed for contracts they cannot honor.
+    virtual SpirvBinary compile_glsl_source(const GlslCompileRequest& request,
+                                            const SpirvCompileOptions& opt,
+                                            const std::filesystem::path& spv_file,
+                                            const std::filesystem::path& glsl_file);
 };
 
 // Main translation interface
 class SpirvTranslator {
 public:
     explicit SpirvTranslator(SpirvCompileOptions opt = {}, std::unique_ptr<class ISpirvCompiler> compiler = {});
+    SpirvCompileResult compile_glsl_to_spirv(const GlslCompileRequest& request);
     SpirvCompileResult translate_kernel_to_spirv(const KernelIR& k);
 
 private:

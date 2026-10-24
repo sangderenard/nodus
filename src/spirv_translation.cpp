@@ -120,6 +120,22 @@ struct CacheKey {
     hash_combine(h, hash_string(glsl));
     return CacheKey{h};
   }
+
+  static CacheKey make(const GlslCompileRequest& request,
+                       const SpirvCompileOptions& opt) {
+    u64 h = 0;
+    hash_combine(h, hash_string(request.source_identity));
+    hash_combine(h, static_cast<u64>(request.stage));
+    hash_combine(h, hash_string(request.entry_point));
+    hash_combine(h, static_cast<u64>(request.target_env));
+    hash_combine(h, static_cast<u64>(opt.glsl_version));
+    for (const auto& d : request.defines) {
+      hash_combine(h, hash_string(d.first));
+      hash_combine(h, hash_string(d.second));
+    }
+    hash_combine(h, hash_string(request.source));
+    return CacheKey{h};
+  }
 };
 
 // ------------------------------
@@ -170,7 +186,9 @@ static inline std::wstring widen(std::string_view s) {
 }
 
 static inline std::wstring quote_windows_arg(const std::wstring& a) {
-  // Minimal CreateProcess-compatible quoting.
+  // CreateProcess-compatible quoting as consumed by CommandLineToArgvW/the
+  // Microsoft C runtime. Backslashes immediately before a quote (and trailing
+  // backslashes before the closing quote) must be doubled.
   if (a.empty()) return L"\"\"";
   bool needs = false;
   for (wchar_t c : a) {
@@ -179,10 +197,22 @@ static inline std::wstring quote_windows_arg(const std::wstring& a) {
   if (!needs) return a;
 
   std::wstring out = L"\"";
+  size_t backslashes = 0;
   for (wchar_t c : a) {
-    if (c == L'"') out += L"\\\"";
-    else out += c;
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (c == L'"') {
+      out.append(backslashes * 2 + 1, L'\\');
+      out.push_back(L'"');
+    } else {
+      out.append(backslashes, L'\\');
+      out.push_back(c);
+    }
+    backslashes = 0;
   }
+  out.append(backslashes * 2, L'\\');
   out += L"\"";
   return out;
 }
@@ -345,8 +375,65 @@ static inline const char* target_env_arg(TargetEnv env) {
     case TargetEnv::Vulkan_1_1: return "vulkan1.1";
     case TargetEnv::Vulkan_1_2: return "vulkan1.2";
     case TargetEnv::Vulkan_1_3: return "vulkan1.3";
-    default: return "vulkan1.2";
+    default: throw std::invalid_argument("Unsupported SPIR-V target environment");
   }
+}
+
+static inline const char* glslang_stage_arg(ShaderStage stage) {
+  switch (stage) {
+    case ShaderStage::Vertex: return "vert";
+    case ShaderStage::TessellationControl: return "tesc";
+    case ShaderStage::TessellationEvaluation: return "tese";
+    case ShaderStage::Geometry: return "geom";
+    case ShaderStage::Fragment: return "frag";
+    case ShaderStage::Compute: return "comp";
+    default: throw std::invalid_argument("Unsupported GLSL shader stage");
+  }
+}
+
+static inline const char* shader_stage_extension(ShaderStage stage) {
+  // glslang stage tokens are also the conventional GLSL file extensions.
+  return glslang_stage_arg(stage);
+}
+
+static inline void validate_request(const GlslCompileRequest& request) {
+  if (request.source.empty()) {
+    throw std::invalid_argument("GLSL source must not be empty");
+  }
+  if (request.entry_point.empty()) {
+    throw std::invalid_argument("GLSL entry point must not be empty");
+  }
+  if (request.source_identity.empty()) {
+    throw std::invalid_argument("GLSL source identity must not be empty");
+  }
+  (void)glslang_stage_arg(request.stage);
+  (void)target_env_arg(request.target_env);
+  for (const auto& define : request.defines) {
+    if (define.first.empty()
+        || !(std::isalpha(static_cast<unsigned char>(define.first.front()))
+             || define.first.front() == '_')
+        || !std::all_of(define.first.begin() + 1, define.first.end(), [](char c) {
+             return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+           })) {
+      throw std::invalid_argument("Invalid GLSL macro name: " + define.first);
+    }
+  }
+}
+
+SpirvBinary ISpirvCompiler::compile_glsl_source(
+    const GlslCompileRequest& request,
+    const SpirvCompileOptions& opt,
+    const std::filesystem::path& spv_file,
+    const std::filesystem::path& glsl_file) {
+  validate_request(request);
+  if (request.stage != ShaderStage::Compute || request.entry_point != "main") {
+    throw std::invalid_argument(
+        "This SPIR-V compiler only supports the legacy compute/main contract");
+  }
+  SpirvCompileOptions effective = opt;
+  effective.env = request.target_env;
+  effective.defines = request.defines;
+  return compile_glsl_compute(request.source, effective, spv_file, glsl_file);
 }
 
 class ExternalGlslangValidatorCompiler final : public ISpirvCompiler {
@@ -355,9 +442,22 @@ public:
                                    const SpirvCompileOptions& opt,
                                    const std::filesystem::path& out_spv_path,
                                    const std::filesystem::path& out_glsl_path) override {
+    GlslCompileRequest request;
+    request.source = glsl;
+    request.target_env = opt.env;
+    request.defines = opt.defines;
+    request.source_identity = out_glsl_path.filename().string();
+    return compile_glsl_source(request, opt, out_spv_path, out_glsl_path);
+  }
+
+  SpirvBinary compile_glsl_source(const GlslCompileRequest& request,
+                                  const SpirvCompileOptions& opt,
+                                  const std::filesystem::path& out_spv_path,
+                                  const std::filesystem::path& out_glsl_path) override {
+    validate_request(request);
     std::filesystem::create_directories(out_spv_path.parent_path());
 
-    write_text_file(out_glsl_path, glsl);
+    write_text_file(out_glsl_path, request.source);
 
 #if defined(_WIN32)
     const std::wstring exe = opt.glslang_validator_path.empty()
@@ -368,9 +468,13 @@ public:
     argv.push_back(exe);
     argv.push_back(L"-V");
     argv.push_back(L"--target-env");
-    argv.push_back(widen(target_env_arg(opt.env)));
+    argv.push_back(widen(target_env_arg(request.target_env)));
+    argv.push_back(L"-S");
+    argv.push_back(widen(glslang_stage_arg(request.stage)));
+    argv.push_back(L"-e");
+    argv.push_back(widen(request.entry_point));
     // -D NAME=VALUE
-    for (const auto& d : opt.defines) {
+    for (const auto& d : request.defines) {
       std::wstring w = L"-D";
       w += widen(d.first);
       if (!d.second.empty()) {
@@ -393,8 +497,12 @@ public:
     argv.push_back(exe);
     argv.push_back("-V");
     argv.push_back("--target-env");
-    argv.push_back(target_env_arg(opt.env));
-    for (const auto& d : opt.defines) {
+    argv.push_back(target_env_arg(request.target_env));
+    argv.push_back("-S");
+    argv.push_back(glslang_stage_arg(request.stage));
+    argv.push_back("-e");
+    argv.push_back(request.entry_point);
+    for (const auto& d : request.defines) {
       std::string s = "-D" + d.first;
       if (!d.second.empty()) s += "=" + d.second;
       argv.push_back(std::move(s));
@@ -418,38 +526,63 @@ public:
 };
 
 #if defined(NODUS_HAVE_SHADERC) && NODUS_HAVE_SHADERC
+static inline shaderc_shader_kind shaderc_stage_kind(ShaderStage stage) {
+  switch (stage) {
+    case ShaderStage::Vertex: return shaderc_vertex_shader;
+    case ShaderStage::TessellationControl: return shaderc_tess_control_shader;
+    case ShaderStage::TessellationEvaluation: return shaderc_tess_evaluation_shader;
+    case ShaderStage::Geometry: return shaderc_geometry_shader;
+    case ShaderStage::Fragment: return shaderc_fragment_shader;
+    case ShaderStage::Compute: return shaderc_compute_shader;
+    default: throw std::invalid_argument("Unsupported GLSL shader stage");
+  }
+}
+
 class ShadercCompiler final : public ISpirvCompiler {
 public:
   SpirvBinary compile_glsl_compute(const std::string& glsl,
                                    const SpirvCompileOptions& opt,
                                    const std::filesystem::path& out_spv_path,
                                    const std::filesystem::path& out_glsl_path) override {
+    GlslCompileRequest request;
+    request.source = glsl;
+    request.target_env = opt.env;
+    request.defines = opt.defines;
+    request.source_identity = out_glsl_path.filename().string();
+    return compile_glsl_source(request, opt, out_spv_path, out_glsl_path);
+  }
+
+  SpirvBinary compile_glsl_source(const GlslCompileRequest& request,
+                                  const SpirvCompileOptions& opt,
+                                  const std::filesystem::path& out_spv_path,
+                                  const std::filesystem::path& out_glsl_path) override {
+    validate_request(request);
     // Optionally keep GLSL on disk for debugging parity with external compiler.
     if (opt.keep_intermediates) {
-      write_text_file(out_glsl_path, glsl);
+      write_text_file(out_glsl_path, request.source);
     }
 
     shaderc::Compiler compiler;
     shaderc::CompileOptions options;
 
     // Target env
-    switch (opt.env) {
+    switch (request.target_env) {
       case TargetEnv::Vulkan_1_1: options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1); break;
       case TargetEnv::Vulkan_1_2: options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2); break;
       case TargetEnv::Vulkan_1_3: options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3); break;
-      default: break;
+      default: throw std::invalid_argument("Unsupported SPIR-V target environment");
     }
 
     // Defines
-    for (const auto& d : opt.defines) {
+    for (const auto& d : request.defines) {
       options.AddMacroDefinition(d.first, d.second);
     }
 
     auto result = compiler.CompileGlslToSpv(
-      glsl.data(), glsl.size(),
-      shaderc_compute_shader,
-      /*input_file_name*/ opt.keep_intermediates ? out_glsl_path.string().c_str() : "kernel.comp",
-      /*entry_point*/ "main",
+      request.source.data(), request.source.size(),
+      shaderc_stage_kind(request.stage),
+      request.source_identity.c_str(),
+      request.entry_point.c_str(),
       options
     );
 
@@ -494,6 +627,46 @@ SpirvTranslator::SpirvTranslator(SpirvCompileOptions opt,
   }
 }
 
+SpirvCompileResult SpirvTranslator::compile_glsl_to_spirv(
+    const GlslCompileRequest& request) {
+  validate_request(request);
+
+  const CacheKey key = CacheKey::make(request, opt_);
+  const std::filesystem::path identity_path(request.source_identity);
+  const std::string identity = identity_path.stem().empty()
+      ? request.source_identity
+      : identity_path.stem().string();
+  const std::string base_name = sanitize_filename(identity) + "_" + key.hex16();
+  const auto base = opt_.cache_dir / base_name;
+  const auto glsl_file = std::filesystem::path(
+      base.string() + "." + shader_stage_extension(request.stage));
+  const auto spv_file = std::filesystem::path(base.string() + ".spv");
+
+  if (opt_.enable_cache && std::filesystem::exists(spv_file)) {
+    SpirvCompileResult result;
+    result.spirv = read_spirv_file(spv_file);
+    if (opt_.keep_intermediates) result.glsl_source = request.source;
+    result.spv_path = spv_file;
+    return result;
+  }
+
+  SpirvCompileResult result;
+  result.spirv = compiler_->compile_glsl_source(
+      request, opt_, spv_file, glsl_file);
+
+  if (!opt_.keep_intermediates) {
+    std::error_code ec;
+    std::filesystem::remove(glsl_file, ec);
+    if (!opt_.enable_cache) std::filesystem::remove(spv_file, ec);
+  }
+
+  if (opt_.keep_intermediates) result.glsl_source = request.source;
+  result.spv_path = (opt_.enable_cache || opt_.keep_intermediates)
+      ? spv_file
+      : std::filesystem::path{};
+  return result;
+}
+
 SpirvCompileResult SpirvTranslator::translate_kernel_to_spirv(const KernelIR& k) {
   // 1) Emit GLSL from Tier-0 kernel IR
   nodus::kernel::GlslEmitOptions emit_opt{};
@@ -521,7 +694,14 @@ SpirvCompileResult SpirvTranslator::translate_kernel_to_spirv(const KernelIR& k)
   }
 
   // 4) Compile
-  SpirvBinary bin = compiler_->compile_glsl_compute(glsl, opt_, spv_file, glsl_file);
+  GlslCompileRequest request;
+  request.source = glsl;
+  request.stage = ShaderStage::Compute;
+  request.entry_point = "main";
+  request.target_env = opt_.env;
+  request.source_identity = k.name + ".comp";
+  request.defines = opt_.defines;
+  SpirvBinary bin = compiler_->compile_glsl_source(request, opt_, spv_file, glsl_file);
 
   // 5) Cleanup intermediates if requested
   if (!opt_.keep_intermediates) {
