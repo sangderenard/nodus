@@ -855,6 +855,25 @@ if(WIN32)
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_python_row>"
   )
 endif()
+add_executable(python_row_plugin_integration_test
+  tests/python_row_plugin_integration_test.cpp
+)
+target_link_libraries(python_row_plugin_integration_test PRIVATE
+  canvas_tables_static
+  nodus_python_row
+)
+target_compile_definitions(python_row_plugin_integration_test PRIVATE
+  NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_compile_features(python_row_plugin_integration_test PRIVATE cxx_std_20)
+add_test(NAME python_row_plugin_integration_test
+  COMMAND python_row_plugin_integration_test
+)
+if(WIN32)
+  set_tests_properties(python_row_plugin_integration_test PROPERTIES
+    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_python_row>"
+  )
+endif()
 set_tests_properties(nodus_python_graph_test PROPERTIES
   ENVIRONMENT "NODUS_HEADLESS_TEST_DLL=$<TARGET_FILE:nodus_headless>"
   ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:nodus_headless>\;${TORCH_INSTALL_PREFIX}/lib"
