@@ -1141,25 +1141,19 @@ public:
 
         size_t bytes = impl->stride * impl->elem_size;
         void* p = nullptr;
-        if (impl->backend) {
-            const gp_mem_backend_vtable_t* vt = gp_mem_backend_get_vtable(impl->backend);
-            if (vt && vt->copy_from_backend) {
-                size_t offset = slot * bytes;
-                void* tmp = nullptr;
-                if (!vt->copy_from_backend(impl->backend, offset, &tmp, std::min<size_t>(sizeof(void*), bytes))) return false;
-                p = tmp;
-            } else {
-                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
-                if (!m) return false;
-                std::memcpy(&p, reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size, std::min<size_t>(sizeof(void*), bytes));
-                gp_mem_backend_unmap(impl->storage_handle);
-            }
-            } else {
-                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
-                if (!m) return false;
-                std::memcpy(&p, reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size, std::min<size_t>(sizeof(void*), bytes));
-                gp_mem_backend_unmap(impl->storage_handle);
-            }
+        gp_mem_backend_handle_t storage = impl->storage_handle;
+        if (!storage) return false;
+        const gp_mem_backend_vtable_t* storage_vt = gp_mem_backend_get_vtable(storage);
+        size_t read_bytes = std::min<size_t>(sizeof(void*), bytes);
+        if (storage_vt && storage_vt->copy_from_backend) {
+            size_t offset = slot * bytes;
+            if (!storage_vt->copy_from_backend(storage, offset, &p, read_bytes)) return false;
+        } else {
+            void* m = gp_mem_backend_map_or_null(storage);
+            if (!m) return false;
+            std::memcpy(&p, reinterpret_cast<uint8_t*>(m) + slot * bytes, read_bytes);
+            gp_mem_backend_unmap(storage);
+        }
         *out_ptr = p;
         return true;
     }
@@ -1200,24 +1194,18 @@ public:
         if (observed != (rseq + 1)) return false;
 
         size_t bytes = impl->stride * impl->elem_size;
-        if (impl->backend) {
-            const gp_mem_backend_vtable_t* vt = gp_mem_backend_get_vtable(impl->backend);
-            if (vt && vt->copy_from_backend) {
-                size_t offset = slot * bytes;
-                if (!vt->copy_from_backend(impl->backend, offset, out_sample_bytes, bytes)) return false;
-            } else {
-                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
-                if (!m) return false;
-                uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
-                std::memcpy(out_sample_bytes, src, bytes);
-                gp_mem_backend_unmap(impl->storage_handle);
-            }
+        gp_mem_backend_handle_t storage = impl->storage_handle;
+        if (!storage) return false;
+        const gp_mem_backend_vtable_t* storage_vt = gp_mem_backend_get_vtable(storage);
+        if (storage_vt && storage_vt->copy_from_backend) {
+            size_t offset = slot * bytes;
+            if (!storage_vt->copy_from_backend(storage, offset, out_sample_bytes, bytes)) return false;
         } else {
-            void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+            void* m = gp_mem_backend_map_or_null(storage);
             if (!m) return false;
-            uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
+            uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * bytes;
             std::memcpy(out_sample_bytes, src, bytes);
-            gp_mem_backend_unmap(impl->storage_handle);
+            gp_mem_backend_unmap(storage);
         }
         r->seq.store(rseq + 1, std::memory_order_relaxed);
         note_activity(rseq + 1, impl->last_read_seq, impl->last_read_region, impl->read_friction, impl->read_phase);
@@ -1271,24 +1259,18 @@ public:
         if (observed != (rseq + 1)) return false;
 
         size_t bytes = impl->stride * impl->elem_size;
-        if (impl->backend) {
-            const gp_mem_backend_vtable_t* vt = gp_mem_backend_get_vtable(impl->backend);
-            if (vt && vt->copy_from_backend) {
-                size_t offset = slot * bytes;
-                if (!vt->copy_from_backend(impl->backend, offset, out_sample_bytes, bytes)) return false;
-            } else {
-                void* m = gp_mem_backend_map_or_null(impl->storage_handle);
-                if (!m) return false;
-                uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
-                std::memcpy(out_sample_bytes, src, bytes);
-                gp_mem_backend_unmap(impl->storage_handle);
-            }
+        gp_mem_backend_handle_t storage = impl->storage_handle;
+        if (!storage) return false;
+        const gp_mem_backend_vtable_t* storage_vt = gp_mem_backend_get_vtable(storage);
+        if (storage_vt && storage_vt->copy_from_backend) {
+            size_t offset = slot * bytes;
+            if (!storage_vt->copy_from_backend(storage, offset, out_sample_bytes, bytes)) return false;
         } else {
-            void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+            void* m = gp_mem_backend_map_or_null(storage);
             if (!m) return false;
-            uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * impl->stride * impl->elem_size;
+            uint8_t* src = reinterpret_cast<uint8_t*>(m) + slot * bytes;
             std::memcpy(out_sample_bytes, src, bytes);
-            gp_mem_backend_unmap(impl->storage_handle);
+            gp_mem_backend_unmap(storage);
         }
         // Note: do NOT advance r->seq and do NOT call note_activity / notify.
         out_written_bytes = impl->stride * impl->elem_size;
