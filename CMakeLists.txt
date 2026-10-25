@@ -944,6 +944,12 @@ add_executable(test_edge_backend_coordination
 target_link_libraries(test_edge_backend_coordination PRIVATE canvas_tables_static)
 add_test(NAME edge_backend_coordination_test COMMAND test_edge_backend_coordination)
 
+add_executable(test_edge_tensor_fifo_peek
+  tests/edge_tensor_fifo_peek_test.cpp
+)
+target_link_libraries(test_edge_tensor_fifo_peek PRIVATE canvas_tables_static)
+add_test(NAME edge_tensor_fifo_peek_test COMMAND test_edge_tensor_fifo_peek)
+
 add_executable(test_meta_edge_snapshot_wrapper
   tests/meta_edge_snapshot_wrapper_test.cpp
 )
@@ -1303,6 +1309,7 @@ set(NODUS_TEST_TARGETS
   test_thread_manager
   test_frame_serialization
   test_edge_backend_coordination
+  test_edge_tensor_fifo_peek
   test_meta_edge_snapshot_wrapper
   test_mem_backend_manifest
   test_tensor_backend_smoke
