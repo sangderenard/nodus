@@ -85,6 +85,9 @@ void test_descriptor_and_generation(const fs::path& source_path) {
     assert(generated.find("PrimitiveType::Int32") != std::string::npos);
     assert(generated.find("PrimitiveType::Int64") != std::string::npos);
     assert(generated.find("Left operand") != std::string::npos);
+    assert(generated.find("c.succeeded = false;") != std::string::npos);
+    assert(generated.find("c.succeeded = interpreter_.execute_tensor_stack(*c.stack.raw, &e);") != std::string::npos);
+    assert(generated.find("if (!c.succeeded)") != std::string::npos);
     const fs::path wrapper_path = source_path.parent_path() / "python_test_ordered.cpp";
     assert(nodus::python_row::write_plugin_source(descriptor, wrapper_path.generic_string(), &error));
     assert(fs::exists(wrapper_path));
