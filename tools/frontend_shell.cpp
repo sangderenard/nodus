@@ -1,3 +1,5 @@
+// Winsock headers (via contract_listener.h) must precede <windows.h>.
+#include "contract_port_canvas.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -10,6 +12,7 @@
 #include <cmath>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -77,6 +80,9 @@ struct CanvasHead {
     std::vector<uint8_t> pixels;
     std::vector<uint8_t> upload_buffer;
     std::string workspace_path;
+    // Contract ports hosted for this canvas (same class the headless graph uses).
+    // Destroyed BEFORE the canvas context (see destroy_canvas_head).
+    std::unique_ptr<nodus::contracts::CanvasContractPorts> contract_ports;
 };
 
 static constexpr size_t kMaxCanvasHeads = 8;
@@ -241,6 +247,7 @@ struct FrontendResources {
 
 struct CanvasTickSnapshot {
     std::array<GP_CanvasContext*, kMaxCanvasHeads> contexts{};
+    std::array<nodus::contracts::CanvasContractPorts*, kMaxCanvasHeads> contract_ports{};
     std::array<size_t, kMaxCanvasHeads> head_indices{};
     size_t count = 0;
 };
@@ -1089,6 +1096,7 @@ private:
         for (size_t i = 0; i < kMaxCanvasHeads; ++i) {
             if (!resources_.canvas_heads[i].context) continue;
             temp.contexts[temp.count] = resources_.canvas_heads[i].context;
+            temp.contract_ports[temp.count] = resources_.canvas_heads[i].contract_ports.get();
             temp.head_indices[temp.count] = i;
             ++temp.count;
         }
@@ -1109,6 +1117,7 @@ private:
             for (size_t entry = 0; entry < snapshot.count; ++entry) {
                 size_t head_idx = snapshot.head_indices[entry];
                 GP_CanvasContext* ctx = snapshot.contexts[entry];
+                nodus::contracts::CanvasContractPorts* ports = snapshot.contract_ports[entry];
                 if (!ctx) continue;
                 bool free_spin = head_thread_free_spin_[head_idx].load(std::memory_order_relaxed);
                 double ratio = head_thread_ratio_[head_idx].load(std::memory_order_relaxed);
@@ -1130,7 +1139,9 @@ private:
                 float dt = static_cast<float>(head_thread_dt_[head_idx].load(std::memory_order_relaxed));
                 int tick_count = static_cast<int>(ticks_to_run);
                 for (int t = 0; t < tick_count; ++t) {
+                    if (ports) ports->pre_step();
                     gp_canvas_step(ctx, dt);
+                    if (ports) ports->post_step();
                 }
                 if (tick_count > 0) {
                     display_params_[head_idx].ticks_since_display.fetch_add(tick_count, std::memory_order_relaxed);
@@ -1176,6 +1187,7 @@ void destroy_canvas_head(CanvasHead& head) {
     if (!head.context) {
         return;
     }
+    head.contract_ports.reset();  // listeners/sockets before the canvas they publish into
     gp_canvas_destroy(head.context);
     head.context = nullptr;
     head.pixels.clear();
@@ -1203,6 +1215,25 @@ bool ensure_canvas_head_initialized(FrontendResources& resources, size_t index) 
         if (ifs.good()) {
             if (!gp_canvas_load_from_file(head.context, workspace_path.c_str())) {
                 std::cerr << "Failed to load canvas workspace: " << workspace_path << "\n";
+            } else {
+                // gp_canvas_load_from_file skips the EDGE_FIFO / CONTRACT_PORT trailer
+                // records; load_trailer applies them and hosts the saved contract ports.
+                // NOTE: autosave (gp_canvas_set_autosave above) rewrites CANVAS V4 only and
+                // has no post-save hook, so the next autosave of a GUI-edited canvas DROPS
+                // the trailer. The trailer survives only if the file is saved through the
+                // headless API or CanvasContractPorts::write_trailer is appended after a save.
+                head.contract_ports = std::make_unique<nodus::contracts::CanvasContractPorts>();
+                std::string trailer_error;
+                if (!head.contract_ports->load_trailer(head.context, workspace_path, &trailer_error)) {
+                    std::cerr << "Failed to load contract ports: " << trailer_error << "\n";
+                }
+                for (size_t pi = 0; pi < head.contract_ports->size(); ++pi) {
+                    nodus::contracts::CanvasContractPorts::PortInfo info;
+                    if (head.contract_ports->info(pi, &info)) {
+                        std::cout << "contract_port " << info.prefix << " 127.0.0.1:" << info.listen_port
+                                  << std::endl;
+                    }
+                }
             }
         }
     }
@@ -2164,6 +2195,7 @@ struct FrontendOptions {
     int width = kDefaultCanvasWidth;
     int height = kDefaultCanvasHeight;
     std::string workspace_path;
+    std::vector<std::pair<std::string, size_t>> acquire_pairs;  // --acquire=PREFIX:CAPACITY
     // timing overrides: negative => not set
     double thread_delay = -1.0;
     double gui_delay = -1.0;
@@ -2188,6 +2220,8 @@ static void print_usage(const char* progname) {
     std::cout << "  --width=<pixels>       Initial canvas width (default: 1000)\n";
     std::cout << "  --height=<pixels>      Initial canvas height (default: 720)\n";
     std::cout << "  --workspace=<path>     Path for primary canvas workspace file\n";
+    std::cout << "  --acquire=PREFIX:CAPACITY  Acquire a contract negotiator pair (repeatable) so a\n";
+    std::cout << "                         saved canvas's <PREFIX>.market/.worker rows resolve\n";
     std::cout << "  --verbose              Enable verbose logging\n";
     std::cout << "  --thread-delay=<s>     Global thread loop sleep (seconds, default ~0.016)\n";
     std::cout << "  --gui-delay=<s>        Global GUI delay used by tick controller (seconds)\n";
@@ -2212,12 +2246,27 @@ FrontendOptions parse_frontend_options(int argc, char** argv) {
     const std::string canvas_display_interval_prefix = "--canvas-display-interval="; // IDX:SEC
     const std::string canvas_display_ratio_prefix = "--canvas-display-ratio="; // IDX:RATIO
     const std::string pause_canvas_prefix = "--pause-canvas="; // IDX
+    const std::string acquire_prefix = "--acquire="; // PREFIX:CAPACITY
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
         if (arg == "-h" || arg == "--help") {
             opts.show_help = true;
         } else if (arg == "--verbose") {
             opts.verbose = true;
+        } else if (arg.rfind(acquire_prefix, 0) == 0) {
+            const std::string v = arg.substr(acquire_prefix.size());
+            const size_t colon = v.rfind(':');
+            if (colon == std::string::npos || colon == 0) {
+                std::cerr << "--acquire expects PREFIX:CAPACITY, got: " << v << "\n";
+            } else {
+                try {
+                    const long cap = std::stol(v.substr(colon + 1));
+                    if (cap <= 0) throw std::out_of_range("capacity");
+                    opts.acquire_pairs.emplace_back(v.substr(0, colon), static_cast<size_t>(cap));
+                } catch (...) {
+                    std::cerr << "--acquire has an invalid capacity: " << v << "\n";
+                }
+            }
         } else if (arg.rfind(device_prefix, 0) == 0) {
             opts.device = arg.substr(device_prefix.size());
         } else if (arg.rfind(width_prefix, 0) == 0) {
@@ -2491,6 +2540,17 @@ int main(int argc, char** argv) {
     if (!initialize_window(resources)) {
         cleanup(resources);
         return EXIT_FAILURE;
+    }
+
+    // Pairs must exist before the canvas loads so saved <prefix>.market/.worker rows resolve.
+    for (const auto& pair : options.acquire_pairs) {
+        try {
+            nodus::contracts::acquire(pair.first, pair.second);
+        } catch (const std::exception& e) {
+            std::cerr << "--acquire " << pair.first << ":" << pair.second << " failed: " << e.what() << "\n";
+            cleanup(resources);
+            return EXIT_FAILURE;
+        }
     }
 
     if (!initialize_canvas_heads(resources)) {

@@ -5,6 +5,7 @@ Run through CTest so NODUS_HEADLESS_TEST_DLL names the just-built library.
 
 from __future__ import annotations
 
+import ctypes
 import math
 import pathlib
 import sys
@@ -14,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from nodus_graph.native import _NativeFifoConfig
 from nodus_graph import (
     BuiltinTool,
     ExecutionContract,
@@ -216,7 +218,7 @@ def test_two_module_fifo_reload_requires_explicit_reattachment() -> None:
             )
             graph.connect(
                 producer.output(0), consumer.input(0),
-                fifo=FifoConfig.scalar_f32(slots=7, top_k=0),
+                fifo=None,
             )
             graph.save(path)
 
@@ -252,6 +254,30 @@ def test_two_module_fifo_reload_requires_explicit_reattachment() -> None:
             restored.push_f32("scale", 3.0)
             restored.step()
             assert_close(restored.pull_f32("result"), 21.0)
+
+    # Complementary case: a configured FIFO is restored by the native loader.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "configured.canvas"
+        with Graph() as graph:
+            producer = graph.add_module("producer", stable_id=0xA001).set_rows(
+                Input(2), Tool(BuiltinTool.ADD), Output(1),
+            )
+            consumer = graph.add_module("consumer", stable_id=0xA002).set_rows(
+                Input(2), Tool(BuiltinTool.MULTIPLY), Output(1),
+            )
+            graph.connect(
+                producer.output(0), consumer.input(0),
+                fifo=FifoConfig.scalar_f32(slots=7, top_k=0),
+            )
+            graph.save(path)
+
+        with Graph() as restored:
+            restored.load(path)
+            restored.step()  # no explicit reattachment needed
+            native = _NativeFifoConfig()
+            assert restored.lib.nodus_headless_get_edge_fifo_config(
+                restored._handle, 0, ctypes.byref(native))
+            assert native.slots == 7 and native.top_k == 0
 
 
 def test_failed_load_preserves_bindings_and_successful_load_invalidates_handles() -> None:

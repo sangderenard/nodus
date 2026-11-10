@@ -653,12 +653,18 @@ find_package(OpenGL REQUIRED)
 if(NODUS_ENABLE_TORCH)
   add_executable(frontend_shell tools/frontend_shell.cpp)
   target_include_directories(frontend_shell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # One image only: the static canvas library carries the tool registry and the
+  # contract-port runtime; linking the DLL beside it duplicated every gp_canvas_* symbol.
   target_link_libraries(frontend_shell PRIVATE
-    canvas_tables
     canvas_tables_static
+    nodus_runtime
     Torch::Torch
     OpenGL::GL
   )
+  if(WIN32)
+    # contract ports hosted by the GUI canvas: loopback listener + socket adapters
+    target_link_libraries(frontend_shell PRIVATE ws2_32)
+  endif()
   if(TARGET nodus_torch_includes)
     target_link_libraries(frontend_shell PRIVATE nodus_torch_includes)
   endif()
@@ -718,6 +724,12 @@ endif()
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# contract_negotiator_registry.cpp / contract_port_canvas.cpp (src glob) hold a
+# ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
+target_link_libraries(canvas_tables PUBLIC nodus_runtime)
+if(WIN32)
+  target_link_libraries(canvas_tables PUBLIC ws2_32)  # contract_listener.h / contract_socket.h in the src glob
+endif()
 target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables PUBLIC Torch::Torch)
@@ -745,6 +757,12 @@ target_compile_definitions(canvas_tables PUBLIC
 target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# contract_negotiator_registry.cpp / contract_port_canvas.cpp (src glob) hold a
+# ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
+target_link_libraries(canvas_tables_static PUBLIC nodus_runtime)
+if(WIN32)
+  target_link_libraries(canvas_tables_static PUBLIC ws2_32)  # contract_listener.h / contract_socket.h in the src glob
+endif()
 target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables_static PUBLIC Torch::Torch)

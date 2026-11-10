@@ -621,9 +621,11 @@ class Graph:
                     fifo: Optional[FifoConfig] = FifoConfig.scalar_f32()) -> Edge:
         """Reattach process-local FIFO semantics to a native-restored edge.
 
-        CANVAS V4 persists topology but not FIFO specs, reader positions, or
-        live samples. Every restored edge must therefore be named here before
-        execution; passing ``None`` preserves deliberate absence.
+        CANVAS V4 persists topology only; configured FIFO specs ride in EDGE_FIFO
+        trailer records that ``load`` restores natively. An edge saved without a
+        FIFO config, and any reader position or live sample, is not restored, so
+        such an edge must be named here before execution; passing ``None``
+        preserves deliberate absence.
         """
         if source.direction != "output" or target.direction != "input":
             raise ValueError("attach_edge requires an output contact followed by an input contact")
@@ -1206,7 +1208,15 @@ class Graph:
         edge_count = int(self.lib.nodus_headless_get_edge_count(self._handle))
         if edge_count < 0:
             raise RuntimeError("native edge enumeration failed after load")
-        self._loaded_unattached_edges = set(range(edge_count))
+        # nodus_headless_load_file already re-attached every edge that carried an
+        # EDGE_FIFO record and restored its config. Only edges with no native FIFO
+        # config remain for explicit attach_edge(); live samples are never restored.
+        probe = _NativeFifoConfig()
+        self._loaded_unattached_edges = {
+            index for index in range(edge_count)
+            if not self.lib.nodus_headless_get_edge_fifo_config(
+                self._handle, index, ctypes.byref(probe))
+        }
 
 
     def _contract_abi(self):
