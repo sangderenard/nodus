@@ -856,6 +856,16 @@ target_link_libraries(contract_negotiator_test PRIVATE canvas_tables_static nodu
 add_test(NAME contract_negotiator_test COMMAND contract_negotiator_test)
 set_tests_properties(contract_negotiator_test PROPERTIES TIMEOUT 30)
 
+# Turing compile host (include/turing_compile_host_tool.h): one-at-a-time,
+# non-blocking compile peer, exercised with a stub compiler driver.
+add_executable(turing_compile_host_test tests/turing_compile_host_test.cpp)
+target_link_libraries(turing_compile_host_test PRIVATE canvas_tables_static nodus_runtime)
+if(WIN32)
+  target_link_libraries(turing_compile_host_test PRIVATE ws2_32)
+endif()
+add_test(NAME turing_compile_host_test COMMAND turing_compile_host_test)
+set_tests_properties(turing_compile_host_test PROPERTIES TIMEOUT 60)
+
 # Engine-side socket protocol and loopback listener (include/contract_socket.h,
 # include/contract_listener.h): a real 127.0.0.1 round trip, no graph.
 add_executable(contract_engine_socket_test tests/contract_engine_socket_test.cpp)
@@ -868,7 +878,7 @@ set_tests_properties(contract_engine_socket_test PROPERTIES TIMEOUT 30)
 if(WIN32)
   # The contract test executables load Torch through canvas_tables_static; without
   # these directories on PATH Windows raises a missing-DLL dialog and ctest times out.
-  foreach(_contract_exe contract_socket_test contract_socket_graph_test contract_negotiator_test contract_engine_socket_test)
+  foreach(_contract_exe contract_socket_test contract_socket_graph_test contract_negotiator_test contract_engine_socket_test turing_compile_host_test)
     set_tests_properties(${_contract_exe} PROPERTIES
       ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:${_contract_exe}>\;${TORCH_INSTALL_PREFIX}/lib"
     )
@@ -1385,6 +1395,7 @@ set(NODUS_TEST_TARGETS
   contract_socket_test
   contract_socket_graph_test
   contract_negotiator_test
+  turing_compile_host_test
   nodus_headless_runtime_test
   test_thread_manager
   test_frame_serialization

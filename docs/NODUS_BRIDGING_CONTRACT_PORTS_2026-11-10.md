@@ -83,3 +83,18 @@ Release only after every graph that bound the pair has been destroyed (a negotia
 - GUI hosting is proven at runtime: `frontend_shell --workspace=<copy> --acquire=gui.proof:4` printed `contract_port gui.proof 127.0.0.1:47611` 2.33 s after launch; an engine and a host peer completed Submit -> Admitted -> Offer/Accept/Result -> Route -> Decision -> Receipt through the window's tick loop. Receipt and the two scripts: docs/receipts/GUI_CONTRACT_PORT_PROOF_2026-11-10.md. Not proven: autosave behaviour after a GUI edit (no autosave write occurred), rendering, clean shutdown.
 - Canvas-host process: tools/run_canvas.py (tests/test_run_canvas.py).
 - Lowering library reader: nodus_graph/lowering_library.py over the Meowdoku server's accounts.db tables (written on the Turing side, branch bridging/web-lane-api).
+
+## Turing compile host (one job at a time)
+
+`include/turing_compile_host_tool.h` (`nodus::contracts::TuringCompileHost`) is the place Turing compile requests now go. It is a negotiator HOST Peer: `negotiator.add_host(host.peer())`. It needs no row of its own; the existing `<prefix>.market` row calls every host once per market turn and each call is one non-blocking `exchange()`.
+
+- Requests: an engine submits a contract whose `id` names the work. The request JSON is `<jobs_dir>/<id>.request.json` (same schema as `tools/turing_row_tool_compiler.py --request`); the product directory is `<jobs_dir>/<id>/`. The contract `payload` is carried untouched and not interpreted.
+- One in flight: the host owns at most one `std::thread`, which runs only `gp_turing_row_tool_compile_only` (validation, driver, receipt check; touches no registry/canvas). While it runs, `exchange()` returns an empty Exchange (no offer accepted). Only after a result is delivered does it take another offer. `stats()` exposes accepted/completed/refused/in_flight (0 or 1).
+- Lane-side adoption: when the job is finished, the next `exchange()` (on the market lane) joins the thread, runs `gp_turing_product_adopt_and_load` if `cfg.adopt`, writes `<product_dir>/compile-host.result.json` (status, tool id, queued/started/finished epoch seconds, wall seconds, adoption report) and returns `Result.payload = status`.
+- Status codes (`CompileStatus`): 1 Adopted, 2 CompiledNotAdopted, 3 ExistingProduct, 16 RequestMissing, 17 CompileFailed, 18 AdoptFailed, 19 Cancelled.
+- Restart: if `<product_dir>/nodus-row-tool-product.receipt` already exists the compiler is not run again; the contract completes with ExistingProduct (adopted on the lane when `cfg.adopt`). Missing request file: refused immediately with RequestMissing.
+- Cancellation: `shutdown()` / destructor sets the `GP_TuringCompileCancel` handle; the driver wait (polling 20 ms) kills the child (Windows: kill-on-close job object, so grandchildren die too) and joins. Never detached. Other callers pass nullptr and keep the INFINITE wait.
+- Loan deadlines count market turns: set the negotiator's `loan_ticks` large enough to cover a compile, or a late result is dropped by the negotiator.
+- Test: `tests/turing_compile_host_test.cpp` (stub driver; ordering, one-in-flight, turn latency, restart refusal, cancel).
+
+Not done: routing of who may submit; the request upload path from the Python server (nothing yet writes `<id>.request.json`); the live canvas does not yet host the compile host.

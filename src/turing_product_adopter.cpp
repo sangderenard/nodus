@@ -4,6 +4,9 @@
 #include "plugin_manager.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +26,7 @@
 #else
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -303,6 +307,8 @@ bool run_compiler_driver(const fs::path& python,
                          const fs::path& turing_root,
                          const fs::path& product_dir,
                          const fs::path& nodus_root,
+                         GP_TuringCompileCancel* cancel,
+                         bool* cancelled,
                          std::string* error) {
     const std::vector<fs::path> args = {
         python, driver, "--request", request, "--output-dir", product_dir,
@@ -326,11 +332,36 @@ bool run_compiler_driver(const fs::path& python,
         *error = "failed to launch compiler driver: " + std::to_string(GetLastError());
         return false;
     }
-    WaitForSingleObject(process.hProcess, INFINITE);
+    if (!cancel) {
+        WaitForSingleObject(process.hProcess, INFINITE);
+    } else {
+        // Kill-on-close job so a cancel also ends the driver's own children.
+        HANDLE job = CreateJobObjectW(nullptr, nullptr);
+        if (job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof(info));
+            AssignProcessToJobObject(job, process.hProcess);
+        }
+        while (WaitForSingleObject(process.hProcess, 20) == WAIT_TIMEOUT) {
+            if (cancel->requested.load()) {
+                if (job) TerminateJobObject(job, 1);
+                TerminateProcess(process.hProcess, 1);
+                WaitForSingleObject(process.hProcess, 5000);
+                if (cancelled) *cancelled = true;
+                break;
+            }
+        }
+        if (job) CloseHandle(job);
+    }
     DWORD exit_code = 1;
     GetExitCodeProcess(process.hProcess, &exit_code);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+    if (cancelled && *cancelled) {
+        *error = "compiler driver cancelled";
+        return false;
+    }
     if (exit_code != 0) {
         *error = "compiler driver failed with exit code " + std::to_string(exit_code);
         return false;
@@ -350,6 +381,24 @@ bool run_compiler_driver(const fs::path& python,
         _exit(127);
     }
     int status = 0;
+    if (cancel) {
+        pid_t done = 0;
+        while ((done = waitpid(child, &status, WNOHANG)) == 0) {
+            if (cancel->requested.load()) {
+                kill(child, SIGKILL);
+                waitpid(child, &status, 0);
+                if (cancelled) *cancelled = true;
+                *error = "compiler driver cancelled";
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (done < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            *error = "compiler driver failed";
+            return false;
+        }
+        return true;
+    }
     if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         *error = "compiler driver failed";
         return false;
@@ -489,6 +538,50 @@ extern "C" int gp_turing_product_adopt_and_load(
     return 1;
 }
 
+extern "C" int gp_turing_row_tool_compile_only(
+    const char* python_executable,
+    const char* nodus_root,
+    const char* request_json,
+    const char* turing_root,
+    const char* product_dir,
+    GP_TuringCompileCancel* cancel,
+    char* out_error,
+    int32_t out_error_cap) {
+    copy_out("", out_error, out_error_cap);
+    if (!python_executable || !python_executable[0] || !request_json || !request_json[0] ||
+        !turing_root || !turing_root[0] || !product_dir || !product_dir[0] ||
+        !nodus_root || !nodus_root[0]) return 0;
+    const fs::path python = fs::absolute(python_executable);
+    const fs::path request = fs::absolute(request_json);
+    const fs::path turing = fs::absolute(turing_root);
+    const fs::path product = fs::absolute(product_dir);
+    const fs::path nodus = fs::absolute(nodus_root);
+    const fs::path driver = nodus / "tools" / "turing_row_tool_compiler.py";
+    if (!fs::is_regular_file(python) || !fs::is_regular_file(request) ||
+        !fs::is_directory(turing) || !fs::is_directory(nodus) ||
+        !fs::is_regular_file(driver)) {
+        std::cerr << "turing_product_adopter: compile request names a missing executable, request, root, or driver\n";
+        copy_out("missing executable, request, root, or driver", out_error, out_error_cap);
+        return 0;
+    }
+    std::error_code ec;
+    fs::create_directories(product, ec);
+    if (ec) { copy_out("cannot create product directory", out_error, out_error_cap); return 0; }
+    std::string error;
+    bool cancelled = false;
+    if (!run_compiler_driver(python, driver, request, turing, product, nodus, cancel, &cancelled, &error)) {
+        std::cerr << "turing_product_adopter: " << error << "\n";
+        copy_out(error, out_error, out_error_cap);
+        return cancelled ? 2 : 0;
+    }
+    if (!fs::is_regular_file(product / "nodus-row-tool-product.receipt")) {
+        std::cerr << "turing_product_adopter: compiler completed without a product receipt\n";
+        copy_out("compiler completed without a product receipt", out_error, out_error_cap);
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int gp_turing_row_tool_compile_and_load(
     const char* python_executable,
     const char* request_json,
@@ -504,36 +597,12 @@ extern "C" int gp_turing_row_tool_compile_and_load(
     if (report) *report = GP_TuringProductAdoptionReport{};
     copy_out("", out_tool_id, out_tool_id_cap);
     copy_out("", out_staged_source, out_staged_source_cap);
-    if (!python_executable || !python_executable[0] || !request_json || !request_json[0] ||
-        !turing_root || !turing_root[0] || !product_dir || !product_dir[0] ||
-        !nodus_root || !nodus_root[0] || !module_library_root || !module_library_root[0]) return 0;
-    const fs::path python = fs::absolute(python_executable);
-    const fs::path request = fs::absolute(request_json);
-    const fs::path turing = fs::absolute(turing_root);
-    const fs::path product = fs::absolute(product_dir);
-    const fs::path nodus = fs::absolute(nodus_root);
-    const fs::path driver = nodus / "tools" / "turing_row_tool_compiler.py";
-    if (!fs::is_regular_file(python) || !fs::is_regular_file(request) ||
-        !fs::is_directory(turing) || !fs::is_directory(nodus) ||
-        !fs::is_regular_file(driver)) {
-        std::cerr << "turing_product_adopter: compile request names a missing executable, request, root, or driver\n";
-        return 0;
-    }
-    std::error_code ec;
-    fs::create_directories(product, ec);
-    if (ec) return 0;
-    std::string error;
-    if (!run_compiler_driver(python, driver, request, turing, product, nodus, &error)) {
-        std::cerr << "turing_product_adopter: " << error << "\n";
-        return 0;
-    }
-    const fs::path receipt = product / "nodus-row-tool-product.receipt";
-    if (!fs::is_regular_file(receipt)) {
-        std::cerr << "turing_product_adopter: compiler completed without a product receipt\n";
-        return 0;
-    }
+    if (!module_library_root || !module_library_root[0]) return 0;
+    if (gp_turing_row_tool_compile_only(python_executable, nodus_root, request_json,
+                                        turing_root, product_dir, nullptr, nullptr, 0) != 1) return 0;
+    const fs::path receipt = fs::absolute(product_dir) / "nodus-row-tool-product.receipt";
     return gp_turing_product_adopt_and_load(
-        receipt.string().c_str(), nodus.string().c_str(), module_library_root,
+        receipt.string().c_str(), fs::absolute(nodus_root).string().c_str(), module_library_root,
         report, out_tool_id, out_tool_id_cap,
         out_staged_source, out_staged_source_cap);
 }

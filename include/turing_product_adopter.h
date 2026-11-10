@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#ifdef __cplusplus
+#include <atomic>
+#endif
 
 // Nodus-side adoption of a complete product emitted by
 // tools/turing_row_tool_compiler.py. This layer does not compile, link, or
@@ -14,9 +17,33 @@ struct GP_TuringProductAdoptionReport {
     int32_t plugin_loaded = 0;
 };
 
+// Cancel handle for the compiler-driver wait. Set `requested` from any thread;
+// the waiting thread kills the child (and its job tree on Windows) and
+// gp_turing_row_tool_compile_only returns 2. nullptr keeps the INFINITE wait.
+#ifdef __cplusplus
+struct GP_TuringCompileCancel {
+    std::atomic<bool> requested{false};
+};
+#else
+typedef struct GP_TuringCompileCancel GP_TuringCompileCancel;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// First half of compile_and_load: validate, run the driver, require the
+// receipt. Touches no registry/canvas, so it is safe on a worker thread.
+// Returns 1 success, 0 failure, 2 cancelled. out_error may be null.
+int gp_turing_row_tool_compile_only(
+    const char* python_executable,
+    const char* nodus_root,
+    const char* request_json,
+    const char* turing_root,
+    const char* product_dir,
+    GP_TuringCompileCancel* cancel,
+    char* out_error,
+    int32_t out_error_cap);
 
 // Adopt an already-compiled product. All receipt paths are product-root
 // relative and are refused if missing or if they escape receipt.parent.
