@@ -87,6 +87,16 @@ static void test_quiescence_and_event() {
 static void test_save_load_round_trip() {
     std::filesystem::path path = std::filesystem::temp_directory_path() / "nodus_headless_test_graph.txt";
 
+    // Run from a fresh empty cwd so we can prove nothing lands in the cwd.
+    namespace fs = std::filesystem;
+    const fs::path prev_cwd = fs::current_path();
+    const fs::path fresh_cwd = fs::temp_directory_path() / "nodus_headless_test_cwd";
+    std::error_code cwd_ec;
+    fs::remove_all(fresh_cwd, cwd_ec);
+    fs::create_directories(fresh_cwd);
+    fs::remove_all(fs::path(path.string() + ".modules"), cwd_ec);
+    fs::current_path(fresh_cwd);
+
     NodusHeadlessGraph* g1 = nodus_headless_create();
     assert(g1);
     int32_t module_a, row_a, module_b, row_b;
@@ -94,9 +104,23 @@ static void test_save_load_round_trip() {
     assert(nodus_headless_save_file(g1, path.string().c_str()));
     nodus_headless_destroy(g1);
 
+    // Serialized tables travel beside the canvas file, never in the cwd.
+    const fs::path modules_dir = fs::path(path.string() + ".modules");
+    assert(fs::is_directory(modules_dir / "module_library" / "serialized") ||
+           fs::is_directory(modules_dir / "serialized"));
+    {
+        bool found_gpmod = false;
+        for (const auto& e : fs::recursive_directory_iterator(modules_dir)) {
+            if (e.path().extension() == ".gpmod") found_gpmod = true;
+        }
+        assert(found_gpmod);
+    }
+    assert(!fs::exists(fresh_cwd / "module_library" / "serialized"));
+
     NodusHeadlessGraph* g2 = nodus_headless_create();
     assert(g2);
     assert(nodus_headless_load_file(g2, path.string().c_str()));
+    assert(!fs::exists(fresh_cwd / "module_library" / "serialized"));
     // The loaded graph must retain the same module/row topology so the same
     // ports resolve again -- this is the save/load fidelity the headless
     // ABI relies on (no new serialization format was introduced).

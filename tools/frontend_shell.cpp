@@ -2773,14 +2773,18 @@ void attach_apply_pending(FrontendResources& resources) {
             std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
             if (ofs) { ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size())); wrote = ofs.good(); }
         }
-        // The loader reads (and the canvas writes) the cwd-relative module_library/; a viewer must
-        // not share that directory with the host or other viewers, so load from the private tmp dir.
+        // Serialized module tables go to the viewer's private tmp dir, never the host's or the cwd.
+        const std::string prev_root = [&]() {
+            const int len = gp_canvas_get_module_library_root(head.context, nullptr, 0);
+            std::vector<char> buf(static_cast<size_t>(len > 0 ? len : 0) + 1, '\0');
+            if (len > 0) gp_canvas_get_module_library_root(head.context, buf.data(), len + 1);
+            return std::string(buf.data());
+        }();
         std::error_code cec;
-        const std::filesystem::path prev_cwd = std::filesystem::current_path(cec);
-        std::filesystem::create_directories(g_attach.tmp_dir / "module_library" / "serialized", cec);
-        std::filesystem::current_path(g_attach.tmp_dir, cec);
+        std::filesystem::create_directories(g_attach.tmp_dir / "module_library", cec);
+        gp_canvas_set_module_library_root(head.context, (g_attach.tmp_dir / "module_library").string().c_str());
         const bool loaded = wrote && gp_canvas_load_from_file(head.context, path.string().c_str());
-        if (!prev_cwd.empty()) std::filesystem::current_path(prev_cwd, cec);
+        gp_canvas_set_module_library_root(head.context, prev_root.c_str());
         if (!loaded) {
             std::cerr << "attach: failed to load canvas revision " << revision << "\n";
         }

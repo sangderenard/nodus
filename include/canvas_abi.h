@@ -401,8 +401,17 @@ int gp_canvas_export_module_library(GP_CanvasContext* ctx, const char* path);
 // Returns 1 on success.
 int gp_canvas_actualize_to_root(GP_CanvasContext* ctx, const char* output_root);
 // Export a single module's serialized blob to the given output root.
-// If output_root is NULL, uses the default `module_library` root.
+// If output_root is NULL, uses the context's module-library root (see below),
+// falling back to the cwd-relative default `module_library` root.
 int gp_canvas_export_module_to_root(GP_CanvasContext* ctx, int module_idx, const char* output_root);
+// Per-context root for the serialized module tables (<root>/serialized/*.gpmod)
+// that gp_canvas_save_to_file writes and gp_canvas_load_from_file reads. NULL or
+// "" clears it, restoring the legacy cwd-relative `module_library` behaviour (one
+// stderr warning the first time a save/load falls back to it). The getter copies
+// the root into out (NUL-terminated, truncated to capacity) and returns its full
+// length; out may be NULL to query the length.
+int gp_canvas_set_module_library_root(GP_CanvasContext* ctx, const char* root);
+int gp_canvas_get_module_library_root(GP_CanvasContext* ctx, char* out, int capacity);
 
 // Templates directory: set a global library directory for templates (used by
 // table template APIs if they are invoked with dir==NULL).

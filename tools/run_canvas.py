@@ -114,6 +114,7 @@ class ConsoleServer:
         with open(path, "rb") as handle:
             data = handle.read()
         os.remove(path)
+        shutil.rmtree(path + ".modules", ignore_errors=True)
         if data != self._last_bytes:
             self._last_bytes = data
             self._revision += 1

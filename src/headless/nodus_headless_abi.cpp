@@ -421,11 +421,33 @@ bool read_config_fields(std::istream& is, NodusHeadlessFifoConfig& c) {
                              c.layout >> c.dtype >> c.backend_type);
 }
 
+// Points the canvas module-library root at <path>.modules for one save/load and
+// restores the previous root on scope exit, so serialized tables never touch the cwd.
+struct ScopedModuleRoot {
+    GP_CanvasContext* ctx;
+    std::string prev;
+    ScopedModuleRoot(GP_CanvasContext* c, const std::string& root, bool create) : ctx(c) {
+        const int len = gp_canvas_get_module_library_root(c, nullptr, 0);
+        if (len > 0) {
+            std::vector<char> buf(static_cast<size_t>(len) + 1, '\0');
+            gp_canvas_get_module_library_root(c, buf.data(), len + 1);
+            prev.assign(buf.data(), static_cast<size_t>(len));
+        }
+        if (create) { std::error_code ec; std::filesystem::create_directories(root, ec); }
+        gp_canvas_set_module_library_root(c, root.c_str());
+    }
+    ~ScopedModuleRoot() { gp_canvas_set_module_library_root(ctx, prev.c_str()); }
+};
+
 } // namespace
 
 extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* path) {
     if (!g || !g->ctx || !path) return 0;
-    int32_t rc = gp_canvas_load_from_file(g->ctx, path);
+    int32_t rc;
+    {
+        ScopedModuleRoot root(g->ctx, std::string(path) + ".modules", false);
+        rc = gp_canvas_load_from_file(g->ctx, path);
+    }
     if (!rc) return 0;
     g->table = gp_canvas_get_container_table(g->ctx);
     // Port and edge bindings are process-local host views; CANVAS V4 does not
@@ -568,7 +590,10 @@ extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* p
         trailer << " " << *p.name << "\n";
     }
     g->contract_ports.write_trailer(trailer);
-    if (!gp_canvas_save_to_file(g->ctx, path)) return 0;
+    {
+        ScopedModuleRoot root(g->ctx, std::string(path) + ".modules", true);
+        if (!gp_canvas_save_to_file(g->ctx, path)) return 0;
+    }
     const std::string text = trailer.str();
     if (text.empty()) return 1;
     std::ofstream ofs(path, std::ios::app);

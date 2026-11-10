@@ -1,3 +1,18 @@
+// Effective module-library root for serialized tables: the context's explicit root,
+// else the legacy cwd-relative default (warned about once per process when requested).
+static std::string gp_canvas_module_root(GP_CanvasContextImpl* cc, bool warn_on_fallback) {
+    if (cc && !cc->module_library_root.empty()) return cc->module_library_root;
+    if (warn_on_fallback) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fputs("nodus: canvas save/load using cwd-relative module_library/ "
+                                 "(no module library root set; see gp_canvas_set_module_library_root)\n", stderr);
+        }
+    }
+    return gp_module_library_default_root();
+}
+
 static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
     std::ostringstream ss;
     ss << cc->modules.size() << ":";
@@ -17,6 +32,7 @@ static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
 }
 
 extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) {
+    gp_canvas_module_root(reinterpret_cast<GP_CanvasContextImpl*>(ctx_), true);
     #include "console_logger.h"
     #ifndef printf
     #define printf(...) CONSOLE_PRINTF(__VA_ARGS__)
@@ -127,7 +143,7 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     // module tables don't own those ropes. Future steps will mirror the
     // contained data back into modules and dedupe on load.
     {
-        std::string root = gp_module_library_default_root();
+        std::string root = gp_canvas_module_root(c, false);
         std::string rel = gp_module_library_module_serialized_path(std::string(), "container");
         std::filesystem::path full = std::filesystem::path(root) / rel;
         try {
@@ -422,6 +438,7 @@ extern "C" int gp_canvas_update_last_save_signature(GP_CanvasContext* ctx_) {
 // will clear current modules/edges/nodes and recreate them. Any canvas-owned
 // tables will be destroyed. Returns 1 on success.
 extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path) {
+    gp_canvas_module_root(reinterpret_cast<GP_CanvasContextImpl*>(ctx_), true);
     if (!ctx_ || !path) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     std::ifstream ifs(path);
@@ -669,7 +686,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         try {
             std::string mid = gp_module_library_module_id(static_cast<int>(i));
             std::string rel = gp_module_library_module_serialized_path(std::string(), mid);
-            std::string root = gp_module_library_default_root();
+            std::string root = gp_canvas_module_root(c, false);
             std::filesystem::path full = std::filesystem::path(root) / rel;
             if (std::filesystem::exists(full) && std::filesystem::file_size(full) > 0) {
                 std::ifstream ifs(full, std::ios::binary);
@@ -715,7 +732,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     // Load the root/container table blob so canvas-level ropes/overlays regain
     // their rope_id bindings before overlays and meta-groups are recreated.
     {
-        std::string root = gp_module_library_default_root();
+        std::string root = gp_canvas_module_root(c, false);
         std::string rel = gp_module_library_module_serialized_path(std::string(), "container");
         std::filesystem::path full = std::filesystem::path(root) / rel;
         if (std::filesystem::exists(full) && std::filesystem::file_size(full) > 0) {
@@ -1536,7 +1553,7 @@ extern "C" int gp_canvas_export_module_to_root(GP_CanvasContext* ctx_, int modul
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return 0;
 
-    std::string root = output_root ? std::string(output_root) : gp_module_library_default_root();
+    std::string root = output_root ? std::string(output_root) : gp_canvas_module_root(c, false);
     std::string module_id = gp_module_library_module_id(module_idx);
     std::string rel = gp_module_library_module_serialized_path(std::string(), module_id);
     std::filesystem::path full = std::filesystem::path(root) / rel;
@@ -1671,3 +1688,22 @@ extern "C" GP_CanvasContext* gp_canvas_get_singleton() {
     return reinterpret_cast<GP_CanvasContext*>(g_canvas_context_singleton);
 }
 
+
+extern "C" int gp_canvas_set_module_library_root(GP_CanvasContext* ctx_, const char* root) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->module_library_root = root ? std::string(root) : std::string();
+    return 1;
+}
+
+extern "C" int gp_canvas_get_module_library_root(GP_CanvasContext* ctx_, char* out, int capacity) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    const std::string &r = c->module_library_root;
+    if (out && capacity > 0) {
+        const size_t n = std::min(r.size(), static_cast<size_t>(capacity - 1));
+        std::memcpy(out, r.data(), n);
+        out[n] = '\0';
+    }
+    return static_cast<int>(r.size());
+}

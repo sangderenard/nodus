@@ -316,6 +316,8 @@ struct GP_CanvasContextImpl {
     std::vector<int>& module_node_id;
     // per-module stable UUIDs (monotonic 64-bit). 0 == unset
     std::vector<uint64_t> module_uuids;
+    // Explicit module-library root for serialized .gpmod tables (empty = cwd-relative default).
+    std::string module_library_root;
     // graph node/contract representation -- see GraphRuntime::NodeContract
     // (include/graph_runtime.h); GraphRuntime-owned.
     std::vector<GraphRuntime::NodeContract>& nodes;

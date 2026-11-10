@@ -93,6 +93,10 @@ NODUS_HEADLESS_API void nodus_headless_destroy(NodusHeadlessGraph* g);
 
 // Load/save the full graph topology (modules, tool/plugin bindings, edges)
 // using nodus's existing canvas save format -- no new format is introduced.
+// The per-module serialized tables (.gpmod) travel beside the canvas file in
+// the directory "<path>.modules" (created on save): both calls point the
+// canvas module-library root there for the duration of the call and restore
+// the previous root afterward, so nothing is written to or read from the cwd.
 NODUS_HEADLESS_API int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* path);
 NODUS_HEADLESS_API int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* path);
 // Export one module's concrete table serialization under
