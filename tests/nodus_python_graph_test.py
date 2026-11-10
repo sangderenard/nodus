@@ -570,6 +570,7 @@ def main() -> int:
         test_two_module_fifo_reload_requires_explicit_reattachment,
         test_failed_load_preserves_bindings_and_successful_load_invalidates_handles,
         test_pointer_contract_reaches_native_scheduler,
+        test_unregistered_plugin_row_is_refused,
         test_typed_fifo_does_not_select_stack_transfer,
         test_simultaneous_graphs_are_refused,
         test_fifo_absence_and_invalid_capacity_are_explicit,
