@@ -96,6 +96,7 @@ bool execute_case(ITool& tool,
     ToolStackContext stack{};
     stack.stack.raw = &raw;
     if (ok) tool.execute_stack(stack);
+    ok = ok && stack.succeeded;
 
     nodus::tensors::AbstractTensorHandle difference{}, sum{};
     ok = ok && raw_stack_pop_abstract_tensor(raw, difference) &&
@@ -108,6 +109,20 @@ bool execute_case(ITool& tool,
     if (difference.id) nodus_tensor_destroy(difference.id);
     if (x) nodus_tensor_destroy(x);
     if (y) nodus_tensor_destroy(y);
+    raw_stack_free_mask(raw);
+    if (raw.backend) gp_mem_backend_release(raw.backend);
+    return ok;
+}
+
+bool execute_refusal_without_inputs(ITool& tool) {
+    ToolStackContext missing_stack{};
+    tool.execute_stack(missing_stack);
+    RawStackFrame raw{};
+    if (!raw_stack_init_frame(raw, 4096)) return false;
+    ToolStackContext empty{};
+    empty.stack.raw = &raw;
+    tool.execute_stack(empty);
+    const bool ok = !missing_stack.succeeded && !empty.succeeded && raw.byte_count == 0;
     raw_stack_free_mask(raw);
     if (raw.backend) gp_mem_backend_release(raw.backend);
     return ok;
@@ -296,9 +311,10 @@ extern "C" __declspec(dllexport) void buffer_entry(void** buffers, int64_t* exte
         std::cerr << "generated wrapper exports or multi-output ports are wrong\n";
         return 1;
     }
+    const bool missing_entry_refused = execute_refusal_without_inputs(*tool);
     tool->initialize(ToolInitContext{});
 
-    bool ok = execute_case(
+    bool ok = missing_entry_refused && execute_refusal_without_inputs(*tool) && execute_case(
         *tool, {1.0, 2.0, 3.0, 4.0}, {0.5, -1.0, 2.0, 8.0},
         {1.5, 1.0, 5.0, 12.0}, {0.5, 3.0, 1.0, -4.0});
     ok = ok && execute_case(

@@ -798,11 +798,45 @@ target_link_libraries(canvas_tables PRIVATE nodus_python_row)
 target_link_libraries(canvas_tables_static PUBLIC nodus_python_row)
 
 # Unit tests
+# Native development-service host reuses the same graph, tools and FIFO.
+add_library(nodus_contract_service SHARED
+  src/headless/contract_service_host.cpp src/headless/nodus_headless_abi.cpp)
+target_compile_definitions(nodus_contract_service PRIVATE NODUS_HEADLESS_BUILD=1)
+target_link_libraries(nodus_contract_service PRIVATE canvas_tables_static nodus_runtime)
+if(WIN32)
+  target_link_libraries(nodus_contract_service PRIVATE ws2_32)
+endif()
+# Socket qualification uses the same native registry image as its headless graph.
+add_executable(contract_socket_test tests/contract_socket_graph_test.cpp)
+target_link_libraries(contract_socket_test PRIVATE canvas_tables_static nodus_runtime)
+add_executable(contract_socket_graph_test
+  tests/contract_socket_graph_test.cpp src/headless/nodus_headless_abi.cpp)
+target_compile_definitions(contract_socket_graph_test PRIVATE
+  NODUS_HEADLESS_BUILD=1 CONTRACT_SOCKET_GRAPH_TEST=1)
+target_link_libraries(contract_socket_graph_test PRIVATE canvas_tables_static nodus_runtime)
+if(WIN32)
+  target_link_libraries(contract_socket_test PRIVATE ws2_32)
+  target_link_libraries(contract_socket_graph_test PRIVATE ws2_32)
+endif()
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/contract-loopback-isolated")
+foreach(_contract_target contract_socket_test contract_socket_graph_test)
+  add_test(NAME ${_contract_target} COMMAND ${_contract_target})
+  set_tests_properties(${_contract_target} PROPERTIES TIMEOUT 30
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/contract-loopback-isolated")
+endforeach()
+
+# Native domain mailman: existing tool registry + existing lossless FIFO ABI.
+add_executable(contract_negotiator_test tests/contract_negotiator_test.cpp)
+target_link_libraries(contract_negotiator_test PRIVATE canvas_tables_static nodus_runtime)
+add_test(NAME contract_negotiator_test COMMAND contract_negotiator_test)
+set_tests_properties(contract_negotiator_test PROPERTIES TIMEOUT 30)
+
 add_executable(test_thread_manager
   tests/thread_manager_test.cpp
 )
 target_link_libraries(test_thread_manager PRIVATE canvas_tables_static)
 add_test(NAME thread_manager_test COMMAND test_thread_manager)
+set_tests_properties(thread_manager_test PROPERTIES TIMEOUT 30)
 if(WIN32)
   set_tests_properties(thread_manager_test PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:test_thread_manager>\;${TORCH_INSTALL_PREFIX}/lib"
@@ -822,6 +856,7 @@ target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_S
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
+set_tests_properties(nodus_headless_runtime_test PROPERTIES TIMEOUT 30)
 
 # Python smoke test: exercises nodus_headless via the ctypes bridge
 # (nodus_headless_bridge.py), the same way an external process would.
@@ -1300,6 +1335,10 @@ add_test(NAME kpath_raster_tool_test COMMAND test_kpath_raster_tool)
 #
 # Ensure asserts remain enabled for test translation units in non-Debug builds.
 set(NODUS_TEST_TARGETS
+  contract_socket_test
+  contract_socket_graph_test
+  contract_negotiator_test
+  nodus_headless_runtime_test
   test_thread_manager
   test_frame_serialization
   test_edge_backend_coordination
@@ -1339,4 +1378,3 @@ if(ENABLE_EIGEN_SIM)
 endif()
 # include auto-discovered sources
 include(cmake/auto_sources.cmake)
-

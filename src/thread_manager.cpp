@@ -1590,10 +1590,13 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         }
     };
 
-        // Parallel execution enabled when scheduled+acyclic or if the
-        // manager is in FreeSpinning mode.
+        // Both modes need an acyclic graph for predecessor-count dispatch.
+        // A partial cycle can have an initial ready node but then exhaust the
+        // ready queue with unfinished nodes, deadlocking every pool worker.
+        // Reuse the existing sequential cyclic order in either mode.
         auto cur_mode = mode_.load(std::memory_order_relaxed);
-        if ((cur_mode == Mode::Scheduled && acyclic && order.size() > 1) || (cur_mode == Mode::FreeSpinning)) {
+        if (acyclic && ((cur_mode == Mode::Scheduled && order.size() > 1) ||
+                        cur_mode == Mode::FreeSpinning)) {
             run_parallel();
         } else {
             run_sequential();

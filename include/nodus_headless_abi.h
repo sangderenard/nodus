@@ -139,6 +139,15 @@ NODUS_HEADLESS_API int32_t nodus_headless_configure_edge_fifo(
 NODUS_HEADLESS_API int32_t nodus_headless_get_edge_fifo_config(
     NodusHeadlessGraph* g, int32_t canvas_edge_idx,
     NodusHeadlessFifoConfig* out_config);
+// Custom native tools can exchange bytes on their configured declared edge.
+// Uses the same producer/consumer contact identity as ordinary scheduled rows.
+// Call from ordered tool rows or at a completed-step boundary, not concurrently.
+NODUS_HEADLESS_API int32_t nodus_headless_publish_edge_token(
+    NodusHeadlessGraph* g, int32_t edge_idx, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* result);
+NODUS_HEADLESS_API int32_t nodus_headless_consume_edge_token(
+    NodusHeadlessGraph* g, int32_t edge_idx, void* bytes, size_t capacity,
+    size_t* written);
 NODUS_HEADLESS_API int32_t nodus_headless_get_edge_unread(
     NodusHeadlessGraph* g, int32_t canvas_edge_idx, int32_t* out_unread);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_uuid(

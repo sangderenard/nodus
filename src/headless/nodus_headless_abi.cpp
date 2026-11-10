@@ -516,6 +516,38 @@ extern "C" int32_t nodus_headless_get_edge_fifo_config(
     return read_table_edge_config(g->table, edge.table_edge_idx, out_config);
 }
 
+extern "C" int32_t nodus_headless_publish_edge_token(
+    NodusHeadlessGraph* g, int32_t index, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* result) {
+    if(result) *result = {};
+    if(!g || !g->table || !result || !bytes || len > INT32_MAX || index < 0 ||
+       static_cast<size_t>(index) >= g->edges.size()) return 0;
+    const auto& edge = g->edges[static_cast<size_t>(index)];
+    if(!edge.configured) return 0;
+    int32_t dropped = 0;
+    result->accepted = gp_table_edge_publish(g->table, edge.table_edge_idx,
+        scalar_reader_key(edge.desc.a_module, edge.desc.a_contact_idx), bytes,
+        static_cast<int32_t>(len), &dropped);
+    result->dropped = dropped;
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_consume_edge_token(
+    NodusHeadlessGraph* g, int32_t index, void* bytes, size_t capacity,
+    size_t* written) {
+    if(written) *written = 0;
+    if(!g || !g->table || !written || !bytes || capacity > INT32_MAX || index < 0 ||
+       static_cast<size_t>(index) >= g->edges.size()) return 0;
+    const auto& edge = g->edges[static_cast<size_t>(index)];
+    if(!edge.configured) return 0;
+    int32_t count = 0;
+    int32_t consumed = gp_table_edge_consume(g->table, edge.table_edge_idx,
+        scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx), bytes,
+        static_cast<int32_t>(capacity), &count);
+    if(consumed && count >= 0) *written = static_cast<size_t>(count);
+    return consumed;
+}
+
 extern "C" int32_t nodus_headless_get_edge_unread(
     NodusHeadlessGraph* g, int32_t canvas_edge_idx, int32_t* out_unread) {
     if (!g || !g->table || !out_unread || canvas_edge_idx < 0 ||

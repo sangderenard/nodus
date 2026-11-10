@@ -24,6 +24,7 @@
 // MouseListener/KeyboardListener/StackDisplay tool kinds -- meaningful only
 // with a live canvas, not a graph-execution concern in the headless sense).
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>

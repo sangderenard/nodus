@@ -139,7 +139,39 @@ static void test_duplicate_module_uuid_is_refused() {
     std::printf("test_duplicate_module_uuid_is_refused: OK\n");
 }
 
+// Exercise the real canvas -> ThreadManager route, not just an isolated
+// predecessor-count helper. The partial cycle has a ready upstream node.
+static void test_partial_cycle_freespinning_completes() {
+    auto* graph = nodus_headless_create();
+    assert(graph);
+    int modules[3];
+    int rows[3];
+    for (int i = 0; i < 3; ++i) {
+        GP_CanvasModuleDesc desc{};
+        desc.w = desc.h = 64;
+        std::snprintf(desc.label, sizeof(desc.label), "cycle_%d", i);
+        modules[i] = nodus_headless_add_module(graph, &desc);
+        assert(modules[i] >= 0);
+        rows[i] = nodus_headless_bind_builtin_tool(graph, modules[i], kToolTensorTool);
+        assert(rows[i] >= 0);
+    }
+    const int ends[3][2] = {{0, 1}, {1, 2}, {2, 1}};
+    for (const auto& pair : ends) {
+        GP_CanvasEdgeDesc edge{};
+        edge.a_module = modules[pair[0]];
+        edge.a_contact_idx = rows[pair[0]];
+        edge.b_module = modules[pair[1]];
+        edge.b_contact_idx = rows[pair[1]];
+        assert(nodus_headless_add_edge(graph, &edge, 0) >= 0);
+    }
+    assert(nodus_headless_set_scheduler_mode(graph, 0));
+    assert(nodus_headless_step(graph, 1.0 / 60.0));
+    nodus_headless_destroy(graph);
+    std::printf("test_partial_cycle_freespinning_completes: OK\n");
+}
+
 int main() {
+    test_partial_cycle_freespinning_completes();
     test_quiescence_and_event();
     test_save_load_round_trip();
     test_overflow_event();

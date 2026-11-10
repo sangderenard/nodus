@@ -913,6 +913,9 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "        if (idx == 1) return ToolPortSpec{ToolPortKind::Return, " << output_indices.size() << "};\n";
     ss << "        return ToolPortSpec{};\n    }\n";
     ss << "    void execute_stack(ToolStackContext& ctx) override {\n";
+    // A compiled row succeeds only after every output is published. Missing
+    // entry/input previously inherited success=true and advanced an idle row.
+    ss << "        ctx.succeeded = false;\n";
     ss << "        if (!ctx.stack.raw || !entry_) return;\n";
     ss << "        RawStackFrame& frame = *ctx.stack.raw;\n";
     ss << "        std::array<nodus::tensors::AbstractTensorHandle, " << doc.values.size() << "> handles{};\n";
@@ -1058,6 +1061,7 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
           "            }\n"
           "            ++pushed;\n"
           "        }\n"
+          "        ctx.succeeded = true;\n"
           "    }\n";
     ss << "private:\n    void* module_ = nullptr;\n    EntryFn entry_ = nullptr;\n"
           "    ValidationResetFn validation_reset_ = nullptr;\n"
