@@ -13,6 +13,8 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -51,6 +53,10 @@
 #endif
 
 #include "canvas_abi.h"
+
+// Defined in the static canvas library (also used by thread_manager.cpp); writes the
+// stack tail of a module on the primary canvas context. Attach mode reuses it.
+extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
 
 namespace {
 
@@ -102,6 +108,321 @@ static void save_frontend_collection_state(const CanvasCollectionState& state);
 static constexpr int kDefaultCanvasWidth = 1000;
 static constexpr int kDefaultCanvasHeight = 720;
 static constexpr int kCanvasSwitchWindowMs = 3000;
+
+// ---------------------------------------------------------------------------
+// Attach mode (--attach=127.0.0.1:<port> --console-token-file=<path>): READ-ONLY
+// viewer of a running headless graph through its console port (protocol
+// nodus-console/1, newline-delimited UTF-8 over loopback TCP). A viewer thread owns
+// the socket; the main loop applies what it posts (canvas bytes, stack tails).
+// ---------------------------------------------------------------------------
+struct AttachJson {
+    char t = 'n';  // n null, b bool, d number, s string, a array, o object
+    double num = 0.0;
+    std::string str;
+    std::vector<AttachJson> arr;
+    std::vector<std::pair<std::string, AttachJson>> obj;
+    const AttachJson* get(const char* key) const {
+        if (t != 'o') return nullptr;
+        for (const auto& kv : obj) if (kv.first == key) return &kv.second;
+        return nullptr;
+    }
+    long long as_count() const {
+        return t == 'd' ? static_cast<long long>(num) : (t == 'a' ? static_cast<long long>(arr.size()) : 0);
+    }
+};
+
+static void attach_json_ws(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+}
+
+static bool attach_json_string(const std::string& s, size_t& i, std::string& out) {
+    if (i >= s.size() || s[i] != '"') return false;
+    ++i;
+    out.clear();
+    while (i < s.size()) {
+        char c = s[i++];
+        if (c == '"') return true;
+        if (c != '\\') { out.push_back(c); continue; }
+        if (i >= s.size()) return false;
+        char e = s[i++];
+        switch (e) {
+            case 'n': out.push_back('\n'); break;
+            case 't': out.push_back('\t'); break;
+            case 'r': out.push_back('\r'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'u': if (i + 4 > s.size()) return false; i += 4; out.push_back('?'); break;
+            default: out.push_back(e); break;
+        }
+    }
+    return false;
+}
+
+static bool attach_json_value(const std::string& s, size_t& i, AttachJson& out, int depth) {
+    if (depth > 32) return false;
+    attach_json_ws(s, i);
+    if (i >= s.size()) return false;
+    char c = s[i];
+    if (c == '{') {
+        out.t = 'o'; ++i; attach_json_ws(s, i);
+        if (i < s.size() && s[i] == '}') { ++i; return true; }
+        while (i < s.size()) {
+            attach_json_ws(s, i);
+            std::string key;
+            if (!attach_json_string(s, i, key)) return false;
+            attach_json_ws(s, i);
+            if (i >= s.size() || s[i] != ':') return false;
+            ++i;
+            AttachJson v;
+            if (!attach_json_value(s, i, v, depth + 1)) return false;
+            out.obj.emplace_back(std::move(key), std::move(v));
+            attach_json_ws(s, i);
+            if (i < s.size() && s[i] == ',') { ++i; continue; }
+            if (i < s.size() && s[i] == '}') { ++i; return true; }
+            return false;
+        }
+        return false;
+    }
+    if (c == '[') {
+        out.t = 'a'; ++i; attach_json_ws(s, i);
+        if (i < s.size() && s[i] == ']') { ++i; return true; }
+        while (i < s.size()) {
+            AttachJson v;
+            if (!attach_json_value(s, i, v, depth + 1)) return false;
+            out.arr.push_back(std::move(v));
+            attach_json_ws(s, i);
+            if (i < s.size() && s[i] == ',') { ++i; continue; }
+            if (i < s.size() && s[i] == ']') { ++i; return true; }
+            return false;
+        }
+        return false;
+    }
+    if (c == '"') { out.t = 's'; return attach_json_string(s, i, out.str); }
+    if (s.compare(i, 4, "true") == 0) { out.t = 'b'; out.num = 1; i += 4; return true; }
+    if (s.compare(i, 5, "false") == 0) { out.t = 'b'; out.num = 0; i += 5; return true; }
+    if (s.compare(i, 4, "null") == 0) { out.t = 'n'; i += 4; return true; }
+    const char* b = s.c_str() + i;
+    char* e = nullptr;
+    double d = std::strtod(b, &e);
+    if (e == b) return false;
+    out.t = 'd'; out.num = d; i += static_cast<size_t>(e - b);
+    return true;
+}
+
+struct AttachState {
+    bool enabled = false;
+    std::string target;  // "127.0.0.1:<port>" for display
+    int port = 0;
+    std::string token;
+    std::mutex mu;  // guards the posted fields below
+    std::string status_line;
+    bool status_dirty = false;
+    bool has_canvas = false;
+    std::string canvas_bytes;
+    std::string canvas_revision;
+    bool has_tails = false;
+    std::vector<std::pair<int, std::vector<float>>> tails;
+    std::atomic<bool> stop{false};
+    std::thread worker;
+    // main-thread only
+    std::string applied_revision;
+    bool ever_applied = false;
+    std::vector<std::pair<int, std::vector<float>>> last_tails;
+    std::string display_line = "RECONNECTING";
+    std::filesystem::path tmp_dir;
+};
+static AttachState g_attach;
+
+static void attach_set_status(const std::string& line) {
+    {
+        std::lock_guard<std::mutex> lock(g_attach.mu);
+        if (line == g_attach.status_line) return;
+        g_attach.status_line = line;
+        g_attach.status_dirty = true;
+    }
+    std::cout << line << std::endl;
+}
+
+static void attach_sleep(int ms) {
+    for (int waited = 0; waited < ms && !g_attach.stop.load(); waited += 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+static bool attach_send_all(SOCKET s, const std::string& data) {
+    size_t off = 0;
+    while (off < data.size()) {
+        int n = static_cast<int>(send(s, data.data() + off, static_cast<int>(data.size() - off), 0));
+        if (n <= 0) return false;
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Blocking buffered reader over a socket with SO_RCVTIMEO set; any error/timeout => false.
+struct AttachReader {
+    SOCKET s;
+    std::string buf;
+    size_t pos = 0;
+    bool fill() {
+        if (pos > 0 && pos == buf.size()) { buf.clear(); pos = 0; }
+        char tmp[65536];
+        int n = static_cast<int>(recv(s, tmp, sizeof(tmp), 0));
+        if (n <= 0) return false;
+        buf.append(tmp, static_cast<size_t>(n));
+        return true;
+    }
+    bool read_line(std::string& out, size_t max_len = 8u << 20) {
+        for (;;) {
+            size_t nl = buf.find('\n', pos);
+            if (nl != std::string::npos) {
+                out.assign(buf, pos, nl - pos);
+                pos = nl + 1;
+                if (!out.empty() && out.back() == '\r') out.pop_back();
+                return true;
+            }
+            if (buf.size() - pos > max_len) return false;
+            if (!fill()) return false;
+        }
+    }
+    bool read_bytes(size_t n, std::string& out) {
+        while (buf.size() - pos < n) {
+            if (!fill()) return false;
+        }
+        out.assign(buf, pos, n);
+        pos += n;
+        return true;
+    }
+};
+
+static std::string attach_state_line(const AttachJson& st) {
+    std::ostringstream os;
+    const AttachJson* rev = st.get("revision");
+    const AttachJson* ticks = st.get("ticks");
+    os << "ATTACHED read-only " << g_attach.target
+       << " rev " << (rev ? rev->as_count() : 0)
+       << " ticks " << (ticks ? ticks->as_count() : 0) << " ports:";
+    const AttachJson* cps = st.get("contract_ports");
+    if (cps && cps->t == 'a') {
+        for (const auto& cp : cps->arr) {
+            const AttachJson* prefix = cp.get("prefix");
+            const AttachJson* lp = cp.get("listen_port");
+            const AttachJson* h = cp.get("hosts");
+            const AttachJson* e = cp.get("engines");
+            os << " " << (prefix ? prefix->str : std::string("?")) << "@" << (lp ? lp->as_count() : 0)
+               << " h=" << (h ? h->as_count() : 0) << " e=" << (e ? e->as_count() : 0);
+        }
+    }
+    return os.str();
+}
+
+static void attach_viewer_main() {
+    try {
+        nodus::contracts::ensure_sockets();
+    } catch (const std::exception& e) {
+        attach_set_status(std::string("REFUSED sockets unavailable: ") + e.what());
+        return;
+    }
+    std::string last_posted_revision;
+    bool posted_any = false;
+    while (!g_attach.stop.load()) {
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        bool connected = false;
+        if (s != INVALID_SOCKET) {
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            a.sin_port = htons(static_cast<uint16_t>(g_attach.port));
+            connected = connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+#ifdef _WIN32
+            DWORD ms = 2000;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+#else
+            timeval tv{2, 0};
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        }
+        if (!connected) {
+            if (s != INVALID_SOCKET) nodus::contracts::WireSocket::close_socket(s);
+            attach_set_status("RECONNECTING");
+            attach_sleep(1500);
+            continue;
+        }
+        AttachReader rd{s};
+        std::string line;
+        bool refused = false;
+        if (!attach_send_all(s, "HELLO nodus-console/1 " + g_attach.token + "\n") || !rd.read_line(line)) {
+            // fall through to reconnect
+        } else if (line.rfind("OK console", 0) == 0) {
+            while (!g_attach.stop.load()) {
+                if (!attach_send_all(s, "SNAPSHOT\n") || !rd.read_line(line)) break;
+                if (line.rfind("REFUSED", 0) == 0) { attach_set_status(line); refused = true; break; }
+                std::istringstream hs(line);
+                std::string word, revision;
+                unsigned long long count = 0;
+                if (!(hs >> word >> revision >> count) || word != "CANVAS" || count > (256ull << 20)) break;
+                std::string bytes, tail, state_line;
+                if (!rd.read_bytes(static_cast<size_t>(count), bytes) || !rd.read_line(tail) || !rd.read_line(state_line)) break;
+                if (state_line.rfind("STATE ", 0) != 0) break;
+                AttachJson st;
+                size_t ji = 6;
+                if (!attach_json_value(state_line, ji, st, 0) || st.t != 'o') break;
+                std::vector<std::pair<int, std::vector<float>>> tails;
+                const AttachJson* mods = st.get("modules");
+                if (mods && mods->t == 'a') {
+                    for (const auto& m : mods->arr) {
+                        const AttachJson* idx = m.get("index");
+                        const AttachJson* tl = m.get("stack_tail");
+                        if (!idx || !tl || tl->t != 'a') continue;
+                        std::vector<float> vals;
+                        for (const auto& v : tl->arr) vals.push_back(static_cast<float>(v.num));
+                        tails.emplace_back(static_cast<int>(idx->num), std::move(vals));
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(g_attach.mu);
+                    if (!posted_any || revision != last_posted_revision) {
+                        g_attach.canvas_bytes = std::move(bytes);
+                        g_attach.canvas_revision = revision;
+                        g_attach.has_canvas = true;
+                        last_posted_revision = revision;
+                        posted_any = true;
+                    }
+                    g_attach.tails = std::move(tails);
+                    g_attach.has_tails = true;
+                }
+                attach_set_status(attach_state_line(st));
+                attach_sleep(500);
+            }
+        } else if (line.rfind("REFUSED", 0) == 0) {
+            attach_set_status(line);
+            refused = true;
+        }
+        nodus::contracts::WireSocket::close_socket(s);
+        if (!refused) attach_set_status("RECONNECTING");
+        attach_sleep(1500);
+    }
+}
+
+static void attach_start_viewer() {
+    std::error_code ec;
+    unsigned long pid =
+#ifdef _WIN32
+        static_cast<unsigned long>(GetCurrentProcessId());
+#else
+        static_cast<unsigned long>(getpid());
+#endif
+    g_attach.tmp_dir = std::filesystem::temp_directory_path(ec) / ("nodus-attach-" + std::to_string(pid));
+    std::filesystem::create_directories(g_attach.tmp_dir, ec);
+    g_attach.worker = std::thread(attach_viewer_main);
+}
+
+static void attach_stop_viewer() {
+    g_attach.stop.store(true);
+    if (g_attach.worker.joinable()) g_attach.worker.join();
+    std::error_code ec;
+    if (!g_attach.tmp_dir.empty()) std::filesystem::remove_all(g_attach.tmp_dir, ec);
+}
 
 // Kpath raster state used as an alternate render source inside the frontend shell.
 static nt::AbstractTensorPool g_demo_tensor_pool(nt::AbstractTensorPool::Options{
@@ -1542,6 +1863,23 @@ InputDispatcher::~InputDispatcher() {
 
 void InputDispatcher::handle_event(const SDL_Event& event) {
     maybe_complete_combo();
+    if (g_attach.enabled) {
+        // Attach mode is read-only: every editing/navigation input is dropped (the canvas
+        // pans/zooms through the same mouse entry points as edits, so no separation exists).
+        switch (event.type) {
+            case SDL_EVENT_KEY_DOWN:
+            case SDL_EVENT_KEY_UP:
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_BUTTON_UP:
+            case SDL_EVENT_MOUSE_MOTION:
+            case SDL_EVENT_MOUSE_WHEEL:
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            case SDL_EVENT_GAMEPAD_BUTTON_UP:
+                return;
+            default:
+                break;
+        }
+    }
     switch (event.type) {
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP: {
@@ -2196,6 +2534,8 @@ struct FrontendOptions {
     int height = kDefaultCanvasHeight;
     std::string workspace_path;
     std::vector<std::pair<std::string, size_t>> acquire_pairs;  // --acquire=PREFIX:CAPACITY
+    std::string attach_target;        // --attach=127.0.0.1:<port> (read-only console viewer)
+    std::string console_token_file;   // --console-token-file=<path>
     // timing overrides: negative => not set
     double thread_delay = -1.0;
     double gui_delay = -1.0;
@@ -2222,6 +2562,9 @@ static void print_usage(const char* progname) {
     std::cout << "  --workspace=<path>     Path for primary canvas workspace file\n";
     std::cout << "  --acquire=PREFIX:CAPACITY  Acquire a contract negotiator pair (repeatable) so a\n";
     std::cout << "                         saved canvas's <PREFIX>.market/.worker rows resolve\n";
+    std::cout << "  --attach=127.0.0.1:<port>  Read-only viewer of a running headless graph's console port\n";
+    std::cout << "                         (hosts no canvas of its own; excludes --workspace/--acquire)\n";
+    std::cout << "  --console-token-file=<path>  File whose first line is the console token (needed by --attach)\n";
     std::cout << "  --verbose              Enable verbose logging\n";
     std::cout << "  --thread-delay=<s>     Global thread loop sleep (seconds, default ~0.016)\n";
     std::cout << "  --gui-delay=<s>        Global GUI delay used by tick controller (seconds)\n";
@@ -2247,12 +2590,18 @@ FrontendOptions parse_frontend_options(int argc, char** argv) {
     const std::string canvas_display_ratio_prefix = "--canvas-display-ratio="; // IDX:RATIO
     const std::string pause_canvas_prefix = "--pause-canvas="; // IDX
     const std::string acquire_prefix = "--acquire="; // PREFIX:CAPACITY
+    const std::string attach_prefix = "--attach=";
+    const std::string token_file_prefix = "--console-token-file=";
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
         if (arg == "-h" || arg == "--help") {
             opts.show_help = true;
         } else if (arg == "--verbose") {
             opts.verbose = true;
+        } else if (arg.rfind(attach_prefix, 0) == 0) {
+            opts.attach_target = arg.substr(attach_prefix.size());
+        } else if (arg.rfind(token_file_prefix, 0) == 0) {
+            opts.console_token_file = arg.substr(token_file_prefix.size());
         } else if (arg.rfind(acquire_prefix, 0) == 0) {
             const std::string v = arg.substr(acquire_prefix.size());
             const size_t colon = v.rfind(':');
@@ -2376,6 +2725,97 @@ static void save_frontend_collection_state(const CanvasCollectionState& state) {
     }
 }
 
+bool initialize_attach_head(FrontendResources& resources) {
+    // One empty canvas, never autosaved, no contract ports, thread manager paused so the
+    // viewer cannot step the graph. Content arrives only through attach_apply_pending().
+    auto& head = resources.canvas_heads[0];
+    if (!create_canvas_head(head, resources.canvas_width_hint, resources.canvas_height_hint)) {
+        std::cerr << "Failed to create attach canvas head\n";
+        return false;
+    }
+    gp_canvas_set_thread_manager_paused(head.context, 1);
+    resources.active_canvas_index = 0;
+    resources.collection_state.active_index = 0;
+    return true;
+}
+
+// Main thread only: apply what the viewer thread posted (canvas load, stack tails, title).
+void attach_apply_pending(FrontendResources& resources) {
+    auto& head = resources.canvas_heads[0];
+    std::string bytes, revision, status;
+    bool has_canvas = false, has_tails = false, dirty = false;
+    std::vector<std::pair<int, std::vector<float>>> tails;
+    {
+        std::lock_guard<std::mutex> lock(g_attach.mu);
+        if (g_attach.has_canvas) {
+            has_canvas = true;
+            bytes = std::move(g_attach.canvas_bytes);
+            revision = g_attach.canvas_revision;
+            g_attach.has_canvas = false;
+        }
+        if (g_attach.has_tails) {
+            has_tails = true;
+            tails = std::move(g_attach.tails);
+            g_attach.has_tails = false;
+        }
+        if (g_attach.status_dirty) {
+            dirty = true;
+            status = g_attach.status_line;
+            g_attach.status_dirty = false;
+        }
+    }
+    if (has_tails) g_attach.last_tails = tails;
+    bool reloaded = false;
+    if (has_canvas && head.context && (!g_attach.ever_applied || revision != g_attach.applied_revision)) {
+        const std::filesystem::path path = g_attach.tmp_dir / "canvas.txt";
+        bool wrote = false;
+        {
+            std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+            if (ofs) { ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size())); wrote = ofs.good(); }
+        }
+        // The loader reads (and the canvas writes) the cwd-relative module_library/; a viewer must
+        // not share that directory with the host or other viewers, so load from the private tmp dir.
+        std::error_code cec;
+        const std::filesystem::path prev_cwd = std::filesystem::current_path(cec);
+        std::filesystem::create_directories(g_attach.tmp_dir / "module_library" / "serialized", cec);
+        std::filesystem::current_path(g_attach.tmp_dir, cec);
+        const bool loaded = wrote && gp_canvas_load_from_file(head.context, path.string().c_str());
+        if (!prev_cwd.empty()) std::filesystem::current_path(prev_cwd, cec);
+        if (!loaded) {
+            std::cerr << "attach: failed to load canvas revision " << revision << "\n";
+        }
+        g_attach.applied_revision = revision;  // never retry the same revision
+        g_attach.ever_applied = true;
+        reloaded = true;
+    }
+    // A load rebuilds the per-module tails, so re-apply the last known values after it.
+    if ((has_tails || reloaded) && head.context && g_attach.ever_applied) {
+        const int module_count = gp_canvas_get_module_count(head.context);
+        for (const auto& t : g_attach.last_tails) {
+            if (t.first < 0 || t.first >= module_count) continue;
+            canvas_set_module_stack_tail(t.first, t.second.data(), static_cast<int>(t.second.size()));
+        }
+    }
+    if (dirty) {
+        g_attach.display_line = status;
+        if (resources.window) SDL_SetWindowTitle(resources.window, ("Nodus " + status).c_str());
+    }
+}
+
+void draw_attach_overlay(FrontendResources& resources) {
+    if (!resources.renderer) return;
+    int w = 0, h = 0;
+    SDL_GetCurrentRenderOutputSize(resources.renderer, &w, &h);
+    SDL_FRect bar{0.0f, 0.0f, static_cast<float>(w), 16.0f};
+    SDL_SetRenderDrawColor(resources.renderer, 0, 0, 0, 255);
+    SDL_RenderFillRect(resources.renderer, &bar);
+    std::string text = g_attach.display_line;
+    const size_t max_chars = static_cast<size_t>(std::max(1, w / 8));
+    if (text.size() > max_chars) text.resize(max_chars);
+    SDL_SetRenderDrawColor(resources.renderer, 255, 255, 255, 255);
+    SDL_RenderDebugText(resources.renderer, 4.0f, 4.0f, text.c_str());
+}
+
 void pump_events(bool& running, InputDispatcher& dispatcher) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -2459,6 +2899,7 @@ void render_frame(FrontendResources& resources, CanvasTickController& controller
         dstf.h = static_cast<float>(dsti.h);
         SDL_RenderTexture(resources.renderer, resources.canvas_texture, nullptr, &dstf);
     }
+    if (g_attach.enabled) draw_attach_overlay(resources);
     SDL_RenderPresent(resources.renderer);
 }
 
@@ -2527,11 +2968,50 @@ int main(int argc, char** argv) {
         return EXIT_SUCCESS;
     }
 
+    if (!options.attach_target.empty()) {
+        if (!options.workspace_path.empty() || !options.acquire_pairs.empty()) {
+            std::cerr << "--attach is a read-only viewer and cannot be combined with --workspace or --acquire\n";
+            return 2;
+        }
+        const std::string kLoop = "127.0.0.1:";
+        int port = 0;
+        try {
+            if (options.attach_target.rfind(kLoop, 0) != 0) throw std::invalid_argument("host");
+            port = std::stoi(options.attach_target.substr(kLoop.size()));
+            if (port <= 0 || port > 65535) throw std::out_of_range("port");
+        } catch (...) {
+            std::cerr << "--attach expects 127.0.0.1:<port> (loopback only), got: " << options.attach_target << "\n";
+            return 2;
+        }
+        if (options.console_token_file.empty()) {
+            std::cerr << "--attach requires --console-token-file=<path>\n";
+            return 2;
+        }
+        std::ifstream tf(options.console_token_file);
+        std::string token;
+        if (!tf || !std::getline(tf, token)) {
+            std::cerr << "--console-token-file could not be read: " << options.console_token_file << "\n";
+            return 2;
+        }
+        while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) token.pop_back();
+        size_t lead = 0;
+        while (lead < token.size() && std::isspace(static_cast<unsigned char>(token[lead]))) ++lead;
+        token.erase(0, lead);
+        if (token.empty()) {
+            std::cerr << "--console-token-file has an empty first line\n";
+            return 2;
+        }
+        g_attach.enabled = true;
+        g_attach.target = options.attach_target;
+        g_attach.port = port;
+        g_attach.token = token;
+    }
+
     InputFilters input_filters = parse_input_filters(argc, argv);
 
     FrontendResources resources;
     initialize_collection_state(resources.collection_state);
-    if (load_frontend_collection_state(resources.collection_state)) {
+    if (!g_attach.enabled && load_frontend_collection_state(resources.collection_state)) {
         std::cout << "Restored frontend canvas collection (active="
                   << resources.collection_state.active_index << ")\n";
     }
@@ -2553,10 +3033,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!initialize_canvas_heads(resources)) {
+    if (!(g_attach.enabled ? initialize_attach_head(resources) : initialize_canvas_heads(resources))) {
         cleanup(resources);
         return EXIT_FAILURE;
     }
+    if (g_attach.enabled) attach_start_viewer();
 
     std::cout << "Torch backend: " << resources.torch_device_name << "\n";
 
@@ -2596,6 +3077,7 @@ int main(int argc, char** argv) {
             bool running = true;
         while (running) {
             pump_events(running, dispatcher);
+            if (g_attach.enabled) attach_apply_pending(resources);
             dispatcher.update();
             tick_controller.record_render(kCanvasStepDt);
             render_frame(resources, tick_controller);
@@ -2614,7 +3096,8 @@ int main(int argc, char** argv) {
         tick_controller.stop();
     }
 
-    save_frontend_collection_state(resources.collection_state);
+    if (g_attach.enabled) attach_stop_viewer();
+    else save_frontend_collection_state(resources.collection_state);
 
     cleanup(resources);
     // Exit without running DLL static destructors: torch/CUDA teardown at
