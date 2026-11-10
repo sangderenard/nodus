@@ -1,4 +1,5 @@
 #include "contract_negotiator_tool.h"
+#include "contract_negotiator_registry.h"
 #include <cassert>
 #include <cstdio>
 using namespace nodus::contracts;
@@ -40,5 +41,17 @@ int main(){
     assert(retry.submit({200,10,8,90}));retry.market_turn();retry.market_turn();retry.worker_turn();
     assert(fresh.generation!=old.generation);assert(retry.contracts()[0].state==ContractNegotiator::State::Loaned);
     assert(!retry.retire(200));assert(!retry.submit({201,10,8,90}));
+    // Process registry: idempotent acquire, live rows, release unregisters.
+    {
+        auto& a=acquire("registry.proof",2);auto& b=acquire("registry.proof",2);
+        assert(&a==&b && find("registry.proof")==&a);
+        auto m=tool_registry_global().create("registry.proof.market");
+        auto w=tool_registry_global().create("registry.proof.worker");
+        assert(m && w);
+        ToolStackContext rs{};m->execute_stack(rs);assert(rs.succeeded); // execute BEFORE release only
+        assert(release("registry.proof"));
+        assert(!tool_registry_global().find("registry.proof.market") && !tool_registry_global().find("registry.proof.worker"));
+        assert(find("registry.proof")==nullptr && !release("registry.proof"));
+    }
     std::puts("native contract negotiator FIFO tests passed");
 }

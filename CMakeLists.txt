@@ -535,6 +535,7 @@ add_library(nodus_runtime SHARED
 target_compile_definitions(nodus_runtime PRIVATE NODUS_RUNTIME_BUILD=1)
 target_include_directories(nodus_runtime PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
 add_executable(edge_runtime_abi_test
@@ -556,6 +557,10 @@ target_include_directories(nodus_headless PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 target_link_libraries(nodus_headless PRIVATE canvas_tables_static)
+if(WIN32)
+  # contract ports: loopback listener and socket adapters (include/contract_listener.h)
+  target_link_libraries(nodus_headless PRIVATE ws2_32)
+endif()
 target_compile_features(nodus_headless PUBLIC cxx_std_20)
 
 # Small helper executable to run the module actualizer from the built project
@@ -830,6 +835,25 @@ add_executable(contract_negotiator_test tests/contract_negotiator_test.cpp)
 target_link_libraries(contract_negotiator_test PRIVATE canvas_tables_static nodus_runtime)
 add_test(NAME contract_negotiator_test COMMAND contract_negotiator_test)
 set_tests_properties(contract_negotiator_test PROPERTIES TIMEOUT 30)
+
+# Engine-side socket protocol and loopback listener (include/contract_socket.h,
+# include/contract_listener.h): a real 127.0.0.1 round trip, no graph.
+add_executable(contract_engine_socket_test tests/contract_engine_socket_test.cpp)
+target_link_libraries(contract_engine_socket_test PRIVATE canvas_tables_static nodus_runtime)
+if(WIN32)
+  target_link_libraries(contract_engine_socket_test PRIVATE ws2_32)
+endif()
+add_test(NAME contract_engine_socket_test COMMAND contract_engine_socket_test)
+set_tests_properties(contract_engine_socket_test PROPERTIES TIMEOUT 30)
+if(WIN32)
+  # The contract test executables load Torch through canvas_tables_static; without
+  # these directories on PATH Windows raises a missing-DLL dialog and ctest times out.
+  foreach(_contract_exe contract_socket_test contract_socket_graph_test contract_negotiator_test contract_engine_socket_test)
+    set_tests_properties(${_contract_exe} PROPERTIES
+      ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:${_contract_exe}>\;${TORCH_INSTALL_PREFIX}/lib"
+    )
+  endforeach()
+endif()
 
 add_executable(test_thread_manager
   tests/thread_manager_test.cpp

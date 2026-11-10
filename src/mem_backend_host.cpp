@@ -395,9 +395,16 @@ extern "C" gp_mem_backend_handle_t gp_mem_backend_create_from_params(
         return gp_mem_backend_create_cpu(bytes);
     }
     if (type == GP_MEM_BACKEND_VULKAN) {
+#if defined(NODUS_HAVE_VULKAN)
         if (params && params_size < sizeof(gp_mem_backend_vulkan_params_t)) return nullptr;
         return gp_mem_backend_create_vulkan(
             params ? static_cast<const gp_mem_backend_vulkan_params_t*>(params) : nullptr);
+#else
+        // This image was built without the Vulkan backend (kernel_vulkan.cpp is
+        // not part of the lean nodus_runtime). Refuse by name instead of
+        // leaving an unresolved symbol at link time.
+        return nullptr;
+#endif
     }
     GenericBackend* backend = new (std::nothrow) GenericBackend(type);
     if (!backend) return nullptr;

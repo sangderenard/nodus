@@ -5736,6 +5736,20 @@ extern "C" int gp_canvas_set_module_rows(GP_CanvasContext* ctx_, int module_idx,
         }
         rows.push_back(std::move(row));
     }
+    // Programmatic adoption refuses a plugin row whose id has no registered
+    // factory: applying it would leave a null instance that later falls
+    // through to the builtin switch at execution.  Nothing is applied, so
+    // the module's existing rows are untouched.  (File-load paths keep their
+    // name-fallback behavior and do not use this check.)
+    for (size_t ri = 0; ri < rows.size(); ++ri) {
+        const auto& row = rows[ri];
+        if (row.kind == ModuleRowKind::Tool && row.tool_origin == ModuleToolOrigin::Plugin &&
+            !row.plugin_id.empty() && !tool_registry_global().find(row.plugin_id)) {
+            fprintf(stderr, "gp_canvas_set_module_rows: no registered tool for plugin_id='%s' (module=%d row=%zu); rows not applied\n",
+                row.plugin_id.c_str(), module_idx, ri);
+            return 0;
+        }
+    }
     canvas_apply_io_rows(ctx, module_idx, rows);
     // This is an explicit host/programmatic row replacement, not a passive
     // UI refresh.  The layout synchronizer normally protects non-focused
