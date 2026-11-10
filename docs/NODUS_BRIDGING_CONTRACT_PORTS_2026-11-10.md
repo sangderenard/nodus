@@ -77,3 +77,9 @@ Release only after every graph that bound the pair has been destroyed (a negotia
 - No restart durability of negotiator state (process-owned; save/load re-declares the port, not contracts).
 - No authentication beyond loopback binding.
 - Program-rows and entity concurrency (proposal steps 4 and 5) not started.
+
+## Status update, later 2026-11-10
+
+- GUI hosting is proven at runtime: `frontend_shell --workspace=<copy> --acquire=gui.proof:4` printed `contract_port gui.proof 127.0.0.1:47611` 2.33 s after launch; an engine and a host peer completed Submit -> Admitted -> Offer/Accept/Result -> Route -> Decision -> Receipt through the window's tick loop. Receipt and the two scripts: docs/receipts/GUI_CONTRACT_PORT_PROOF_2026-11-10.md. Not proven: autosave behaviour after a GUI edit (no autosave write occurred), rendering, clean shutdown.
+- Canvas-host process: tools/run_canvas.py (tests/test_run_canvas.py).
+- Lowering library reader: nodus_graph/lowering_library.py over the Meowdoku server's accounts.db tables (written on the Turing side, branch bridging/web-lane-api).
