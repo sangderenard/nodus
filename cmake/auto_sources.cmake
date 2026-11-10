@@ -34,6 +34,13 @@ if(NODUS_CANVAS_SOURCES)
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]thread_pool\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]mem_backend_host\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]spirv_translation\\.cpp$")
+  # kernel_torch.cpp and mem_backend_torch.cpp include <torch/torch.h> unconditionally.
+  # A NODUS_ENABLE_TORCH=OFF image (the Torch-free service build) leaves them out;
+  # the Torch build keeps them. Both configurations must build.
+  if(NOT NODUS_ENABLE_TORCH)
+    list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]kernels[/\\\\]kernel_torch\\.cpp$")
+    list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]mem_backend_torch\\.cpp$")
+  endif()
   target_sources(canvas_tables PRIVATE ${NODUS_CANVAS_SOURCES})
   if(TARGET canvas_tables_static)
     target_sources(canvas_tables_static PRIVATE ${NODUS_CANVAS_SOURCES})
