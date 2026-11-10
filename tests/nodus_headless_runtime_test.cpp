@@ -4,12 +4,23 @@
 // the same table-edge transport real graph edges use, save/load preserves
 // enough structure to re-resolve the same ports, and edge overflow is
 // observable through the event queue.
+// Winsock headers must precede anything that may pull in <windows.h>.
+#include "contract_socket.h"
+#include "contract_listener.h"
+
 #include <cassert>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 
 #include "nodus_headless_abi.h"
+
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")  // test client sockets; CMake links ws2_32 only into nodus_headless
+#endif
 
 namespace {
 constexpr int32_t kToolTensorAllocator = 12;
@@ -139,6 +150,28 @@ static void test_duplicate_module_uuid_is_refused() {
     std::printf("test_duplicate_module_uuid_is_refused: OK\n");
 }
 
+static void test_unregistered_plugin_row_is_refused() {
+    NodusHeadlessGraph* graph = nodus_headless_create();
+    assert(graph);
+    GP_CanvasModuleDesc desc{};
+    std::strncpy(desc.label, "plugin", sizeof(desc.label) - 1);
+    int32_t module = nodus_headless_add_module(graph, &desc);
+    assert(module >= 0);
+    GP_CanvasModuleRowDesc good[2]{};
+    good[0].kind = 0; good[0].attachment_count = 1;
+    good[1].kind = 2; good[1].attachment_count = 1;
+    assert(nodus_headless_set_module_rows(graph, module, good, 2));
+    int32_t before = nodus_headless_get_module_row_count(graph, module);
+    GP_CanvasModuleRowDesc bad[1]{};
+    bad[0].kind = 1;
+    bad[0].tool_origin = 1;
+    bad[0].plugin_id = "no.such.plugin";
+    assert(!nodus_headless_set_module_rows(graph, module, bad, 1));
+    assert(nodus_headless_get_module_row_count(graph, module) == before);
+    nodus_headless_destroy(graph);
+    std::printf("test_unregistered_plugin_row_is_refused: OK\n");
+}
+
 // Exercise the real canvas -> ThreadManager route, not just an isolated
 // predecessor-count helper. The partial cycle has a ready upstream node.
 static void test_partial_cycle_freespinning_completes() {
@@ -170,11 +203,221 @@ static void test_partial_cycle_freespinning_completes() {
     std::printf("test_partial_cycle_freespinning_completes: OK\n");
 }
 
+static bool same_config(const NodusHeadlessFifoConfig& a, const NodusHeadlessFifoConfig& b) {
+    return a.token_bytes == b.token_bytes && a.slots == b.slots && a.top_k == b.top_k &&
+           a.type_id == b.type_id && a.layout == b.layout && a.dtype == b.dtype &&
+           a.backend_type == b.backend_type;
+}
+
+static void test_save_load_persists_ports_and_edge_fifo() {
+    std::filesystem::path path = std::filesystem::temp_directory_path() / "nodus_headless_test_ports.txt";
+    std::filesystem::path plain = std::filesystem::temp_directory_path() / "nodus_headless_test_plain_v4.txt";
+
+    NodusHeadlessGraph* g1 = nodus_headless_create();
+    assert(g1);
+    int32_t module_a, row_a, module_b, row_b;
+    int32_t edge_idx = build_two_module_graph(g1, &module_a, &row_a, &module_b, &row_b);
+    // A V4 file saved before anything is configured carries no trailer.
+    assert(nodus_headless_save_file(g1, plain.string().c_str()));
+
+    NodusHeadlessFifoConfig edge_cfg{};
+    edge_cfg.token_bytes = 24; edge_cfg.slots = 7; edge_cfg.top_k = 3;
+    edge_cfg.type_id = nodus_headless_abstract_tensor_type_id();
+    edge_cfg.backend_type = 0;
+    assert(nodus_headless_configure_edge_fifo(g1, edge_idx, &edge_cfg));
+    NodusHeadlessFifoConfig in_cfg = edge_cfg;
+    in_cfg.token_bytes = 16; in_cfg.slots = 5; in_cfg.top_k = 2;
+    NodusHeadlessFifoConfig out_cfg = edge_cfg;
+    out_cfg.token_bytes = 8; out_cfg.slots = 9; out_cfg.top_k = 4;
+    // Output declared first so declaration order differs from in/out grouping.
+    assert(nodus_headless_declare_output_port_ex(g1, "result port", module_b, row_b, &out_cfg, /*start_at_head=*/0));
+    assert(nodus_headless_declare_input_port_ex(g1, "feed", module_a, row_a, &in_cfg));
+    assert(nodus_headless_save_file(g1, path.string().c_str()));
+    nodus_headless_destroy(g1);
+
+    NodusHeadlessGraph* g2 = nodus_headless_create();
+    assert(g2);
+    assert(nodus_headless_load_file(g2, path.string().c_str()));
+    NodusHeadlessFifoConfig got{};
+    assert(nodus_headless_get_edge_fifo_config(g2, 0, &got));
+    assert(same_config(got, edge_cfg));
+
+    assert(nodus_headless_get_port_count(g2, 0) == 1);
+    assert(nodus_headless_get_port_count(g2, 1) == 1);
+    char name[64];
+    int32_t mod = -1, contact = -1, start = -1;
+    assert(nodus_headless_get_port_at(g2, 0, 0, name, sizeof(name), &mod, &contact, &start, &got));
+    assert(std::strcmp(name, "feed") == 0 && mod == module_a && contact == row_a && start == 1);
+    assert(same_config(got, in_cfg));
+    assert(nodus_headless_get_port_at(g2, 1, 0, name, sizeof(name), &mod, &contact, &start, &got));
+    assert(std::strcmp(name, "result port") == 0 && mod == module_b && contact == row_b && start == 0);
+    assert(same_config(got, out_cfg));
+    assert(nodus_headless_get_port_fifo_config(g2, "feed", 0, &got) && same_config(got, in_cfg));
+    assert(nodus_headless_get_port_fifo_config(g2, "result port", 1, &got) && same_config(got, out_cfg));
+    nodus_headless_destroy(g2);
+
+    NodusHeadlessGraph* g3 = nodus_headless_create();
+    assert(g3);
+    assert(nodus_headless_load_file(g3, plain.string().c_str()));
+    assert(nodus_headless_get_port_count(g3, 0) == 0);
+    assert(nodus_headless_get_port_count(g3, 1) == 0);
+    assert(nodus_headless_get_edge_count(g3) == 1);
+    nodus_headless_destroy(g3);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(plain, ec);
+    std::printf("test_save_load_persists_ports_and_edge_fifo: OK\n");
+}
+
+// ---- Contract port: loopback socket transport owned by the canvas ----------
+// The negotiator pair is process-owned (acquired through the ABI; the
+// registry itself lives inside the DLL image). Participants reach it only
+// through the listener the canvas opens and the headless step.
+#define REQUIRE(x) do{if(!(x)){std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
+using namespace nodus::contracts;
+
+static SOCKET contract_connect(uint16_t port) {
+    ensure_sockets();
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    REQUIRE(s != INVALID_SOCKET);
+    sockaddr_in a{};
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
+    REQUIRE(connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+    return s;
+}
+static WireMessage contract_hello(uint64_t role, uint64_t id) {
+    WireMessage m{WireKind::Hello, {}}; m.result.loan.work = {role, id, 2, 0}; return m;
+}
+static WireMessage contract_submit(Contract c) {
+    WireMessage m{WireKind::Submit, {}}; m.result.loan.work = c; return m;
+}
+static WireMessage contract_decision(uint64_t id, uint64_t generation, uint64_t value) {
+    WireMessage m{WireKind::Decision, {}};
+    m.result.loan.work.id = id; m.result.loan.generation = generation; m.result.payload = value; return m;
+}
+
+static void test_contract_port_loopback_and_persistence() {
+    const char* kPrefix = "hl.proof";
+    const std::string market_id = std::string(kPrefix) + ".market";
+    const std::string worker_id = std::string(kPrefix) + ".worker";
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "nodus_headless_test_contract_port.txt";
+    REQUIRE(nodus_headless_acquire_contract_pair(kPrefix, 4));
+
+    NodusHeadlessGraph* g = nodus_headless_create();
+    REQUIRE(g);
+    GP_CanvasModuleDesc desc{}; desc.w = desc.h = 64;
+    const int m = nodus_headless_add_module(g, &desc), w = nodus_headless_add_module(g, &desc);
+    REQUIRE(m >= 0 && w >= 0);
+    const int mr = nodus_headless_bind_plugin_tool(g, m, market_id.c_str());
+    const int wr = nodus_headless_bind_plugin_tool(g, w, worker_id.c_str());
+    REQUIRE(mr >= 0 && wr >= 0);
+    GP_CanvasEdgeDesc edge{};
+    edge.a_module = m; edge.a_contact_idx = mr; edge.b_module = w; edge.b_contact_idx = wr;
+    const int edge_id = nodus_headless_add_edge(g, &edge, 0);
+    REQUIRE(edge_id >= 0);
+    NodusHeadlessFifoConfig config{};
+    config.token_bytes = sizeof(Result); config.slots = 4; config.top_k = 0;
+    config.type_id = 0x534A5231; config.layout = 2; config.dtype = 8;
+    REQUIRE(nodus_headless_configure_edge_fifo(g, edge_id, &config));
+    REQUIRE(nodus_headless_set_scheduler_mode(g, 1));
+
+    // Refusals: empty prefix, bad capacity, unattached edge, whitespace prefix.
+    REQUIRE(!nodus_headless_declare_contract_port(g, "", 4, edge_id, 0));
+    REQUIRE(!nodus_headless_declare_contract_port(g, kPrefix, 0, edge_id, 0));
+    REQUIRE(!nodus_headless_declare_contract_port(g, kPrefix, 4, edge_id + 5, 0));
+    REQUIRE(!nodus_headless_declare_contract_port(g, "a b", 4, edge_id, 0));
+    const int32_t port = nodus_headless_declare_contract_port(g, kPrefix, 4, edge_id, 0);
+    REQUIRE(port > 0);
+    REQUIRE(!nodus_headless_declare_contract_port(g, kPrefix, 4, edge_id, 0));  // already declared
+    int32_t got_port = 0, hosts = -1, engines = -1;
+    REQUIRE(nodus_headless_get_contract_port(g, kPrefix, &got_port, &hosts, &engines));
+    REQUIRE(got_port == port && hosts == 0 && engines == 0);
+    REQUIRE(nodus_headless_get_contract_port_count(g) == 1);
+    {
+        char name[64]; int32_t cap = 0, eidx = -1, lport = 0;
+        REQUIRE(nodus_headless_get_contract_port_at(g, 0, name, sizeof(name), &cap, &eidx, &lport));
+        REQUIRE(std::strcmp(name, kPrefix) == 0 && cap == 4 && eidx == edge_id && lport == port);
+    }
+
+    const uint64_t kEngine = 7, kHost = 1, kHostPayload = 555;
+    ContractSocket engine_client(contract_connect(static_cast<uint16_t>(port)));
+    ContractSocket host_client(contract_connect(static_cast<uint16_t>(port)));
+    REQUIRE(engine_client.send_message(contract_hello(2, kEngine)));
+    REQUIRE(engine_client.send_message(contract_submit({100, kEngine, 3, 4})));
+    REQUIRE(host_client.send_message(contract_hello(1, kHost)));
+
+    bool admitted = false; int offers = 0, routes = 0, receipts = 0;
+    for (int tick = 0; tick < 5000 && !(admitted && offers && routes && receipts); ++tick) {
+        REQUIRE(nodus_headless_step(g, 1.0 / 60.0));
+        engine_client.poll(); host_client.poll();
+        WireMessage msg{};
+        while (engine_client.receive(msg)) {
+            if (msg.kind == WireKind::Admitted) { REQUIRE(msg.result.loan.work.id == 100); admitted = true; }
+            if (msg.kind == WireKind::Route) {
+                REQUIRE(msg.result.payload == kHostPayload && msg.result.loan.host == kHost &&
+                        msg.result.loan.work.engine == kEngine);
+                ++routes;
+                REQUIRE(engine_client.send_message(contract_decision(msg.result.loan.work.id, msg.result.loan.generation, 1)));
+            }
+        }
+        while (host_client.receive(msg)) {
+            if (msg.kind == WireKind::Offer) {
+                ++offers;
+                REQUIRE(host_client.send_message({WireKind::Accept, {msg.result.loan, 0}}));
+                REQUIRE(host_client.send_message({WireKind::Result, {msg.result.loan, kHostPayload}}));
+            }
+            if (msg.kind == WireKind::Receipt) { REQUIRE(msg.result.payload == 1); ++receipts; }
+        }
+        engine_client.poll(); host_client.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(admitted && offers == 1 && routes == 1 && receipts == 1);
+    REQUIRE(nodus_headless_get_contract_port(g, kPrefix, nullptr, &hosts, &engines) && hosts == 1 && engines == 1);
+
+    // Save, tear down (listener/sockets before graph), forget the process-owned
+    // pair as a fresh process would, then load: the port must come back live.
+    REQUIRE(nodus_headless_save_file(g, path.string().c_str()));
+    nodus_headless_destroy(g);
+    REQUIRE(nodus_headless_release_contract_pair(kPrefix));
+    REQUIRE(nodus_headless_acquire_contract_pair(kPrefix, 4));
+
+    NodusHeadlessGraph* g2 = nodus_headless_create();
+    REQUIRE(g2);
+    REQUIRE(nodus_headless_load_file(g2, path.string().c_str()));
+    REQUIRE(nodus_headless_set_scheduler_mode(g2, 1));
+    int32_t port2 = 0;
+    REQUIRE(nodus_headless_get_contract_port(g2, kPrefix, &port2, &hosts, &engines));
+    REQUIRE(port2 > 0 && hosts == 0 && engines == 0 && nodus_headless_get_contract_port_count(g2) == 1);
+
+    ContractSocket engine2(contract_connect(static_cast<uint16_t>(port2)));
+    REQUIRE(engine2.send_message(contract_hello(2, 8)));
+    REQUIRE(engine2.send_message(contract_submit({200, 8, 1, 2})));
+    bool admitted2 = false;
+    for (int tick = 0; tick < 5000 && !admitted2; ++tick) {
+        REQUIRE(nodus_headless_step(g2, 1.0 / 60.0));
+        engine2.poll();
+        WireMessage msg{};
+        while (engine2.receive(msg))
+            if (msg.kind == WireKind::Admitted) { REQUIRE(msg.result.loan.work.id == 200); admitted2 = true; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(admitted2);
+    nodus_headless_destroy(g2);
+    REQUIRE(nodus_headless_release_contract_pair(kPrefix));
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::printf("test_contract_port_loopback_and_persistence: OK\n");
+}
+
 int main() {
     test_partial_cycle_freespinning_completes();
     test_quiescence_and_event();
     test_save_load_round_trip();
+    test_save_load_persists_ports_and_edge_fifo();
     test_overflow_event();
     test_duplicate_module_uuid_is_refused();
+    test_unregistered_plugin_row_is_refused();
+    test_contract_port_loopback_and_persistence();
     return 0;
 }

@@ -124,9 +124,12 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_contract(
 NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
-// Reattach process-local FIFO configuration to an edge restored by native
-// canvas persistence. FIFO specs and live samples are intentionally not
-// serialized by CANVAS V4; callers must make that choice again after load.
+// Configured edge FIFOs and named ports are persisted by
+// nodus_headless_save_file as EDGE_FIFO / PORT trailer records appended after
+// the CANVAS V4 body, and restored by nodus_headless_load_file (load returns 0
+// if a record cannot be re-attached). CANVAS V4 itself does not carry them, so
+// gp_canvas_load_from_file alone (as frontend_shell uses it) restores topology
+// only. Live samples are never serialized.
 NODUS_HEADLESS_API int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g);
 NODUS_HEADLESS_API int32_t nodus_headless_get_edge(
     NodusHeadlessGraph* g, int32_t edge_idx,
@@ -239,6 +242,44 @@ NODUS_HEADLESS_API int32_t nodus_headless_get_port_at(
 NODUS_HEADLESS_API int32_t nodus_headless_get_port_unread(
     NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
     int32_t* out_unread);
+
+// Contract ports: a canvas-owned loopback-socket transport for a contract
+// negotiator pair. The negotiator and its `<prefix>.market` / `<prefix>.worker`
+// plugin rows are process-owned (contract_negotiator_registry.h); the canvas
+// owns the result edge between the rows and a 127.0.0.1 listener. Hosts
+// (Hello role 1) and engines (Hello role 2) that connect and say Hello are
+// bound to that negotiator inside nodus_headless_step. Persisted by
+// nodus_headless_save_file (CONTRACT_PORT trailer record) and re-declared live
+// by nodus_headless_load_file. A closed peer stays registered (the negotiator
+// has no removal API); its exchange simply returns an empty Exchange.
+//
+// Create the process-owned pair (market/worker rows) so a caller that cannot
+// reach the C++ registry (e.g. Python) can bind plugin rows by prefix.
+// Idempotent; returns 1 on success.
+NODUS_HEADLESS_API int32_t nodus_headless_acquire_contract_pair(const char* prefix, int32_t capacity);
+// Unregister and destroy the process-owned pair; 1 if it existed. Only call
+// after every graph that bound its rows or declared a contract port on it has
+// been destroyed (a reload in the same process needs this, because a
+// negotiator that already holds contracts refuses a new result transport).
+NODUS_HEADLESS_API int32_t nodus_headless_release_contract_pair(const char* prefix);
+// Declare a contract port on a configured result edge (token_bytes ==
+// sizeof(Result), type 0x534A5231, layout 2, dtype 8, top_k 0). listen_port 0
+// picks an ephemeral loopback port. Returns the bound port (>0), or 0 when the
+// prefix is empty/contains whitespace, capacity <= 0, the edge is not attached
+// and configured, the prefix or edge is already declared, the transport cannot
+// be bound, or listening fails.
+NODUS_HEADLESS_API int32_t nodus_headless_declare_contract_port(
+    NodusHeadlessGraph* g, const char* prefix, int32_t capacity,
+    int32_t edge_id, int32_t listen_port);
+// Returns 1 if `prefix` is declared; any out pointer may be NULL.
+NODUS_HEADLESS_API int32_t nodus_headless_get_contract_port(
+    NodusHeadlessGraph* g, const char* prefix, int32_t* out_listen_port,
+    int32_t* out_hosts, int32_t* out_engines);
+// Declaration-order enumeration of contract ports.
+NODUS_HEADLESS_API int32_t nodus_headless_get_contract_port_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_get_contract_port_at(
+    NodusHeadlessGraph* g, int32_t ordinal, char* out_prefix, int32_t cap,
+    int32_t* out_capacity, int32_t* out_edge_idx, int32_t* out_listen_port);
 
 // Scheduler-produced scalar stack inspection. Snapshot rows exist for native
 // StackDisplay rows. These calls are read-only and must follow a completed

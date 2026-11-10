@@ -289,10 +289,29 @@ def test_pointer_contract_reaches_native_scheduler() -> None:
             Output(1),
         )
         assert module.native_contract is ExecutionContract.ABSTRACT_TENSOR_POINTER
-        # Typed connector transport now owns this contract. A missing plugin
-        # produces no value, but the graph is no longer rejected merely for
-        # carrying AbstractTensorHandle values.
+        # Typed connector transport owns this contract; the graph is not
+        # rejected merely for carrying AbstractTensorHandle values. The
+        # abstract-tensor vocabulary is registered explicitly in the headless
+        # image, so this row has a live instance; an unregistered id would be
+        # refused by name at set_rows (test_unregistered_plugin_row_is_refused).
         graph.step()
+
+
+def test_unregistered_plugin_row_is_refused() -> None:
+    with Graph() as graph:
+        module = graph.add_module("missing")
+        module.set_rows(Input(1), Output(1))
+        try:
+            module.set_rows(
+                Input(1),
+                PluginTool("no.such.plugin", 1, 1),
+                Output(1),
+            )
+        except RuntimeError as exc:
+            assert "no.such.plugin" in str(exc)
+        else:
+            raise AssertionError("unregistered plugin row was adopted")
+        assert len(module.rows) == 2
 
 
 def test_typed_fifo_does_not_select_stack_transfer() -> None:
@@ -455,6 +474,93 @@ def test_runtime_shape_sources_are_communicable() -> None:
     assert GraphDefinition.from_mapping(definition.to_mapping()) == definition
 
 
+def test_contract_port_loopback_round_trip() -> None:
+    """A canvas-owned contract port: peers connect over loopback and are bound
+    to the process-owned negotiator pair; contract flows engine -> host -> engine."""
+    import ctypes
+    import socket
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools"))
+    from contract_service_peer import (  # noqa: E402
+        EnginePeer, ServicePeer, connect_loopback, ROLE_ENGINE,
+    )
+    from nodus_headless_bridge import CanvasEdgeDesc  # noqa: E402
+    from nodus_graph.native import _fifo  # noqa: E402
+
+    prefix = "py.proof"
+    with Graph() as graph:
+        # Python cannot reach the C++ registry: the image creates the pair.
+        graph.acquire_contract_pair(prefix, 4)
+        market = graph.add_module("market")
+        worker = graph.add_module("worker")
+        market.set_rows(PluginTool(prefix + ".market", 0, 0))
+        worker.set_rows(PluginTool(prefix + ".worker", 0, 0))
+        # The plugin rows are native rows 0; no Input/Output rows may sit between
+        # them (an Output row would publish stack values onto the result edge).
+        desc = CanvasEdgeDesc(a_module=market.index, a_contact_idx=0,
+                              b_module=worker.index, b_contact_idx=0)
+        edge_id = graph.lib.nodus_headless_add_edge(graph._handle, ctypes.byref(desc), 0)
+        assert edge_id >= 0
+        result_fifo = FifoConfig(token_bytes=64, slots=4, top_k=0,
+                                 type_id=0x534A5231, layout=2, dtype=8)
+        assert graph.lib.nodus_headless_configure_edge_fifo(
+            graph._handle, edge_id, ctypes.byref(_fifo(result_fifo)))
+
+        port = graph.declare_contract_port(prefix, 4, edge_id)
+        assert port > 0
+        assert graph.contract_port(prefix) == (port, 0, 0)
+        assert graph.contract_port("no.such.port") is None
+        assert graph.contract_ports() == [(prefix, 4, edge_id, port)]
+        try:
+            graph.declare_contract_port(prefix, 4, edge_id)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("duplicate contract port was accepted")
+
+        events = {"admitted": [], "routed": [], "receipts": []}
+
+        class Producer:
+            def admitted(self, identifier):
+                events["admitted"].append(identifier)
+
+            def route(self, result):
+                events["routed"].append(result)
+                return 1
+
+        engine_peer = EnginePeer(connect_loopback(port, ROLE_ENGINE, 7), Producer())
+        host_connection = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            host_peer = ServicePeer(
+                host_connection, executor, lambda loan: 555,
+                lambda loan, accepted: events["receipts"].append(accepted),
+                announce=True, identity=1,
+            )
+            assert engine_peer.submit((100, 7, 3, 4))
+            for _ in range(5000):
+                graph.step()
+                engine_peer.poll()
+                host_peer.poll()
+                if events["admitted"] and events["routed"] and events["receipts"]:
+                    break
+                time.sleep(0.001)
+            assert engine_peer.error is None and host_peer.error is None
+            assert events["admitted"] == [100]
+            assert len(events["routed"]) == 1 and events["routed"][0][7] == 555
+            assert events["receipts"] == [True]
+        assert graph.contract_port(prefix) == (port, 1, 1)
+
+        path = pathlib.Path(tempfile.gettempdir()) / "nodus_python_contract_port.txt"
+        graph.save(path)
+        text = path.read_text(encoding="utf-8")
+        path.unlink()
+        assert f"CONTRACT_PORT {prefix} 4 {market.index} 0 {worker.index} 0 0" in text
+        engine_peer.close()
+        host_peer.close()
+
+
 def main() -> int:
     cases = [
         test_scalar_stack_and_native_roundtrip,
@@ -471,6 +577,7 @@ def main() -> int:
         test_complete_definition_roundtrip_and_execution,
         test_definition_refuses_contract_disagreement_before_native_adoption,
         test_runtime_shape_sources_are_communicable,
+        test_contract_port_loopback_round_trip,
     ]
     for case in cases:
         case()

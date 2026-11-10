@@ -1,5 +1,10 @@
+// Winsock headers must precede anything that may pull in <windows.h>.
+#include "contract_listener.h"
+#include "contract_negotiator_registry.h"
 #include "nodus_headless_abi.h"
 
+#include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
+#include "tool_registry.h"
 #include "canvas_abi.h"
 #include "table_abi.h"
 #include "value_types.h"
@@ -8,9 +13,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <deque>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +65,27 @@ struct NodusHeadlessGraph {
 
     uint64_t tick_id = 0;
     uint64_t next_port_declaration_order = 0;
+
+    // A contract port: a canvas-owned loopback-socket transport bound to one
+    // process-owned negotiator pair (<prefix>.market/.worker rows) and the
+    // result edge between them. Held by unique_ptr so the addresses captured
+    // by peer callbacks stay stable while the vector grows.
+    struct ContractPortBinding {
+        std::string prefix;
+        size_t capacity = 0;
+        int32_t edge_idx = -1;
+        uint16_t listen_port = 0;       // actual bound port
+        uint16_t requested_port = 0;    // as declared (0 = ephemeral); this is what is saved
+        // Cleared in the destructor, before the sockets die, so callbacks the
+        // process-owned negotiator still holds (it has no removal API) become inert.
+        std::shared_ptr<bool> alive = std::make_shared<bool>(true);
+        std::unique_ptr<nodus::contracts::ContractListener> listener;
+        std::vector<std::unique_ptr<nodus::contracts::ContractSocket>> hosts;
+        std::vector<std::unique_ptr<nodus::contracts::EngineSocket>> engines;
+        std::vector<std::pair<uint64_t, uint64_t>> rejected;  // (contract id, generation)
+        ~ContractPortBinding() { *alive = false; }
+    };
+    std::vector<std::unique_ptr<ContractPortBinding>> contract_ports;
 };
 
 namespace {
@@ -242,6 +272,15 @@ int32_t attach_edge_binding(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc& desc
 } // namespace
 
 extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
+    // The static registrar in abstract_tensor_graph_ir.cpp is dropped when
+    // canvas_tables_static is linked into this image, so register the
+    // abstract_tensor.* vocabulary explicitly. register_tool refuses a
+    // duplicate id without throwing (it only logs), so the call is
+    // idempotent; the flag just avoids re-walking the table per graph.
+    static std::once_flag abstract_tensor_vocabulary_once;
+    std::call_once(abstract_tensor_vocabulary_once, [] {
+        nodus::tensors::register_abstract_tensor_tool_ir(tool_registry_global());
+    });
     // The native canvas still owns process-global contact and table helpers.
     // Refuse coexistence instead of perturbing an already-running UI/bridge.
     if (gp_canvas_get_singleton() != nullptr) return nullptr;
@@ -364,27 +403,219 @@ extern "C" void nodus_headless_tensor_destroy(uint64_t handle) {
 
 extern "C" void nodus_headless_destroy(NodusHeadlessGraph* g) {
     if (!g) return;
+    // Listeners and sockets go before the graph. The negotiators are
+    // process-owned and are deliberately NOT released here.
+    g->contract_ports.clear();
     if (g->ctx) gp_canvas_destroy(g->ctx);
     if (g->vulkan_backend) gp_mem_backend_release(g->vulkan_backend);
     delete g;
 }
+
+namespace {
+
+// Trailer records appended after the CANVAS V4 body by nodus_headless_save_file.
+// The canvas loader skips tags it does not know, so the file stays a valid V4
+// canvas; these records carry the process-local state V4 itself does not.
+struct TrailerEdge {
+    GP_CanvasEdgeDesc desc{};
+    NodusHeadlessFifoConfig config{};
+};
+struct TrailerContractPort {
+    std::string prefix;
+    int64_t capacity = 0;
+    GP_CanvasEdgeDesc desc{};
+    int32_t listen_port = 0;
+};
+struct TrailerPort {
+    int32_t is_output = 0;
+    int32_t module_idx = 0;
+    int32_t row_idx = 0;
+    int32_t start_at_head = 1;
+    uint64_t order = 0;
+    NodusHeadlessFifoConfig config{};
+    std::string name;
+};
+
+void write_config_fields(std::ostream& os, const NodusHeadlessFifoConfig& c) {
+    os << c.token_bytes << " " << c.slots << " " << c.top_k << " " << c.type_id << " "
+       << c.layout << " " << c.dtype << " " << c.backend_type;
+}
+
+bool read_config_fields(std::istream& is, NodusHeadlessFifoConfig& c) {
+    return static_cast<bool>(is >> c.token_bytes >> c.slots >> c.top_k >> c.type_id >>
+                             c.layout >> c.dtype >> c.backend_type);
+}
+
+} // namespace
 
 extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* path) {
     if (!g || !g->ctx || !path) return 0;
     int32_t rc = gp_canvas_load_from_file(g->ctx, path);
     if (!rc) return 0;
     g->table = gp_canvas_get_container_table(g->ctx);
-    // Port bindings are process-local host views, not canvas persistence.
-    // Callers reattach them after load to the restored stable identities.
+    // Port and edge bindings are process-local host views; CANVAS V4 does not
+    // carry them. Drop stale ones, then restore from the trailer records
+    // written by nodus_headless_save_file (absent in plain V4 files).
     g->input_ports.clear();
     g->output_ports.clear();
     g->edges.clear();
+    g->contract_ports.clear();
+    g->next_port_declaration_order = 0;
+
+    std::vector<TrailerEdge> trailer_edges;
+    std::vector<TrailerPort> trailer_ports;
+    std::vector<TrailerContractPort> trailer_contract_ports;
+    {
+        std::ifstream ifs(path);
+        std::string line;
+        while (std::getline(ifs, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::istringstream ss(line);
+            std::string tag; ss >> tag;
+            if (tag == "EDGE_FIFO") {
+                TrailerEdge te;
+                if (!(ss >> te.desc.a_module >> te.desc.a_contact_idx >> te.desc.b_module >>
+                      te.desc.b_contact_idx) || !read_config_fields(ss, te.config)) {
+                    std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                    return 0;
+                }
+                trailer_edges.push_back(te);
+            } else if (tag == "PORT") {
+                TrailerPort tp;
+                std::string dir; ss >> dir;
+                if ((dir != "in" && dir != "out") ||
+                    !(ss >> tp.module_idx >> tp.row_idx >> tp.start_at_head >> tp.order) ||
+                    !read_config_fields(ss, tp.config)) {
+                    std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                    return 0;
+                }
+                tp.is_output = dir == "out" ? 1 : 0;
+                std::getline(ss, tp.name);
+                if (!tp.name.empty() && tp.name[0] == ' ') tp.name.erase(0, 1);
+                trailer_ports.push_back(std::move(tp));
+            } else if (tag == "CONTRACT_PORT") {
+                TrailerContractPort cp;
+                if (!(ss >> cp.prefix >> cp.capacity >> cp.desc.a_module >> cp.desc.a_contact_idx >>
+                      cp.desc.b_module >> cp.desc.b_contact_idx >> cp.listen_port)) {
+                    std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                    return 0;
+                }
+                trailer_contract_ports.push_back(std::move(cp));
+            }
+        }
+    }
+
+    for (const auto& te : trailer_edges) {
+        GP_CanvasEdgeDesc desc = te.desc;
+        const int32_t canvas_edge_idx = nodus_headless_attach_edge(g, &desc);
+        if (canvas_edge_idx < 0 ||
+            !nodus_headless_configure_edge_fifo(g, canvas_edge_idx, &te.config)) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot restore EDGE_FIFO %d %d %d %d\n",
+                         te.desc.a_module, te.desc.a_contact_idx, te.desc.b_module, te.desc.b_contact_idx);
+            return 0;
+        }
+    }
+    std::stable_sort(trailer_ports.begin(), trailer_ports.end(),
+                     [](const TrailerPort& l, const TrailerPort& r) { return l.order < r.order; });
+    for (const auto& tp : trailer_ports) {
+        const int32_t ok = tp.is_output
+            ? nodus_headless_declare_output_port_ex(g, tp.name.c_str(), tp.module_idx, tp.row_idx,
+                                                    &tp.config, tp.start_at_head)
+            : nodus_headless_declare_input_port_ex(g, tp.name.c_str(), tp.module_idx, tp.row_idx,
+                                                   &tp.config);
+        if (!ok) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot restore PORT %s %d %d %s\n",
+                         tp.is_output ? "out" : "in", tp.module_idx, tp.row_idx, tp.name.c_str());
+            return 0;
+        }
+    }
+    // Contract ports last: they need their result edge (EDGE_FIFO) restored.
+    for (const auto& cp : trailer_contract_ports) {
+        int32_t edge_id = -1;
+        for (size_t i = 0; i < g->edges.size(); ++i) {
+            const auto& e = g->edges[i];
+            if (e.configured && e.desc.a_module == cp.desc.a_module &&
+                e.desc.a_contact_idx == cp.desc.a_contact_idx &&
+                e.desc.b_module == cp.desc.b_module && e.desc.b_contact_idx == cp.desc.b_contact_idx) {
+                edge_id = static_cast<int32_t>(i);
+                break;
+            }
+        }
+        if (edge_id < 0 || cp.capacity <= 0 || cp.capacity > INT32_MAX ||
+            nodus_headless_declare_contract_port(g, cp.prefix.c_str(), static_cast<int32_t>(cp.capacity),
+                                                 edge_id, cp.listen_port) <= 0) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot restore CONTRACT_PORT %s\n",
+                         cp.prefix.c_str());
+            return 0;
+        }
+    }
     return rc;
 }
 
 extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* path) {
     if (!g || !g->ctx || !path) return 0;
-    return gp_canvas_save_to_file(g->ctx, path);
+    // Collect trailer state first so a refusal leaves no file behind.
+    struct OutPort { const std::string* name; const PortBinding* pb; int32_t is_output; };
+    std::vector<OutPort> ports;
+    for (const auto& kv : g->input_ports) ports.push_back({&kv.first, &kv.second, 0});
+    for (const auto& kv : g->output_ports) ports.push_back({&kv.first, &kv.second, 1});
+    std::sort(ports.begin(), ports.end(), [](const OutPort& l, const OutPort& r) {
+        return l.pb->declaration_order < r.pb->declaration_order;
+    });
+    std::ostringstream trailer;
+    for (const auto& e : g->edges) {
+        if (!e.configured) continue;
+        NodusHeadlessFifoConfig c{};
+        if (!read_table_edge_config(g->table, e.table_edge_idx, &c)) {
+            std::fprintf(stderr, "nodus_headless_save_file: cannot read FIFO config for edge %d %d %d %d\n",
+                         e.desc.a_module, e.desc.a_contact_idx, e.desc.b_module, e.desc.b_contact_idx);
+            return 0;
+        }
+        trailer << "EDGE_FIFO " << e.desc.a_module << " " << e.desc.a_contact_idx << " "
+                << e.desc.b_module << " " << e.desc.b_contact_idx << " ";
+        write_config_fields(trailer, c);
+        trailer << "\n";
+    }
+    for (const auto& p : ports) {
+        if (p.name->find_first_of("\r\n") != std::string::npos) {
+            std::fprintf(stderr, "nodus_headless_save_file: port name contains a newline; refusing to save\n");
+            return 0;
+        }
+        NodusHeadlessFifoConfig c{};
+        if (!read_table_edge_config(g->table, p.pb->edge_idx, &c)) {
+            std::fprintf(stderr, "nodus_headless_save_file: cannot read FIFO config for port %s\n",
+                         p.name->c_str());
+            return 0;
+        }
+        trailer << "PORT " << (p.is_output ? "out" : "in") << " " << p.pb->module_idx << " "
+                << p.pb->row_idx << " " << p.pb->start_at_head << " " << p.pb->declaration_order << " ";
+        write_config_fields(trailer, c);
+        trailer << " " << *p.name << "\n";
+    }
+    for (const auto& cp : g->contract_ports) {
+        if (cp->prefix.empty() ||
+            std::any_of(cp->prefix.begin(), cp->prefix.end(),
+                        [](unsigned char c) { return std::isspace(c) != 0; })) {
+            std::fprintf(stderr, "nodus_headless_save_file: contract port prefix contains whitespace; refusing to save\n");
+            return 0;
+        }
+        const auto& e = g->edges[static_cast<size_t>(cp->edge_idx)];
+        trailer << "CONTRACT_PORT " << cp->prefix << " " << cp->capacity << " "
+                << e.desc.a_module << " " << e.desc.a_contact_idx << " "
+                << e.desc.b_module << " " << e.desc.b_contact_idx << " " << cp->requested_port << "\n";
+    }
+    if (!gp_canvas_save_to_file(g->ctx, path)) return 0;
+    const std::string text = trailer.str();
+    if (text.empty()) return 1;
+    std::ofstream ofs(path, std::ios::app);
+    if (!ofs) {
+        std::fprintf(stderr, "nodus_headless_save_file: cannot append trailer to %s\n", path);
+        return 0;
+    }
+    // Leading blank line guarantees the trailer starts on its own line; the
+    // canvas loader skips empty lines.
+    ofs << "\n" << text;
+    return ofs ? 1 : 0;
 }
 
 extern "C" int32_t nodus_headless_export_module_to_root(
@@ -737,14 +968,172 @@ extern "C" int32_t nodus_headless_get_stack_tail(
         g->ctx, module_idx, out_values, capacity, out_count);
 }
 
+extern "C" int32_t nodus_headless_acquire_contract_pair(const char* prefix, int32_t capacity) {
+    if (!prefix || !*prefix || capacity <= 0) return 0;
+    try {
+        nodus::contracts::acquire(prefix, static_cast<size_t>(capacity));
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t nodus_headless_release_contract_pair(const char* prefix) {
+    if (!prefix || !*prefix) return 0;
+    try {
+        return nodus::contracts::release(prefix) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t nodus_headless_declare_contract_port(
+    NodusHeadlessGraph* g, const char* prefix, int32_t capacity, int32_t edge_id,
+    int32_t listen_port) {
+    using namespace nodus::contracts;
+    if (!g || !g->ctx || !g->table || !prefix || !*prefix || capacity <= 0 ||
+        listen_port < 0 || listen_port > 65535 || edge_id < 0 ||
+        static_cast<size_t>(edge_id) >= g->edges.size()) return 0;
+    const std::string name(prefix);
+    if (std::any_of(name.begin(), name.end(), [](unsigned char c) { return std::isspace(c) != 0; })) return 0;
+    const auto& edge = g->edges[static_cast<size_t>(edge_id)];
+    if (!edge.configured) return 0;
+    NodusHeadlessFifoConfig fifo{};
+    if (!read_table_edge_config(g->table, edge.table_edge_idx, &fifo) ||
+        fifo.token_bytes != static_cast<int32_t>(sizeof(Result))) return 0;
+    for (const auto& cp : g->contract_ports)
+        if (cp->prefix == name || cp->edge_idx == edge_id) return 0;
+    try {
+        auto binding = std::make_unique<NodusHeadlessGraph::ContractPortBinding>();
+        binding->listener = std::make_unique<ContractListener>(static_cast<uint16_t>(listen_port));
+        ContractNegotiator& negotiator = acquire(name, static_cast<size_t>(capacity));
+        const std::shared_ptr<bool> alive = binding->alive;
+        if (!negotiator.bind_result_transport(
+                [=](const Result& r) {
+                    NodusHeadlessPublishResult p{};
+                    return *alive && nodus_headless_publish_edge_token(g, edge_id, &r, sizeof(r), &p) &&
+                           p.accepted && !p.dropped;
+                },
+                [=](Result& r) {
+                    size_t n = 0;
+                    return *alive && nodus_headless_consume_edge_token(g, edge_id, &r, sizeof(r), &n) &&
+                           n == sizeof(r);
+                })) return 0;
+        binding->prefix = name;
+        binding->capacity = static_cast<size_t>(capacity);
+        binding->edge_idx = edge_id;
+        binding->requested_port = static_cast<uint16_t>(listen_port);
+        binding->listen_port = binding->listener->port();
+        const int32_t bound = binding->listen_port;
+        g->contract_ports.push_back(std::move(binding));
+        return bound;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t nodus_headless_get_contract_port(
+    NodusHeadlessGraph* g, const char* prefix, int32_t* out_listen_port,
+    int32_t* out_hosts, int32_t* out_engines) {
+    if (!g || !prefix) return 0;
+    for (const auto& cp : g->contract_ports) {
+        if (cp->prefix != prefix) continue;
+        if (out_listen_port) *out_listen_port = cp->listen_port;
+        if (out_hosts) *out_hosts = static_cast<int32_t>(cp->hosts.size());
+        if (out_engines) *out_engines = static_cast<int32_t>(cp->engines.size());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int32_t nodus_headless_get_contract_port_count(NodusHeadlessGraph* g) {
+    return g ? static_cast<int32_t>(g->contract_ports.size()) : 0;
+}
+
+extern "C" int32_t nodus_headless_get_contract_port_at(
+    NodusHeadlessGraph* g, int32_t ordinal, char* out_prefix, int32_t cap,
+    int32_t* out_capacity, int32_t* out_edge_idx, int32_t* out_listen_port) {
+    if (!g || ordinal < 0 || static_cast<size_t>(ordinal) >= g->contract_ports.size() ||
+        !out_prefix || cap <= 0 || !out_capacity || !out_edge_idx || !out_listen_port) return 0;
+    const auto& cp = *g->contract_ports[static_cast<size_t>(ordinal)];
+    const size_t n = std::min(cp.prefix.size(), static_cast<size_t>(cap - 1));
+    std::memcpy(out_prefix, cp.prefix.data(), n);
+    out_prefix[n] = '\0';
+    *out_capacity = static_cast<int32_t>(cp.capacity);
+    *out_edge_idx = cp.edge_idx;
+    *out_listen_port = cp.listen_port;
+    return 1;
+}
+
+namespace {
+
+// Accept new peers and pump engine sockets before the scheduled tick. Runs on
+// the caller's lane; ThreadManager is idle between steps, so negotiator calls
+// here and inside the tick never overlap.
+void contract_ports_pre_step(NodusHeadlessGraph* g) {
+    using namespace nodus::contracts;
+    for (auto& up : g->contract_ports) {
+        auto* cp = up.get();
+        auto* negotiator = find(cp->prefix);
+        if (!negotiator) continue;
+        const std::shared_ptr<bool> alive = cp->alive;
+        cp->listener->poll([=](SOCKET s, uint64_t role, uint64_t id) {
+            try {
+                if (role == 2) {
+                    cp->engines.push_back(std::make_unique<EngineSocket>(s));
+                    auto* e = cp->engines.back().get();
+                    auto* rejected = &cp->rejected;
+                    if (!negotiator->add_engine({id,
+                            [=](const Result& r) {
+                                if (!*alive) return false;
+                                const int decision = e->route(r);
+                                if (decision == -1) rejected->emplace_back(r.loan.work.id, r.loan.generation);
+                                return decision == 1;
+                            },
+                            [=](Contract& c) { return *alive && e->request(c); },
+                            [=](uint64_t cid) { if (*alive) e->admitted(cid); }})) {
+                        cp->engines.pop_back();  // duplicate id: socket closed by destructor
+                    }
+                } else {
+                    cp->hosts.push_back(std::make_unique<ContractSocket>(s));
+                    auto* h = cp->hosts.back().get();
+                    // A closed peer's exchange() yields an empty Exchange (poll is a no-op once
+                    // closed); the negotiator has no remove API so the entry stays.
+                    if (!negotiator->add_host({id,
+                            [=](const Loan* l) { return *alive ? h->exchange(l) : Exchange{}; },
+                            [=](uint64_t gen, bool ok) { if (*alive) h->receipt(gen, ok); }})) {
+                        cp->hosts.pop_back();
+                    }
+                }
+            } catch (...) {
+                WireSocket::close_socket(s);  // constructor threw before adopting the socket
+            }
+        });
+        for (auto& e : cp->engines) e->poll();
+    }
+}
+
+void contract_ports_post_step(NodusHeadlessGraph* g) {
+    for (auto& cp : g->contract_ports) {
+        auto* negotiator = nodus::contracts::find(cp->prefix);
+        if (negotiator)
+            for (const auto& r : cp->rejected) negotiator->reject_pending(r.first, r.second);
+        cp->rejected.clear();
+    }
+}
+
+} // namespace
+
 extern "C" int32_t nodus_headless_step(NodusHeadlessGraph* g, double dt) {
     if (!g || !g->ctx) return 0;
+    contract_ports_pre_step(g);
     int32_t rc = gp_canvas_step(g->ctx, static_cast<float>(dt));
     // gp_canvas_step intentionally remains asynchronous for the interactive
     // UI.  A headless step is an observation boundary: Python/native callers
     // must be able to pull values produced by this tick when it returns.
     if (rc) rc = gp_canvas_wait_for_thread_manager(g->ctx);
     if (rc) ++g->tick_id;
+    contract_ports_post_step(g);
     return rc;
 }
 

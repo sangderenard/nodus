@@ -556,7 +556,9 @@ target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
 target_include_directories(nodus_headless PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
-target_link_libraries(nodus_headless PRIVATE canvas_tables_static)
+# contract ports hold a ContractNegotiator, whose standalone FIFO is the
+# nodus_edge_runtime ABI exported by nodus_runtime.
+target_link_libraries(nodus_headless PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
   # contract ports: loopback listener and socket adapters (include/contract_listener.h)
   target_link_libraries(nodus_headless PRIVATE ws2_32)
@@ -878,6 +880,9 @@ add_executable(nodus_headless_runtime_test
 )
 target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
+if(WIN32)
+  target_link_libraries(nodus_headless_runtime_test PRIVATE ws2_32)
+endif()
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
 set_tests_properties(nodus_headless_runtime_test PROPERTIES TIMEOUT 30)

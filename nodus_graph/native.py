@@ -429,7 +429,9 @@ class Module:
             self.graph._handle, self.index, native_rows, len(rows),
         )
         if not ok:
-            raise RuntimeError("native module row configuration failed")
+            plugin_ids = [row.plugin_id for row in rows if isinstance(row, PluginTool)]
+            detail = f" (plugin ids: {', '.join(plugin_ids)}; unregistered ids are refused)" if plugin_ids else ""
+            raise RuntimeError("native module row configuration failed" + detail)
         resolved_contract = contract or ExecutionContract.OPAQUE
         native_contract = {
             ExecutionContract.SCALAR_F32: 0,
@@ -1205,3 +1207,76 @@ class Graph:
         if edge_count < 0:
             raise RuntimeError("native edge enumeration failed after load")
         self._loaded_unattached_edges = set(range(edge_count))
+
+
+    def _contract_abi(self):
+        # Declared lazily, append-only: _load() above is left untouched.
+        lib = self.lib
+        if getattr(lib, "_contract_port_abi", False):
+            return lib
+        lib.nodus_headless_acquire_contract_pair.restype = ctypes.c_int32
+        lib.nodus_headless_acquire_contract_pair.argtypes = (ctypes.c_char_p, ctypes.c_int32)
+        lib.nodus_headless_declare_contract_port.restype = ctypes.c_int32
+        lib.nodus_headless_declare_contract_port.argtypes = (
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+        )
+        lib.nodus_headless_get_contract_port.restype = ctypes.c_int32
+        lib.nodus_headless_get_contract_port.argtypes = (
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+        )
+        lib.nodus_headless_get_contract_port_count.restype = ctypes.c_int32
+        lib.nodus_headless_get_contract_port_count.argtypes = (ctypes.c_void_p,)
+        lib.nodus_headless_get_contract_port_at.restype = ctypes.c_int32
+        lib.nodus_headless_get_contract_port_at.argtypes = (
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_int32),
+        )
+        lib._contract_port_abi = True
+        return lib
+
+    def acquire_contract_pair(self, prefix: str, capacity: int) -> None:
+        """Create the process-owned `<prefix>.market` / `<prefix>.worker` plugin rows."""
+        lib = self._contract_abi()
+        if not lib.nodus_headless_acquire_contract_pair(prefix.encode("utf-8"), int(capacity)):
+            raise RuntimeError(f"native contract pair acquisition failed: {prefix}")
+
+    def declare_contract_port(self, prefix: str, capacity: int, edge: Union[Edge, int],
+                              listen_port: int = 0) -> int:
+        """Bind a loopback contract listener to the result edge; returns the bound port."""
+        lib = self._contract_abi()
+        edge_index = edge.native_index if isinstance(edge, Edge) else int(edge)
+        port = int(lib.nodus_headless_declare_contract_port(
+            self._handle, prefix.encode("utf-8"), int(capacity), edge_index, int(listen_port),
+        ))
+        if port <= 0:
+            raise RuntimeError(f"native contract port declaration failed: {prefix}")
+        return port
+
+    def contract_port(self, prefix: str) -> Optional[tuple[int, int, int]]:
+        """(listen_port, host_count, engine_count) or None if not declared."""
+        lib = self._contract_abi()
+        port, hosts, engines = ctypes.c_int32(), ctypes.c_int32(), ctypes.c_int32()
+        if not lib.nodus_headless_get_contract_port(
+            self._handle, prefix.encode("utf-8"), ctypes.byref(port),
+            ctypes.byref(hosts), ctypes.byref(engines),
+        ):
+            return None
+        return (port.value, hosts.value, engines.value)
+
+    def contract_ports(self) -> list:
+        """Declaration-order list of (prefix, capacity, edge_index, listen_port)."""
+        lib = self._contract_abi()
+        count = int(lib.nodus_headless_get_contract_port_count(self._handle))
+        result = []
+        for ordinal in range(count):
+            name = ctypes.create_string_buffer(1024)
+            capacity, edge_index, port = ctypes.c_int32(), ctypes.c_int32(), ctypes.c_int32()
+            if not lib.nodus_headless_get_contract_port_at(
+                self._handle, ordinal, ctypes.cast(name, ctypes.c_char_p), len(name),
+                ctypes.byref(capacity), ctypes.byref(edge_index), ctypes.byref(port),
+            ):
+                raise RuntimeError(f"native contract port {ordinal} query failed")
+            result.append((name.value.decode("utf-8"), capacity.value, edge_index.value, port.value))
+        return result
