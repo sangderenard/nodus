@@ -11,8 +11,10 @@ with a status; the tool records the status and commits. This module is that host
 
 ``native`` is the loaded ``contract_service_peer`` module (the caller chooses how to load
 it). A handler takes the request (a dict: task, scheduled_for, fired_at, catch_up,
-stands_for, reason) and returns ``DONE`` or ``UNCHANGED``, optionally with a sentence:
-``return DONE`` or ``return UNCHANGED, "the manual has not changed"``. A handler that raises
+stands_for, reason) and returns ``DONE`` or ``UNCHANGED``, optionally with a sentence, and
+optionally with an output (any JSON value, the finished output of the table's tick):
+``return DONE`` or ``return UNCHANGED, "the manual has not changed"`` or
+``return DONE, "3 identities matched", [...]``. A handler that raises
 is recorded as ``FAILED``; a task with no handler as ``UNKNOWN_TASK``. Nothing here retries:
 the cron tool decides what runs again, from its ledger.
 
@@ -71,7 +73,7 @@ class CronHost:
 
     def _dispatch(self, loan) -> int:
         """Never raises: every outcome is a status, so one bad task cannot stop the host."""
-        started, task, detail = time.time(), None, ""
+        started, task, detail, output = time.time(), None, "", None
         try:
             self._prune()
             try:
@@ -88,7 +90,10 @@ class CronHost:
                 else:
                     try:
                         answer = handler(request)
-                        status, detail = answer if isinstance(answer, tuple) else (answer, "")
+                        answer = answer if isinstance(answer, tuple) else (answer,)
+                        status, detail = answer[0], (answer[1] if len(answer) > 1 else "")
+                        if len(answer) > 2:
+                            output = answer[2]
                         if status not in (DONE, UNCHANGED):
                             status, detail = FAILED, f"the handler returned {status!r}, not DONE or UNCHANGED"
                     except Exception as error:   # the task's failure is its status
@@ -96,6 +101,8 @@ class CronHost:
             record = {"schema": "nodus.cron.result.v1", "contract": loan.contract, "task": task, "status": status,
                       "status_name": STATUS_NAMES[status], "detail": str(detail)[:2000],
                       "started": started, "finished": time.time()}
+            if output is not None:
+                record["output"] = output
             try:
                 (self.jobs_dir / f"{loan.contract}.result.json").write_text(json.dumps(record), encoding="utf-8")
             except OSError:
