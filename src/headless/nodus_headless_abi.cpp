@@ -1,5 +1,7 @@
 // Winsock headers must precede anything that may pull in <windows.h>.
 #include "contract_port_canvas.h"
+#include "contract_negotiator_registry.h"
+#include "turing_compile_host_tool.h"
 #include "nodus_headless_abi.h"
 
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
@@ -16,6 +18,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -957,6 +960,101 @@ extern "C" int32_t nodus_headless_get_stack_tail(
         g->ctx, module_idx, out_values, capacity, out_count);
 }
 
+namespace {
+// Compile hosts attached to a process-owned negotiator pair, keyed by prefix then
+// host id. The negotiator has no host-removal API, so the Peer it holds is a thin
+// wrapper over a slot that outlives it (shared_ptr); detaching empties the slot and
+// the wrapper then answers with an empty Exchange, exactly like a closed peer. A
+// later attach with the same id refills the slot. Every host is stopped (cancel +
+// join) before its negotiator is released.
+struct CompileHostSlot {
+    std::unique_ptr<nodus::contracts::TuringCompileHost> host;
+    nodus::contracts::Peer inner;
+};
+std::mutex g_compile_hosts_mu;
+std::map<std::string, std::map<uint64_t, std::shared_ptr<CompileHostSlot>>> g_compile_hosts;
+
+void detach_slot(CompileHostSlot& slot) {
+    if (slot.host) slot.host->shutdown(); // cancels a running job, joins
+    slot.host.reset();
+    slot.inner = nodus::contracts::Peer{};
+}
+}
+
+extern "C" int32_t nodus_headless_attach_compile_host(
+    const char* prefix, uint64_t host_id, const char* python_executable, const char* nodus_root,
+    const char* turing_root, const char* module_library_root, const char* jobs_dir, int32_t adopt) {
+    auto empty = [](const char* s) { return !s || !*s; };
+    if (empty(prefix) || !host_id || empty(python_executable) || empty(nodus_root) ||
+        empty(turing_root) || empty(module_library_root) || empty(jobs_dir)) return 0;
+    try {
+        auto* negotiator = nodus::contracts::find(prefix);
+        if (!negotiator) return 0;
+        std::lock_guard<std::mutex> lock(g_compile_hosts_mu);
+        auto& hosts = g_compile_hosts[prefix];
+        auto found = hosts.find(host_id);
+        if (found != hosts.end() && found->second->host) return 0;
+        nodus::contracts::CompileHostConfig cfg;
+        cfg.python_executable = python_executable; cfg.nodus_root = nodus_root;
+        cfg.turing_root = turing_root; cfg.module_library_root = module_library_root;
+        cfg.jobs_dir = jobs_dir; cfg.host_id = host_id; cfg.adopt = adopt != 0;
+        auto host = std::make_unique<nodus::contracts::TuringCompileHost>(std::move(cfg));
+        if (found != hosts.end()) { // slot already registered with the negotiator
+            found->second->inner = host->peer();
+            found->second->host = std::move(host);
+            return 1;
+        }
+        auto slot = std::make_shared<CompileHostSlot>();
+        slot->inner = host->peer();
+        slot->host = std::move(host);
+        nodus::contracts::Peer wrapper;
+        wrapper.id = host_id;
+        wrapper.exchange = [slot](const nodus::contracts::Loan* offer) {
+            return slot->host ? slot->inner.exchange(offer) : nodus::contracts::Exchange{};
+        };
+        wrapper.receipt = [slot](uint64_t generation, bool accepted) {
+            if (slot->host && slot->inner.receipt) slot->inner.receipt(generation, accepted);
+        };
+        if (!negotiator->add_host(std::move(wrapper))) { detach_slot(*slot); return 0; }
+        hosts[host_id] = slot;
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t nodus_headless_detach_compile_host(const char* prefix, uint64_t host_id) {
+    if (!prefix || !*prefix || !host_id) return 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_compile_hosts_mu);
+        auto p = g_compile_hosts.find(prefix);
+        if (p == g_compile_hosts.end()) return 0;
+        auto h = p->second.find(host_id);
+        if (h == p->second.end() || !h->second->host) return 0;
+        detach_slot(*h->second);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t nodus_headless_compile_host_stats(const char* prefix, uint64_t host_id, uint64_t* out5) {
+    if (!prefix || !*prefix || !host_id || !out5) return 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_compile_hosts_mu);
+        auto p = g_compile_hosts.find(prefix);
+        if (p == g_compile_hosts.end()) return 0;
+        auto h = p->second.find(host_id);
+        if (h == p->second.end() || !h->second->host) return 0;
+        const auto s = h->second->host->stats();
+        out5[0] = s.accepted; out5[1] = s.completed; out5[2] = s.refused;
+        out5[3] = s.acknowledged; out5[4] = static_cast<uint64_t>(s.in_flight);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" int32_t nodus_headless_acquire_contract_pair(const char* prefix, int32_t capacity) {
     if (!prefix || !*prefix || capacity <= 0) return 0;
     try {
@@ -970,6 +1068,14 @@ extern "C" int32_t nodus_headless_acquire_contract_pair(const char* prefix, int3
 extern "C" int32_t nodus_headless_release_contract_pair(const char* prefix) {
     if (!prefix || !*prefix) return 0;
     try {
+        { // hosts end (cancel + join) before the negotiator they are registered with
+            std::lock_guard<std::mutex> lock(g_compile_hosts_mu);
+            auto p = g_compile_hosts.find(prefix);
+            if (p != g_compile_hosts.end()) {
+                for (auto& item : p->second) detach_slot(*item.second);
+                g_compile_hosts.erase(p);
+            }
+        }
         return nodus::contracts::release(prefix) ? 1 : 0;
     } catch (...) {
         return 0;

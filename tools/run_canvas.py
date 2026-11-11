@@ -254,6 +254,14 @@ def _parse_acquire(text: str):
     return prefix, int(cap)
 
 
+def _parse_compile_host(text: str):
+    # JOBS_DIR may hold a drive colon (C:/jobs); only the first two colons split.
+    parts = text.split(":", 2)
+    if len(parts) != 3 or not parts[0] or not parts[1].isdigit() or int(parts[1]) == 0 or not parts[2]:
+        raise ValueError(f"--compile-host expects PREFIX:HOST_ID:JOBS_DIR (HOST_ID non-zero), got {text!r}")
+    return parts[0], int(parts[1]), parts[2]
+
+
 def _claim_stdout():
     """The native library writes diagnostics to fd 1; keep the real stdout for JSON only."""
     sys.stdout.flush()
@@ -268,6 +276,17 @@ def main(argv=None) -> int:
     parser.add_argument("--rate", type=float, default=60.0)
     parser.add_argument("--acquire", action="append", default=[], metavar="PREFIX:CAPACITY")
     parser.add_argument("--ticks", type=int, default=None)
+    parser.add_argument("--compile-host", action="append", default=[], metavar="PREFIX:HOST_ID:JOBS_DIR",
+                        help="attach a Turing compile host to an --acquire'd prefix (repeatable); "
+                             "requests <JOBS_DIR>/<id>.request.json, products <JOBS_DIR>/<id>/")
+    parser.add_argument("--compile-python", default=None,
+                        help="python for the Turing compiler driver (default: this interpreter)")
+    parser.add_argument("--turing-root", default=None,
+                        help="Turing checkout (default: ../turing next to this repo)")
+    parser.add_argument("--module-library-root", default=None,
+                        help="module library root (default: <canvas>.modules)")
+    parser.add_argument("--compile-adopt", action="store_true",
+                        help="adopt and load compiled products on the canvas lane (default off)")
     parser.add_argument("--console-port", type=int, default=None,
                         help="read-only admin console on 127.0.0.1 (0 = ephemeral)")
     parser.add_argument("--console-token-file", default=None,
@@ -289,6 +308,17 @@ def main(argv=None) -> int:
             if not token:
                 raise ValueError("console token file is empty")
         acquires = [_parse_acquire(a) for a in args.acquire]
+        compile_hosts = [_parse_compile_host(a) for a in args.compile_host]
+        acquired = {prefix for prefix, _ in acquires}
+        for prefix, _host_id, _jobs in compile_hosts:
+            if prefix not in acquired:
+                raise ValueError(f"--compile-host prefix {prefix!r} must also be given to --acquire")
+        if len({(p, h) for p, h, _ in compile_hosts}) != len(compile_hosts):
+            raise ValueError("--compile-host PREFIX:HOST_ID given twice")
+        repo_root = pathlib.Path(__file__).resolve().parent.parent
+        compile_python = args.compile_python or sys.executable
+        turing_root = args.turing_root or str(repo_root.parent / "turing")
+        module_library_root = args.module_library_root or (args.canvas + ".modules")
         signal.signal(signal.SIGINT, _on_signal)
         signal.signal(signal.SIGTERM, _on_signal)
         if hasattr(signal, "SIGBREAK"):
@@ -304,6 +334,18 @@ def main(argv=None) -> int:
             for prefix, capacity in acquires:
                 graph.acquire_contract_pair(prefix, capacity)
             graph.load(args.canvas)
+            attached = []
+            try:
+                for prefix, host_id, jobs_dir in compile_hosts:
+                    graph.attach_compile_host(
+                        prefix, host_id, python_executable=compile_python, nodus_root=str(repo_root),
+                        turing_root=turing_root, module_library_root=module_library_root,
+                        jobs_dir=jobs_dir, adopt=args.compile_adopt)
+                    attached.append((prefix, host_id))
+            except BaseException:
+                for prefix, host_id in attached:
+                    graph.detach_compile_host(prefix, host_id)
+                raise
             ports = []
             for prefix, capacity, edge, declared in graph.contract_ports():
                 bound = graph.contract_port(prefix)
@@ -314,17 +356,25 @@ def main(argv=None) -> int:
                               "pid": os.getpid(), "console_port": console_port}),
                   file=out, flush=True)
             next_t = time.perf_counter()
-            while not _stop and (args.ticks is None or ticks < args.ticks):
-                graph.step(period)
-                ticks += 1
-                if console is not None:
-                    console.service(graph)
-                next_t += period
-                delay = next_t - time.perf_counter()
-                if delay > 0:
-                    time.sleep(delay)
-                else:
-                    next_t = time.perf_counter()
+            try:
+                while not _stop and (args.ticks is None or ticks < args.ticks):
+                    graph.step(period)
+                    ticks += 1
+                    if console is not None:
+                        console.service(graph)
+                    next_t += period
+                    delay = next_t - time.perf_counter()
+                    if delay > 0:
+                        time.sleep(delay)
+                    else:
+                        next_t = time.perf_counter()
+            finally:
+                # Hosts end (running compile cancelled, thread joined) before any pair is released.
+                for prefix, host_id in attached:
+                    try:
+                        graph.detach_compile_host(prefix, host_id)
+                    except RuntimeError as exc:
+                        print(f"run_canvas: {exc}", file=sys.stderr, flush=True)
         if console is not None:
             console.close()
         print(json.dumps({"ticks": ticks}), file=out, flush=True)

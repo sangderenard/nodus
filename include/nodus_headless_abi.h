@@ -261,11 +261,29 @@ NODUS_HEADLESS_API int32_t nodus_headless_get_port_unread(
 // reach the C++ registry (e.g. Python) can bind plugin rows by prefix.
 // Idempotent; returns 1 on success.
 NODUS_HEADLESS_API int32_t nodus_headless_acquire_contract_pair(const char* prefix, int32_t capacity);
-// Unregister and destroy the process-owned pair; 1 if it existed. Only call
+// Detaches every compile host of the prefix first, then unregister and destroy the process-owned pair; 1 if it existed. Only call
 // after every graph that bound its rows or declared a contract port on it has
 // been destroyed (a reload in the same process needs this, because a
 // negotiator that already holds contracts refuses a new result transport).
 NODUS_HEADLESS_API int32_t nodus_headless_release_contract_pair(const char* prefix);
+// Compile host (include/turing_compile_host_tool.h) attached to the negotiator
+// of an acquired pair; its Peer is added to that negotiator, so the existing
+// `<prefix>.market` row drives it on the lane that steps the canvas. Only the
+// compile wait runs on the host's single worker thread. Returns 1 on success; 0
+// (the ABI reports failure by return value only) when the prefix has no acquired
+// pair, host_id is 0, a host with that id is already attached to the prefix, or
+// any string argument is NULL/empty. After a detach the same id may be attached
+// again. adopt != 0 adopts the product on the lane after a compile.
+NODUS_HEADLESS_API int32_t nodus_headless_attach_compile_host(
+    const char* prefix, uint64_t host_id, const char* python_executable,
+    const char* nodus_root, const char* turing_root, const char* module_library_root,
+    const char* jobs_dir, int32_t adopt);
+// Cancels a running job (the host's cancel path), joins its thread, destroys the
+// host before returning. 1 if a host was attached.
+NODUS_HEADLESS_API int32_t nodus_headless_detach_compile_host(const char* prefix, uint64_t host_id);
+// out5 = {accepted, completed, refused, acknowledged, in_flight}; 0 if not attached.
+NODUS_HEADLESS_API int32_t nodus_headless_compile_host_stats(
+    const char* prefix, uint64_t host_id, uint64_t* out5);
 // Declare a contract port on a configured result edge (token_bytes ==
 // sizeof(Result), type 0x534A5231, layout 2, dtype 8, top_k 0). listen_port 0
 // picks an ephemeral loopback port. Returns the bound port (>0), or 0 when the

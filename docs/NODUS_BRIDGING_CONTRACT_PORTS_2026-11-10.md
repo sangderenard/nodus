@@ -98,3 +98,14 @@ Release only after every graph that bound the pair has been destroyed (a negotia
 - Test: `tests/turing_compile_host_test.cpp` (stub driver; ordering, one-in-flight, turn latency, restart refusal, cancel).
 
 Not done: routing of who may submit; the request upload path from the Python server (nothing yet writes `<id>.request.json`); the live canvas does not yet host the compile host.
+
+## Compile host on a live canvas
+
+A headless canvas can now attach the Turing compile host (above) to a negotiator prefix it has acquired.
+
+- ABI (`include/nodus_headless_abi.h`): `nodus_headless_attach_compile_host(prefix, host_id, python_executable, nodus_root, turing_root, module_library_root, jobs_dir, adopt)` -> 1/0; `nodus_headless_detach_compile_host(prefix, host_id)` (cancels a running job, joins, destroys the host); `nodus_headless_compile_host_stats(prefix, host_id, uint64_t out5[5])` = accepted, completed, refused, acknowledged, in_flight. Refused (0, the ABI reports by return value only): no acquired pair, host_id 0, id already attached to the prefix, any empty/NULL argument. `nodus_headless_release_contract_pair` detaches every host of the prefix first. Python: `Graph.attach_compile_host / detach_compile_host / compile_host_stats` (RuntimeError on refusal).
+- `tools/run_canvas.py`: `--compile-host PREFIX:HOST_ID:JOBS_DIR` (repeatable; PREFIX must also be in `--acquire`, refused before start otherwise), `--compile-python` (default: running interpreter), `--turing-root` (default: `../turing` beside this repo), `--module-library-root` (default: `<canvas>.modules`), `--compile-adopt` (adoption is off by default). Hosts are detached on shutdown.
+- File convention: request `<JOBS_DIR>/<contract id>.request.json` (placed by the submitter before the contract is submitted), product dir `<JOBS_DIR>/<id>/`, outcome `<JOBS_DIR>/<id>/compile-host.result.json`; `Result.payload` is the `CompileStatus`. Market lane steps the host; only the compile wait runs on its one thread.
+- Limitation: the negotiator has no host-removal API. A detached host stays registered as an inert wrapper (empty Exchange) and the same id can be re-attached; while an inert wrapper shares a negotiator with a live host it is still offered contracts and holds each reservation until the loan expires, which delays the live host. Detach is for shutdown, not for hot-swapping beside other hosts, until the negotiator gains a removal call.
+- Test: `tests/turing_compile_host_abi_test.cpp` (`turing_compile_host_abi_test`; refusals, RequestMissing, ExistingProduct with a nonexistent python so no compiler can run, idle detach, release-after-attach). No Python-level test was added (it needs a rebuilt `nodus_headless` DLL).
+- NOT done: `build-service` has not been relinked, so the live canvas host does not have these ABI functions or flags yet. No real Turing compile has been run through an attached host.

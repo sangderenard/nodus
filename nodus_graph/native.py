@@ -1243,6 +1243,17 @@ class Graph:
             ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
             ctypes.POINTER(ctypes.c_int32),
         )
+        lib.nodus_headless_attach_compile_host.restype = ctypes.c_int32
+        lib.nodus_headless_attach_compile_host.argtypes = (
+            ctypes.c_char_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32,
+        )
+        lib.nodus_headless_detach_compile_host.restype = ctypes.c_int32
+        lib.nodus_headless_detach_compile_host.argtypes = (ctypes.c_char_p, ctypes.c_uint64)
+        lib.nodus_headless_compile_host_stats.restype = ctypes.c_int32
+        lib.nodus_headless_compile_host_stats.argtypes = (
+            ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
+        )
         lib._contract_port_abi = True
         return lib
 
@@ -1251,6 +1262,53 @@ class Graph:
         lib = self._contract_abi()
         if not lib.nodus_headless_acquire_contract_pair(prefix.encode("utf-8"), int(capacity)):
             raise RuntimeError(f"native contract pair acquisition failed: {prefix}")
+
+    def attach_compile_host(self, prefix: str, host_id: int, *,
+                            python_executable: Union[str, pathlib.Path],
+                            nodus_root: Union[str, pathlib.Path],
+                            turing_root: Union[str, pathlib.Path],
+                            module_library_root: Union[str, pathlib.Path],
+                            jobs_dir: Union[str, pathlib.Path], adopt: bool = False) -> None:
+        """Attach a Turing compile host peer to the negotiator of an acquired pair.
+
+        Requests: ``<jobs_dir>/<contract id>.request.json``; product dir ``<jobs_dir>/<id>/``;
+        outcome ``compile-host.result.json`` in it. Refused (RuntimeError) when the prefix has
+        no acquired pair, host_id is 0, the id is already attached to the prefix, or a path is
+        empty; the ABI reports failure by return value only.
+        """
+        lib = self._contract_abi()
+        paths = {"python_executable": python_executable, "nodus_root": nodus_root,
+                 "turing_root": turing_root, "module_library_root": module_library_root,
+                 "jobs_dir": jobs_dir}
+        for name, value in paths.items():
+            if not str(value):
+                raise RuntimeError(f"native compile host attach refused: {name} is empty")
+        if not int(host_id):
+            raise RuntimeError("native compile host attach refused: host_id must be non-zero")
+        if not lib.nodus_headless_attach_compile_host(
+            prefix.encode("utf-8"), int(host_id), *(str(v).encode("utf-8") for v in paths.values()),
+            1 if adopt else 0,
+        ):
+            raise RuntimeError(
+                f"native compile host attach refused: {prefix} host {int(host_id)} "
+                "(no acquired contract pair for the prefix, or that host id is already attached)")
+
+    def detach_compile_host(self, prefix: str, host_id: int) -> None:
+        """Cancel any running compile, join the host's thread and destroy the host."""
+        lib = self._contract_abi()
+        if not lib.nodus_headless_detach_compile_host(prefix.encode("utf-8"), int(host_id)):
+            raise RuntimeError(
+                f"native compile host detach refused: {prefix} host {int(host_id)} is not attached")
+
+    def compile_host_stats(self, prefix: str, host_id: int) -> dict:
+        """accepted / completed / refused / acknowledged / in_flight of an attached host."""
+        lib = self._contract_abi()
+        out = (ctypes.c_uint64 * 5)()
+        if not lib.nodus_headless_compile_host_stats(prefix.encode("utf-8"), int(host_id), out):
+            raise RuntimeError(
+                f"native compile host stats refused: {prefix} host {int(host_id)} is not attached")
+        names = ("accepted", "completed", "refused", "acknowledged", "in_flight")
+        return {name: int(value) for name, value in zip(names, out)}
 
     def declare_contract_port(self, prefix: str, capacity: int, edge: Union[Edge, int],
                               listen_port: int = 0) -> int:
