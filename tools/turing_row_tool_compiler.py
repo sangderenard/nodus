@@ -31,7 +31,7 @@ The adapter always sets ``ssa_composition`` true.  It never links SSA itself.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import dataclasses
 import hashlib
 import json
@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -816,6 +817,75 @@ def _site_context(request: RowToolRequest) -> dict[str, Any] | None:
 
 
 @contextmanager
+def _site_compiler_diagnostics(output: Path):
+    """Capture Python, CRT and inherited child output in this isolated process."""
+    work = output / "compiler-work"
+    work.mkdir(parents=True, exist_ok=True)
+    paths = [work / "stdout.log", work / "stderr.log"]
+    for path in paths:
+        _product_relative(output, path)
+    # Python streams can be wrappers (including pytest capture); preserve those
+    # separately from the process descriptors that native tools inherit.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    windows = None
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        windows = ctypes.WinDLL("kernel32", use_last_error=True)
+        windows.GetStdHandle.argtypes = [wintypes.DWORD]
+        windows.GetStdHandle.restype = wintypes.HANDLE
+        windows.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+        windows.SetStdHandle.restype = wintypes.BOOL
+
+        def set_handle(number, handle):
+            if not windows.SetStdHandle(number, handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+    saved = []
+    with ExitStack() as stack:
+        streams = [stack.enter_context(path.open("a", encoding="utf-8", buffering=1))
+                   for path in paths]
+        try:
+            for descriptor, stream, handle_number in zip((1, 2), streams, (-11, -12)):
+                duplicate = os.dup(descriptor)
+                inheritable = os.get_inheritable(descriptor)
+                handle = windows.GetStdHandle(handle_number) if windows is not None else None
+                handle_matches_fd = (windows is not None and
+                                     handle == msvcrt.get_osfhandle(descriptor))
+                saved.append((descriptor, duplicate, inheritable, handle_number,
+                              handle, handle_matches_fd))
+                os.dup2(stream.fileno(), descriptor, inheritable=True)
+                if windows is not None:
+                    set_handle(handle_number, msvcrt.get_osfhandle(descriptor))
+            with redirect_stdout(streams[0]), redirect_stderr(streams[1]):
+                try:
+                    yield
+                except BaseException:
+                    traceback.print_exc(file=streams[1])
+                    raise
+                finally:
+                    streams[0].flush()
+                    streams[1].flush()
+        finally:
+            # Restore before closing the log streams or returning to CLI output.
+            restore_error = None
+            for descriptor, duplicate, inheritable, handle_number, handle, matches_fd in reversed(saved):
+                try:
+                    os.dup2(duplicate, descriptor, inheritable=inheritable)
+                    if windows is not None:
+                        set_handle(handle_number, msvcrt.get_osfhandle(descriptor)
+                                   if matches_fd else handle)
+                except OSError as error:
+                    restore_error = restore_error or error
+                finally:
+                    os.close(duplicate)
+            if restore_error is not None:
+                raise restore_error
+
+
+@contextmanager
 def _site_compiler_environment(output: Path):
     previous = {key: os.environ.get(key)
                 for key in (*_SITE_DIRECTORIES, "PYTHONDONTWRITEBYTECODE")}
@@ -866,7 +936,7 @@ def compile_row_tool(
                  "state": "running", "automatic_deletion": False}
     _write_json(receipt, lifecycle)
     try:
-        with _site_compiler_environment(output):
+        with _site_compiler_environment(output), _site_compiler_diagnostics(output):
             manifest = _compile_row_tool(request, compiler=compiler)
         lifecycle["state"] = "completed" if manifest["loadable"] else "uncompiled"
         return manifest
@@ -1057,6 +1127,9 @@ def _compile_row_tool(
             if path is not None:
                 _product_relative(output, path)
 
+    # Diagnostic records must include buffered output emitted during compilation.
+    sys.stdout.flush()
+    sys.stderr.flush()
     artifact_records = [
         _artifact_record(output, authored_path, "authored-source"),
         _artifact_record(output, submitted_path, "submitted-source"),

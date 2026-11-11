@@ -95,3 +95,14 @@ These controls route trusted compiler outputs; they are not an OS sandbox for
 arbitrary authored Python or a defense against concurrent filesystem mutation.
 Verification uses injected fake compilers and pure path tests only. No real
 compiler, native build, live service, or live database was exercised.
+
+
+Site compilation also captures Python stdout/stderr, process file descriptors
+1/2, and Windows standard handles into `compiler-work/stdout.log` and
+`compiler-work/stderr.log`. Inheriting tool children use those job-owned logs.
+The capture begins before the Turing boundary import, flushes before artifact
+hashing, preserves failure tracebacks, and restores streams/descriptors/handles
+before the CLI prints its final manifest path. Logs append on an explicit rerun.
+Children that intentionally select other streams or explicit files remain
+responsible for those destinations. Plain Python printing-child tests verify
+inheritance without invoking any compiler.

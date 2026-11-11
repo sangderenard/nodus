@@ -570,3 +570,68 @@ def test_site_rejects_external_backend_return(tmp_path):
     with pytest.raises(ProductError, match="outside the product root"):
         compile_row_tool(site_request(tmp_path), compiler=ExternalCompiler())
     assert not (tmp_path / "product" / ADOPTION_RECEIPT_NAME).exists()
+
+
+def test_site_captures_python_fd_and_child_diagnostics(tmp_path, monkeypatch):
+    import sys
+    import subprocess
+    import hashlib
+    import tools.turing_row_tool_compiler as adapter
+
+    class NoisyCompiler(FakeCompiler):
+        def lower(self, *args, **kwargs):
+            print("python stdout")
+            print("python stderr", file=sys.stderr)
+            os.write(1, b"fd stdout\n")
+            os.write(2, b"fd stderr\n")
+            # Only a plain Python printing process, never a compiler or build.
+            subprocess.run([sys.executable, "-c", "import sys; print('child stdout'); print('child stderr', file=sys.stderr)"], check=True)
+            return super().lower(*args, **kwargs)
+
+    def fake_boundary(root):
+        print("boundary import stdout")
+        print("boundary import stderr", file=sys.stderr)
+        return NoisyCompiler()
+
+    monkeypatch.setattr(adapter, "TuringBoundary", fake_boundary)
+    old_streams = (sys.stdout, sys.stderr)
+    old_inheritable = (os.get_inheritable(1), os.get_inheritable(2))
+    manifest = compile_row_tool(site_request(tmp_path))
+    assert (sys.stdout, sys.stderr) == old_streams
+    assert (os.get_inheritable(1), os.get_inheritable(2)) == old_inheritable
+    work = tmp_path / "product" / "compiler-work"
+    for name in ("stdout", "stderr"):
+        path = work / f"{name}.log"
+        contents = path.read_text()
+        for origin in ("python", "fd", "child", "boundary import"):
+            assert f"{origin} {name}" in contents
+        record = next(item for item in manifest["artifacts"] if item["path"] == f"compiler-work/{name}.log")
+        assert record["bytes"] == path.stat().st_size
+        assert record["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    print("post-compile CLI output")
+    assert "post-compile CLI output" not in (work / "stdout.log").read_text()
+
+
+def test_site_diagnostic_failure_restores_streams_and_retains_traceback(tmp_path):
+    import sys
+    from tools.turing_row_tool_compiler import _site_compiler_diagnostics
+
+    old_streams = (sys.stdout, sys.stderr)
+    before = (os.fstat(1), os.fstat(2))
+    with pytest.raises(RuntimeError, match="deliberate diagnostic failure"):
+        with _site_compiler_diagnostics(tmp_path):
+            print("failure stdout")
+            print("failure stderr", file=sys.stderr)
+            raise RuntimeError("deliberate diagnostic failure")
+    assert (sys.stdout, sys.stderr) == old_streams
+    after = (os.fstat(1), os.fstat(2))
+    assert [(s.st_dev, s.st_ino, s.st_mode) for s in before] == [(s.st_dev, s.st_ino, s.st_mode) for s in after]
+    assert "failure stdout" in (tmp_path / "compiler-work" / "stdout.log").read_text()
+    error = (tmp_path / "compiler-work" / "stderr.log").read_text()
+    assert "failure stderr" in error
+    assert "Traceback" in error
+    assert "RuntimeError: deliberate diagnostic failure" in error
+    # A second job must get its own output rather than reusing closed handles.
+    with _site_compiler_diagnostics(tmp_path / "second"):
+        os.write(1, b"second fd output\n")
+    assert "second fd output" in (tmp_path / "second" / "compiler-work" / "stdout.log").read_text()
