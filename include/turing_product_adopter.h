@@ -32,6 +32,9 @@ typedef struct GP_TuringCompileCancel GP_TuringCompileCancel;
 extern "C" {
 #endif
 
+// Presence of source-only request fields forbids the existing-row receipt shortcut.
+int gp_turing_row_tool_request_has_source_mode(const char* request_json);
+
 // First half of compile_and_load: validate, run the driver, require the
 // receipt. Touches no registry/canvas, so it is safe on a worker thread.
 // Returns 1 adoptable product, 0 failure, 2 cancelled, 3 source-only emission.

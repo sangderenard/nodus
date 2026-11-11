@@ -176,7 +176,23 @@ bool top_level_json_value(const std::string& text, const std::string& key, size_
         std::string token;
         for (; pos < text.size(); ++pos) {
             const char c = text[pos];
-            if (escaped) { token.push_back(c); escaped = false; continue; }
+            if (escaped) {
+                // JSON permits escaped ASCII in field names; source-mode guards
+                // must recognize e.g. unstable\u005fsource_only as the same key.
+                if (c == 'u' && pos + 4 < text.size()) {
+                    unsigned value = 0; bool valid = true;
+                    for (size_t i = 1; i <= 4; ++i) {
+                        const char h = text[pos + i];
+                        const int digit = h >= '0' && h <= '9' ? h - '0' :
+                            h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                        if (digit < 0) { valid = false; break; }
+                        value = value * 16 + static_cast<unsigned>(digit);
+                    }
+                    if (valid && value <= 127) { token.push_back(static_cast<char>(value)); pos += 4; }
+                    else token.push_back(c);
+                } else token.push_back(c);
+                escaped = false; continue;
+            }
             if (c == '\\') { escaped = true; continue; }
             if (c == '"') break;
             token.push_back(c);
@@ -207,6 +223,14 @@ bool json_string_field(const std::string& text, const std::string& key, std::str
         value.push_back(c);
     }
     return false;
+}
+
+bool json_literal_field(const std::string& text, const std::string& key, const std::string& literal) {
+    size_t pos = 0;
+    if (!top_level_json_value(text, key, &pos) || text.compare(pos, literal.size(), literal) != 0) return false;
+    const size_t end = pos + literal.size();
+    return end == text.size() || std::isspace(static_cast<unsigned char>(text[end])) ||
+           text[end] == ',' || text[end] == '}';
 }
 
 bool json_true_field(const std::string& text, const std::string& key) {
@@ -538,6 +562,18 @@ extern "C" int gp_turing_product_adopt_and_load(
     return 1;
 }
 
+extern "C" int gp_turing_row_tool_request_has_source_mode(const char* request_json) {
+    if (!request_json) return 0;
+    std::ifstream in(request_json, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    size_t pos = 0;
+    // Presence, not truthiness: malformed/duplicate/mixed-mode requests must
+    // never revive an unrelated runnable receipt. Legacy row requests have
+    // neither field and retain their existing-product fast path.
+    return top_level_json_value(text, "unstable_source_only", &pos) ||
+           top_level_json_value(text, "source_names", &pos);
+}
+
 extern "C" int gp_turing_row_tool_compile_only(
     const char* python_executable,
     const char* nodus_root,
@@ -581,7 +617,8 @@ extern "C" int gp_turing_row_tool_compile_only(
         const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         std::string schema, state;
         if (json_string_field(text, "schema", &schema) && schema == "nodus-turing-source-only-product-v1") {
-            if (!json_true_field(text, "unstable_source_only") || json_true_field(text, "loadable") ||
+            if (!json_true_field(text, "unstable_source_only") || !json_literal_field(text, "loadable", "false") ||
+                !json_literal_field(text, "buffer_abi", "null") ||
                 !json_string_field(text, "state", &state) || state != "emitted-not-built" ||
                 fs::exists(product / "nodus-row-tool-product.receipt")) {
                 copy_out("invalid source-only emission manifest", out_error, out_error_cap);

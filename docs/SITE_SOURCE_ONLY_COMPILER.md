@@ -39,7 +39,12 @@ Native `gp_turing_row_tool_compile_only` returns 3 for source-only emission;
 auto-adoption-disabled hosts treat this as a compiled/runnable row. A forged
 source manifest marked loadable, or accompanied by an adoption receipt, fails.
 `compile_and_load` still requires return 1, and the adopter only accepts the
-original row-product schema. Existing native status numbers do not change.
+original row-product schema. Existing native status numbers do not change. Before the existing-product fast
+path, any request containing a source-mode field is refused if a row receipt
+already exists (including escaped field names and duplicate-mode fields).
+Legacy row requests without source-mode fields keep their restart behavior.
+The native source-only manifest check requires `buffer_abi: null` and explicit
+`loadable: false`.
 
 Tests use only fake divider boundaries and stub compiler scripts. The compiler
 itself, live Site service, backend build/link, and GPU render are not run by

@@ -38,7 +38,8 @@ if req.get("fail"): sys.exit(3)
 if req.get("source_only"):
     with open(os.path.join(a.output_dir, "nodus-row-tool-product.json"), "w") as f:
         json.dump({"schema": "nodus-turing-source-only-product-v1", "unstable_source_only": True,
-                   "state": "emitted-not-built", "loadable": bool(req.get("forged_loadable"))}, f)
+                   "state": "emitted-not-built", "loadable": bool(req.get("forged_loadable")),
+                   "buffer_abi": {} if req.get("forged_abi") else None}, f)
     if req.get("forged_receipt"):
         with open(os.path.join(a.output_dir, "nodus-row-tool-product.receipt"), "w") as f:
             f.write("backend=c\nmanifest=nodus-row-tool-product.json\nabi=missing\nbinary=missing\n")
@@ -160,10 +161,11 @@ int main() {
         assert(!fs::exists(base / "lib"));
     }
     // A forged mixed source-only/runnable product cannot become a success or adoption.
-    for (int id : {403, 404}) {
+    for (int id : {403, 404, 405}) {
         write(jobs / (std::to_string(id) + ".request.json"), id == 403
               ? R"({"source_only":true,"forged_loadable":true})"
-              : R"({"source_only":true,"forged_receipt":true})");
+              : id == 404 ? R"({"source_only":true,"forged_receipt":true})"
+              : R"({"source_only":true,"forged_abi":true})");
         auto source_cfg = cfg; source_cfg.adopt = true;
         TuringCompileHost host(source_cfg); Peer p = host.peer();
         Loan loan; loan.work = {static_cast<uint64_t>(id), 10, 1, 5};
@@ -175,6 +177,26 @@ int main() {
         }
         assert(e.has_result && e.result.payload == (uint64_t)CompileStatus::CompileFailed);
         assert(!fs::exists(base / "lib"));
+    }
+    // Existing runnable receipt must not bypass source-only admission or call adoption.
+    for (const std::string request : {R"({"unstable_source_only":true})",
+                                     R"({"unstable\u005fsource_only":true})",
+                                     R"({"unstable_source_only":false,"unstable_source_only":true})",
+                                     R"({"source_names":["entry"]})"}) {
+        const int before = lines(counter);
+        write(jobs / "501.request.json", request);
+        write(jobs / "501" / "nodus-row-tool-product.receipt",
+              "NODUS ROW TOOL PRODUCT V1\nBACKEND \"c\"\nMANIFEST \"m.json\"\nABI \"a.nodus_buffer_abi.txt\"\nBINARY \"b.dll\"\n");
+        write(jobs / "501" / "m.json", R"({"schema":"nodus-turing-row-tool-product-v1","loadable":true,"backend":"c"})");
+        write(jobs / "501" / "a.nodus_buffer_abi.txt", "descriptor"); write(jobs / "501" / "b.dll", "binary");
+        auto source_cfg = cfg; source_cfg.adopt = true;
+        TuringCompileHost host(source_cfg); Peer p = host.peer();
+        Loan loan; loan.work = {501, 10, 1, 5}; loan.generation = 1; loan.host = 7; loan.deadline = 1000;
+        assert(p.exchange(&loan).accepted_generation == 1);
+        auto e = p.exchange(nullptr);
+        assert(e.has_result && e.result.payload == (uint64_t)CompileStatus::CompileFailed);
+        assert(lines(counter) == before); // no driver, importer, build or load
+        assert(fs::exists(jobs / "501" / "nodus-row-tool-product.receipt"));
     }
     // Cancellation: shutdown kills a 10 s child promptly.
     {

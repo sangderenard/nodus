@@ -123,7 +123,13 @@ private:
         slot_ = Slot{};
         job_.started = job_.queued;
         if (fs::is_regular_file(fs::path(job_.product) / "nodus-row-tool-product.receipt", ec)) {
-            slot_.rc = 1; job_.existing = true;
+            if (gp_turing_row_tool_request_has_source_mode(job_.request.c_str())) {
+                slot_.rc = 0;
+                slot_.error = "source-only request cannot reuse a runnable product receipt";
+                ++stats_.refused;
+            } else {
+                slot_.rc = 1; job_.existing = true;
+            }
             finish_now();
         } else if (!fs::is_regular_file(job_.request, ec)) {
             slot_.rc = -1; // request missing
