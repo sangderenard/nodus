@@ -254,13 +254,22 @@ NODUS_HEADLESS_API int32_t nodus_headless_get_port_unread(
 // (Hello role 1) and engines (Hello role 2) that connect and say Hello are
 // bound to that negotiator inside nodus_headless_step. Persisted by
 // nodus_headless_save_file (CONTRACT_PORT trailer record) and re-declared live
-// by nodus_headless_load_file. A closed peer stays registered (the negotiator
-// has no removal API); its exchange simply returns an empty Exchange.
+// by nodus_headless_load_file. A peer whose socket closed is removed from the
+// negotiator at the next step (ContractNegotiator::remove_engine/remove_host), so
+// its id can connect again.
 //
 // Create the process-owned pair (market/worker rows) so a caller that cannot
 // reach the C++ registry (e.g. Python) can bind plugin rows by prefix.
 // Idempotent; returns 1 on success.
 NODUS_HEADLESS_API int32_t nodus_headless_acquire_contract_pair(const char* prefix, int32_t capacity);
+// Same, with the loan length in market turns (>0; the plain function uses 60). A
+// loan that outlives its length is re-offered, so a prefix carrying a compile host
+// needs loan_ticks >= market rate x the longest compile it accepts. Acquiring an
+// existing prefix with a DIFFERENT loan length returns 0 (the same length is the
+// normal shared acquire).
+NODUS_HEADLESS_API int32_t nodus_headless_acquire_contract_pair_with_loan(const char* prefix, int32_t capacity, uint64_t loan_ticks);
+// Loan length of an acquired pair; 0 if the prefix is unknown.
+NODUS_HEADLESS_API uint64_t nodus_headless_contract_pair_loan_ticks(const char* prefix);
 // Detaches every compile host of the prefix first, then unregister and destroy the process-owned pair; 1 if it existed. Only call
 // after every graph that bound its rows or declared a contract port on it has
 // been destroyed (a reload in the same process needs this, because a

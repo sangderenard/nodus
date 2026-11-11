@@ -1226,6 +1226,11 @@ class Graph:
             return lib
         lib.nodus_headless_acquire_contract_pair.restype = ctypes.c_int32
         lib.nodus_headless_acquire_contract_pair.argtypes = (ctypes.c_char_p, ctypes.c_int32)
+        lib.nodus_headless_acquire_contract_pair_with_loan.restype = ctypes.c_int32
+        lib.nodus_headless_acquire_contract_pair_with_loan.argtypes = (
+            ctypes.c_char_p, ctypes.c_int32, ctypes.c_uint64)
+        lib.nodus_headless_contract_pair_loan_ticks.restype = ctypes.c_uint64
+        lib.nodus_headless_contract_pair_loan_ticks.argtypes = (ctypes.c_char_p,)
         lib.nodus_headless_declare_contract_port.restype = ctypes.c_int32
         lib.nodus_headless_declare_contract_port.argtypes = (
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
@@ -1257,10 +1262,25 @@ class Graph:
         lib._contract_port_abi = True
         return lib
 
-    def acquire_contract_pair(self, prefix: str, capacity: int) -> None:
-        """Create the process-owned `<prefix>.market` / `<prefix>.worker` plugin rows."""
+    def acquire_contract_pair(self, prefix: str, capacity: int, loan_ticks: Optional[int] = None) -> None:
+        """Create the process-owned `<prefix>.market` / `<prefix>.worker` plugin rows.
+
+        loan_ticks is the loan length in market turns (default 60). A prefix that
+        carries a compile host needs loan_ticks >= market rate x the longest compile.
+        An existing prefix acquired with a different loan length is refused.
+        """
         lib = self._contract_abi()
-        if not lib.nodus_headless_acquire_contract_pair(prefix.encode("utf-8"), int(capacity)):
+        key = prefix.encode("utf-8")
+        if loan_ticks is None:
+            ok = lib.nodus_headless_acquire_contract_pair(key, int(capacity))
+        else:
+            ok = lib.nodus_headless_acquire_contract_pair_with_loan(key, int(capacity), int(loan_ticks))
+        if not ok:
+            have = lib.nodus_headless_contract_pair_loan_ticks(key)
+            if loan_ticks is not None and have and have != int(loan_ticks):
+                raise RuntimeError(
+                    f"contract pair {prefix!r} is already acquired with loan_ticks={have}, "
+                    f"refusing loan_ticks={int(loan_ticks)}")
             raise RuntimeError(f"native contract pair acquisition failed: {prefix}")
 
     def attach_compile_host(self, prefix: str, host_id: int, *,

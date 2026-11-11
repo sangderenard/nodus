@@ -38,6 +38,7 @@ public:
         int64_t capacity = 0;
         GP_CanvasEdgeDesc desc{};
         int32_t listen_port = 0;
+        uint64_t loan_ticks = 0;  // optional trailing field; 0 = absent (pair default)
     };
 
     CanvasContractPorts();  // out of line as well: the defaulted body would instantiate the vector cleanup here
@@ -51,7 +52,8 @@ public:
     // opens the loopback listener. The edge must already hold a result-sized
     // FIFO spec (sizeof(Result)). Returns false (error filled) on refusal.
     bool declare(GP_CanvasContext* ctx, const std::string& prefix, size_t capacity,
-                 int canvas_edge_idx, uint16_t requested_port, std::string* error);
+                 int canvas_edge_idx, uint16_t requested_port, std::string* error,
+                 uint64_t loan_ticks = 0);  // 0 = take the pair as it is (default 60 if new)
 
     // Listener poll + Hello role dispatch + engine socket polls. Same lane as step.
     void pre_step();
@@ -64,6 +66,8 @@ public:
     // CONTRACT_PORT records is left untouched (returns true).
     bool load_trailer(GP_CanvasContext* ctx, const std::string& canvas_path, std::string* error);
     // CONTRACT_PORT lines only (EDGE_FIFO is written by the owner of edge state).
+    // The loan length is appended as a trailing field only when it is not the default
+    // 60, so a canvas file carries it and old readers/files are unaffected.
     void write_trailer(std::ostream& os) const;
 
     // Parse only the CONTRACT_PORT records of a file (false + error if malformed).

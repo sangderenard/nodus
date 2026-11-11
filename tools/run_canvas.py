@@ -248,10 +248,17 @@ class ConsoleServer:
 
 
 def _parse_acquire(text: str):
-    prefix, sep, cap = text.rpartition(":")
-    if not sep or not prefix or not cap.isdigit():
-        raise ValueError(f"--acquire expects PREFIX:CAPACITY, got {text!r}")
-    return prefix, int(cap)
+    # PREFIX:CAPACITY or PREFIX:CAPACITY:LOAN_TICKS (loan length in market turns).
+    parts = text.split(":")
+    loan = None
+    if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+        loan = int(parts.pop())
+        if loan == 0:
+            raise ValueError(f"--acquire LOAN_TICKS must be > 0, got {text!r}")
+    prefix, cap = ":".join(parts[:-1]), parts[-1]
+    if len(parts) < 2 or not prefix or not cap.isdigit():
+        raise ValueError(f"--acquire expects PREFIX:CAPACITY[:LOAN_TICKS], got {text!r}")
+    return prefix, int(cap), loan
 
 
 def _parse_compile_host(text: str):
@@ -274,7 +281,10 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--canvas", required=True)
     parser.add_argument("--rate", type=float, default=60.0)
-    parser.add_argument("--acquire", action="append", default=[], metavar="PREFIX:CAPACITY")
+    parser.add_argument("--acquire", action="append", default=[], metavar="PREFIX:CAPACITY[:LOAN_TICKS]",
+                        help="acquire a contract pair; LOAN_TICKS = loan length in market turns (default 60). "
+                             "A prefix carrying a compile host needs LOAN_TICKS >= --rate x the longest compile, "
+                             "e.g. --acquire turing:8:36000 at 60/s allows 10 minutes")
     parser.add_argument("--ticks", type=int, default=None)
     parser.add_argument("--compile-host", action="append", default=[], metavar="PREFIX:HOST_ID:JOBS_DIR",
                         help="attach a Turing compile host to an --acquire'd prefix (repeatable); "
@@ -309,7 +319,7 @@ def main(argv=None) -> int:
                 raise ValueError("console token file is empty")
         acquires = [_parse_acquire(a) for a in args.acquire]
         compile_hosts = [_parse_compile_host(a) for a in args.compile_host]
-        acquired = {prefix for prefix, _ in acquires}
+        acquired = {prefix for prefix, _, _ in acquires}
         for prefix, _host_id, _jobs in compile_hosts:
             if prefix not in acquired:
                 raise ValueError(f"--compile-host prefix {prefix!r} must also be given to --acquire")
@@ -331,8 +341,8 @@ def main(argv=None) -> int:
             console = ConsoleServer(token, os.path.basename(args.canvas), lambda: ticks)
             console_port = console.start(args.console_port)
         with Graph() as graph:
-            for prefix, capacity in acquires:
-                graph.acquire_contract_pair(prefix, capacity)
+            for prefix, capacity, loan in acquires:
+                graph.acquire_contract_pair(prefix, capacity, loan)
             graph.load(args.canvas)
             attached = []
             try:

@@ -56,6 +56,8 @@ int main() {
     const fs::path jobs = base / "jobs";
     fs::create_directories(jobs / "302");
     { std::ofstream(jobs / "302" / "nodus-row-tool-product.receipt") << "backend=c\n"; }
+    fs::create_directories(jobs / "303");
+    { std::ofstream(jobs / "303" / "nodus-row-tool-product.receipt") << "backend=c\n"; }
     const std::string j = jobs.string(), b = base.string();
     const char* py = "Z:/no/such/python.exe";
 
@@ -76,8 +78,7 @@ int main() {
     // Attach, duplicate refused.
     REQUIRE(attach(kPrefix, kHost, py, b.c_str(), b.c_str(), b.c_str(), j.c_str()));
     REQUIRE(!attach(kPrefix, kHost, py, b.c_str(), b.c_str(), b.c_str(), j.c_str()));
-    // The same id on another prefix is independent. (A detached id stays registered with its
-    // negotiator, which has no host removal, so it is not used on the prefix driven below.)
+    // The same id on another prefix is independent.
     REQUIRE(nodus_headless_acquire_contract_pair("abi.compile.other", 8));
     REQUIRE(attach("abi.compile.other", kHost, py, b.c_str(), b.c_str(), b.c_str(), j.c_str()));
     REQUIRE(nodus_headless_release_contract_pair("abi.compile.other"));
@@ -92,12 +93,27 @@ int main() {
     REQUIRE(nodus_headless_compile_host_stats(kPrefix, kHost, st));
     REQUIRE(st[0] == 2 && st[1] == 2 && st[2] == 1 && st[3] == 2 && st[4] == 0);
 
-    // Detach while idle; the negotiator keeps turning (wrapper answers empty); stats gone; id reusable.
+    // Detach while idle: the host is REMOVED from the negotiator (no inert wrapper), stats gone.
+    REQUIRE(rig.neg->host_count() == 1);
     REQUIRE(nodus_headless_detach_compile_host(kPrefix, kHost));
     REQUIRE(!nodus_headless_detach_compile_host(kPrefix, kHost));
     REQUIRE(!nodus_headless_compile_host_stats(kPrefix, kHost, st));
+    REQUIRE(rig.neg->host_count() == 0);
     for (int i = 0; i < 5; ++i) { rig.neg->worker_turn(); rig.neg->market_turn(); }
+    // A second live host on the same prefix gets the next contract promptly: with the old inert
+    // wrapper registered it would sit behind the wrapper's reservation until the loan expired.
+    REQUIRE(attach(kPrefix, kHost + 1, py, b.c_str(), b.c_str(), b.c_str(), j.c_str()));
+    rig.to_submit.push_back(303);
+    int turns = 0;
+    while (rig.routed.size() < 3 && turns < 20) { rig.neg->worker_turn(); rig.neg->market_turn(); ++turns; }
+    REQUIRE(rig.routed.size() == 3 && turns <= 10);
+    REQUIRE(rig.routed[2].first == 303 && rig.routed[2].second == (uint64_t)CompileStatus::ExistingProduct);
+    REQUIRE(rig.neg->discarded_results() == 0);
+    REQUIRE(nodus_headless_detach_compile_host(kPrefix, kHost + 1));
+    REQUIRE(rig.neg->host_count() == 0);
+    // The detached id can be attached again (and is a registered host again).
     REQUIRE(attach(kPrefix, kHost, py, b.c_str(), b.c_str(), b.c_str(), j.c_str()));
+    REQUIRE(rig.neg->host_count() == 1);
     REQUIRE(nodus_headless_compile_host_stats(kPrefix, kHost, st) && st[0] == 0);
 
     // Release with a host still attached: host ends first, pair goes, nothing dangles.

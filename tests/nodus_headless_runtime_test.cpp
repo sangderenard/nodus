@@ -434,6 +434,114 @@ static void test_contract_port_loopback_and_persistence() {
     std::printf("test_contract_port_loopback_and_persistence: OK\n");
 }
 
+// Engine id reuse after its socket closed, duplicate LIVE id refused, loan_ticks carried by
+// the pair and persisted in the CONTRACT_PORT trailer. Real loopback contract port; no compile.
+static void test_contract_port_engine_reconnect_and_loan_ticks() {
+    const char* kPrefix = "hl.reconnect";
+    const std::string market_id = std::string(kPrefix) + ".market";
+    const std::string worker_id = std::string(kPrefix) + ".worker";
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "nodus_headless_test_reconnect.txt";
+    // Loan length rules.
+    REQUIRE(!nodus_headless_acquire_contract_pair_with_loan(kPrefix, 4, 0));
+    REQUIRE(nodus_headless_acquire_contract_pair_with_loan(kPrefix, 4, 600));
+    REQUIRE(nodus_headless_contract_pair_loan_ticks(kPrefix) == 600);
+    REQUIRE(nodus_headless_acquire_contract_pair_with_loan(kPrefix, 4, 600));   // same length: shared acquire
+    REQUIRE(!nodus_headless_acquire_contract_pair_with_loan(kPrefix, 4, 61));   // different length refused
+    REQUIRE(nodus_headless_acquire_contract_pair(kPrefix, 4));                  // unspecified: takes the pair as is
+    REQUIRE(nodus_headless_contract_pair_loan_ticks(kPrefix) == 600);
+
+    NodusHeadlessGraph* g = nodus_headless_create();
+    REQUIRE(g);
+    GP_CanvasModuleDesc desc{}; desc.w = desc.h = 64;
+    const int m = nodus_headless_add_module(g, &desc), w = nodus_headless_add_module(g, &desc);
+    const int mr = nodus_headless_bind_plugin_tool(g, m, market_id.c_str());
+    const int wr = nodus_headless_bind_plugin_tool(g, w, worker_id.c_str());
+    REQUIRE(m >= 0 && w >= 0 && mr >= 0 && wr >= 0);
+    GP_CanvasEdgeDesc edge{};
+    edge.a_module = m; edge.a_contact_idx = mr; edge.b_module = w; edge.b_contact_idx = wr;
+    const int edge_id = nodus_headless_add_edge(g, &edge, 0);
+    REQUIRE(edge_id >= 0);
+    NodusHeadlessFifoConfig config{};
+    config.token_bytes = sizeof(Result); config.slots = 4; config.top_k = 0;
+    config.type_id = 0x534A5231; config.layout = 2; config.dtype = 8;
+    REQUIRE(nodus_headless_configure_edge_fifo(g, edge_id, &config));
+    REQUIRE(nodus_headless_set_scheduler_mode(g, 1));
+    const int32_t port = nodus_headless_declare_contract_port(g, kPrefix, 4, edge_id, 0);
+    REQUIRE(port > 0);
+
+    const uint64_t kHostPayload = 777;
+    ContractSocket host_client(contract_connect(static_cast<uint16_t>(port)));
+    REQUIRE(host_client.send_message(contract_hello(1, 1)));
+    auto engine_count = [&]() { int32_t h = 0, e = -1; REQUIRE(nodus_headless_get_contract_port(g, kPrefix, nullptr, &h, &e)); return e; };
+    // One full cycle for the engine on `client`: Admitted, host Offer/Accept/Result, Route, Decision.
+    auto cycle = [&](ContractSocket& client, uint64_t engine, uint64_t cid) {
+        REQUIRE(client.send_message(contract_submit({cid, engine, 1, 2})));
+        bool admitted = false, routed = false;
+        for (int tick = 0; tick < 5000 && !routed; ++tick) {
+            REQUIRE(nodus_headless_step(g, 1.0 / 60.0));
+            client.poll(); host_client.poll();
+            WireMessage msg{};
+            while (client.receive(msg)) {
+                if (msg.kind == WireKind::Admitted) { REQUIRE(msg.result.loan.work.id == cid); admitted = true; }
+                if (msg.kind == WireKind::Route) {
+                    REQUIRE(msg.result.loan.work.id == cid && msg.result.payload == kHostPayload);
+                    REQUIRE(msg.result.loan.generation >= 1);
+                    routed = true;
+                    REQUIRE(client.send_message(contract_decision(cid, msg.result.loan.generation, 1)));
+                }
+            }
+            while (host_client.receive(msg))
+                if (msg.kind == WireKind::Offer) {
+                    REQUIRE(host_client.send_message({WireKind::Accept, {msg.result.loan, 0}}));
+                    REQUIRE(host_client.send_message({WireKind::Result, {msg.result.loan, kHostPayload}}));
+                }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        REQUIRE(admitted && routed);
+        for (int i = 0; i < 20; ++i) { REQUIRE(nodus_headless_step(g, 1.0 / 60.0)); client.poll(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    };
+
+    {   // First life of engine 9001.
+        ContractSocket first(contract_connect(static_cast<uint16_t>(port)));
+        REQUIRE(first.send_message(contract_hello(2, 9001)));
+        cycle(first, 9001, 1);
+        REQUIRE(engine_count() == 1);
+    }   // socket closed here
+    for (int tick = 0; tick < 2000 && engine_count() != 0; ++tick) {
+        REQUIRE(nodus_headless_step(g, 1.0 / 60.0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(engine_count() == 0);   // the closed engine was removed
+
+    // Reconnect with the same id; a second LIVE connection with that id is refused.
+    ContractSocket again(contract_connect(static_cast<uint16_t>(port)));
+    REQUIRE(again.send_message(contract_hello(2, 9001)));
+    cycle(again, 9001, 2);
+    REQUIRE(engine_count() == 1);
+    ContractSocket dup(contract_connect(static_cast<uint16_t>(port)));
+    REQUIRE(dup.send_message(contract_hello(2, 9001)));
+    for (int tick = 0; tick < 3000 && !dup.closed(); ++tick) {
+        REQUIRE(nodus_headless_step(g, 1.0 / 60.0));
+        dup.poll(); again.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(dup.closed() && !again.closed() && engine_count() == 1);
+
+    // The loan length is in the trailer and a fresh process-owned pair comes back with it.
+    REQUIRE(nodus_headless_save_file(g, path.string().c_str()));
+    nodus_headless_destroy(g);
+    REQUIRE(nodus_headless_release_contract_pair(kPrefix));
+    REQUIRE(nodus_headless_contract_pair_loan_ticks(kPrefix) == 0);
+    NodusHeadlessGraph* g2 = nodus_headless_create();
+    REQUIRE(g2 && nodus_headless_load_file(g2, path.string().c_str()));
+    REQUIRE(nodus_headless_contract_pair_loan_ticks(kPrefix) == 600);
+    nodus_headless_destroy(g2);
+    REQUIRE(nodus_headless_release_contract_pair(kPrefix));
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::printf("test_contract_port_engine_reconnect_and_loan_ticks: OK\n");
+}
+
 int main() {
     test_partial_cycle_freespinning_completes();
     test_quiescence_and_event();
@@ -443,5 +551,6 @@ int main() {
     test_duplicate_module_uuid_is_refused();
     test_unregistered_plugin_row_is_refused();
     test_contract_port_loopback_and_persistence();
+    test_contract_port_engine_reconnect_and_loan_ticks();
     return 0;
 }

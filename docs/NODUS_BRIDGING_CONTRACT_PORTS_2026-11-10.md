@@ -55,7 +55,7 @@ The static registrar is dropped when `canvas_tables_static` is linked, so `abstr
 - `nodus_headless_get_contract_port`, `nodus_headless_get_contract_port_count`, `nodus_headless_get_contract_port_at`
 - Python: `Graph.acquire_contract_pair`, `Graph.declare_contract_port`, `Graph.contract_port`, `Graph.contract_ports`.
 
-Release only after every graph that bound the pair has been destroyed (a negotiator holding contracts refuses a new result transport). A closed peer stays registered; its exchange returns an empty Exchange.
+Release only after every graph that bound the pair has been destroyed (a negotiator holding contracts refuses a new result transport). A peer whose socket closed is removed from the negotiator at the next `pre_step` (see Removal semantics), so its id can connect again; a second LIVE connection with a still-connected id is refused as a duplicate.
 
 ## Pre-existing build repairs (d16e395)
 
@@ -106,6 +106,27 @@ A headless canvas can now attach the Turing compile host (above) to a negotiator
 - ABI (`include/nodus_headless_abi.h`): `nodus_headless_attach_compile_host(prefix, host_id, python_executable, nodus_root, turing_root, module_library_root, jobs_dir, adopt)` -> 1/0; `nodus_headless_detach_compile_host(prefix, host_id)` (cancels a running job, joins, destroys the host); `nodus_headless_compile_host_stats(prefix, host_id, uint64_t out5[5])` = accepted, completed, refused, acknowledged, in_flight. Refused (0, the ABI reports by return value only): no acquired pair, host_id 0, id already attached to the prefix, any empty/NULL argument. `nodus_headless_release_contract_pair` detaches every host of the prefix first. Python: `Graph.attach_compile_host / detach_compile_host / compile_host_stats` (RuntimeError on refusal).
 - `tools/run_canvas.py`: `--compile-host PREFIX:HOST_ID:JOBS_DIR` (repeatable; PREFIX must also be in `--acquire`, refused before start otherwise), `--compile-python` (default: running interpreter), `--turing-root` (default: `../turing` beside this repo), `--module-library-root` (default: `<canvas>.modules`), `--compile-adopt` (adoption is off by default). Hosts are detached on shutdown.
 - File convention: request `<JOBS_DIR>/<contract id>.request.json` (placed by the submitter before the contract is submitted), product dir `<JOBS_DIR>/<id>/`, outcome `<JOBS_DIR>/<id>/compile-host.result.json`; `Result.payload` is the `CompileStatus`. Market lane steps the host; only the compile wait runs on its one thread.
-- Limitation: the negotiator has no host-removal API. A detached host stays registered as an inert wrapper (empty Exchange) and the same id can be re-attached; while an inert wrapper shares a negotiator with a live host it is still offered contracts and holds each reservation until the loan expires, which delays the live host. Detach is for shutdown, not for hot-swapping beside other hosts, until the negotiator gains a removal call.
-- Test: `tests/turing_compile_host_abi_test.cpp` (`turing_compile_host_abi_test`; refusals, RequestMissing, ExistingProduct with a nonexistent python so no compiler can run, idle detach, release-after-attach). No Python-level test was added (it needs a rebuilt `nodus_headless` DLL).
+- Detach: after cancelling and joining, the host is removed from the negotiator (`remove_host`); no inert wrapper remains, a second live host on the prefix is offered the next contract at once, and the same id can be attached again. A loan the detached host held is re-offered (see below).
+- Test: `tests/turing_compile_host_abi_test.cpp` (`turing_compile_host_abi_test`; refusals, RequestMissing, ExistingProduct with a nonexistent python so no compiler can run, idle detach, detach then a second live host served within 10 turns, same id re-attached, release-after-attach). No Python-level test was added (it needs a rebuilt `nodus_headless` DLL).
 - NOT done: `build-service` has not been relinked, so the live canvas host does not have these ABI functions or flags yet. No real Turing compile has been run through an attached host.
+
+## Removal semantics (`include/contract_negotiator.h`)
+
+`ContractNegotiator::remove_engine(id)` / `remove_host(id)`; both return false for an unknown id. Peers are held by INDEX inside the negotiator (host/offer/engine vectors, round-robin cursors, references held across the exchange/route/request callbacks) while contracts and loans name peers by ID. Removal therefore never mutates the vectors mid-turn: from inside `market_turn()`/`worker_turn()` it is deferred to the end of that turn; between turns it applies at once.
+
+- Engine removed: contracts not in flight (Unaccepted, Committed) are dropped. A Loaned contract stays until its host answers; the host completes normally, the result has no engine and is discarded (`discarded_results()`), and a loan that expires first is dropped instead of re-offered. A Returned contract is discarded the same way when its result is consumed. The id can be added again.
+- Host removed: its retained offer goes with it; each Loaned contract it held returns to Unaccepted with the loan cleared and is re-offered to another host under a NEW generation (`reoffered_loans()`), so a late result of the old generation cannot match. A Returned contract (host result already accepted and published) is left alone and routes to its engine.
+- `contract_port_canvas.cpp`: at the start of each `pre_step`, engine and host sockets found closed are removed from the negotiator and from the binding, then the listener is polled (so a reconnect with the same id in the same step succeeds).
+- Tests: `contract_negotiator_test` (all removal cases, deferral, loan length), `nodus_headless_runtime_test` (same engine id reconnects through a real loopback port and gets a second contract routed; duplicate live id refused), `turing_compile_host_abi_test`.
+
+## Loan length (`loan_ticks`)
+
+A loan lives `loan_ticks` market turns (default 60, one second at 60 turns/s). Work held longer is re-offered under a new generation, and a late result of the old generation is dropped.
+
+RULE: a prefix that carries a compile host needs `loan_ticks >= market rate x the longest compile you accept`. The default made a real 8 s compile re-loan up to generation 10 and finish as ExistingProduct.
+
+- Chosen where the pair is acquired: registry `acquire(prefix, capacity, loan_ticks = 0)` (0 = unspecified: 60 for a new pair, an existing pair as it is); `nodus_headless_acquire_contract_pair_with_loan(prefix, capacity, loan_ticks)` (the old function keeps 60); `nodus_headless_contract_pair_loan_ticks(prefix)`; Python `Graph.acquire_contract_pair(prefix, capacity, loan_ticks=None)`.
+- Acquiring an existing prefix with a DIFFERENT explicit loan length is refused ("already acquired with loan_ticks=N, refusing loan_ticks=M"); the same length is the ordinary shared acquire.
+- `tools/run_canvas.py --acquire PREFIX:CAPACITY[:LOAN_TICKS]` (two-field form unchanged). Example, ten minutes of compile at 60 turns/s: `--acquire turing:8:36000 --compile-host turing:7:C:/jobs`.
+- Persisted: the CONTRACT_PORT record gets an optional trailing field `... <listen_port> [<loan_ticks>]`, written only when the length is not 60. Reason: a canvas file that loads onto a fresh process must come back with the loan length its compile host needs. Old files (no field) load with the default; loading a record whose length differs from an already-acquired pair is refused. GUI `frontend_shell --acquire=PREFIX:CAPACITY` has no loan option yet (default 60).
+- Test: `contract_negotiator_test` (a host holding a loan 100 turns completes at generation 1 with loan_ticks 600; with the default 60 the same scenario re-loans and never completes) and `nodus_headless_runtime_test` (refusal rules, trailer round trip).

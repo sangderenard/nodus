@@ -10,7 +10,10 @@
 namespace nodus::contracts {
 // Creates and registers on first call; returns the existing instance after.
 // Throws std::runtime_error naming the prefix if registration fails.
-ContractNegotiator& acquire(const std::string& prefix, size_t capacity);
+// loan_ticks (market turns a loan lives): 0 = unspecified (new pair gets the default
+// 60; an existing pair is returned whatever it has). A nonzero value on an existing
+// pair whose loan length differs throws std::runtime_error naming both lengths.
+ContractNegotiator& acquire(const std::string& prefix, size_t capacity, uint64_t loan_ticks = 0);
 ContractNegotiator* find(const std::string& prefix);
 // Unregisters both tool ids, destroys the negotiator; false if unknown.
 // No bound row instance may execute after release.

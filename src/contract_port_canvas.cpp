@@ -49,11 +49,12 @@ struct CanvasContractPorts::Binding {
     uint16_t listen_port = 0;
     uint16_t requested_port = 0;
     // Cleared in the destructor, before the sockets die, so callbacks the
-    // process-owned negotiator still holds (it has no removal API) become inert.
+    // process-owned negotiator still holds become inert.
     std::shared_ptr<bool> alive = std::make_shared<bool>(true);
     std::unique_ptr<ContractListener> listener;
     std::vector<std::unique_ptr<ContractSocket>> hosts;
     std::vector<std::unique_ptr<EngineSocket>> engines;
+    std::vector<uint64_t> host_ids, engine_ids;  // parallel to hosts / engines
     std::vector<std::pair<uint64_t, uint64_t>> rejected;  // (contract id, generation)
     ~Binding() { *alive = false; }
 };
@@ -70,7 +71,8 @@ CanvasContractPorts::~CanvasContractPorts() {
 void CanvasContractPorts::clear() { ports_.clear(); }
 
 bool CanvasContractPorts::declare(GP_CanvasContext* ctx, const std::string& prefix, size_t capacity,
-                                  int canvas_edge_idx, uint16_t requested_port, std::string* error) {
+                                  int canvas_edge_idx, uint16_t requested_port, std::string* error,
+                                  uint64_t loan_ticks) {
     if (!ctx || prefix.empty() || capacity == 0 || capacity > INT32_MAX || canvas_edge_idx < 0)
         return fail(error, "contract port: invalid arguments");
     if (std::any_of(prefix.begin(), prefix.end(), [](unsigned char c) { return std::isspace(c) != 0; }))
@@ -95,7 +97,7 @@ bool CanvasContractPorts::declare(GP_CanvasContext* ctx, const std::string& pref
     try {
         auto b = std::make_unique<Binding>();
         b->listener = std::make_unique<ContractListener>(requested_port);
-        ContractNegotiator& negotiator = acquire(prefix, capacity);
+        ContractNegotiator& negotiator = acquire(prefix, capacity, loan_ticks);
         const std::shared_ptr<bool> alive = b->alive;
         const unsigned long long wkey = scalar_reader_key(desc.a_module, desc.a_contact_idx);
         const unsigned long long rkey = scalar_reader_key(desc.b_module, desc.b_contact_idx);
@@ -139,6 +141,21 @@ void CanvasContractPorts::pre_step() {
         auto* negotiator = nodus::contracts::find(cp->prefix);
         if (!negotiator) continue;
         const std::shared_ptr<bool> alive = cp->alive;
+        // Peers whose socket closed are removed first, so the same id can connect
+        // again (a LIVE duplicate id is still refused by add_engine/add_host).
+        for (size_t i = cp->engines.size(); i-- > 0;) {
+            cp->engines[i]->poll();
+            if (!cp->engines[i]->closed()) continue;
+            negotiator->remove_engine(cp->engine_ids[i]);
+            cp->engines.erase(cp->engines.begin() + i);
+            cp->engine_ids.erase(cp->engine_ids.begin() + i);
+        }
+        for (size_t i = cp->hosts.size(); i-- > 0;) {
+            if (!cp->hosts[i]->closed()) continue;
+            negotiator->remove_host(cp->host_ids[i]);
+            cp->hosts.erase(cp->hosts.begin() + i);
+            cp->host_ids.erase(cp->host_ids.begin() + i);
+        }
         cp->listener->poll([=](SOCKET s, uint64_t role, uint64_t id) {
             try {
                 if (role == 2) {
@@ -155,16 +172,19 @@ void CanvasContractPorts::pre_step() {
                             [=](Contract& c) { return *alive && e->request(c); },
                             [=](uint64_t cid) { if (*alive) e->admitted(cid); }})) {
                         cp->engines.pop_back();  // duplicate id: socket closed by destructor
+                    } else {
+                        cp->engine_ids.push_back(id);
                     }
                 } else {
                     cp->hosts.push_back(std::make_unique<ContractSocket>(s));
                     auto* h = cp->hosts.back().get();
-                    // A closed peer's exchange() yields an empty Exchange (poll is a no-op once
-                    // closed); the negotiator has no remove API so the entry stays.
+                    // A closed host is removed in the next pre_step (its loans are re-offered).
                     if (!negotiator->add_host({id,
                             [=](const Loan* l) { return *alive ? h->exchange(l) : Exchange{}; },
                             [=](uint64_t gen, bool ok) { if (*alive) h->receipt(gen, ok); }})) {
                         cp->hosts.pop_back();
+                    } else {
+                        cp->host_ids.push_back(id);
                     }
                 }
             } catch (...) {
@@ -198,6 +218,8 @@ bool CanvasContractPorts::parse_records(const std::string& path, std::vector<Rec
         if (!(ss >> cp.prefix >> cp.capacity >> cp.desc.a_module >> cp.desc.a_contact_idx >>
               cp.desc.b_module >> cp.desc.b_contact_idx >> cp.listen_port))
             return fail(error, "malformed record: " + line);
+        uint64_t lt = 0;
+        if (ss >> lt) cp.loan_ticks = lt;  // optional trailing field
         if (out) out->push_back(std::move(cp));
     }
     return true;
@@ -264,17 +286,20 @@ bool CanvasContractPorts::load_trailer(GP_CanvasContext* ctx, const std::string&
             return fail(error, "cannot restore CONTRACT_PORT " + r.prefix);
         std::string why;
         if (!declare(ctx, r.prefix, static_cast<size_t>(r.capacity), canvas_edge,
-                     static_cast<uint16_t>(r.listen_port), &why))
+                     static_cast<uint16_t>(r.listen_port), &why, r.loan_ticks))
             return fail(error, "cannot restore CONTRACT_PORT " + r.prefix + ": " + why);
     }
     return true;
 }
 
 void CanvasContractPorts::write_trailer(std::ostream& os) const {
-    for (const auto& cp : ports_)
+    for (const auto& cp : ports_) {
         os << "CONTRACT_PORT " << cp->prefix << " " << cp->capacity << " "
            << cp->desc.a_module << " " << cp->desc.a_contact_idx << " "
-           << cp->desc.b_module << " " << cp->desc.b_contact_idx << " " << cp->requested_port << "\n";
+           << cp->desc.b_module << " " << cp->desc.b_contact_idx << " " << cp->requested_port;
+        if (auto* n = nodus::contracts::find(cp->prefix); n && n->loan_ticks() != 60) os << " " << n->loan_ticks();
+        os << "\n";
+    }
 }
 
 bool CanvasContractPorts::info(size_t ordinal, PortInfo* out) const {

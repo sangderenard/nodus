@@ -2,6 +2,8 @@
 #include "contract_negotiator_registry.h"
 #include <cassert>
 #include <cstdio>
+#include <deque>
+#include <memory>
 using namespace nodus::contracts;
 int main(){
     auto choose=[](const Peer&,const std::vector<ContractNegotiator::Entry>& entries){
@@ -52,6 +54,96 @@ int main(){
         assert(release("registry.proof"));
         assert(!tool_registry_global().find("registry.proof.market") && !tool_registry_global().find("registry.proof.worker"));
         assert(find("registry.proof")==nullptr && !release("registry.proof"));
+    }
+    // ---- Removal API ----
+    {
+        auto fresh=[&](size_t cap=4,uint64_t ticks=50){return std::make_unique<ContractNegotiator>(cap,choose,ticks);};
+        auto never=[](const Result&){return false;};
+        auto none=[](Contract&){return false;};
+        // Engine removal with nothing in flight; id reusable; unknown id refused.
+        auto n=fresh();
+        assert(n->add_engine({10,never,none}) && n->engine_count()==1);
+        assert(!n->remove_engine(11));
+        assert(n->remove_engine(10) && n->engine_count()==0 && !n->remove_engine(10));
+        assert(!n->submit({1,10,1,1}));
+        assert(n->add_engine({10,never,none}) && n->submit({1,10,1,1}));
+        // Engine removal with pending (unaccepted) contracts: dropped, other engines' work kept.
+        assert(n->add_engine({11,never,none}) && n->submit({2,10,1,1}) && n->submit({3,11,1,1}));
+        assert(n->remove_engine(10) && n->contracts().size()==1 && n->contracts()[0].work.id==3);
+        assert(n->discarded_results()==0);
+        // Engine removal with a loan in flight: host completes, result discarded and counted.
+        {
+            auto b=fresh(); Loan held{}; int stage=0; int routed=0;
+            assert(b->add_engine({10,[&](const Result&){++routed;return true;},none}));
+            assert(b->add_host({1,[&](const Loan* o){Exchange e;
+                if(o && stage==0){held=*o;e.accepted_generation=o->generation;stage=1;}
+                else if(stage==1 && !o){e.has_result=true;e.result={held,5};stage=2;}
+                return e;}}));
+            assert(b->submit({7,10,1,1}));b->market_turn();
+            assert(b->contracts()[0].state==ContractNegotiator::State::Loaned);
+            assert(b->remove_engine(10));
+            assert(b->contracts().size()==1 && b->contracts()[0].state==ContractNegotiator::State::Loaned);
+            b->market_turn();                                   // host returns its result
+            assert(b->contracts()[0].state==ContractNegotiator::State::Returned);
+            b->worker_turn();
+            assert(routed==0 && b->discarded_results()==1 && b->contracts().empty());
+            b->worker_turn();assert(b->discarded_results()==1);
+        }
+        // Host removal with a loan in flight: re-offered to another host under a new generation.
+        {
+            auto b=fresh(); Loan held1{},held2{}; int stage2=0; int routed=0; uint64_t routed_host=0,routed_gen=0;
+            assert(b->add_engine({10,[&](const Result& r){++routed;routed_host=r.loan.host;routed_gen=r.loan.generation;return true;},none}));
+            assert(b->add_host({1,[&](const Loan* o){Exchange e;if(o){held1=*o;e.accepted_generation=o->generation;}return e;}}));
+            assert(b->add_host({2,[&](const Loan* o){Exchange e;
+                if(o && stage2==0){held2=*o;e.accepted_generation=o->generation;stage2=1;}
+                else if(stage2==1 && !o){e.has_result=true;e.result={held2,6};stage2=2;}
+                return e;}}));
+            assert(b->submit({8,10,1,1}));b->market_turn();      // host 1 takes it, never answers
+            assert(held1.generation==1 && b->contracts()[0].state==ContractNegotiator::State::Loaned);
+            assert(b->remove_host(1) && !b->remove_host(1) && b->host_count()==1);
+            assert(b->reoffered_loans()==1 && b->contracts()[0].state==ContractNegotiator::State::Unaccepted);
+            b->market_turn();b->market_turn();                   // host 2: offer+accept, then result
+            assert(b->contracts()[0].state==ContractNegotiator::State::Returned);
+            b->worker_turn();
+            assert(routed==1 && routed_host==2 && routed_gen==held2.generation && held2.generation>held1.generation);
+        }
+        // Removal requested from inside a turn is deferred to its end.
+        {
+            auto b=fresh(); Loan held{}; int stage=0; ContractNegotiator* self=b.get(); bool inside_true=false;
+            assert(b->add_engine({10,[&](const Result&){inside_true=self->remove_engine(10);assert(self->engine_count()==1);return true;},none}));
+            assert(b->add_host({1,[&](const Loan* o){Exchange e;
+                if(o && stage==0){held=*o;e.accepted_generation=o->generation;stage=1;}
+                else if(stage==1 && !o){e.has_result=true;e.result={held,5};stage=2;}
+                return e;}}));
+            assert(b->submit({9,10,1,1}));b->market_turn();b->market_turn();b->worker_turn();
+            assert(inside_true && b->engine_count()==0 && b->contracts().empty());
+        }
+    }
+    // ---- loan_ticks chosen at acquire ----
+    {
+        auto scenario=[&](const char* prefix,uint64_t loan,uint64_t* generation_out,int* routed_out){
+            auto& n=loan?acquire(prefix,2,loan):acquire(prefix,2);
+            std::deque<Result> fifo; int routed=0; uint64_t gen=0; Loan held{}; uint64_t accepted_at=0;
+            assert(n.bind_result_transport([&](const Result& r){fifo.push_back(r);return true;},
+                [&](Result& r){if(fifo.empty())return false;r=fifo.front();fifo.pop_front();return true;}));
+            assert(n.add_engine({10,[&](const Result& r){++routed;gen=r.loan.generation;return true;},[](Contract&){return false;}}));
+            assert(n.add_host({1,[&](const Loan* o){Exchange e;                       // holds each loan 100 turns
+                if(o){held=*o;accepted_at=n.turns();e.accepted_generation=o->generation;}
+                else if(held.generation && n.turns()-accepted_at>=100){e.has_result=true;e.result={held,5};held={};}
+                return e;}}));
+            assert(n.submit({1,10,1,1}));
+            for(int i=0;i<150 && !routed;++i){n.market_turn();n.worker_turn();}
+            *generation_out=routed?gen:n.contracts().empty()?0:n.contracts()[0].loan.generation;*routed_out=routed;
+            assert(release(prefix));
+        };
+        uint64_t g=0;int r=0;
+        scenario("loan.long",600,&g,&r);assert(r==1 && g==1);            // completes at generation 1, no re-loan
+        scenario("loan.default",0,&g,&r);assert(r==0 && g>=2);           // default 60: re-loaned, never completes
+        auto& a=acquire("loan.rule",2,300);
+        assert(a.loan_ticks()==300 && &acquire("loan.rule",2,300)==&a && &acquire("loan.rule",2)==&a);
+        bool refused=false;try{acquire("loan.rule",2,301);}catch(const std::runtime_error&){refused=true;}
+        assert(refused && release("loan.rule"));
+        assert(acquire("loan.dflt",2).loan_ticks()==60 && release("loan.dflt"));
     }
     std::puts("native contract negotiator FIFO tests passed");
 }
