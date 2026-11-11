@@ -52,6 +52,7 @@ enum class CompileStatus : uint64_t {
     Adopted = 1,
     CompiledNotAdopted = 2,
     ExistingProduct = 3,
+    EmittedNotBuilt = 4, // source-only; never adopt or load
     RequestMissing = 16,
     CompileFailed = 17,
     AdoptFailed = 18,
@@ -163,6 +164,7 @@ private:
         std::string error = slot.error;
         if (slot.rc == -1) { status = CompileStatus::RequestMissing; error = "request file missing"; }
         else if (slot.rc == 2) status = CompileStatus::Cancelled;
+        else if (slot.rc == 3) status = CompileStatus::EmittedNotBuilt;
         else if (slot.rc != 1) status = CompileStatus::CompileFailed;
         else if (!cfg_.adopt) status = job_.existing ? CompileStatus::ExistingProduct : CompileStatus::CompiledNotAdopted;
         else {

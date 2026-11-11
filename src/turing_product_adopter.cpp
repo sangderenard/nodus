@@ -574,6 +574,22 @@ extern "C" int gp_turing_row_tool_compile_only(
         copy_out(error, out_error, out_error_cap);
         return cancelled ? 2 : 0;
     }
+    // Source-only emission is deliberately not an adoptable row product.
+    // Keep it distinct even when the host was configured to auto-adopt.
+    {
+        std::ifstream in(product / "nodus-row-tool-product.json", std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::string schema, state;
+        if (json_string_field(text, "schema", &schema) && schema == "nodus-turing-source-only-product-v1") {
+            if (!json_true_field(text, "unstable_source_only") || json_true_field(text, "loadable") ||
+                !json_string_field(text, "state", &state) || state != "emitted-not-built" ||
+                fs::exists(product / "nodus-row-tool-product.receipt")) {
+                copy_out("invalid source-only emission manifest", out_error, out_error_cap);
+                return 0;
+            }
+            return 3;
+        }
+    }
     if (!fs::is_regular_file(product / "nodus-row-tool-product.receipt")) {
         std::cerr << "turing_product_adopter: compiler completed without a product receipt\n";
         copy_out("compiler completed without a product receipt", out_error, out_error_cap);

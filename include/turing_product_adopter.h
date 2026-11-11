@@ -34,7 +34,8 @@ extern "C" {
 
 // First half of compile_and_load: validate, run the driver, require the
 // receipt. Touches no registry/canvas, so it is safe on a worker thread.
-// Returns 1 success, 0 failure, 2 cancelled. out_error may be null.
+// Returns 1 adoptable product, 0 failure, 2 cancelled, 3 source-only emission.
+// Source-only emission must never be adopted or loaded. out_error may be null.
 int gp_turing_row_tool_compile_only(
     const char* python_executable,
     const char* nodus_root,
