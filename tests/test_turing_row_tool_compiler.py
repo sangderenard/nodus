@@ -420,3 +420,153 @@ def test_real_turing_public_boundary_opt_in(tmp_path, backend):
     }
     after_logs = set(identity_root.glob("*")) if identity_root.exists() else set()
     assert after_logs == before_logs
+
+
+def site_request(tmp_path):
+    data = request(tmp_path)
+    data["ssa_composition"]["directory"] = str(tmp_path / "product" / "composition")
+    data["site_artifact_context"] = {
+        "owner_id": 7, "workspace_id": "a" * 32, "job_id": "divider-17",
+        "job_directory": str(tmp_path / "product"),
+    }
+    return data
+
+
+def test_site_job_routes_all_existing_caches_and_restores_state(tmp_path, monkeypatch):
+    import tempfile
+    import json
+    import sys
+    from tools.turing_row_tool_compiler import _SITE_DIRECTORIES
+
+    class EnvironmentCompiler(FakeCompiler):
+        def lower(self, *args, **kwargs):
+            output = tmp_path / "product"
+            for key in _SITE_DIRECTORIES:
+                path = Path(os.environ[key])
+                assert path.is_relative_to(output)
+                (path / "retained.txt").write_text(key)
+            assert Path(tempfile.gettempdir()).is_relative_to(output)
+            assert sys.dont_write_bytecode
+            assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1"
+            return super().lower(*args, **kwargs)
+
+    monkeypatch.setenv("TURING_HOST_SSA_CACHE", "old-cache")
+    before = dict(os.environ)
+    old_temp = tempfile.tempdir
+    old_cwd = Path.cwd()
+    manifest = compile_row_tool(site_request(tmp_path), compiler=EnvironmentCompiler())
+    assert dict(os.environ) == before
+    assert tempfile.tempdir == old_temp
+    assert Path.cwd() == old_cwd
+    assert manifest["site_artifact_context"]["owner_id"] == 7
+    lifecycle = json.loads((tmp_path / "product" / "site-artifact-lifecycle.json").read_text())
+    assert lifecycle["state"] == "completed"
+    assert lifecycle["automatic_deletion"] is False
+    assert lifecycle["finished_at"] >= lifecycle["started_at"]
+    assert sum(item["path"].endswith("retained.txt") for item in manifest["artifacts"]) == len(set(_SITE_DIRECTORIES.values()))
+
+
+def test_site_failure_keeps_ownership_and_restores_environment(tmp_path):
+    import json
+    import tempfile
+
+    class BrokenCompiler(FakeCompiler):
+        def lower(self, *args, **kwargs):
+            Path("failure.log").write_text("diagnostic")
+            raise RuntimeError("fake lowering failure")
+
+    before = dict(os.environ)
+    old_temp = tempfile.tempdir
+    old_cwd = Path.cwd()
+    with pytest.raises(RuntimeError, match="fake lowering failure"):
+        compile_row_tool(site_request(tmp_path), compiler=BrokenCompiler())
+    assert dict(os.environ) == before
+    assert tempfile.tempdir == old_temp
+    assert Path.cwd() == old_cwd
+    lifecycle = json.loads((tmp_path / "product" / "site-artifact-lifecycle.json").read_text())
+    assert lifecycle["state"] == "failed"
+    assert lifecycle["workspace_id"] == "a" * 32
+    assert (tmp_path / "product" / "compiler-work" / "failure.log").is_file()
+
+
+@pytest.mark.parametrize("field,value", [("owner_id", 0), ("owner_id", True),
+    ("workspace_id", "bad"), ("job_id", ""), ("job_directory", "relative")])
+def test_site_rejects_invalid_context_before_writes(tmp_path, field, value):
+    data = site_request(tmp_path)
+    data["site_artifact_context"][field] = value
+    with pytest.raises(ValueError):
+        compile_row_tool(data, compiler=FakeCompiler())
+    assert not (tmp_path / "product").exists()
+
+
+def test_site_rejects_output_override_and_composition_escape(tmp_path):
+    data = site_request(tmp_path)
+    data["output_dir"] = str(tmp_path / "elsewhere")
+    with pytest.raises(ProductError, match="ledger job_directory"):
+        compile_row_tool(data, compiler=FakeCompiler())
+    data = site_request(tmp_path)
+    data["ssa_composition"]["directory"] = str(tmp_path / "outside")
+    with pytest.raises(ProductError, match="outside the product root"):
+        compile_row_tool(data, compiler=FakeCompiler())
+    assert not (tmp_path / "product").exists()
+
+
+@pytest.mark.parametrize("git_file", [False, True])
+def test_site_rejects_repository_and_worktree_outputs(tmp_path, git_file):
+    marker = tmp_path / ".git"
+    if git_file:
+        marker.write_text("gitdir: elsewhere")
+    else:
+        marker.mkdir()
+    with pytest.raises(ProductError, match="outside repository"):
+        compile_row_tool(site_request(tmp_path), compiler=FakeCompiler())
+    assert not (tmp_path / "product").exists()
+
+
+def test_site_rejects_existing_output_symlink_escape(tmp_path):
+    output = tmp_path / "product"
+    output.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (output / "compiler-work").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("creating symlinks is not permitted")
+    with pytest.raises(ProductError, match="outside the product root"):
+        compile_row_tool(site_request(tmp_path), compiler=FakeCompiler())
+    assert not list(outside.iterdir())
+
+
+def test_site_environment_applies_before_boundary_import(tmp_path, monkeypatch):
+    import tools.turing_row_tool_compiler as adapter
+
+    def fake_boundary(root):
+        assert Path(os.environ["TURING_HOST_SSA_CACHE"]).is_relative_to(tmp_path / "product")
+        assert Path.cwd() == tmp_path / "product" / "compiler-work"
+        return FakeCompiler()
+
+    monkeypatch.setattr(adapter, "TuringBoundary", fake_boundary)
+    assert compile_row_tool(site_request(tmp_path))["loadable"]
+
+
+def test_site_rejects_backend_filename_escape_before_write(tmp_path):
+    class EscapingCompiler(FakeCompiler):
+        def emit_c(self, *args, **kwargs):
+            artifact = super().emit_c(*args, **kwargs)
+            artifact.name = "../../escape"
+            return artifact
+
+    with pytest.raises(ProductError, match="invalid backend artifact name"):
+        compile_row_tool(site_request(tmp_path), compiler=EscapingCompiler())
+    assert not (tmp_path / "escape.c").exists()
+
+
+def test_site_rejects_external_backend_return(tmp_path):
+    class ExternalCompiler(FakeCompiler):
+        def compile_c(self, artifact, directory):
+            return SimpleNamespace(library_path=tmp_path / "existing.dll")
+
+    (tmp_path / "existing.dll").write_bytes(b"not a native library")
+    with pytest.raises(ProductError, match="outside the product root"):
+        compile_row_tool(site_request(tmp_path), compiler=ExternalCompiler())
+    assert not (tmp_path / "product" / ADOPTION_RECEIPT_NAME).exists()
