@@ -10,7 +10,10 @@ Optional read-only admin console (--console-port / --console-token-file), protoc
 nodus-console/1, newline-delimited UTF-8 over 127.0.0.1:
   HELLO nodus-console/1 <token>  -> OK console <canvas-basename> read-only | REFUSED <reason> (closes)
   SNAPSHOT -> CANVAS <revision> <n>\\n<n bytes>\\nSTATE <json>\\n
+  DIGEST | GRAPH | TOOLS | ACTIVITY -> JSON <VERB> <n>
+<n bytes of compact sorted-key UTF-8 JSON>
   anything else -> REFUSED read-only
+(docs/NODUS_CONSOLE_READ_PROTOCOL_2026-11-10.md)
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from nodus_graph import Graph  # noqa: E402
 from nodus_graph.native import _NativeFifoConfig  # noqa: E402
+from nodus_graph import console_views  # noqa: E402
 
 _stop = False
 
@@ -63,7 +67,11 @@ class ConsoleServer:
         self._wanted = threading.Event()
         self._clients = 0
         self._closing = False
-        self._snap = None  # (monotonic_time, canvas_bytes, state_json_bytes, revision)
+        self._snap = None  # (monotonic_time, canvas_bytes, state_json_bytes, revision, views)
+        self._want_views = set()  # views clients asked for; built on the stepping thread
+        self._rate = 0.0
+        self._started = time.time()
+        self._hosts = []  # [(prefix, host_id)], read on the stepping thread only
         self._generation = 0
         self._last_bytes = None
         self._revision = 0
@@ -76,6 +84,10 @@ class ConsoleServer:
         self._listener.settimeout(0.2)
         threading.Thread(target=self._accept_loop, daemon=True).start()
         return self._listener.getsockname()[1]
+
+    def set_context(self, rate: float, hosts: list) -> None:
+        self._rate = rate
+        self._hosts = hosts
 
     def close(self) -> None:
         with self._cond:
@@ -92,13 +104,17 @@ class ConsoleServer:
         if not self._wanted.is_set():
             return
         with self._lock:
+            wanted = set(self._want_views)
             fresh = (self._snap is not None
-                     and time.monotonic() - self._snap[0] < CONSOLE_COALESCE_SECONDS)
+                     and time.monotonic() - self._snap[0] < CONSOLE_COALESCE_SECONDS
+                     and wanted <= set(self._snap[4]))
         if fresh:
             return
         self._wanted.clear()
+        with self._lock:
+            self._want_views -= wanted
         try:
-            snap = self._build(graph)
+            snap = self._build(graph, wanted)
         except Exception as exc:  # noqa: BLE001
             print(f"run_canvas: console snapshot failed: {exc}", file=sys.stderr, flush=True)
             snap = None
@@ -108,7 +124,7 @@ class ConsoleServer:
             self._generation += 1
             self._cond.notify_all()
 
-    def _build(self, graph):
+    def _build(self, graph, wanted=frozenset()):
         path = os.path.join(self._tmp, "snapshot.nodus.txt")
         graph.save(path)
         with open(path, "rb") as handle:
@@ -157,7 +173,24 @@ class ConsoleServer:
                  "contract_ports": cports, "ports": ports,
                  # The Python API exposes no event queue; nothing is reported.
                  "events": []}
-        return (time.monotonic(), data, json.dumps(state).encode("utf-8"), self._revision)
+        tick = self._ticks_fn()
+        views = {"digest": console_views.dumps(console_views.digest_document(
+            graph, canvas=self._canvas_name, revision=self._revision, data=data, tick=tick,
+            rate=self._rate, started=self._started, compile_hosts=len(self._hosts)))}
+        try:
+            graph_doc = None
+            if wanted & {"graph", "tools"}:
+                graph_doc = console_views.graph_document(graph, revision=self._revision)
+            if "graph" in wanted:
+                views["graph"] = console_views.dumps(graph_doc)
+            if "tools" in wanted:
+                views["tools"] = console_views.dumps(console_views.tools_document(graph, graph_doc))
+            if "activity" in wanted:
+                views["activity"] = console_views.dumps(console_views.activity_document(
+                    graph, tick=tick, compile_hosts=list(self._hosts)))
+        except Exception as exc:  # noqa: BLE001
+            print(f"run_canvas: console view failed: {exc}", file=sys.stderr, flush=True)
+        return (time.monotonic(), data, json.dumps(state).encode("utf-8"), self._revision, views)
 
     # ---- client threads --------------------------------------------------
     def _accept_loop(self) -> None:
@@ -218,9 +251,19 @@ class ConsoleServer:
                         if not self._send(conn, b"REFUSED unavailable\n"):
                             return
                         continue
-                    _t, data, state, revision = snap
+                    _t, data, state, revision, _views = snap
                     head = b"CANVAS %d %d\n" % (revision, len(data))
                     if not self._send(conn, head + data + b"\nSTATE " + state + b"\n"):
+                        return
+                elif line in self._VERBS:
+                    view = self._VERBS[line]
+                    snap = self._snapshot(view)
+                    body = snap[4].get(view) if snap else None
+                    if body is None:
+                        if not self._send(conn, b"REFUSED unavailable\n"):
+                            return
+                        continue
+                    if not self._send(conn, b"JSON %s %d\n" % (line, len(body)) + body):
                         return
                 elif not self._send(conn, b"REFUSED read-only\n"):
                     return
@@ -232,10 +275,14 @@ class ConsoleServer:
             except OSError:
                 pass
 
-    def _snapshot(self):
+    _VERBS = {b"DIGEST": "digest", b"GRAPH": "graph", b"TOOLS": "tools", b"ACTIVITY": "activity"}
+
+    def _snapshot(self, view="digest"):
         with self._cond:
-            if self._snap and time.monotonic() - self._snap[0] < CONSOLE_COALESCE_SECONDS:
+            if (self._snap and time.monotonic() - self._snap[0] < CONSOLE_COALESCE_SECONDS
+                    and view in self._snap[4]):
                 return self._snap
+            self._want_views.add(view)
             generation = self._generation
             self._wanted.set()
             deadline = time.monotonic() + CONSOLE_STEP_WAIT_SECONDS
@@ -340,6 +387,7 @@ def main(argv=None) -> int:
         if token is not None:
             console = ConsoleServer(token, os.path.basename(args.canvas), lambda: ticks)
             console_port = console.start(args.console_port)
+            console.set_context(args.rate, [])
         with Graph() as graph:
             for prefix, capacity, loan in acquires:
                 graph.acquire_contract_pair(prefix, capacity, loan)
@@ -356,6 +404,8 @@ def main(argv=None) -> int:
                 for prefix, host_id in attached:
                     graph.detach_compile_host(prefix, host_id)
                 raise
+            if console is not None:
+                console.set_context(args.rate, attached)
             ports = []
             for prefix, capacity, edge, declared in graph.contract_ports():
                 bound = graph.contract_port(prefix)
