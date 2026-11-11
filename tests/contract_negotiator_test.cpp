@@ -145,5 +145,39 @@ int main(){
         assert(refused && release("loan.rule"));
         assert(acquire("loan.dflt",2).loan_ticks()==60 && release("loan.dflt"));
     }
+    // ---- Registration identity: a contract belongs to the connection that submitted it, not to an id ----
+    {
+        auto run=[&](bool settle_first){
+            ContractNegotiator n(4,choose,50); Loan held{}; int routed_old=0,routed_new=0; bool decided=false;
+            assert(n.add_host({1,[&](const Loan* o){Exchange e;if(o){held=*o;e.accepted_generation=o->generation;}
+                else if(held.generation){e.has_result=true;e.result={held,5};held={};}return e;}}));
+            assert(n.add_engine({10,[&](const Result&){++routed_old;return decided;},[](Contract&){return false;}}));
+            assert(n.submit({1,10,1,1}));
+            for(int i=0;i<8;++i){n.market_turn();n.worker_turn();}
+            assert(n.contracts().size()==1 && n.contracts()[0].state==ContractNegotiator::State::Returned && routed_old>=1);
+            if(settle_first){ // Decision arrived, then the connection closed: commit it, nothing is discarded
+                decided=true;assert(n.settle_engine(10));
+                assert(n.contracts()[0].state==ContractNegotiator::State::Committed);
+            } else assert(!n.settle_engine(10)); // undecided
+            assert(n.remove_engine(10));
+            assert(n.discarded_results()==(settle_first?0u:1u) && n.contracts().empty());
+            // Same id, new registration: it must never be sent the old registration's result.
+            assert(n.add_engine({10,[&](const Result&){++routed_new;return true;},[](Contract&){return false;}}));
+            for(int i=0;i<4;++i){n.market_turn();n.worker_turn();}
+            assert(routed_new==0);
+        };
+        run(false);run(true);
+        // A result still in the FIFO when its engine is replaced by a same-id registration is discarded at consume time.
+        ContractNegotiator n(4,choose,50); Loan held{}; int routed_new=0;
+        assert(n.add_host({1,[&](const Loan* o){Exchange e;if(o){held=*o;e.accepted_generation=o->generation;}
+            else if(held.generation){e.has_result=true;e.result={held,5};held={};}return e;}}));
+        assert(n.add_engine({10,[](const Result&){return false;},[](Contract&){return false;}}));
+        assert(n.submit({1,10,1,1}));
+        n.market_turn();n.market_turn();                       // loaned, result published; worker has not consumed it yet
+        assert(n.remove_engine(10));
+        assert(n.add_engine({10,[&](const Result&){++routed_new;return true;},[](Contract&){return false;}}));
+        for(int i=0;i<4;++i){n.market_turn();n.worker_turn();}
+        assert(routed_new==0 && n.discarded_results()==1 && n.contracts().empty());
+    }
     std::puts("native contract negotiator FIFO tests passed");
 }

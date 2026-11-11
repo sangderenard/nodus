@@ -414,6 +414,10 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
         for (int t : n.output_types) ofs << " " << t;
         ofs << "\n";
     }
+    // Declared root-reflection module (canvas_ensure_root_module); written only when one exists. A headless
+    // canvas has none, so its files carry no such record.
+    if (c->root_module_idx >= 0 && c->root_module_idx < static_cast<int>(c->modules.size()))
+        ofs << "ROOT_MODULE " << c->root_module_idx << "\n";
     ofs.close();
     // Update in-memory signature to reflect this successful save using atomic flip
     try {
@@ -437,6 +441,16 @@ extern "C" int gp_canvas_update_last_save_signature(GP_CanvasContext* ctx_) {
 // Load canvas state from file written by `gp_canvas_save_to_file`. The loader
 // will clear current modules/edges/nodes and recreate them. Any canvas-owned
 // tables will be destroyed. Returns 1 on success.
+// LEGACY FALLBACK, files saved before the ROOT_MODULE record only. Those files do not say which module is the
+// root-reflection module; the only trace is that canvas_ensure_root_module labelled it "ROOT" at the index the
+// GUI canvas already used. Kept so an old GUI canvas keeps its root after load; a file saved by current code
+// that has a root carries ROOT_MODULE and never reaches this, and a headless graph (prev_root < 0) adopts nothing.
+static void canvas_adopt_legacy_root_module_by_label(GP_CanvasContextImpl* c, int prev_root) {
+    if (prev_root < 0 || prev_root >= static_cast<int>(c->modules.size())) return;
+    const auto& label = c->modules[prev_root].label;
+    if (std::strncmp(label, "ROOT", sizeof(label)) == 0) c->root_module_idx = prev_root;
+}
+
 extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path) {
     gp_canvas_module_root(reinterpret_cast<GP_CanvasContextImpl*>(ctx_), true);
     if (!ctx_ || !path) return 0;
@@ -510,6 +524,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         version = 1;
     }
 
+    int saved_root_module_idx = -1;  // declared by the file's ROOT_MODULE record, -1 if absent
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
         std::istringstream ss(line);
@@ -595,6 +610,8 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             int out_count = 0; ss >> out_count;
             for (int i = 0; i < out_count; ++i) { int t; ss >> t; nc.output_types.push_back(t); }
             nodes.push_back(std::move(nc));
+        } else if (tag == "ROOT_MODULE") {
+            ss >> saved_root_module_idx;
         } else if (tag == "OFFSET") {
             ss >> file_offx >> file_offy;
         } else if (tag == "META_GROUP") {
@@ -648,6 +665,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
         }
     }
 
+    const int prev_root_module_idx = c->root_module_idx;  // canvas_clear_workspace forgets it
     canvas_clear_workspace(c);
     c->width = file_w;
     c->height = file_h;
@@ -727,6 +745,15 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                 }
             }
         }
+    }
+
+    // Root-reflection module: adopt the index the file declares (ROOT_MODULE record, written by save only when a
+    // root exists). Files that predate the record go through the legacy fallback. Anything else leaves -1, so
+    // the index never names an ordinary module (a headless graph has no root module).
+    if (saved_root_module_idx >= 0) {
+        if (saved_root_module_idx < static_cast<int>(c->modules.size())) c->root_module_idx = saved_root_module_idx;
+    } else {
+        canvas_adopt_legacy_root_module_by_label(c, prev_root_module_idx);
     }
 
     // Load the root/container table blob so canvas-level ropes/overlays regain

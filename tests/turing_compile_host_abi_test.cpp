@@ -80,9 +80,21 @@ static const char* state_name(ContractNegotiator::State s) {
 }
 struct LoopbackRig {
     const char* prefix; NodusHeadlessGraph* g = nullptr; uint16_t port = 0; uint64_t host_id; int steps = 0;
-    LoopbackRig(const char* p, uint64_t host, const fs::path& jobs, const fs::path& base)
+    // load_from == nullptr: build the graph by hand (create path). Otherwise the live canvas host's
+    // order (tools/run_canvas.py): create, acquire the pair, nodus_headless_load_file, attach.
+    LoopbackRig(const char* p, uint64_t host, const fs::path& jobs, const fs::path& base, const fs::path* load_from = nullptr)
         : prefix(p), host_id(host) {
         const std::string market = std::string(p) + ".market", worker = std::string(p) + ".worker";
+        if (load_from) {
+            g = nodus_headless_create(); REQUIRE(g);
+            REQUIRE(nodus_headless_set_scheduler_mode(g, 1));   // Graph.__init__ sets SCHEDULED before anything else
+            REQUIRE(nodus_headless_acquire_contract_pair_with_loan(p, 4, 54000));
+            REQUIRE(nodus_headless_load_file(g, load_from->string().c_str()));
+            // A headless graph has no root-reflection module; the index must not name market (module 0).
+            REQUIRE(gp_canvas_get_root_module_idx() == -1);
+            {}
+            int32_t lp = 0; REQUIRE(nodus_headless_get_contract_port(g, p, &lp, nullptr, nullptr) && lp > 0); port = (uint16_t)lp;
+        } else {
         REQUIRE(nodus_headless_acquire_contract_pair_with_loan(p, 4, 54000));
         g = nodus_headless_create(); REQUIRE(g);
         GP_CanvasModuleDesc d{}; d.w = d.h = 64;
@@ -95,9 +107,11 @@ struct LoopbackRig {
         REQUIRE(nodus_headless_configure_edge_fifo(g, edge, &c));
         REQUIRE(nodus_headless_set_scheduler_mode(g, 1));
         const int32_t pt = nodus_headless_declare_contract_port(g, p, 4, edge, 0); REQUIRE(pt > 0); port = (uint16_t)pt;
+        }
         const std::string j = jobs.string(), b = base.string();
         REQUIRE(attach(p, host, "Z:/no/such/python.exe", b.c_str(), b.c_str(), b.c_str(), j.c_str()));
     }
+    void save(const fs::path& f) { REQUIRE(nodus_headless_save_file(g, f.string().c_str())); }
     ~LoopbackRig() { nodus_headless_destroy(g); nodus_headless_release_contract_pair(prefix); }
     void step() { REQUIRE(nodus_headless_step(g, 1.0 / 60.0)); ++steps; }
     void dump(const char* why) {
@@ -105,6 +119,7 @@ struct LoopbackRig {
         std::fprintf(stderr, "STALL %s: step=%d market_turns=%llu entries=%zu discarded=%llu reoffered=%llu engines=%zu\n", why, steps,
                      (unsigned long long)n->turns(), n->contracts().size(), (unsigned long long)n->discarded_results(),
                      (unsigned long long)n->reoffered_loans(), n->engine_count());
+        std::fprintf(stderr, "  root_module_idx=%d\n", gp_canvas_get_root_module_idx());
         for (auto& e : n->contracts())
             std::fprintf(stderr, "  contract %llu engine %llu state %s gen %llu host %llu deadline %llu\n", (unsigned long long)e.work.id,
                          (unsigned long long)e.work.engine, state_name(e.state), (unsigned long long)e.loan.generation,
@@ -119,6 +134,8 @@ struct LoopbackRig {
         ContractSocket c(lb_connect(port));
         REQUIRE(c.send_message(lb_hello(2, engine_id)));
         REQUIRE(c.send_message(lb_submit({cid, engine_id, 1, 2})));
+        c.poll();   // Hello+Submit are in the server's socket buffers before its next step, as Decision+FIN of the previous engine are
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         bool admitted = false;
         for (int i = 1; i <= bound; ++i) {
             step(); c.poll();
@@ -170,6 +187,7 @@ static void loopback_missing_requests() {
         std::printf("  stats accepted=%llu completed=%llu refused=%llu ack=%llu in_flight=%llu\n", (unsigned long long)st[0], (unsigned long long)st[1],
                     (unsigned long long)st[2], (unsigned long long)st[3], (unsigned long long)st[4]);
         REQUIRE(st[1] == 6 && st[4] == 0);
+        REQUIRE(find(r.prefix)->discarded_results() == 0);
     }
     {   // Engines that leave before any result: the next one with the same id is still served promptly.
         LoopbackRig r("abi.lb.b", 7, jobs, base);
@@ -182,6 +200,104 @@ static void loopback_missing_requests() {
         REQUIRE(find(r.prefix)->contracts().empty());
         uint64_t st[5] = {}; REQUIRE(nodus_headless_compile_host_stats(r.prefix, 7, st));
         REQUIRE(st[4] == 0);
+    }
+    std::error_code ec; fs::remove_all(base, ec);
+}
+
+// The live sequence (tools/run_canvas.py): a canvas file with a contract port is loaded into a fresh
+// headless graph AFTER the pair was acquired, then the compile host is attached. Eight contracts, each on
+// its own engine connection with the same engine id. Nothing may wait for the loan deadline (54000 turns).
+static void loopback_loaded_canvas() {
+    const fs::path base = fs::temp_directory_path() / ("turing_compile_host_abi_ld_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const fs::path jobs = base / "jobs"; fs::create_directories(jobs);
+    const fs::path file = base / "messenger.canvas";
+    {   // Saved where its <file>.modules directory exists, then COPIED alone: the live canvas file is a bare
+        // copy (srv/state/canvas/messenger.canvas has no .modules beside it), so load restores no module
+        // or root tables from disk.
+        const fs::path saved = base / "saved.canvas";
+        { LoopbackRig r("abi.ld", 7, jobs, base); r.save(saved); }
+        fs::copy_file(saved, file);
+    }
+    LoopbackRig r("abi.ld", 7, jobs, base, &file);
+    for (uint64_t cid = 1; cid <= 8; ++cid) {
+        const int n = r.engine(9001, 7000 + cid, true, kRouteBound);
+        std::printf("  loaded canvas: contract %llu routed after %d steps\n", (unsigned long long)(7000 + cid), n);
+    }
+    r.settle(kRouteBound);
+    // Every Decision was sent and the socket closed in the same instant: each contract is committed per its
+    // Decision (none discarded as "engine gone") and each engine received only its own Route (engine() checks).
+    REQUIRE(find(r.prefix)->discarded_results() == 0);
+    uint64_t st[5] = {}; REQUIRE(nodus_headless_compile_host_stats(r.prefix, 7, st));
+    REQUIRE(st[1] == 8 && st[4] == 0);
+}
+
+// A contract port whose result edge cannot hold `capacity` results is refused (the lossless edge would refuse
+// the publish after `slots` results and the contract would wait out its loan).
+static void declare_refuses_small_edge() {
+    NodusHeadlessGraph* g = nodus_headless_create(); REQUIRE(g);
+    GP_CanvasModuleDesc d{}; d.w = d.h = 64;
+    const int m = nodus_headless_add_module(g, &d), w = nodus_headless_add_module(g, &d);
+    GP_CanvasEdgeDesc e{}; e.a_module = m; e.a_contact_idx = 0; e.b_module = w; e.b_contact_idx = 0;
+    const int edge = nodus_headless_add_edge(g, &e, 0); REQUIRE(edge >= 0);
+    NodusHeadlessFifoConfig c{}; c.token_bytes = sizeof(Result); c.slots = 3; c.top_k = 0; c.type_id = 0x534A5231; c.layout = 2; c.dtype = 8;
+    REQUIRE(nodus_headless_configure_edge_fifo(g, edge, &c));
+    REQUIRE(nodus_headless_declare_contract_port(g, "abi.slots", 4, edge, 0) == 0);   // 3 slots < capacity 4
+    REQUIRE(nodus_headless_get_contract_port_count(g) == 0);
+    REQUIRE(nodus_headless_declare_contract_port(g, "abi.slots", 3, edge, 0) > 0);    // 3 slots == capacity 3
+    nodus_headless_destroy(g);
+    nodus_headless_release_contract_pair("abi.slots");
+}
+
+// ROOT_MODULE record: save writes it only when a root-reflection module exists; load adopts it. A file that
+// predates the record keeps its root through the legacy label fallback; a headless graph has no root.
+static std::string read_all(const fs::path& f) { std::ifstream i(f, std::ios::binary); return std::string((std::istreambuf_iterator<char>(i)), std::istreambuf_iterator<char>()); }
+static void root_module_record_paths() {
+    const fs::path base = fs::temp_directory_path() / ("turing_root_record_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(base);
+    const fs::path gui = base / "gui.canvas", legacy = base / "legacy.canvas", head = base / "head.canvas";
+    {   // A GUI-style canvas: gp_canvas_create makes the root-reflection module.
+        GP_CanvasContext* c = gp_canvas_create(800, 600); REQUIRE(c);
+        gp_canvas_set_module_library_root(c, (base / "gui.mods").string().c_str());
+        REQUIRE(gp_canvas_get_root_module_idx() == 0);
+        GP_CanvasModuleDesc d{}; d.w = d.h = 64; REQUIRE(gp_canvas_add_module(c, &d) == 1);
+        REQUIRE(gp_canvas_save_to_file(c, gui.string().c_str()));
+        gp_canvas_destroy(c);
+    }
+    std::string text = read_all(gui);
+    REQUIRE(text.find("ROOT_MODULE 0") != std::string::npos);
+    {   // new file: adopted from the record
+        GP_CanvasContext* c = gp_canvas_create(800, 600); REQUIRE(c);
+        gp_canvas_set_module_library_root(c, (base / "gui.mods").string().c_str());
+        REQUIRE(gp_canvas_load_from_file(c, gui.string().c_str()));
+        REQUIRE(gp_canvas_get_root_module_idx() == 0);
+        gp_canvas_destroy(c);
+    }
+    {   // pre-record file: same content without the record, adopted through the legacy fallback only
+        const size_t at = text.find("ROOT_MODULE");
+        std::ofstream(legacy, std::ios::binary) << text.substr(0, at);
+        GP_CanvasContext* c = gp_canvas_create(800, 600); REQUIRE(c);
+        gp_canvas_set_module_library_root(c, (base / "legacy.mods").string().c_str());
+        REQUIRE(gp_canvas_load_from_file(c, legacy.string().c_str()));
+        REQUIRE(gp_canvas_get_root_module_idx() == 0);
+        gp_canvas_destroy(c);
+    }
+    {   // headless graph: no root module, no record; load leaves -1 (and a canvas that has a root does not
+        // mistake module 0 of such a file for it)
+        NodusHeadlessGraph* g = nodus_headless_create(); REQUIRE(g);
+        GP_CanvasModuleDesc d{}; d.w = d.h = 64; REQUIRE(nodus_headless_add_module(g, &d) == 0);
+        REQUIRE(gp_canvas_get_root_module_idx() == -1);
+        REQUIRE(nodus_headless_save_file(g, head.string().c_str()));
+        REQUIRE(read_all(head).find("ROOT_MODULE") == std::string::npos);
+        nodus_headless_destroy(g);
+        g = nodus_headless_create(); REQUIRE(g);
+        REQUIRE(nodus_headless_load_file(g, head.string().c_str()));
+        REQUIRE(gp_canvas_get_root_module_idx() == -1);
+        nodus_headless_destroy(g);
+        GP_CanvasContext* c = gp_canvas_create(800, 600); REQUIRE(c);   // root at 0, then loads a file whose module 0 is not a root
+        gp_canvas_set_module_library_root(c, (base / "head.canvas.modules").string().c_str());
+        REQUIRE(gp_canvas_load_from_file(c, head.string().c_str()));
+        REQUIRE(gp_canvas_get_root_module_idx() == -1);
+        gp_canvas_destroy(c);
     }
     std::error_code ec; fs::remove_all(base, ec);
 }
@@ -265,6 +381,9 @@ int main() {
 
     std::error_code ec; fs::remove_all(base, ec);
     loopback_missing_requests();
+    loopback_loaded_canvas();
+    declare_refuses_small_edge();
+    root_module_record_paths();
     std::printf("turing_compile_host_abi_test: OK\n");
     return 0;
 }

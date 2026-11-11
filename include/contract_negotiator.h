@@ -29,11 +29,12 @@ struct Producer {
     std::function<bool(const Result&)> route; // true only after engine commit
     std::function<bool(Contract&)> request; // peek only; engine retains until admitted
     std::function<void(uint64_t)> admitted; // optional admission acknowledgement
+    uint64_t registration=0; // set by add_engine: one value per registration, never reused
 };
 class ContractNegotiator {
 public:
     enum class State { Unaccepted, Loaned, Returned, Committed };
-    struct Entry { Contract work; State state=State::Unaccepted; Loan loan{}; };
+    struct Entry { Contract work; State state=State::Unaccepted; Loan loan{}; uint64_t registration=0; };
     // Operator chooses an unaccepted index from the retained stack. SIZE_MAX
     // means no offer. Pricing/pressure is policy, not guessed by transport.
     using Offer = std::function<size_t(const Peer&, const std::vector<Entry>&)>;
@@ -68,6 +69,7 @@ public:
     bool add_engine(Producer engine){
         if(!engine.id || !engine.route || !engine.request) return false;
         for(auto& e:engines_) if(e.id==engine.id) return false;
+        engine.registration=++registrations_;
         engines_.push_back(std::move(engine)); return true;
     }
     // REMOVAL. Peers are held by index (hosts_/offers_/engines_ vectors, round-robin
@@ -85,6 +87,19 @@ public:
     // (result already published, not yet routed) is discarded the same way when its
     // result is consumed. The id may then be added again.
     //
+    // A Returned contract (the host's result is back, the engine has not decided) whose engine
+    // is removed has nobody to decide it: it is retired at once if its result is the one being
+    // routed, otherwise when its result is consumed, and discarded_results() counts it either
+    // way. It is never re-routed to a later engine that registers under the same id: a contract
+    // belongs to the REGISTRATION (connection) that submitted it, not to an id. Each add_engine
+    // stamps the engine with a fresh `registration`, each Entry records the registration that
+    // submitted it, and routing requires both the id and the registration to match.
+    //
+    // settle_engine(id): gives a registration that is about to be removed one last chance to
+    // decide the result being routed to it, using decisions it had already delivered before it
+    // closed (a Decision followed by close must commit, not be lost). Call it before
+    // remove_engine for a peer whose connection closed; returns true if the contract committed.
+    //
     // remove_host(id): the host is unregistered together with its retained offer. Each
     // Loaned contract it held returns to Unaccepted with its loan cleared and is
     // re-offered to another host under a NEW generation (reoffered_loans() counts
@@ -100,6 +115,17 @@ public:
         if(in_turn_){ if(!has_host(id))return false; deferred_.push_back({true,id}); return true; }
         return apply_remove_host(id);
     }
+    bool settle_engine(uint64_t id){
+        if(in_turn_||!pending_||pending_result_.loan.work.engine!=id)return false;
+        auto* entry=find(pending_result_.loan.work.id);
+        if(!entry||entry->state!=State::Returned)return false;
+        for(auto& engine:engines_) if(engine.id==id){
+            if(engine.registration!=entry->registration)return false;
+            if(!engine.route(pending_result_))return false;
+            entry->state=State::Committed;pending_=false;return true;
+        }
+        return false;
+    }
     uint64_t discarded_results() const{return discarded_results_;}
     uint64_t reoffered_loans() const{return reoffered_loans_;}
     uint64_t loan_ticks() const{return loan_ticks_;}
@@ -109,7 +135,8 @@ public:
         if(!work.id || entries_.size()>=capacity_) return false;
         bool known=false; for(auto& e:engines_) known|=e.id==work.engine;
         if(!known || find(work.id)) return false;
-        entries_.push_back({work}); return true;
+        Entry entry{work}; for(auto& e:engines_) if(e.id==work.engine) entry.registration=e.registration;
+        entries_.push_back(entry); return true;
     }
     // Owner rejects a validated-but-uncommitted result; release FIFO head and reoffer.
     bool reject_pending(uint64_t id,uint64_t generation){
@@ -134,7 +161,7 @@ public:
             e.state=State::Unaccepted;
         // Work of a removed engine whose loan expired has nowhere to go.
         entries_.erase(std::remove_if(entries_.begin(),entries_.end(),[&](const Entry& e){
-            return e.state==State::Unaccepted && !has_engine(e.work.engine);}),entries_.end());
+            return e.state==State::Unaccepted && !has_registration(e.registration);}),entries_.end());
         if(hosts_.empty()) return;
         const size_t host_index=host_cursor_++ % hosts_.size();
         auto& host=hosts_[host_index];
@@ -183,7 +210,9 @@ public:
         }
         if(pending_){
             bool routed_to_known=false;
+            const auto* owner=find(pending_result_.loan.work.id);
             for(auto& engine:engines_) if(engine.id==pending_result_.loan.work.engine){
+                if(!owner || owner->registration!=engine.registration) break;  // another registration's id
                 routed_to_known=true;
                 if(engine.route(pending_result_)){
                     auto* entry=find(pending_result_.loan.work.id);
@@ -215,12 +244,22 @@ private:
         }
     };
     bool has_engine(uint64_t id) const{for(auto& e:engines_)if(e.id==id)return true;return false;}
+    bool has_registration(uint64_t r) const{for(auto& e:engines_)if(e.registration==r)return true;return false;}
     bool has_host(uint64_t id) const{for(auto& h:hosts_)if(h.id==id)return true;return false;}
     bool apply_remove_engine(uint64_t id){
         for(auto it=engines_.begin();it!=engines_.end();++it) if(it->id==id){
+            const uint64_t reg=it->registration;
             engines_.erase(it);
+            if(pending_){ // the result being routed to this registration has nobody to decide it
+                auto* e=find(pending_result_.loan.work.id);
+                if(e && e->registration==reg){
+                    const uint64_t dead=e->work.id;
+                    entries_.erase(std::remove_if(entries_.begin(),entries_.end(),[&](const Entry& x){return x.work.id==dead;}),entries_.end());
+                    pending_=false;++discarded_results_;
+                }
+            }
             entries_.erase(std::remove_if(entries_.begin(),entries_.end(),[&](const Entry& e){
-                return e.work.engine==id && (e.state==State::Unaccepted || e.state==State::Committed);}),entries_.end());
+                return e.registration==reg && (e.state==State::Unaccepted || e.state==State::Committed);}),entries_.end());
             return true;
         } return false;
     }
@@ -252,6 +291,7 @@ private:
     size_t host_cursor_=0,engine_cursor_=0; NodusEdgeRuntime* fifo_=nullptr;
     std::vector<Peer> hosts_; std::vector<Loan> offers_; std::vector<Producer> engines_; std::vector<Entry> entries_;
     bool pending_=false; Result pending_result_{};
+    uint64_t registrations_=0;
     bool in_turn_=false; std::vector<Removal> deferred_; uint64_t discarded_results_=0,reoffered_loans_=0;
 };
 } // namespace nodus::contracts

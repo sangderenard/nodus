@@ -91,6 +91,12 @@ bool CanvasContractPorts::declare(GP_CanvasContext* ctx, const std::string& pref
         spec.elem_size <= 0 ||
         static_cast<int64_t>(spec.dims[0]) * spec.elem_size != static_cast<int64_t>(sizeof(Result)))
         return fail(error, "contract port: result edge is not configured for sizeof(Result) tokens");
+    // Up to `capacity` contracts can be Returned at once, each holding one result until the worker consumes
+    // it. A lossless result edge with fewer slots refuses the publish (the host's result is not accepted and
+    // the contract waits out its loan), so the declared edge must be able to hold that many results.
+    if (spec.slots < 0 || static_cast<uint64_t>(spec.slots) < capacity)
+        return fail(error, "contract port: result edge has " + std::to_string(spec.slots) +
+                               " slots, fewer than the negotiator capacity " + std::to_string(capacity));
     for (const auto& p : ports_)
         if (p->prefix == prefix || p->canvas_edge_idx == canvas_edge_idx)
             return fail(error, "contract port: prefix or edge already declared");
@@ -146,6 +152,10 @@ void CanvasContractPorts::pre_step() {
         for (size_t i = cp->engines.size(); i-- > 0;) {
             cp->engines[i]->poll();
             if (!cp->engines[i]->closed()) continue;
+            // Frames the peer sent before it closed are processed before the closure is acted on:
+            // a Decision followed at once by close commits its contract (settle_engine) instead of
+            // being lost with the socket. What is still undecided is then retired by remove_engine.
+            negotiator->settle_engine(cp->engine_ids[i]);
             negotiator->remove_engine(cp->engine_ids[i]);
             cp->engines.erase(cp->engines.begin() + i);
             cp->engine_ids.erase(cp->engine_ids.begin() + i);

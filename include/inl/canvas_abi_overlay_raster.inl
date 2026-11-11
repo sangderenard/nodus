@@ -587,11 +587,6 @@ extern "C" int gp_canvas_clear_meta_and_overlays(GP_CanvasContext* ctx_) {
 
     // 6) Clear modules/workspace (destroys tables/stages and remaining edges)
     canvas_clear_workspace(c);
-    // The synthetic root-reflection module was one of the modules just destroyed. Leaving its
-    // index behind made the next module added (index 0) the "root": ThreadManager then
-    // subscribed a never-draining reader under the root key to that module's edges, which
-    // filled any lossless edge (e.g. the contract result edge) after `slots` tokens.
-    c->root_module_idx = -1;
 
     // reset overlay id generator
     c->next_overlay_id = 1;

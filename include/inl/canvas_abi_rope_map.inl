@@ -844,6 +844,12 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     if (ctx->container_table) {
         gp_table_clear_edges(ctx->container_table);
     }
+    // The synthetic root-reflection module is one of the modules destroyed here. Forgetting its index is
+    // part of destroying the modules: a stale index names whatever module is added next (index 0), and
+    // ThreadManager (thread_manager.cpp, root-table FIFO block) subscribes a never-draining reader under the
+    // root key to every edge touching "the root", which fills any lossless edge (the contract result edge)
+    // after `slots` tokens. Every path that clears the workspace (create, load) goes through here.
+    ctx->root_module_idx = -1;
     ctx->modules.clear();
     ctx->module_tables.clear();
     ctx->module_table_owned.clear();
