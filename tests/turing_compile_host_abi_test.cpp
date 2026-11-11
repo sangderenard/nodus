@@ -1,6 +1,9 @@
 // Compile host attached through the headless ABI (nodus_headless_attach_compile_host).
 // No Turing compile runs here: the python executable is a path that does not exist,
 // so any attempt to spawn the compiler would show up as CompileFailed.
+// Winsock headers must precede anything that may pull in <windows.h>.
+#include "contract_socket.h"
+#include "contract_listener.h"
 #include "nodus_headless_abi.h"
 #include "contract_negotiator_registry.h"
 #include "turing_compile_host_tool.h"
@@ -11,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace nodus::contracts;
@@ -48,6 +52,138 @@ struct Rig {
 static int32_t attach(const char* prefix, uint64_t id, const char* py, const char* nodus,
                       const char* turing, const char* lib, const char* jobs, int32_t adopt = 0) {
     return nodus_headless_attach_compile_host(prefix, id, py, nodus, turing, lib, jobs, adopt);
+}
+
+// ---- Real loopback contract port + attached compile host, one engine connection per contract ----
+// Mirrors the live canvas host: pair acquired with loan_ticks 54000, one compile host, engines that
+// connect with the SAME id, Submit, wait for Route, send Decision, close. Every request file is
+// missing so the host finishes each job at once (RequestMissing) and no compiler runs.
+static SOCKET lb_connect(uint16_t port) {
+    ensure_sockets();
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    REQUIRE(s != INVALID_SOCKET);
+    sockaddr_in a{};
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
+    REQUIRE(connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+    return s;
+}
+static WireMessage lb_hello(uint64_t role, uint64_t id) {
+    WireMessage m{WireKind::Hello, {}}; m.result.loan.work = {role, id, 2, 0}; return m;
+}
+static WireMessage lb_submit(Contract c) { WireMessage m{WireKind::Submit, {}}; m.result.loan.work = c; return m; }
+static WireMessage lb_decision(uint64_t id, uint64_t gen, uint64_t v) {
+    WireMessage m{WireKind::Decision, {}}; m.result.loan.work.id = id; m.result.loan.generation = gen; m.result.payload = v; return m;
+}
+static const char* state_name(ContractNegotiator::State s) {
+    switch (s) { case ContractNegotiator::State::Unaccepted: return "Unaccepted"; case ContractNegotiator::State::Loaned: return "Loaned";
+                 case ContractNegotiator::State::Returned: return "Returned"; default: return "Committed"; }
+}
+struct LoopbackRig {
+    const char* prefix; NodusHeadlessGraph* g = nullptr; uint16_t port = 0; uint64_t host_id; int steps = 0;
+    LoopbackRig(const char* p, uint64_t host, const fs::path& jobs, const fs::path& base)
+        : prefix(p), host_id(host) {
+        const std::string market = std::string(p) + ".market", worker = std::string(p) + ".worker";
+        REQUIRE(nodus_headless_acquire_contract_pair_with_loan(p, 4, 54000));
+        g = nodus_headless_create(); REQUIRE(g);
+        GP_CanvasModuleDesc d{}; d.w = d.h = 64;
+        const int m = nodus_headless_add_module(g, &d), w = nodus_headless_add_module(g, &d);
+        const int mr = nodus_headless_bind_plugin_tool(g, m, market.c_str()), wr = nodus_headless_bind_plugin_tool(g, w, worker.c_str());
+        REQUIRE(m >= 0 && w >= 0 && mr >= 0 && wr >= 0);
+        GP_CanvasEdgeDesc e{}; e.a_module = m; e.a_contact_idx = mr; e.b_module = w; e.b_contact_idx = wr;
+        const int edge = nodus_headless_add_edge(g, &e, 0); REQUIRE(edge >= 0);
+        NodusHeadlessFifoConfig c{}; c.token_bytes = sizeof(Result); c.slots = 4; c.top_k = 0; c.type_id = 0x534A5231; c.layout = 2; c.dtype = 8;
+        REQUIRE(nodus_headless_configure_edge_fifo(g, edge, &c));
+        REQUIRE(nodus_headless_set_scheduler_mode(g, 1));
+        const int32_t pt = nodus_headless_declare_contract_port(g, p, 4, edge, 0); REQUIRE(pt > 0); port = (uint16_t)pt;
+        const std::string j = jobs.string(), b = base.string();
+        REQUIRE(attach(p, host, "Z:/no/such/python.exe", b.c_str(), b.c_str(), b.c_str(), j.c_str()));
+    }
+    ~LoopbackRig() { nodus_headless_destroy(g); nodus_headless_release_contract_pair(prefix); }
+    void step() { REQUIRE(nodus_headless_step(g, 1.0 / 60.0)); ++steps; }
+    void dump(const char* why) {
+        auto* n = find(prefix); uint64_t st[5] = {}; nodus_headless_compile_host_stats(prefix, host_id, st);
+        std::fprintf(stderr, "STALL %s: step=%d market_turns=%llu entries=%zu discarded=%llu reoffered=%llu engines=%zu\n", why, steps,
+                     (unsigned long long)n->turns(), n->contracts().size(), (unsigned long long)n->discarded_results(),
+                     (unsigned long long)n->reoffered_loans(), n->engine_count());
+        for (auto& e : n->contracts())
+            std::fprintf(stderr, "  contract %llu engine %llu state %s gen %llu host %llu deadline %llu\n", (unsigned long long)e.work.id,
+                         (unsigned long long)e.work.engine, state_name(e.state), (unsigned long long)e.loan.generation,
+                         (unsigned long long)e.loan.host, (unsigned long long)e.loan.deadline);
+        std::fprintf(stderr, "  host stats accepted=%llu completed=%llu refused=%llu acknowledged=%llu in_flight=%llu\n",
+                     (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2], (unsigned long long)st[3], (unsigned long long)st[4]);
+    }
+    // One engine connection, id `engine_id`, one contract `cid`. wait=true: send the Decision when Route
+    // arrives and close. wait=false: close as soon as Admitted arrived (the client gave up before any result).
+    // Returns canvas steps from Submit to Route (or to Admitted when !wait); aborts with a dump past `bound`.
+    int engine(uint64_t engine_id, uint64_t cid, bool wait, int bound) {
+        ContractSocket c(lb_connect(port));
+        REQUIRE(c.send_message(lb_hello(2, engine_id)));
+        REQUIRE(c.send_message(lb_submit({cid, engine_id, 1, 2})));
+        bool admitted = false;
+        for (int i = 1; i <= bound; ++i) {
+            step(); c.poll();
+            WireMessage m{};
+            while (c.receive(m)) {
+                if (m.kind == WireKind::Admitted) admitted = true;
+                if (m.kind == WireKind::Route) {
+                    REQUIRE(m.result.loan.work.id == cid && m.result.payload == (uint64_t)CompileStatus::RequestMissing);
+                    REQUIRE(c.send_message(lb_decision(cid, m.result.loan.generation, 1))); c.poll();
+                    return i;
+                }
+            }
+            if (!wait && admitted) return i;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        char why[96]; std::snprintf(why, sizeof why, "contract %llu admitted=%d no %s within %d steps", (unsigned long long)cid, (int)admitted, wait ? "Route" : "Admitted", bound);
+        dump(why); std::abort();
+    }
+    // Step with no peer until every entry has left the negotiator and the host is idle, within `bound` steps.
+    void settle(int bound) {
+        auto* n = find(prefix);
+        for (int i = 0; i < bound; ++i) {
+            step();
+            uint64_t st[5] = {}; nodus_headless_compile_host_stats(prefix, host_id, st);
+            if (n->contracts().empty() && n->engine_count() == 0 && st[4] == 0) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        dump("settle"); std::abort();
+    }
+};
+
+// Protocol bound, per contract: step 1 listener accepts+reads Hello, tick runs worker (Submit -> admit);
+// step 2 market offers+host accepts and (missing request) finishes at once; step 3 market takes the
+// finished Result (accept_result -> publish); step 4 worker consumes it and routes (Route frame is
+// queued+sent). Hello/Submit may land one step later than they were sent, so 6 gives two spare steps.
+static const int kRouteBound = 6;
+
+static void loopback_missing_requests() {
+    const fs::path base = fs::temp_directory_path() / ("turing_compile_host_abi_lb_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const fs::path jobs = base / "jobs"; fs::create_directories(jobs);
+    {
+        LoopbackRig r("abi.lb.a", 7, jobs, base);
+        for (uint64_t cid = 1; cid <= 6; ++cid) {
+            const int n = r.engine(9001, 5000 + cid, true, kRouteBound);
+            std::printf("  contract %llu routed after %d steps\n", (unsigned long long)(5000 + cid), n);
+        }
+        r.settle(kRouteBound);
+        uint64_t st[5] = {}; REQUIRE(nodus_headless_compile_host_stats(r.prefix, 7, st));
+        std::printf("  stats accepted=%llu completed=%llu refused=%llu ack=%llu in_flight=%llu\n", (unsigned long long)st[0], (unsigned long long)st[1],
+                    (unsigned long long)st[2], (unsigned long long)st[3], (unsigned long long)st[4]);
+        REQUIRE(st[1] == 6 && st[4] == 0);
+    }
+    {   // Engines that leave before any result: the next one with the same id is still served promptly.
+        LoopbackRig r("abi.lb.b", 7, jobs, base);
+        for (uint64_t cid = 1; cid <= 3; ++cid) r.engine(9001, 6000 + cid, false, kRouteBound);       // abandoned
+        for (uint64_t cid = 4; cid <= 6; ++cid) {
+            const int n = r.engine(9001, 6000 + cid, true, kRouteBound);
+            std::printf("  after abandon: contract %llu routed after %d steps\n", (unsigned long long)(6000 + cid), n);
+        }
+        r.settle(kRouteBound);
+        REQUIRE(find(r.prefix)->contracts().empty());
+        uint64_t st[5] = {}; REQUIRE(nodus_headless_compile_host_stats(r.prefix, 7, st));
+        REQUIRE(st[4] == 0);
+    }
+    std::error_code ec; fs::remove_all(base, ec);
 }
 
 int main() {
@@ -128,6 +264,7 @@ int main() {
     REQUIRE(nodus_headless_release_contract_pair(kPrefix));
 
     std::error_code ec; fs::remove_all(base, ec);
+    loopback_missing_requests();
     std::printf("turing_compile_host_abi_test: OK\n");
     return 0;
 }
