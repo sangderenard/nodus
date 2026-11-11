@@ -170,3 +170,17 @@ Open: Committed entries are only retired by the owner (`retire`) or by removal o
 ## ROOT_MODULE record
 
 `gp_canvas_save_to_file` writes `ROOT_MODULE <module index>` after the NODE records, only when a root-reflection module exists (a headless graph has none, so its files have no such line); `gp_canvas_load_from_file` adopts that index. Files without the record go through `canvas_adopt_legacy_root_module_by_label` (legacy: module at the canvas's previous root index labelled "ROOT"; a headless graph's previous index is -1, so it adopts nothing). Test: `root_module_record_paths` (new file, pre-record file, headless-saved file loads with -1).
+
+## A second contract port on a canvas (2026-11-11)
+
+Measured: a canvas host serves only the contract ports its canvas file declares. `run_canvas.py --acquire PREFIX:CAP`
+before the load creates the process-owned negotiator and its two plugin rows' behaviour, not a port; the load restores
+the file's `CONTRACT_PORT` records and nothing else. Acquiring `studio.product` beside a canvas that declared only
+`gui.proof` printed one port.
+
+`tools/add_contract_port.py --canvas IN --out OUT --prefix P --capacity N --port PORT [--loan TURNS] [--keep
+PREFIX:CAP[:LOAN] ...]` adds one: it loads the canvas, adds a `<prefix> market` and a `<prefix> worker` module with
+the plugin rows, joins them with a result edge of the required shape, declares the port and saves to a new file. The
+kept pairs' ports are bound while it runs, so the host that owns them must be stopped (or the input must be a copy
+with other ports). Verified on a copy: both ports listed by `run_canvas.py`, and a Python host peer plus an engine
+peer completed a contract on the new one (turing `tests/test_meowdoku_studio_pictures.py`, opt-in test).
