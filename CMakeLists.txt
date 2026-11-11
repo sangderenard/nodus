@@ -879,6 +879,19 @@ endif()
 add_test(NAME turing_compile_host_abi_test COMMAND turing_compile_host_abi_test)
 set_tests_properties(turing_compile_host_abi_test PROPERTIES TIMEOUT 60)
 
+# Cron schedule core (include/cron_schedule.h): pure, header-only, no runtime dependencies.
+add_executable(cron_schedule_test tests/cron_schedule_test.cpp)
+target_include_directories(cron_schedule_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_test(NAME cron_schedule_test COMMAND cron_schedule_test)
+set_tests_properties(cron_schedule_test PROPERTIES TIMEOUT 30)
+
+# Cron tool (include/cron_tool.h): a negotiator ENGINE that asks for due work and reasons
+# about missed runs; exercised against the real ContractNegotiator with a fake host and clock.
+add_executable(cron_tool_test tests/cron_tool_test.cpp)
+target_link_libraries(cron_tool_test PRIVATE canvas_tables_static nodus_runtime)
+add_test(NAME cron_tool_test COMMAND cron_tool_test)
+set_tests_properties(cron_tool_test PROPERTIES TIMEOUT 30)
+
 # Engine-side socket protocol and loopback listener (include/contract_socket.h,
 # include/contract_listener.h): a real 127.0.0.1 round trip, no graph.
 add_executable(contract_engine_socket_test tests/contract_engine_socket_test.cpp)

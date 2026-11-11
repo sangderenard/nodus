@@ -1259,6 +1259,16 @@ class Graph:
         lib.nodus_headless_compile_host_stats.argtypes = (
             ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
         )
+        # The cron tool arrived after the contract ABI. A library built before it still serves
+        # everything else; only attach_cron/detach_cron/cron_stats are refused, by name.
+        lib._cron_abi = hasattr(lib, "nodus_headless_attach_cron")
+        if lib._cron_abi:
+            lib.nodus_headless_attach_cron.restype = ctypes.c_int32
+            lib.nodus_headless_attach_cron.argtypes = (ctypes.c_char_p, ctypes.c_uint64, ctypes.c_char_p)
+            lib.nodus_headless_detach_cron.restype = ctypes.c_int32
+            lib.nodus_headless_detach_cron.argtypes = (ctypes.c_char_p, ctypes.c_uint64)
+            lib.nodus_headless_cron_stats.restype = ctypes.c_int32
+            lib.nodus_headless_cron_stats.argtypes = (ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64))
         lib._contract_port_abi = True
         return lib
 
@@ -1312,6 +1322,43 @@ class Graph:
             raise RuntimeError(
                 f"native compile host attach refused: {prefix} host {int(host_id)} "
                 "(no acquired contract pair for the prefix, or that host id is already attached)")
+
+    def _cron_abi(self):
+        lib = self._contract_abi()
+        if not getattr(lib, "_cron_abi", False):
+            raise RuntimeError("this headless library was built before the cron tool; rebuild nodus_headless")
+        return lib
+
+    def attach_cron(self, prefix: str, engine_id: int, jobs_dir: Union[str, pathlib.Path]) -> None:
+        """Attach the cron tool to the negotiator of an acquired pair, as an engine.
+
+        ``<jobs_dir>/cron.table`` is the schedule; the tool keeps ``cron.ledger`` and ``cron.log`` there
+        and writes ``<contract id>.request.json`` before each contract. Refused (RuntimeError) when the
+        prefix has no acquired pair, engine_id is 0 or already attached, or the table is missing or
+        malformed; the reason is then the last line of ``cron.log``.
+        """
+        lib = self._cron_abi()
+        if not str(jobs_dir) or not int(engine_id):
+            raise RuntimeError("native cron attach refused: jobs_dir is empty or engine_id is zero")
+        if not lib.nodus_headless_attach_cron(prefix.encode("utf-8"), int(engine_id), str(jobs_dir).encode("utf-8")):
+            raise RuntimeError(
+                f"native cron attach refused: {prefix} engine {int(engine_id)} "
+                f"(no acquired pair, the id is already an engine, or cron.table is missing or malformed; "
+                f"see {jobs_dir}/cron.log)")
+
+    def detach_cron(self, prefix: str, engine_id: int) -> None:
+        lib = self._cron_abi()
+        if not lib.nodus_headless_detach_cron(prefix.encode("utf-8"), int(engine_id)):
+            raise RuntimeError(f"native cron detach refused: {prefix} engine {int(engine_id)} is not attached")
+
+    def cron_stats(self, prefix: str, engine_id: int) -> dict:
+        """fired / finished / skipped / interrupted / tasks / gap_seconds / in_flight / last_status."""
+        lib = self._cron_abi()
+        out = (ctypes.c_uint64 * 8)()
+        if not lib.nodus_headless_cron_stats(prefix.encode("utf-8"), int(engine_id), out):
+            raise RuntimeError(f"native cron stats refused: {prefix} engine {int(engine_id)} is not attached")
+        names = ("fired", "finished", "skipped", "interrupted", "tasks", "gap_seconds", "in_flight", "last_status")
+        return {name: int(value) for name, value in zip(names, out)}
 
     def detach_compile_host(self, prefix: str, host_id: int) -> None:
         """Cancel any running compile, join the host's thread and destroy the host."""

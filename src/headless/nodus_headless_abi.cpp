@@ -2,6 +2,7 @@
 #include "contract_port_canvas.h"
 #include "contract_negotiator_registry.h"
 #include "turing_compile_host_tool.h"
+#include "cron_tool.h"
 #include "nodus_headless_abi.h"
 
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
@@ -991,6 +992,77 @@ void detach_slot(CompileHostSlot& slot) {
 }
 }
 
+namespace {
+// Cron tools, by prefix and engine id. A tool is destroyed only after its engine has
+// been removed from the negotiator, so no Producer callback can outlive it.
+std::mutex g_crons_mu;
+std::map<std::string, std::map<uint64_t, std::shared_ptr<nodus::cron::CronTool>>> g_crons;
+}
+
+extern "C" int32_t nodus_headless_attach_cron(const char* prefix, uint64_t engine_id, const char* jobs_dir) {
+    if (!prefix || !*prefix || !engine_id || !jobs_dir || !*jobs_dir) return 0;
+    try {
+        auto* negotiator = nodus::contracts::find(prefix);
+        if (!negotiator) return 0;
+        std::lock_guard<std::mutex> lock(g_crons_mu);
+        auto& tools = g_crons[prefix];
+        if (tools.count(engine_id)) return 0;
+        nodus::cron::CronConfig cfg;
+        cfg.jobs_dir = jobs_dir; cfg.engine_id = engine_id;
+        const std::string key = prefix;
+        cfg.retire = [key](uint64_t id) {
+            auto* n = nodus::contracts::find(key);
+            return n ? n->retire(id) : true;   // no negotiator left: nothing to retire
+        };
+        auto tool = std::make_shared<nodus::cron::CronTool>(std::move(cfg));
+        std::string why;
+        if (!tool->open(&why)) {
+            std::ofstream log(std::filesystem::path(jobs_dir) / "cron.log", std::ios::binary | std::ios::app);
+            if (log) log << "0 - attach refused: " << why << "\n";
+            return 0;
+        }
+        if (!negotiator->add_engine(tool->producer())) return 0;
+        tools[engine_id] = std::move(tool);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t nodus_headless_detach_cron(const char* prefix, uint64_t engine_id) {
+    if (!prefix || !*prefix || !engine_id) return 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_crons_mu);
+        auto p = g_crons.find(prefix);
+        if (p == g_crons.end()) return 0;
+        auto t = p->second.find(engine_id);
+        if (t == p->second.end()) return 0;
+        if (auto* negotiator = nodus::contracts::find(prefix)) negotiator->remove_engine(engine_id);
+        p->second.erase(t);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" int32_t nodus_headless_cron_stats(const char* prefix, uint64_t engine_id, uint64_t* out8) {
+    if (!prefix || !*prefix || !engine_id || !out8) return 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_crons_mu);
+        auto p = g_crons.find(prefix);
+        if (p == g_crons.end()) return 0;
+        auto t = p->second.find(engine_id);
+        if (t == p->second.end()) return 0;
+        const auto s = t->second->stats();
+        out8[0] = s.fired; out8[1] = s.finished; out8[2] = s.skipped; out8[3] = s.interrupted;
+        out8[4] = s.tasks; out8[5] = static_cast<uint64_t>(s.gap_seconds);
+        out8[6] = static_cast<uint64_t>(s.in_flight); out8[7] = s.last_status;
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 extern "C" int32_t nodus_headless_attach_compile_host(
     const char* prefix, uint64_t host_id, const char* python_executable, const char* nodus_root,
     const char* turing_root, const char* module_library_root, const char* jobs_dir, int32_t adopt) {
@@ -1102,6 +1174,15 @@ extern "C" int32_t nodus_headless_release_contract_pair(const char* prefix) {
                     if (negotiator) negotiator->remove_host(item.first);
                 }
                 g_compile_hosts.erase(p);
+            }
+        }
+        { // cron engines leave the negotiator before it is released
+            std::lock_guard<std::mutex> lock(g_crons_mu);
+            auto p = g_crons.find(prefix);
+            if (p != g_crons.end()) {
+                auto* negotiator = nodus::contracts::find(prefix);
+                for (auto& item : p->second) if (negotiator) negotiator->remove_engine(item.first);
+                g_crons.erase(p);
             }
         }
         return nodus::contracts::release(prefix) ? 1 : 0;

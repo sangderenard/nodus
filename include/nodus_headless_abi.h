@@ -293,6 +293,22 @@ NODUS_HEADLESS_API int32_t nodus_headless_detach_compile_host(const char* prefix
 // out5 = {accepted, completed, refused, acknowledged, in_flight}; 0 if not attached.
 NODUS_HEADLESS_API int32_t nodus_headless_compile_host_stats(
     const char* prefix, uint64_t host_id, uint64_t* out5);
+// Cron tool (include/cron_tool.h) attached to the negotiator of an acquired pair as an
+// ENGINE: its Producer is added to that negotiator, so the existing `<prefix>.worker`
+// row asks it for due work on the lane that steps the canvas, and any host on the
+// prefix performs the task. jobs_dir holds cron.table (the schedule, read here),
+// cron.ledger, cron.log and one <contract id>.request.json per run. Returns 1 on
+// success; 0 when the prefix has no acquired pair, engine_id is 0 or already an engine
+// of the prefix, jobs_dir is NULL/empty, or the table is missing or malformed (the
+// reason is then the last line of <jobs_dir>/cron.log when that file can be written).
+NODUS_HEADLESS_API int32_t nodus_headless_attach_cron(
+    const char* prefix, uint64_t engine_id, const char* jobs_dir);
+// Removes the engine from the negotiator and destroys the tool. A run that is out
+// stays recorded as started in the ledger and is reasoned about at the next attach.
+NODUS_HEADLESS_API int32_t nodus_headless_detach_cron(const char* prefix, uint64_t engine_id);
+// out8 = {fired, finished, skipped, interrupted, tasks, gap_seconds, in_flight, last_status}.
+NODUS_HEADLESS_API int32_t nodus_headless_cron_stats(
+    const char* prefix, uint64_t engine_id, uint64_t* out8);
 // Declare a contract port on a configured result edge (token_bytes ==
 // sizeof(Result), type 0x534A5231, layout 2, dtype 8, top_k 0). listen_port 0
 // picks an ephemeral loopback port. Returns the bound port (>0), or 0 when the

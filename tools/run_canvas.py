@@ -316,6 +316,14 @@ def _parse_compile_host(text: str):
     return parts[0], int(parts[1]), parts[2]
 
 
+def _parse_cron(text: str):
+    # JOBS_DIR may hold a drive colon (C:/jobs); only the first two colons split.
+    parts = text.split(":", 2)
+    if len(parts) != 3 or not parts[0] or not parts[1].isdigit() or int(parts[1]) == 0 or not parts[2]:
+        raise ValueError(f"--cron expects PREFIX:ENGINE_ID:JOBS_DIR (ENGINE_ID non-zero), got {text!r}")
+    return parts[0], int(parts[1]), parts[2]
+
+
 def _claim_stdout():
     """The native library writes diagnostics to fd 1; keep the real stdout for JSON only."""
     sys.stdout.flush()
@@ -336,6 +344,9 @@ def main(argv=None) -> int:
     parser.add_argument("--compile-host", action="append", default=[], metavar="PREFIX:HOST_ID:JOBS_DIR",
                         help="attach a Turing compile host to an --acquire'd prefix (repeatable); "
                              "requests <JOBS_DIR>/<id>.request.json, products <JOBS_DIR>/<id>/")
+    parser.add_argument("--cron", action="append", default=[], metavar="PREFIX:ENGINE_ID:JOBS_DIR",
+                        help="attach the cron tool as an engine of an acquired prefix; JOBS_DIR/cron.table is its "
+                             "schedule and it keeps cron.ledger, cron.log and one request file per run there")
     parser.add_argument("--compile-python", default=None,
                         help="python for the Turing compiler driver (default: this interpreter)")
     parser.add_argument("--turing-root", default=None,
@@ -372,6 +383,12 @@ def main(argv=None) -> int:
                 raise ValueError(f"--compile-host prefix {prefix!r} must also be given to --acquire")
         if len({(p, h) for p, h, _ in compile_hosts}) != len(compile_hosts):
             raise ValueError("--compile-host PREFIX:HOST_ID given twice")
+        crons = [_parse_cron(a) for a in args.cron]
+        for prefix, _engine_id, _jobs in crons:
+            if prefix not in acquired:
+                raise ValueError(f"--cron prefix {prefix!r} must also be given to --acquire")
+        if len({(p, e) for p, e, _ in crons}) != len(crons):
+            raise ValueError("--cron PREFIX:ENGINE_ID given twice")
         repo_root = pathlib.Path(__file__).resolve().parent.parent
         compile_python = args.compile_python or sys.executable
         turing_root = args.turing_root or str(repo_root.parent / "turing")
@@ -404,6 +421,17 @@ def main(argv=None) -> int:
                 for prefix, host_id in attached:
                     graph.detach_compile_host(prefix, host_id)
                 raise
+            scheduled, cron_report = [], []
+            for prefix, engine_id, jobs_dir in crons:      # after the load: the engine joins the restored negotiator
+                # A cron tool that cannot start (an unreadable table, a library built before it) is reported
+                # and left off; it must not take the canvas host and its other services down with it.
+                try:
+                    graph.attach_cron(prefix, engine_id, jobs_dir)
+                    scheduled.append((prefix, engine_id))
+                    cron_report.append({"prefix": prefix, "engine": engine_id, "attached": True})
+                except RuntimeError as exc:
+                    print(f"run_canvas: {exc}", file=sys.stderr, flush=True)
+                    cron_report.append({"prefix": prefix, "engine": engine_id, "attached": False, "reason": str(exc)})
             if console is not None:
                 console.set_context(args.rate, attached)
             ports = []
@@ -413,7 +441,7 @@ def main(argv=None) -> int:
                               "listen_port": bound[0] if bound else declared,
                               "capacity": capacity, "edge": edge})
             print(json.dumps({"canvas": args.canvas, "contract_ports": ports,
-                              "pid": os.getpid(), "console_port": console_port}),
+                              "pid": os.getpid(), "console_port": console_port, "cron": cron_report}),
                   file=out, flush=True)
             next_t = time.perf_counter()
             try:
@@ -429,6 +457,11 @@ def main(argv=None) -> int:
                     else:
                         next_t = time.perf_counter()
             finally:
+                for prefix, engine_id in scheduled:
+                    try:
+                        graph.detach_cron(prefix, engine_id)
+                    except RuntimeError as exc:
+                        print(f"run_canvas: {exc}", file=sys.stderr, flush=True)
                 # Hosts end (running compile cancelled, thread joined) before any pair is released.
                 for prefix, host_id in attached:
                     try:
