@@ -101,6 +101,9 @@ static void test_save_load_round_trip() {
     assert(g1);
     int32_t module_a, row_a, module_b, row_b;
     build_two_module_graph(g1, &module_a, &row_a, &module_b, &row_b);
+    assert(nodus_headless_set_module_exec_mode(g1, module_a, 3));
+    assert(nodus_headless_set_module_stack_contract(g1, module_a, 0));
+    assert(!nodus_headless_set_module_exec_mode(g1, module_a, 4));
     assert(nodus_headless_save_file(g1, path.string().c_str()));
     nodus_headless_destroy(g1);
 
@@ -120,6 +123,10 @@ static void test_save_load_round_trip() {
     NodusHeadlessGraph* g2 = nodus_headless_create();
     assert(g2);
     assert(nodus_headless_load_file(g2, path.string().c_str()));
+    int32_t exec_mode = -1;
+    int32_t stack_contract = -1;
+    assert(nodus_headless_get_module_exec_mode(g2, module_a, &exec_mode) && exec_mode == 3);
+    assert(nodus_headless_get_module_stack_contract(g2, module_a, &stack_contract) && stack_contract == 0);
     assert(!fs::exists(fresh_cwd / "module_library" / "serialized"));
     // The loaded graph must retain the same module/row topology so the same
     // ports resolve again -- this is the save/load fidelity the headless

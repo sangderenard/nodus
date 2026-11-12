@@ -127,6 +127,27 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t contract);
 NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract);
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t mode);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_mode);
+
+// Register the native Radio source and UDP broadcast rows. Configure before
+// binding either row. Both rows belong to one Opaque Free table, in that
+// order. The source reuses the native WASAPI/fftfree scope named here.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_configure(
+    const wchar_t* scope_dll, const wchar_t* fftfree_dll,
+    const char* destination_host, uint16_t destination_port,
+    uint32_t fft_size, uint32_t overlap, uint32_t band_count,
+    float min_hz, float max_hz);
+typedef struct NodusRadioStatus {
+    uint64_t captured_frames;
+    uint64_t emitted_packets;
+    uint64_t dropped_packets;
+    uint32_t sample_rate;
+    int32_t capture_running;
+} NodusRadioStatus;
+NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
 // Configured edge FIFOs and named ports are persisted by
 // nodus_headless_save_file as EDGE_FIFO / PORT trailer records appended after

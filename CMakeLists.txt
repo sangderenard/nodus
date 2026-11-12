@@ -551,6 +551,7 @@ add_test(NAME edge_runtime_abi_test COMMAND edge_runtime_abi_test)
 # ThreadManager, but exports only its own narrow nodus_headless_* surface.
 add_library(nodus_headless SHARED
   src/headless/nodus_headless_abi.cpp
+  src/headless/radio_rows.cpp
 )
 target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
 target_include_directories(nodus_headless PUBLIC
@@ -625,6 +626,13 @@ add_executable(nodus_headless_demo tools/nodus_headless_demo.cpp)
 target_include_directories(nodus_headless_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_demo PRIVATE nodus_headless)
 target_compile_features(nodus_headless_demo PUBLIC cxx_std_20)
+
+# Native Radio: one headless table containing its ordered capture/fftfree and
+# UDP rows, executed by the independent Free table worker.
+add_executable(nodus_radio tools/nodus_radio.cpp)
+target_include_directories(nodus_radio PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(nodus_radio PRIVATE nodus_headless)
+target_compile_features(nodus_radio PRIVATE cxx_std_20)
 
 # Loads a real bridge-generated canvas (turing's nodus_canvas_kpn.py output)
 # headlessly, validates its computed output against an independent Python
