@@ -357,7 +357,7 @@ private:
     std::condition_variable pool_cv_;
     std::condition_variable pool_done_cv_;
     std::vector<std::thread> pool_workers_;
-    std::function<void(size_t)> pool_task_;
+    std::function<void()> pool_task_;
     uint64_t pool_generation_ = 0;
     size_t pool_target_ = 0;
     size_t pool_completed_ = 0;
