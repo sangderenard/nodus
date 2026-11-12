@@ -48,6 +48,15 @@ int main(int argc, char** argv) {
     check(!nodus::exec::refusal({compressor, {}, core + "/turing/src", {core}}).empty(), "a working directory inside the core is refused");
     check(!nodus::exec::refusal({compressor, {}, "", {core}}).empty(), "no working directory is refused");
     check(nodus::exec::refusal({compressor, {}, scratch, {core}}).empty(), "the compressor outside the core is allowed");
+    const std::string users = core + "/srv/state/content/users";
+    check(nodus::exec::refusal({compressor, {}, users + "/account/2/exec", {core}, {users}}).empty(),
+          "a working directory in a user folder is allowed though the folder is inside the core");
+    check(!nodus::exec::refusal({compressor, {}, core + "/srv/state", {core}, {users}}).empty(),
+          "beside the user folders it is still the core");
+    check(!nodus::exec::refusal({compressor, {}, core + "/srv/state/content/users-old", {core}, {users}}).empty(),
+          "a folder whose name only starts like a user folder is not one");
+    check(!nodus::exec::refusal({"git.exe", {}, users + "/account/2", {core}, {users}}).empty(),
+          "and Git is refused in a user folder too");
     {
         Child child;
         check(!child.start({compressor, {"-c"}, core, {core}}, why) && !child.running(), "start() applies the rules");

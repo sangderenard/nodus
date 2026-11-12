@@ -562,6 +562,9 @@ target_link_libraries(nodus_headless PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
   # contract ports: loopback listener and socket adapters (include/contract_listener.h)
   target_link_libraries(nodus_headless PRIVATE ws2_32)
+  # The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
+  # refers to that object, so from the static library the linker would leave it out; this keeps it in.
+  target_link_options(nodus_headless PRIVATE "/INCLUDE:nodus_exec_row_source")
 endif()
 target_compile_features(nodus_headless PUBLIC cxx_std_20)
 

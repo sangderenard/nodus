@@ -1,7 +1,8 @@
 // exec_row_registry_test declare <file> <compressor> <scratch-dir> [core-root]
 //     writes a declarations file (two good rows, two the rules refuse).
 // exec_row_registry_test check <file> <compressor> <scratch-dir> [core-root]
-//     run with NODUS_EXEC_ROWS=<file> and NODUS_EXEC_CORE_ROOTS=<core-root> in the environment, so the rows were
+//     run with NODUS_EXEC_ROWS=<file>, NODUS_EXEC_CORE_ROOTS=<core-root> and
+//     NODUS_EXEC_WORK_ROOTS=<core-root>/srv/state/content/users in the environment, so the rows were
 //     registered when this image loaded; finds them in the real tool registry, makes them the way a canvas does
 //     (by id, with an empty init context), and passes a span through both.
 #include "exec_row.h"
@@ -78,7 +79,9 @@ int main(int argc, char** argv) {
             "row exec.zstd.unpack\n  name Zstd unpack\n  program " + compressor + "\n  argument -d\n  argument -c\n"
             "  directory " + scratch + "\n  most 1\n\n"
             "row exec.git\n  program C:/Program Files/Git/cmd/git.exe\n  argument --version\n  directory " + scratch + "\n\n"
-            "row exec.inside\n  program " + compressor + "\n  argument -c\n  directory " + core + "/turing\n");
+            "row exec.inside\n  program " + compressor + "\n  argument -c\n  directory " + core + "/turing\n\n"
+            "row exec.userfolder\n  program " + compressor + "\n  argument -c\n  directory " + core +
+            "/srv/state/content/users/account/2/exec\n");
         return 0;
     }
 
@@ -90,6 +93,8 @@ int main(int argc, char** argv) {
     check(pack && !pack->source_path.empty(), "with the row's source recorded");
     check(!registry.find("exec.git"), "a declared row that would run Git is not registered");
     check(!registry.find("exec.inside"), "nor one whose working directory is inside the core");
+    check(registry.find("exec.userfolder") != nullptr,
+          "but one in a declared user folder is, though that folder is inside the core");
     check(!registry.find("exec_row") && !registry.find("exec"), "and there is no exec row that was not declared");
 
     // Made the way a canvas makes a plugin row: by id, with an init context that carries no settings.
@@ -141,8 +146,8 @@ int main(int argc, char** argv) {
           "with no declared core no row is registered");
     SetEnvironmentVariableA("NODUS_EXEC_CORE_ROOTS", core.c_str());
     report.clear();
-    check(nodus::exec::register_declared_rows(file, local, report) == 2 && local.find("exec.zstd.pack") && !local.find("exec.git"),
-          "with the core declared the two good rows are, into any registry");
+    check(nodus::exec::register_declared_rows(file, local, report) == 3 && local.find("exec.zstd.pack") && !local.find("exec.git"),
+          "with the core declared the three good rows are, into any registry");
     check(nodus::exec::register_declared_rows(file, local, report) == 0 && report.find("already taken") != std::string::npos,
           "and a second registration of the same ids is refused");
     std::printf("%s\n", failures ? "FAILED" : "all passed");

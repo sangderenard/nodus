@@ -14,7 +14,8 @@
 //
 // Rules a row's program is held to, checked by start(): it is never Git (Git in the core is asked for through the
 // service, turing examples/meowdoku/core_git.py holds the same rule), and its working directory is never inside one
-// of the forbidden roots (the core repositories). The child is put in a job that dies with this object, gets no
+// of the forbidden roots (the core repositories) unless it is inside one of the work roots: the untracked user
+// folders and checkout leases where people are meant to work, which sit inside the core's folders but are not it. The child is put in a job that dies with this object, gets no
 // console window, inherits only its two pipe ends, and its error stream goes nowhere.
 //
 // Windows only for now; the POSIX form (pipe/fork/exec) is not written.
@@ -46,6 +47,7 @@ struct Program {
     std::vector<std::string> arguments;
     std::string working_dir;                   // must exist; never inside a forbidden root
     std::vector<std::string> forbidden_roots;  // the core repositories
+    std::vector<std::string> work_roots;       // user folders and checkout leases: allowed even inside the core
 };
 
 inline std::string normalized(std::string path) {
@@ -61,6 +63,12 @@ inline std::string full_path(const std::string& path) {
     return normalized(length && length < sizeof(buffer) ? std::string(buffer, length) : path);
 }
 
+// True when `path` (already a full path) is `root` or inside it.
+inline bool within(const std::string& path, const std::string& root) {
+    const std::string held = full_path(root);
+    return path == held || path.rfind(held + "/", 0) == 0;
+}
+
 // Why this program may not be started as asked; empty when it may.
 inline std::string refusal(const Program& program) {
     std::string name = normalized(program.path);
@@ -70,11 +78,12 @@ inline std::string refusal(const Program& program) {
         return "a row never runs Git; Git in the core is asked for through the service";
     if (program.working_dir.empty()) return "a row's program needs a declared working directory";
     const std::string where = full_path(program.working_dir);
-    for (const std::string& root : program.forbidden_roots) {
-        const std::string held = full_path(root);
-        if (where == held || where.rfind(held + "/", 0) == 0)
-            return "a row's program never runs with its working directory inside the core (" + root + ")";
-    }
+    for (const std::string& work : program.work_roots)
+        if (within(where, work)) return {};
+    for (const std::string& root : program.forbidden_roots)
+        if (within(where, root))
+            return "a row's program never runs with its working directory inside the core (" + root +
+                   ") outside a user folder or checkout lease";
     return {};
 }
 

@@ -8,6 +8,9 @@
 // NODUS_EXEC_CORE_ROOTS (paths separated by ';') that the process hosting Nodus is started with. A row's saved
 // settings cannot add to them or leave them out, and a host that declared none gets a row that starts nothing.
 //
+// The places people are meant to work, the untracked user folders and checkout leases, are declared the same way in
+// NODUS_EXEC_WORK_ROOTS. A row's working directory inside one of them is allowed though it is inside the core.
+//
 // Declared rows. A canvas binds a tool row by its registry id alone and hands it no settings, so an exec row that can
 // be placed in a canvas is one the host declared: the environment variable NODUS_EXEC_ROWS names a text file, and
 // each row in it becomes one registry entry (src/tools/exec_row_registered.cpp). The file is blocks of
@@ -80,14 +83,14 @@ inline bool read_settings(InputArchive& in, RowSettings& settings) {
     return true;
 }
 
-// The core repositories as the host declared them for this process. Empty when the host declared none.
-inline std::vector<std::string> declared_core_roots() {
+// Paths separated by ';' from one variable of the process environment. Empty when it is not set.
+inline std::vector<std::string> environment_paths(const char* variable) {
     std::vector<std::string> roots;
     // The process environment itself, not a C runtime's copy of it: a row built as its own DLL has its own runtime.
-    const DWORD needed = GetEnvironmentVariableA("NODUS_EXEC_CORE_ROOTS", nullptr, 0);
+    const DWORD needed = GetEnvironmentVariableA(variable, nullptr, 0);
     if (needed == 0) return roots;
     std::string all(needed, '\0');
-    all.resize(GetEnvironmentVariableA("NODUS_EXEC_CORE_ROOTS", all.data(), needed));
+    all.resize(GetEnvironmentVariableA(variable, all.data(), needed));
     size_t start = 0;
     while (start <= all.size()) {
         const size_t end = all.find(';', start);
@@ -98,6 +101,12 @@ inline std::vector<std::string> declared_core_roots() {
     }
     return roots;
 }
+
+// The core repositories as the host declared them for this process. Empty when the host declared none.
+inline std::vector<std::string> declared_core_roots() { return environment_paths("NODUS_EXEC_CORE_ROOTS"); }
+
+// The user folders and checkout leases the host declared for this process.
+inline std::vector<std::string> declared_work_roots() { return environment_paths("NODUS_EXEC_WORK_ROOTS"); }
 
 struct DeclaredRow {
     std::string id;
@@ -156,7 +165,8 @@ inline std::string declared_rows_file() {
 
 // The program a row with these settings would start, held to the host's declaration of the core.
 inline bool row_program(const RowSettings& settings, Program& program, std::string& why) {
-    program = Program{settings.program, settings.arguments, settings.working_dir, declared_core_roots()};
+    program = Program{settings.program, settings.arguments, settings.working_dir, declared_core_roots(),
+                      declared_work_roots()};
     if (settings.program.empty()) { why = "the row has no program"; return false; }
     if (program.forbidden_roots.empty()) {
         why = "the host declared no core (NODUS_EXEC_CORE_ROOTS); a row starts nothing until it does";
