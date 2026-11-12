@@ -147,6 +147,8 @@ typedef struct NodusRadioStatus {
     uint32_t sample_rate;
     int32_t capture_running;
 } NodusRadioStatus;
+// Select WAV playback before constructing/launching the Radio table. No loopback capture.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int32_t loop);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
 // Configured edge FIFOs and named ports are persisted by

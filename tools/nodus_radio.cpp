@@ -20,9 +20,9 @@ std::wstring path_from_utf8(const char* source) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 5 || argc > 8) {
+    if (argc < 5 || argc > 10) {
         std::fprintf(stderr,
-            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024]\n");
+            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0]\n");
         return 2;
     }
     const int port = std::atoi(argv[4]);
@@ -39,6 +39,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Radio configuration or row registration failed\n");
         return 1;
     }
+    if (argc > 8 && !nodus_headless_radio_file_source(path_from_utf8(argv[8]).c_str(), argc > 9 ? std::atoi(argv[9]) : 0)) {
+        std::fprintf(stderr, "Radio file-source configuration failed\n"); return 1;
+    }
     NodusHeadlessGraph* graph = nodus_headless_create();
     if (!graph) return 1;
     GP_CanvasModuleDesc module{};
@@ -46,7 +49,7 @@ int main(int argc, char** argv) {
     std::strncpy(module.label, "radio", sizeof(module.label) - 1);
     const int table = nodus_headless_add_module(graph, &module);
     const GP_CanvasModuleRowDesc rows[] = {
-        {1, 0, 1, 1, "radio.system_output"},
+        {1, 0, 1, 1, argc > 8 ? "radio.file_output" : "radio.system_output"},
         {1, 0, 1, 1, "radio.udp_broadcast"},
     };
     if (table < 0 || !nodus_headless_set_module_rows(graph, table, rows, 2) ||
@@ -58,8 +61,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::signal(SIGINT, on_signal);
-    std::printf("Radio: one Free table, rows=[system_output+fftfree, udp_broadcast], udp://%s:%d, bands=%d\n",
-                argv[3], port, bands);
+    std::printf("Radio: one Free table, source=%s, udp://%s:%d, bands=%d\n",
+                argc > 8 ? "wav+fftfree" : "system_output+fftfree", argv[3], port, bands);
     std::fflush(stdout);
     const auto started = std::chrono::steady_clock::now();
     while (!stopping.load(std::memory_order_relaxed)) {
@@ -73,6 +76,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(status.dropped_packets));
             std::fflush(stdout);
         }
+        if (argc > 8 && !status.capture_running) break;
         if (seconds > 0 && std::chrono::steady_clock::now() - started >= std::chrono::seconds(seconds)) break;
     }
     NodusRadioStatus status{};
@@ -82,5 +86,5 @@ int main(int argc, char** argv) {
     const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - stop_begin).count();
     std::printf("shutdown_ms=%lld\n", static_cast<long long>(stop_ms));
-    return status.capture_running && status.emitted_packets ? 0 : 1;
+    return status.emitted_packets ? 0 : 1;
 }
