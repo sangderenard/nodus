@@ -682,11 +682,10 @@ bool ThreadManager::get_module_timing(int module_idx, ModuleTiming* out) const {
     if (module_idx < 0 || static_cast<size_t>(module_idx) >= module_ledger_.size()) return false;
     const auto &ledger = module_ledger_[static_cast<size_t>(module_idx)];
     out->run_count = ledger.run_count.load(std::memory_order_relaxed);
-    // convert microseconds back to seconds
-    uint64_t last_us = ledger.last_run_wall_time_us.load(std::memory_order_relaxed);
-    uint64_t total_us = ledger.total_run_wall_time_us.load(std::memory_order_relaxed);
-    out->last_run_wall_time = static_cast<double>(last_us) / 1e6;
-    out->total_run_wall_time = static_cast<double>(total_us) / 1e6;
+    const uint64_t last_ns = ledger.last_run_wall_time_ns.load(std::memory_order_relaxed);
+    const uint64_t total_ns = ledger.total_run_wall_time_ns.load(std::memory_order_relaxed);
+    out->last_run_wall_time = static_cast<double>(last_ns) / 1e9;
+    out->total_run_wall_time = static_cast<double>(total_ns) / 1e9;
     return true;
 }
 
@@ -769,13 +768,21 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         RawStackFrame* module_stack = (mod.module_idx >= 0) ? ensure_module_tool_stack(mod.module_idx) : nullptr;
         if (!module_stack) return;
         ValueTypeId stack_default_type = module_tool_stack_default_type();
-        const ValueType* stack_type_info = ValueTypeRegistry::global().get(stack_default_type);
-        size_t stack_elem_size = (stack_type_info && stack_type_info->size > 0) ? stack_type_info->size : sizeof(double);
+        static const ValueTypeId scalar_type = ValueTypeRegistry::global().builtin(VT_FLOAT64);
+        const bool scalar_stack = mod.stack_contract == ModuleStackContract::ScalarF32 &&
+            stack_default_type == scalar_type;
+        const ValueType* stack_type_info = scalar_stack ? nullptr : ValueTypeRegistry::global().get(stack_default_type);
+        size_t stack_elem_size = scalar_stack ? sizeof(double) :
+            (stack_type_info && stack_type_info->size > 0 ? stack_type_info->size : sizeof(double));
         reset_module_tool_stack(*module_stack);
         std::vector<float> stack_snapshot;
         auto push_value = [&](float value) {
             double dv = static_cast<double>(value);
-            raw_stack_push_typed(*module_stack, &dv, stack_default_type);
+            if (scalar_stack) {
+                raw_stack_push_known_type(*module_stack, &dv, stack_default_type, sizeof(dv));
+            } else {
+                raw_stack_push_typed(*module_stack, &dv, stack_default_type);
+            }
         };
         auto pop_value = [&]() -> float {
             if (!module_stack || module_stack->byte_count == 0) {
@@ -784,13 +791,18 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
 #endif
                 return 0.0f;
             }
-            ValueTypeId top_tid = kInvalidValueTypeId;
-            if (!raw_stack_peek_type(*module_stack, top_tid) || top_tid != stack_default_type) {
-                return 0.0f;
+            if (!scalar_stack) {
+                ValueTypeId top_tid = kInvalidValueTypeId;
+                if (!raw_stack_peek_type(*module_stack, top_tid) || top_tid != stack_default_type) {
+                    return 0.0f;
+                }
             }
             size_t before = module_stack->byte_count / (stack_elem_size ? stack_elem_size : 1);
             double dv = 0.0;
-            if (!raw_stack_pop_typed(*module_stack, &dv, stack_default_type)) {
+            const int popped = scalar_stack
+                ? raw_stack_pop_known_type(*module_stack, &dv, stack_default_type, sizeof(dv), false)
+                : raw_stack_pop_typed(*module_stack, &dv, stack_default_type);
+            if (!popped) {
                 return 0.0f;
             }
 #if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
@@ -846,7 +858,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
         // Optional timing measurement for this module execution
         bool _tm_measured = false;
-        double _tm_last_run_secs = 0.0;
+        uint64_t _tm_last_run_ns = 0;
         bool _tm_enabled = timing_enabled_.load(std::memory_order_relaxed);
         std::chrono::high_resolution_clock::time_point _tm_start;
         if (_tm_enabled) {
@@ -1502,7 +1514,8 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         canvas_set_module_stack_tail(mod_idx, tail_ptr, static_cast<int>(stack_snapshot.size()));
         if (_tm_enabled) {
             auto _tm_end = std::chrono::high_resolution_clock::now();
-            _tm_last_run_secs = std::chrono::duration<double>(_tm_end - _tm_start).count();
+            _tm_last_run_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                _tm_end - _tm_start).count());
             _tm_measured = true;
         }
         if (mod.module_idx >= 0) {
@@ -1520,11 +1533,9 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                 ledger.tool_cycle = tool_cycle;
             }
             if (_tm_measured) {
-                // store times as integer microseconds to allow atomic fetch_add
-                uint64_t us = static_cast<uint64_t>(std::lround(_tm_last_run_secs * 1e6));
                 ledger.run_count.fetch_add(1, std::memory_order_relaxed);
-                ledger.last_run_wall_time_us.store(us, std::memory_order_relaxed);
-                ledger.total_run_wall_time_us.fetch_add(us, std::memory_order_relaxed);
+                ledger.last_run_wall_time_ns.store(_tm_last_run_ns, std::memory_order_relaxed);
+                ledger.total_run_wall_time_ns.fetch_add(_tm_last_run_ns, std::memory_order_relaxed);
             }
         }
 }

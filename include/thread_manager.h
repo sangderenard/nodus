@@ -259,9 +259,9 @@ private:
         // timing DB fields (updated when timing enabled). Use atomics so updates
         // can be performed without taking the ThreadManager mutex.
         std::atomic<uint64_t> run_count{0};
-        // Store wall-time values as integer microseconds to allow atomic adds.
-        std::atomic<uint64_t> last_run_wall_time_us{0}; // microseconds
-        std::atomic<uint64_t> total_run_wall_time_us{0}; // microseconds
+        // Store nanoseconds so sub-microsecond rows remain measurable.
+        std::atomic<uint64_t> last_run_wall_time_ns{0};
+        std::atomic<uint64_t> total_run_wall_time_ns{0};
         // Sleep control: until which tick id or until what wall-time (us) this module should be dormant.
         std::atomic<uint64_t> sleep_until_tick{0};
         std::atomic<uint64_t> sleep_until_time_us{0};
@@ -274,8 +274,8 @@ private:
             tool_cycle = o.tool_cycle;
             exec_tick_counter = o.exec_tick_counter;
             run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_ns.store(o.last_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_ns.store(o.total_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
@@ -287,8 +287,8 @@ private:
             tool_cycle = o.tool_cycle;
             exec_tick_counter = o.exec_tick_counter;
             run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_ns.store(o.last_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_ns.store(o.total_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
             return *this;
@@ -300,15 +300,15 @@ private:
             tool_cycle = o.tool_cycle;
             exec_tick_counter = o.exec_tick_counter;
             run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_ns.store(o.last_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_ns.store(o.total_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
             // leave source in a valid zeroed state
             o.ticks = 0; o.last_tick_id = 0; o.last_dt = 0.0; o.tool_cycle = 0; o.exec_tick_counter = 0;
             o.run_count.store(0, std::memory_order_relaxed);
-            o.last_run_wall_time_us.store(0, std::memory_order_relaxed);
-            o.total_run_wall_time_us.store(0, std::memory_order_relaxed);
+            o.last_run_wall_time_ns.store(0, std::memory_order_relaxed);
+            o.total_run_wall_time_ns.store(0, std::memory_order_relaxed);
             o.sleep_until_tick.store(0, std::memory_order_relaxed);
             o.sleep_until_time_us.store(0, std::memory_order_relaxed);
         }
@@ -320,14 +320,14 @@ private:
             tool_cycle = o.tool_cycle;
             exec_tick_counter = o.exec_tick_counter;
             run_count.store(o.run_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            last_run_wall_time_us.store(o.last_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            total_run_wall_time_us.store(o.total_run_wall_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_run_wall_time_ns.store(o.last_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            total_run_wall_time_ns.store(o.total_run_wall_time_ns.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_tick.store(o.sleep_until_tick.load(std::memory_order_relaxed), std::memory_order_relaxed);
             sleep_until_time_us.store(o.sleep_until_time_us.load(std::memory_order_relaxed), std::memory_order_relaxed);
             o.ticks = 0; o.last_tick_id = 0; o.last_dt = 0.0; o.tool_cycle = 0; o.exec_tick_counter = 0;
             o.run_count.store(0, std::memory_order_relaxed);
-            o.last_run_wall_time_us.store(0, std::memory_order_relaxed);
-            o.total_run_wall_time_us.store(0, std::memory_order_relaxed);
+            o.last_run_wall_time_ns.store(0, std::memory_order_relaxed);
+            o.total_run_wall_time_ns.store(0, std::memory_order_relaxed);
             o.sleep_until_tick.store(0, std::memory_order_relaxed);
             o.sleep_until_time_us.store(0, std::memory_order_relaxed);
             return *this;
