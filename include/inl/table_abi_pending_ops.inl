@@ -100,6 +100,12 @@ int32_t gp_table_get_sim_enabled(GP_TableContext* ctx, int32_t* out_enabled) {
 }
 
 // Apply pending ops (manager thread should call this before scheduling)
+int32_t gp_table_has_pending_ops(GP_TableContext* ctx) {
+    if (!ctx) return 0;
+    std::lock_guard<std::mutex> lk(ctx->pending_ops_mu);
+    return ctx->pending_ops.empty() ? 0 : 1;
+}
+
 int32_t gp_table_apply_pending_ops(GP_TableContext* ctx) {
     if (!ctx) return 0;
     std::vector<GP_TableContext::PendingOp> ops;

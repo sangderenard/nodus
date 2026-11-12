@@ -134,6 +134,7 @@ public:
         Sequential = 0,
         Pooled = 1,
         Slip = 2,
+        Free = 3,
     };
 
         struct ModuleContract {
@@ -339,7 +340,12 @@ private:
     void set_module_sleep_delay(int module_idx, uint64_t delay_ticks, double delay_seconds);
 
     void run_loop();
-    void run_scheduled_tick(const TickRequest& req);
+    void run_scheduled_tick(const TickRequest& req, bool preserve_free_tables = false);
+    void execute_module_iteration(const TickRequest& req, int mod_idx);
+    void start_free_workers(const TickRequest& req);
+    void stop_free_workers();
+    bool free_request_matches(const TickRequest& req) const;
+    bool free_tables_have_pending_ops(const TickRequest& req) const;
     void ensure_pool_workers(size_t count);
     void pool_worker_loop(size_t index, uint64_t seen_generation);
 
@@ -349,6 +355,9 @@ private:
     std::atomic<bool> persistent_workers_{true};
     std::atomic<bool> running_{false};
     std::thread worker_;
+    std::vector<std::thread> free_workers_;
+    std::shared_ptr<TickRequest> free_request_;
+    std::atomic<bool> free_running_{false};
 
     // Parallel module lanes persist across ticks. The manager publishes one
     // tick-local ready-queue callback, then waits for the participating lanes

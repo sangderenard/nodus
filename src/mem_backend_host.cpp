@@ -63,6 +63,7 @@ static constexpr uint32_t kCpuBackendMagic = 0x4E43'4255u; // "NCBU"
 struct CpuBackend {
     uint32_t magic; // == kCpuBackendMagic; must stay the first member (offset 0)
     std::mutex mu;
+    std::atomic<bool> fixed_io{false};
     void* ptr;
     size_t size;
     std::atomic<int> refs;
@@ -165,6 +166,7 @@ static int cpu_resize(gp_mem_backend_handle_t buffer_h, size_t bytes) {
     CpuBackend* b = reinterpret_cast<CpuBackend*>(buffer_h);
     std::lock_guard<std::mutex> lk(b->mu);
     if (bytes == b->size) return 1;
+    if (b->fixed_io.load(std::memory_order_acquire)) return 0;
     void* p = nullptr;
     if (bytes > 0) {
         p = std::realloc(b->ptr, bytes);
@@ -195,6 +197,11 @@ static void cpu_free(gp_mem_backend_handle_t buffer_h) {
 static int cpu_copy_to_backend(gp_mem_backend_handle_t h, size_t offset, const void* src, size_t bytes) {
     if (!h || !src) return 0;
     CpuBackend* b = reinterpret_cast<CpuBackend*>(h);
+    if (b->fixed_io.load(std::memory_order_acquire)) {
+        if (offset > b->size || bytes > b->size - offset) return 0;
+        std::memcpy(reinterpret_cast<char*>(b->ptr) + offset, src, bytes);
+        return 1;
+    }
     std::lock_guard<std::mutex> lk(b->mu);
     if (offset + bytes > b->size) return 0;
     std::memcpy(reinterpret_cast<char*>(b->ptr) + offset, src, bytes);
@@ -204,6 +211,11 @@ static int cpu_copy_to_backend(gp_mem_backend_handle_t h, size_t offset, const v
 static int cpu_copy_from_backend(gp_mem_backend_handle_t h, size_t offset, void* dst, size_t bytes) {
     if (!h || !dst) return 0;
     CpuBackend* b = reinterpret_cast<CpuBackend*>(h);
+    if (b->fixed_io.load(std::memory_order_acquire)) {
+        if (offset > b->size || bytes > b->size - offset) return 0;
+        std::memcpy(dst, reinterpret_cast<char*>(b->ptr) + offset, bytes);
+        return 1;
+    }
     std::lock_guard<std::mutex> lk(b->mu);
     if (offset + bytes > b->size) return 0;
     std::memcpy(dst, reinterpret_cast<char*>(b->ptr) + offset, bytes);
@@ -383,6 +395,14 @@ extern "C" gp_mem_backend_handle_t gp_mem_backend_create_cpu(size_t initial_byte
 
 extern "C" gp_mem_backend_handle_t gp_mem_backend_create_host(size_t initial_bytes) {
     return gp_mem_backend_create_cpu(initial_bytes);
+}
+
+extern "C" int gp_mem_backend_pin_fixed_cpu_buffer(gp_mem_backend_handle_t h) {
+    if (!h || gp_mem_backend_get_type(h) != GP_MEM_BACKEND_CPU) return 0;
+    CpuBackend* b = reinterpret_cast<CpuBackend*>(h);
+    std::lock_guard<std::mutex> lk(b->mu);
+    b->fixed_io.store(true, std::memory_order_release);
+    return 1;
 }
 
 extern "C" gp_mem_backend_handle_t gp_mem_backend_create_from_params(

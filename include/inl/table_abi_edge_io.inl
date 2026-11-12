@@ -1232,6 +1232,20 @@ int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned lo
     return 1;
 }
 
+int32_t gp_table_edge_can_publish(GP_TableContext* ctx, int32_t edge_idx, int32_t sample_count) {
+    if (!ctx || sample_count <= 0 || edge_idx < 0 ||
+        edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    const EdgeTensorFifo& fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
+    if (!fifo.impl || !fifo.impl->configured) return 0;
+    const auto* impl = fifo.impl.get();
+    if (impl->top_k > 0) return 1;
+    const uint64_t required = static_cast<uint64_t>(sample_count);
+    if (required > impl->slots) return 0;
+    const uint64_t head = impl->write_seq.load(std::memory_order_acquire);
+    const uint64_t tail = fifo.min_reader_seq(head);
+    return head >= tail && head - tail <= impl->slots - required ? 1 : 0;
+}
+
 int32_t gp_table_edge_set_batch_metadata(GP_TableContext* ctx, int32_t edge_idx, const GP_TableEdgeBatchMetadata* metadata) {
     if (!ctx || !metadata) return 0;
     ensure_edge_fifos(ctx);
