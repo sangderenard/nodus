@@ -920,8 +920,16 @@ add_executable(test_thread_manager
 target_link_libraries(test_thread_manager PRIVATE canvas_tables_static)
 add_test(NAME thread_manager_test COMMAND test_thread_manager)
 set_tests_properties(thread_manager_test PROPERTIES TIMEOUT 30)
+
+# Actual ThreadManager/GraphRuntime row execution with native CPU table FIFOs.
+# No graphics context, shader compilation, rendering, or device dispatch.
+add_executable(test_thread_manager_affinity tests/thread_manager_affinity_test.cpp)
+target_link_libraries(test_thread_manager_affinity PRIVATE canvas_tables_static)
+target_compile_features(test_thread_manager_affinity PRIVATE cxx_std_20)
+add_test(NAME thread_manager_affinity_test COMMAND test_thread_manager_affinity)
+set_tests_properties(thread_manager_affinity_test PROPERTIES TIMEOUT 30 LABELS "cpu;scheduler")
 if(WIN32)
-  set_tests_properties(thread_manager_test PROPERTIES
+  set_tests_properties(thread_manager_test thread_manager_affinity_test PROPERTIES
     ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:test_thread_manager>\;${TORCH_INSTALL_PREFIX}/lib"
   )
 endif()

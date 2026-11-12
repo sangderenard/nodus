@@ -499,6 +499,10 @@ int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int
 // call to gp_canvas_wait_for_thread_manager.
 int gp_canvas_set_thread_manager_mode(GP_CanvasContext* ctx, int mode);
 int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx, int* out_mode);
+// Debug switch: 1 keeps pooled worker entities alive across ticks (default),
+// 0 creates and joins parallel workers on each tick.
+int gp_canvas_set_persistent_workers(GP_CanvasContext* ctx, int enabled);
+int gp_canvas_get_persistent_workers(GP_CanvasContext* ctx, int* out_enabled);
 int gp_canvas_wait_for_thread_manager(GP_CanvasContext* ctx);
 int gp_canvas_get_thread_manager_paused(GP_CanvasContext* ctx, int* out_paused);
 int gp_canvas_set_thread_manager_paused(GP_CanvasContext* ctx, int paused);

@@ -596,6 +596,22 @@ extern "C" int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx_, int* ou
     return 1;
 }
 
+extern "C" int gp_canvas_set_persistent_workers(GP_CanvasContext* ctx_, int enabled) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->thread_mgr) return 0;
+    c->thread_mgr->set_persistent_workers(enabled != 0);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_persistent_workers(GP_CanvasContext* ctx_, int* out_enabled) {
+    if (!ctx_ || !out_enabled) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->thread_mgr) return 0;
+    *out_enabled = c->thread_mgr->persistent_workers() ? 1 : 0;
+    return 1;
+}
+
 extern "C" int gp_canvas_wait_for_thread_manager(GP_CanvasContext* ctx_) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);

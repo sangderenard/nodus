@@ -57,6 +57,7 @@ EXPORTS
     gp_canvas_get_table_tool_number
     gp_canvas_get_templates_dir
     gp_canvas_get_thread_manager_mode
+    gp_canvas_get_persistent_workers
     gp_canvas_get_thread_manager_paused
     gp_canvas_get_tool_row_id
     gp_canvas_get_window_node_id
@@ -112,6 +113,7 @@ EXPORTS
     gp_canvas_set_table_tool_number
     gp_canvas_set_templates_dir
     gp_canvas_set_thread_manager_mode
+    gp_canvas_set_persistent_workers
     gp_canvas_set_thread_manager_paused
     gp_canvas_stash_managed_event_payload
     gp_canvas_step

@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <array>
+#include <functional>
 #include "edge_reader_registry.h"
 #include "table_abi.h"
 #include "value_types.h"
@@ -187,6 +188,8 @@ public:
 
     void set_mode(Mode mode);
     Mode mode() const;
+    void set_persistent_workers(bool enabled);
+    bool persistent_workers() const;
     void set_module_tool_stack_default_type(ValueTypeId tid);
     ValueTypeId module_tool_stack_default_type() const;
 
@@ -337,12 +340,28 @@ private:
 
     void run_loop();
     void run_scheduled_tick(const TickRequest& req);
+    void ensure_pool_workers(size_t count);
+    void pool_worker_loop(size_t index, uint64_t seen_generation);
 
     GraphRuntime* graph_runtime_ = nullptr;
 
     std::atomic<Mode> mode_{Mode::Scheduled};
+    std::atomic<bool> persistent_workers_{true};
     std::atomic<bool> running_{false};
     std::thread worker_;
+
+    // Parallel module lanes persist across ticks. The manager publishes one
+    // tick-local ready-queue callback, then waits for the participating lanes
+    // before the callback's stack-owned state goes out of scope.
+    std::mutex pool_mu_;
+    std::condition_variable pool_cv_;
+    std::condition_variable pool_done_cv_;
+    std::vector<std::thread> pool_workers_;
+    std::function<void()> pool_task_;
+    uint64_t pool_generation_ = 0;
+    size_t pool_target_ = 0;
+    size_t pool_completed_ = 0;
+    bool pool_stop_ = false;
 
     mutable std::mutex mu_;
     std::condition_variable cv_;

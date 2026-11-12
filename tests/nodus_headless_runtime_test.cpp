@@ -543,6 +543,16 @@ static void test_contract_port_engine_reconnect_and_loan_ticks() {
 }
 
 int main() {
+    {
+        NodusHeadlessGraph* scheduler = nodus_headless_create();
+        assert(scheduler);
+        int32_t persistent = -1;
+        assert(nodus_headless_get_persistent_workers(scheduler, &persistent) && persistent == 1);
+        assert(nodus_headless_set_persistent_workers(scheduler, 0));
+        assert(nodus_headless_get_persistent_workers(scheduler, &persistent) && persistent == 0);
+        assert(nodus_headless_set_persistent_workers(scheduler, 1));
+        nodus_headless_destroy(scheduler);
+    }
     test_partial_cycle_freespinning_completes();
     test_quiescence_and_event();
     test_save_load_round_trip();

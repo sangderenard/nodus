@@ -2539,6 +2539,7 @@ struct FrontendOptions {
     // timing overrides: negative => not set
     double thread_delay = -1.0;
     double gui_delay = -1.0;
+    int persistent_workers = 1;
 
     struct CanvasConfig {
         int idx = 0;
@@ -2567,6 +2568,7 @@ static void print_usage(const char* progname) {
     std::cout << "  --console-token-file=<path>  File whose first line is the console token (needed by --attach)\n";
     std::cout << "  --verbose              Enable verbose logging\n";
     std::cout << "  --thread-delay=<s>     Global thread loop sleep (seconds, default ~0.016)\n";
+    std::cout << "  --persistent-workers=0|1  Keep pooled workers across ticks (default 1)\n";
     std::cout << "  --gui-delay=<s>        Global GUI delay used by tick controller (seconds)\n";
     std::cout << "  --canvas-config=IDX:DT:RATIO:FREE  Per-canvas thread config (FREE=0/1)\n";
     std::cout << "  --canvas-display-interval=IDX:SEC  Set display interval for canvas IDX\n";
@@ -2584,6 +2586,7 @@ FrontendOptions parse_frontend_options(int argc, char** argv) {
     const std::string height_prefix = "--height=";
     const std::string workspace_prefix = "--workspace=";
     const std::string thread_delay_prefix = "--thread-delay=";
+    const std::string persistent_workers_prefix = "--persistent-workers=";
     const std::string gui_delay_prefix = "--gui-delay=";
     const std::string canvas_config_prefix = "--canvas-config="; // IDX:DT:RATIO:FREE
     const std::string canvas_display_interval_prefix = "--canvas-display-interval="; // IDX:SEC
@@ -2626,6 +2629,10 @@ FrontendOptions parse_frontend_options(int argc, char** argv) {
             opts.workspace_path = arg.substr(workspace_prefix.size());
         } else if (arg.rfind(thread_delay_prefix, 0) == 0) {
             opts.thread_delay = std::stod(arg.substr(thread_delay_prefix.size()));
+        } else if (arg.rfind(persistent_workers_prefix, 0) == 0) {
+            const std::string value = arg.substr(persistent_workers_prefix.size());
+            if (value == "0" || value == "1") opts.persistent_workers = value[0] - '0';
+            else std::cerr << "--persistent-workers must be 0 or 1\n";
         } else if (arg.rfind(gui_delay_prefix, 0) == 0) {
             opts.gui_delay = std::stod(arg.substr(gui_delay_prefix.size()));
         } else if (arg.rfind(canvas_config_prefix, 0) == 0) {
@@ -3052,6 +3059,10 @@ int main(int argc, char** argv) {
     else tick_controller.set_global_thread_delay(kCanvasStepDt);
     if (options.gui_delay >= 0.0) tick_controller.set_global_gui_delay(options.gui_delay);
     else tick_controller.set_global_gui_delay(kCanvasStepDt);
+
+    for (const auto& head : resources.canvas_heads) {
+        if (head.context) gp_canvas_set_persistent_workers(head.context, options.persistent_workers);
+    }
 
     // apply per-canvas configs
     for (const auto& cc : options.canvas_configs) {

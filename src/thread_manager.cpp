@@ -321,6 +321,10 @@ int32_t ThreadManager::find_node_index(GP_TableContext* table, uint64_t key) con
 void ThreadManager::start() {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) return;
+    {
+        std::lock_guard<std::mutex> lk(pool_mu_);
+        pool_stop_ = false;
+    }
     worker_ = std::thread([this]() { run_loop(); });
 }
 
@@ -334,6 +338,16 @@ void ThreadManager::stop() {
     cv_.notify_all();
     cv_done_.notify_all();
     if (worker_.joinable()) worker_.join();
+    {
+        std::lock_guard<std::mutex> lk(pool_mu_);
+        pool_stop_ = true;
+    }
+    pool_cv_.notify_all();
+    for (auto& lane : pool_workers_) if (lane.joinable()) lane.join();
+    pool_workers_.clear();
+    pool_task_ = {};
+    pool_target_ = 0;
+    pool_completed_ = 0;
 }
 
 void ThreadManager::set_mode(Mode mode) {
@@ -342,6 +356,44 @@ void ThreadManager::set_mode(Mode mode) {
 
 ThreadManager::Mode ThreadManager::mode() const {
     return mode_.load(std::memory_order_relaxed);
+}
+
+void ThreadManager::set_persistent_workers(bool enabled) {
+    persistent_workers_.store(enabled, std::memory_order_relaxed);
+}
+
+bool ThreadManager::persistent_workers() const {
+    return persistent_workers_.load(std::memory_order_relaxed);
+}
+
+void ThreadManager::ensure_pool_workers(size_t count) {
+    // Called only by the manager lane, between parallel ticks.
+    while (pool_workers_.size() < count) {
+        const size_t index = pool_workers_.size();
+        const uint64_t seen = pool_generation_;
+        pool_workers_.emplace_back([this, index, seen]() { pool_worker_loop(index, seen); });
+    }
+}
+
+void ThreadManager::pool_worker_loop(size_t index, uint64_t seen_generation) {
+    for (;;) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lk(pool_mu_);
+            pool_cv_.wait(lk, [&]() {
+                return pool_stop_ || (pool_generation_ != seen_generation && index < pool_target_);
+            });
+            if (pool_stop_) return;
+            seen_generation = pool_generation_;
+            task = pool_task_;
+        }
+        task();
+        {
+            std::lock_guard<std::mutex> lk(pool_mu_);
+            ++pool_completed_;
+            if (pool_completed_ == pool_target_) pool_done_cv_.notify_one();
+        }
+    }
 }
 
 void ThreadManager::submit_tick(TickRequest req, bool wait) {
@@ -1531,8 +1583,8 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         for (int i = 0; i < N; ++i) {
             // Slip modules are enqueued immediately regardless of predecessor
             // counts. Pooled modules join the ready set when their predecessors
-            // are satisfied. Sequential modules remain manager-thread-only
-            // unless forced into parallel by other policies.
+            // are satisfied. Sequential modules use the same dependency
+            // queue, but only the manager thread may take them.
             if (pred_count[i].load(std::memory_order_relaxed) == 0 || req.modules[static_cast<size_t>(i)].exec_mode == ThreadManager::ExecMode::Slip) {
                 ready.push_back(i);
             }
@@ -1547,46 +1599,68 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         std::mutex ready_mu;
         std::condition_variable ready_cv;
         std::atomic<int> remaining(static_cast<int>(order.size()));
-        auto worker = [&]() {
+        auto worker = [&](bool manager_lane) {
             while (true) {
                 int idx = -1;
                 {
                     std::unique_lock<std::mutex> lk(ready_mu);
-                    ready_cv.wait(lk, [&]() { return !ready.empty() || remaining.load(std::memory_order_relaxed) == 0; });
-                    if (ready.empty()) {
+                    auto next_ready = [&]() {
+                        return std::find_if(ready.begin(), ready.end(), [&](int candidate) {
+                            const bool sequential = req.modules[static_cast<size_t>(candidate)].exec_mode == ExecMode::Sequential;
+                            return sequential == manager_lane;
+                        });
+                    };
+                    ready_cv.wait(lk, [&]() { return next_ready() != ready.end() || remaining.load(std::memory_order_relaxed) == 0; });
+                    auto next = next_ready();
+                    if (next == ready.end()) {
                         if (remaining.load(std::memory_order_relaxed) == 0) break;
                         continue;
                     }
-                    idx = ready.front();
-                    ready.pop_front();
+                    idx = *next;
+                    ready.erase(next);
                 }
                 execute_module(idx);
-                for (int succ_idx : succ[idx]) {
-                    if (succ_idx < 0 || succ_idx >= N) continue;
-                    int prev = pred_count[succ_idx].fetch_sub(1, std::memory_order_relaxed);
-                    if (prev == 1) {
-                        std::lock_guard<std::mutex> lk(ready_mu);
-                        ready.push_back(succ_idx);
-                        ready_cv.notify_one();
-                    }
-                }
-                if (remaining.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                {
                     std::lock_guard<std::mutex> lk(ready_mu);
-                    ready_cv.notify_all();
+                    for (int succ_idx : succ[idx]) {
+                        if (succ_idx < 0 || succ_idx >= N) continue;
+                        int prev = pred_count[succ_idx].fetch_sub(1, std::memory_order_relaxed);
+                        // Slip modules were already admitted at tick start.
+                        // Re-enqueuing them when predecessors finish would
+                        // execute them twice and release their successors early.
+                        if (prev == 1 && req.modules[static_cast<size_t>(succ_idx)].exec_mode != ExecMode::Slip) {
+                            ready.push_back(succ_idx);
+                        }
+                    }
+                    remaining.fetch_sub(1, std::memory_order_relaxed);
                 }
+                // A newly ready module may belong to either lane; waking an
+                // arbitrary worker can leave the manager asleep indefinitely.
+                ready_cv.notify_all();
             }
         };
-        std::vector<std::thread> workers;
-        workers.reserve(thread_count);
-        for (int ti = 0; ti < thread_count; ++ti) {
-            workers.emplace_back(worker);
-        }
-        {
-            std::lock_guard<std::mutex> lk(ready_mu);
-            ready_cv.notify_all();
-        }
-        for (auto& worker_thread : workers) {
-            if (worker_thread.joinable()) worker_thread.join();
+        if (persistent_workers()) {
+            ensure_pool_workers(static_cast<size_t>(thread_count));
+            {
+                std::lock_guard<std::mutex> lk(pool_mu_);
+                pool_task_ = [&]() { worker(false); };
+                pool_target_ = static_cast<size_t>(thread_count);
+                pool_completed_ = 0;
+                ++pool_generation_;
+            }
+            pool_cv_.notify_all();
+            // Sequential rows still execute on the manager lane.
+            worker(true);
+            std::unique_lock<std::mutex> lk(pool_mu_);
+            pool_done_cv_.wait(lk, [&]() { return pool_completed_ == pool_target_; });
+            pool_task_ = {};
+        } else {
+            // Debug path: reproduce the former per-tick construction/join.
+            std::vector<std::thread> workers;
+            workers.reserve(thread_count);
+            for (int ti = 0; ti < thread_count; ++ti) workers.emplace_back(worker, false);
+            worker(true);
+            for (auto& lane : workers) if (lane.joinable()) lane.join();
         }
     };
 
