@@ -3,7 +3,8 @@
 //
 // Wraps a GP_CanvasContext purely as an in-process graph container and tool
 // dispatch mechanism: nothing here ever calls gp_canvas_raster_rgba or any
-// other rendering entry point, and no window/SDL/GL handle is ever created.
+// other rendering entry point, and no window or GL rendering context is created by this graph API. Optional
+// audio tool rows may own SDL audio-device handles.
 // This is the "Prong 1" headless entry point: build or load a tool graph,
 // run ThreadManager's real scheduler to quiescence, and exchange data at a
 // small set of named external ports, all from a plain console process (or
@@ -149,6 +150,11 @@ typedef struct NodusRadioStatus {
 } NodusRadioStatus;
 // Select WAV playback before constructing/launching the Radio table. No loopback capture.
 NODUS_HEADLESS_API int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int32_t loop);
+// Opt-in private PCM RTP sender; configure before binding rows, then bind its
+// canonical canvas output FIFO before launching. Requires file source, hop 256.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_configure(uint16_t loopback_port);
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, uint64_t* dropped);
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module_idx);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
 // Configured edge FIFOs and named ports are persisted by
@@ -254,6 +260,11 @@ NODUS_HEADLESS_API int32_t nodus_headless_declare_output_port_ex(
     int32_t start_at_head);
 NODUS_HEADLESS_API int32_t nodus_headless_push_token(NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len);
 NODUS_HEADLESS_API int32_t nodus_headless_push_token_ex(
+    NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* out_result);
+// Native source rows may publish onto a declared output using the same edge
+// transport. Declare/configure all ports before launching persistent workers.
+NODUS_HEADLESS_API int32_t nodus_headless_publish_output_token(
     NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
     NodusHeadlessPublishResult* out_result);
 NODUS_HEADLESS_API int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written);

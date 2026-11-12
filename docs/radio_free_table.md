@@ -108,3 +108,61 @@ Tempest was generated with unchanged `spectral-analyzer/demo_song_wav.py` at
 by that repository's MIT license. Output and its license stay in untracked user
 assets, not this repository. Its generator docstring says PCM16, but its actual
 writer emits float32; SDL's WAV conversion supports the real emitted format.
+
+## Opt-in PCM backend output
+
+A final CLI argument selects a **separate private PCM destination**:
+
+```powershell
+nodus_radio.exe <scope.dll> <fft.dll> 127.0.0.1 <NRAD-port> 0 5 1024 <wav> 1 <PCM-port>
+```
+
+This file-source mode uses a third registered row, `radio.pcm_rtp`, in the same
+Free table. The source publishes the actual stereo samples into the canonical
+canvas/table-edge named output `radio.pcm`; the RTP row consumes that FIFO. It
+is not a spectrum reconstruction, private queue replacement, or new router.
+The FIFO is 16 fixed-size blocks, keeps the newest 8 on overflow, and records
+refused/overwritten packets. `nodus_headless_publish_output_token` is the narrow
+native writer operation on an existing named output, using the ordinary table
+edge publication API. Declare/bind before starting persistent execution.
+
+Initial scope: WAV sources, 256-frame hops (1024 FFT / overlap4), stereo48kHz.
+SDL performs necessary resampling before the samples enter the scope/PCM FIFO.
+The 2064-byte internal block carries first-frame index, rate, valid frame count,
+and 256 interleaved float32 stereo frames. The wire uses standard RTPv2 dynamic
+payload96, L16/48000/2, signed16 big-endian samples. RTP timestamps increment in
+sample frames; initial sequence, timestamp and SSRC are randomized. Typical
+payload1024 bytes + RTP header12 bytes fits a normal Ethernet MTU. Clipping and
+16-bit quantization are explicit; NRAD v1 remains unchanged. A partial final
+file block is a shorter valid RTP payload (the initial backend's fixed-block
+receiver may discard it; pad/flush policy is not silently invented).
+
+The sender binds and targets loopback only. It prints its source port and SSRC
+for a backend to pin, and separate `pcm_packets` / `pcm_dropped` counters.
+RTP itself is not encrypted or authenticated. No public endpoint, firewall rule,
+account grant, multicast, or automatic public subscription was added. Existing
+backend policy must authorize/allocate a subscription before opening its port.
+
+### Current native UDP route, not the optional SQL send quota
+
+The current `tools/udp_router/udp_router.cpp` in canonical Nodus owns UDP sockets
+and greedily drains them into bounded per-destination BATCH frames for local TCP
+service clients. OPEN/CLOSE/SEND ownership is per connection. It has no600/minute
+rate gate. Python `relay.py` has a configurable600/minute default only for its
+own authenticated outgoing send API; this does **not** restrict native incoming
+PCM or the native service BATCH interface. No quota change or alternate router
+is needed for this path.
+
+`tools/test_radio_pcm_router.py` runs the real WAV source, real canvas FIFO,
+RTP row, unchanged native router and BATCH subscription in isolated loopback
+processes. It explicitly selects `SDL_AUDIODRIVER=dummy`, so it is silent. A
+three-second run received576 valid PCM packets with monotonic timestamps and
+sequence, stableSSRC, nonzero stereo data and expected mono-to-stereo mapping.
+
+A separate four-second integration with Turing's actual backend `Subscription`
+(at5d8597c7) observed756 sent, zero native drops;738 accepted by the subscriber,
+zero invalid/foreign/rejected and zero resyncs. The caller-clocked consumer
+returned756 blocks including18 silence concealments and reported10 late packets.
+These startup/clock/end-of-stream results are not a lossless or production PA
+latency guarantee. The receiver needs caller clock/lifetime management; native
+RTP currently has no RTCP BYE/end-of-stream message. No live site deployed.

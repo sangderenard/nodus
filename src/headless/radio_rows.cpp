@@ -10,9 +10,11 @@
 #include <SDL3/SDL.h>
 
 #include <array>
+#include <algorithm>
 #include <filesystem>
 #include <climits>
 #include <cstdio>
+#include <random>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -40,10 +42,14 @@ struct Config {
     float max_hz = 0;
     std::wstring wav;
     bool loop = false;
+    uint16_t pcm_port = 0;
 };
 
 struct Shared {
     Config config;
+    NodusHeadlessGraph* pcm_graph = nullptr;
+    std::atomic<uint64_t> pcm_dropped{0};
+    std::atomic<uint64_t> pcm_emitted{0};
     std::atomic<uint64_t> captured{0};
     std::atomic<uint64_t> emitted{0};
     std::atomic<uint64_t> dropped{0};
@@ -53,6 +59,15 @@ struct Shared {
 
 std::mutex config_mutex;
 std::shared_ptr<Shared> configured;
+
+struct PcmBlock {
+    uint64_t first_frame = 0;
+    uint32_t sample_rate = 48000;
+    uint32_t frames = 0;
+    std::array<float, 512> stereo{};
+};
+static_assert(sizeof(PcmBlock) == 2064);
+constexpr const char* kPcmPort = "radio.pcm";
 
 struct RadioFrame {
     uint32_t magic = kFrameMagic;
@@ -107,17 +122,17 @@ public:
             if (!SDL_LoadWAV(reinterpret_cast<const char*>(utf8.c_str()), &spec, &original, &length)) return;
             const int source_frame_bytes = SDL_AUDIO_FRAMESIZE(spec);
             if (source_frame_bytes <= 0 || spec.freq <= 0 ||
-                (static_cast<uint64_t>(length) / source_frame_bytes) * 8 > 64u * 1024u * 1024u) {
+                (static_cast<uint64_t>(length) / source_frame_bytes) * 8 * (c.pcm_port ? 48000 : spec.freq) / spec.freq > 64u * 1024u * 1024u) {
                 SDL_free(original); return;
             }
-            SDL_AudioSpec target{SDL_AUDIO_F32, 2, spec.freq};
+            SDL_AudioSpec target{SDL_AUDIO_F32, 2, c.pcm_port ? 48000 : spec.freq};
             Uint8* converted = nullptr;
             int converted_length = 0;
             const bool ok = length <= INT_MAX && SDL_ConvertAudioSamples(&spec, original, static_cast<int>(length),
                 &target, &converted, &converted_length);
             SDL_free(original);
             if (!ok) return;
-            if (converted_length <= 0 || converted_length % (2 * sizeof(float))) { SDL_free(converted); return; }
+            if (converted_length <= 0 || converted_length > 64 * 1024 * 1024 || converted_length % (2 * sizeof(float))) { SDL_free(converted); return; }
             samples_.resize(static_cast<size_t>(converted_length) / sizeof(float));
             std::memcpy(samples_.data(), converted, converted_length);
             SDL_free(converted);
@@ -159,6 +174,15 @@ public:
             if (!SDL_PutAudioStreamData(stream_, samples_.data() + position_, static_cast<int>(count * 2 * sizeof(float))) ||
                 !feed_(scope_, samples_.data() + position_, count, rate_)) {
                 shared_->running.store(0); ctx.succeeded = false; return;
+            }
+            if (shared_->config.pcm_port && shared_->pcm_graph) {
+                PcmBlock block{};
+                block.frames = static_cast<uint32_t>(count);
+                block.first_frame = frame_count_(scope_) - count;
+                std::copy_n(samples_.data() + position_, count * 2, block.stereo.data());
+                NodusHeadlessPublishResult result{};
+                if (!nodus_headless_publish_output_token(shared_->pcm_graph, kPcmPort, &block, sizeof(block), &result) ||
+                    !result.accepted || result.dropped) shared_->pcm_dropped.fetch_add(1);
             }
             position_ += count * 2;
         }
@@ -301,6 +325,71 @@ private:
     int destination_bytes_ = 0;
 };
 
+// Independent PCM destination: RTP v2 / dynamic PT 96 / L16 48000 Hz stereo.
+// NRAD is unchanged. The sender consumes the real canvas output FIFO, not FFT.
+class RadioPcmUdp final : public ITool {
+public:
+    explicit RadioPcmUdp(std::shared_ptr<Shared> shared) : shared_(std::move(shared)) {}
+    ~RadioPcmUdp() noexcept override { shutdown(); }
+    const char* id_cstr() const noexcept override { return "radio.pcm_rtp"; }
+    const char* name_cstr() const noexcept override { return "Radio PCM RTP"; }
+    void initialize(const ToolInitContext&) override {
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data)) return;
+        ready_ = true;
+        socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (socket_ == INVALID_SOCKET) return;
+        sockaddr_in local{}; local.sin_family = AF_INET; local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(socket_, reinterpret_cast<sockaddr*>(&local), sizeof(local))) return;
+        u_long nonblocking = 1; ioctlsocket(socket_, FIONBIO, &nonblocking);
+        int size = sizeof(local); getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &size);
+        destination_.sin_family = AF_INET;
+        destination_.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        destination_.sin_port = htons(shared_->config.pcm_port);
+        std::random_device random;
+        ssrc_ = random(); sequence_ = static_cast<uint16_t>(random()); timestamp_base_ = random();
+        std::printf("radio_pcm_source_port=%u rtp_payload=96 encoding=L16 rate=48000 channels=2 ssrc=%u\n",
+            static_cast<unsigned>(ntohs(local.sin_port)), ssrc_);
+        std::fflush(stdout);
+    }
+    void shutdown() override {
+        if (socket_ != INVALID_SOCKET) { closesocket(socket_); socket_ = INVALID_SOCKET; }
+        if (ready_) { WSACleanup(); ready_ = false; }
+    }
+    void tick(double, HostAPI&) override {}
+    void render(RenderContext&) override {}
+    void execute_stack(ToolStackContext&) override {
+        if (!shared_->pcm_graph || socket_ == INVALID_SOCKET) return;
+        PcmBlock block{}; size_t written = 0;
+        if (!nodus_headless_pull_token(shared_->pcm_graph, kPcmPort, &block, sizeof(block), &written)) return;
+        if (written != sizeof(block) || !block.frames || block.frames > 256 || block.sample_rate != 48000) {
+            shared_->pcm_dropped.fetch_add(1); return;
+        }
+        std::array<uint8_t, 12 + 1024> packet{};
+        packet[0] = 0x80; packet[1] = 96;
+        auto u16 = [&](size_t pos, uint16_t x) { packet[pos] = static_cast<uint8_t>(x >> 8); packet[pos + 1] = static_cast<uint8_t>(x); };
+        auto u32 = [&](size_t pos, uint32_t x) { u16(pos, static_cast<uint16_t>(x >> 16)); u16(pos + 2, static_cast<uint16_t>(x)); };
+        u16(2, sequence_++); u32(4, timestamp_base_ + static_cast<uint32_t>(block.first_frame)); u32(8, ssrc_);
+        for (size_t i = 0; i < block.frames * 2; ++i) {
+            const float sample = std::clamp(block.stereo[i], -1.0f, 1.0f);
+            const int value = static_cast<int>(std::lround(sample * 32767.0f));
+            u16(12 + i * 2, static_cast<uint16_t>(static_cast<int16_t>(value)));
+        }
+        const int bytes = 12 + block.frames * 4;
+        if (sendto(socket_, reinterpret_cast<const char*>(packet.data()), bytes, 0,
+                   reinterpret_cast<const sockaddr*>(&destination_), sizeof(destination_)) != bytes)
+            shared_->pcm_dropped.fetch_add(1);
+        else shared_->pcm_emitted.fetch_add(1);
+    }
+private:
+    std::shared_ptr<Shared> shared_;
+    SOCKET socket_ = INVALID_SOCKET;
+    sockaddr_in destination_{};
+    bool ready_ = false;
+    uint16_t sequence_ = 0;
+    uint32_t ssrc_ = 0, timestamp_base_ = 0;
+};
+
 ToolRegistry::Entry entry(const char* id, const char* name,
                           ToolRegistry::Factory factory) {
     ToolRegistry::Entry result;
@@ -352,6 +441,34 @@ extern "C" int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int
         [shared] { return ToolRegistry::Factory::result_type(new RadioSource(shared), [](ITool* p) { delete p; }); })) ? 1 : 0;
 }
 
+extern "C" int32_t nodus_headless_radio_pcm_configure(uint16_t port) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!configured || !port || configured->config.wav.empty() || configured->running.load() ||
+        configured->config.fft_size / configured->config.overlap != 256) return 0;
+    auto shared = configured;
+    if (!tool_registry_global().register_tool(entry("radio.pcm_rtp", "Radio PCM RTP",
+        [shared] { return ToolRegistry::Factory::result_type(new RadioPcmUdp(shared), [](ITool* p) { delete p; }); }))) return 0;
+    configured->config.pcm_port = port;
+    return 1;
+}
+extern "C" int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!configured || !configured->config.pcm_port || configured->captured.load()) return 0;
+    NodusHeadlessFifoConfig fifo{};
+    fifo.token_bytes = sizeof(PcmBlock); fifo.slots = 16; fifo.top_k = 8;
+    fifo.type_id = -1; fifo.layout = 2; fifo.dtype = 0; fifo.backend_type = GP_MEM_BACKEND_CPU;
+    if (!nodus_headless_declare_output_port_ex(graph, kPcmPort, module, 2, &fifo, 1)) return 0;
+    configured->pcm_graph = graph;
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, uint64_t* dropped) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!configured || !emitted || !dropped) return 0;
+    *emitted = configured->pcm_emitted.load(); *dropped = configured->pcm_dropped.load();
+    return 1;
+}
+
 extern "C" int32_t nodus_headless_radio_status(NodusRadioStatus* out_status) {
     if (!out_status) return 0;
     std::lock_guard<std::mutex> lock(config_mutex);
@@ -368,5 +485,8 @@ extern "C" int32_t nodus_headless_radio_configure(
     const wchar_t*, const wchar_t*, const char*, uint16_t,
     uint32_t, uint32_t, uint32_t, float, float) { return 0; }
 extern "C" int32_t nodus_headless_radio_file_source(const wchar_t*, int32_t) { return 0; }
+extern "C" int32_t nodus_headless_radio_pcm_configure(uint16_t) { return 0; }
+extern "C" int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph*, int32_t) { return 0; }
+extern "C" int32_t nodus_headless_radio_pcm_status(uint64_t*, uint64_t*) { return 0; }
 extern "C" int32_t nodus_headless_radio_status(NodusRadioStatus*) { return 0; }
 #endif

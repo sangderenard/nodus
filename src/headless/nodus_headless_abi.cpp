@@ -924,6 +924,20 @@ extern "C" int32_t nodus_headless_push_token_ex(
     return 1;
 }
 
+extern "C" int32_t nodus_headless_publish_output_token(
+    NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* out_result) {
+    if (out_result) *out_result = NodusHeadlessPublishResult{};
+    if (!g || !g->table || !port_name || !bytes) return 0;
+    auto it = g->output_ports.find(port_name);
+    if (it == g->output_ports.end() || len != static_cast<size_t>(it->second.config.token_bytes)) return 0;
+    int32_t dropped = 0;
+    const int32_t ok = gp_table_edge_publish(g->table, it->second.edge_idx, it->second.key,
+        bytes, static_cast<int32_t>(len), &dropped);
+    if (out_result) { out_result->accepted = ok != 0; out_result->dropped = dropped != 0; }
+    return 1;
+}
+
 extern "C" int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written) {
     if (!g || !g->table || !port_name) return 0;
     auto it = g->output_ports.find(port_name);
