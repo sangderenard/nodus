@@ -30,6 +30,7 @@
 #include "tool_api.h"
 #include "value_types.h"
 
+#include <cstdio>
 #include <deque>
 #include <memory>
 #include <string>
@@ -74,11 +75,16 @@ public:
     bool deserialize(InputArchive& in) override {
         nodus::exec::RowSettings read;
         if (!nodus::exec::read_settings(in, read)) return false;
+        configure(std::move(read));
+        return true;
+    }
+
+    // The row's settings, replacing whatever it had. A declared row is given its settings this way when it is made.
+    void configure(nodus::exec::RowSettings settings) {
         shutdown();
-        settings_ = std::move(read);
+        settings_ = std::move(settings);
         refused_.clear();
         keep_one_waiting();
-        return true;
     }
 
     void execute_stack(ToolStackContext& ctx) override {
@@ -185,6 +191,7 @@ private:
 
     void report(const std::string& why) {
         if (g_host) g_host->log(("exec row: " + why).c_str());
+        else std::fprintf(stderr, "exec row: %s\n", why.c_str());      // compiled into the image: no plugin host
     }
 
     nodus::exec::RowSettings settings_;

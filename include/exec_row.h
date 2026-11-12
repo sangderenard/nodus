@@ -7,6 +7,20 @@
 // The core roots are declared by the host, never by the row: they come from the environment variable
 // NODUS_EXEC_CORE_ROOTS (paths separated by ';') that the process hosting Nodus is started with. A row's saved
 // settings cannot add to them or leave them out, and a host that declared none gets a row that starts nothing.
+//
+// Declared rows. A canvas binds a tool row by its registry id alone and hands it no settings, so an exec row that can
+// be placed in a canvas is one the host declared: the environment variable NODUS_EXEC_ROWS names a text file, and
+// each row in it becomes one registry entry (src/tools/exec_row_registered.cpp). The file is blocks of
+// "key value" lines, the value running to the end of the line; a "row" line starts a block:
+//
+//   row exec.zstd.pack                 the registry id; always under "exec."
+//   name Zstd pack                     shown in the tool menu (the id when left out)
+//   program C:/tools/zstd/zstd.exe
+//   argument -c                        any number, in order
+//   directory C:/scratch/exec          the working directory, outside the core
+//   most 2                             children working at once (2 when left out)
+//
+// Blank lines and lines that start with '#' are skipped. Anything else stops the reading with the line named.
 #pragma once
 
 #include "exec_pipe.h"
@@ -83,6 +97,61 @@ inline std::vector<std::string> declared_core_roots() {
         start = end + 1;
     }
     return roots;
+}
+
+struct DeclaredRow {
+    std::string id;
+    std::string name;
+    RowSettings settings;
+};
+
+// The rows a declarations file holds. False, with the reason, when the file cannot be read as one.
+inline bool read_declared_rows(const std::string& path, std::vector<DeclaredRow>& rows, std::string& why) {
+    std::ifstream file(path);
+    if (!file.good()) { why = "the declarations file cannot be opened: " + path; return false; }
+    std::vector<DeclaredRow> read;
+    std::string line;
+    for (int number = 1; std::getline(file, line); ++number) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        const size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || line[first] == '#') continue;
+        const size_t gap = line.find_first_of(" \t", first);
+        const std::string key = line.substr(first, gap == std::string::npos ? std::string::npos : gap - first);
+        const size_t at = gap == std::string::npos ? std::string::npos : line.find_first_not_of(" \t", gap);
+        const std::string value = at == std::string::npos ? std::string() : line.substr(at);
+        const std::string where = "line " + std::to_string(number) + " of " + path + ": ";
+        if (value.empty()) { why = where + "'" + key + "' has no value"; return false; }
+        if (key == "row") {
+            if (value.rfind("exec.", 0) != 0 || value.size() == 5) { why = where + "a declared row's id is under 'exec.'"; return false; }
+            for (const DeclaredRow& other : read)
+                if (other.id == value) { why = where + "row '" + value + "' is declared twice"; return false; }
+            read.push_back(DeclaredRow{value, value, RowSettings{}});
+            continue;
+        }
+        if (read.empty()) { why = where + "'" + key + "' comes before any 'row'"; return false; }
+        DeclaredRow& row = read.back();
+        if (key == "name") row.name = value;
+        else if (key == "program") row.settings.program = value;
+        else if (key == "argument") row.settings.arguments.push_back(value);
+        else if (key == "directory") row.settings.working_dir = value;
+        else if (key == "most") {
+            char* end = nullptr;
+            const unsigned long most = std::strtoul(value.c_str(), &end, 10);
+            if (!end || *end != '\0' || most == 0 || most > 64) { why = where + "'most' is a count from 1 to 64"; return false; }
+            row.settings.most_at_once = static_cast<uint32_t>(most);
+        } else { why = where + "'" + key + "' is not a declaration"; return false; }
+    }
+    rows = std::move(read);
+    return true;
+}
+
+// The declarations file the host named for this process; empty when it named none.
+inline std::string declared_rows_file() {
+    const DWORD needed = GetEnvironmentVariableA("NODUS_EXEC_ROWS", nullptr, 0);
+    if (needed == 0) return {};
+    std::string path(needed, '\0');
+    path.resize(GetEnvironmentVariableA("NODUS_EXEC_ROWS", path.data(), needed));
+    return path;
 }
 
 // The program a row with these settings would start, held to the host's declaration of the core.

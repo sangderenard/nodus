@@ -22,3 +22,13 @@ foreach(target exec_row_tool exec_row_test)
   target_link_libraries(${target} PRIVATE "${NODUS_TENSOR_CORE_DIR}/nodus_tensor_core.lib")
   target_compile_definitions(${target} PRIVATE NOMINMAX)
 endforeach()
+
+# The row as it sits in the tool registry: the registration source and the real registry, compiled here by
+# themselves, so the registration is proven without building the canvas image.
+#   exec_row_registry_test declare <file> <compressor> <scratch-dir>
+#   (with NODUS_EXEC_ROWS=<file> and NODUS_EXEC_CORE_ROOTS=<core> set)  exec_row_registry_test check <file> <compressor> <scratch-dir>
+add_executable(exec_row_registry_test exec_row_registry_test.cpp
+  "${NODUS_ROOT}/src/tools/exec_row_registered.cpp" "${NODUS_ROOT}/src/tool_registry.cpp")
+target_include_directories(exec_row_registry_test PRIVATE "${NODUS_ROOT}" "${NODUS_ROOT}/include")
+target_link_libraries(exec_row_registry_test PRIVATE "${NODUS_TENSOR_CORE_DIR}/nodus_tensor_core.lib")
+target_compile_definitions(exec_row_registry_test PRIVATE NOMINMAX)
