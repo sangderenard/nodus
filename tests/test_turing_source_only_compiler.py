@@ -133,3 +133,39 @@ def test_cli_emission_success_without_adoption(source_request, tmp_path, monkeyp
     assert adapter.main(['--request', str(path)]) == 0
 
 
+
+
+@pytest.mark.parametrize('name', [
+    'main.<locals>._doc_id', 'Owner.method.<locals>.inner',
+    'outer.<locals>.inner.<locals>.deep', 'Outer.Inner.method',
+    'outer.<locals>.LocalClass.method', 'Owner.method.<locals>.inner.<locals>.deep',
+])
+def test_authored_nested_names_preserved(source_request, name):
+    source_request['source_names'] = [name]
+    stub = StubDivider()
+    result = adapter.compile_row_tool(source_request, compiler=stub)
+    assert stub.spec['names'] == [name]
+    assert result['source_names'] == [name]
+    assert result['attempt']['entries'][0]['name'] == name
+    assert stub.source == source_request['source_text'].encode()
+
+
+@pytest.mark.parametrize('name', [
+    '', '.entry', 'entry.', 'Owner..method', '<locals>', '<locals>.entry',
+    'outer.<locals>', 'outer.<locals>.<locals>.inner', 'outer.<locals>..inner',
+    'outer.<local>.inner', 'outer.<lambda>.inner', 'outer.<locals>/inner',
+    'outer/<locals>/inner', 'outer.\\inner', '../outer', 'C:/outer',
+    'outer.<locals>.../inner', 'outer.<locals>.inner\x00',
+])
+def test_malformed_authored_names_rejected_before_writes(source_request, name):
+    source_request['source_names'] = [name]
+    with pytest.raises(ValueError, match='source_names'):
+        adapter.compile_row_tool(source_request, compiler=StubDivider())
+    assert not Path(source_request['output_dir']).exists()
+
+
+def test_nested_name_stem_collision_rejected(source_request):
+    source_request['source_names'] = ['main.<locals>._doc_id', 'main_locals__doc_id']
+    with pytest.raises(ValueError, match='collide'):
+        adapter.compile_row_tool(source_request, compiler=StubDivider())
+    assert not Path(source_request['output_dir']).exists()

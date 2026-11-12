@@ -247,6 +247,24 @@ class RowToolRequest:
         )
 
 
+def _valid_authored_name(name: Any) -> bool:
+    """Validate catalogue spelling, not source structure or a replacement partition.
+
+    Turing's source divider uses C.m and f.<locals>.g, including repeated
+    lexical nesting. Preserve those names verbatim for the existing divider.
+    """
+    if not isinstance(name, str):
+        return False
+    parts = name.split(".")
+    return all(
+        part.isidentifier() or (
+            part == "<locals>" and 0 < index < len(parts) - 1
+            and parts[index - 1].isidentifier() and parts[index + 1].isidentifier()
+        )
+        for index, part in enumerate(parts)
+    )
+
+
 def _source_only_request(value: Mapping[str, Any]) -> RowToolRequest:
     allowed = {"unstable_source_only", "source_names", "source_text", "source_path",
                "backend", "output_dir", "extraction_contract", "turing_root",
@@ -256,8 +274,7 @@ def _source_only_request(value: Mapping[str, Any]) -> RowToolRequest:
                          + ", ".join(sorted(set(value) - allowed)))
     names = value.get("source_names")
     if (not isinstance(names, (list, tuple)) or not names
-            or any(not isinstance(name, str) or not name or
-                   any(not part.isidentifier() for part in name.split(".")) for name in names)
+            or any(not _valid_authored_name(name) for name in names)
             or len(set(names)) != len(names)):
         raise ValueError("source_names must be non-empty unique authored names")
     # The existing divider maps qualified names to directory stems.
