@@ -182,7 +182,13 @@ int main() {
     for (const std::string request : {R"({"unstable_source_only":true})",
                                      R"({"unstable\u005fsource_only":true})",
                                      R"({"unstable_source_only":false,"unstable_source_only":true})",
-                                     R"({"source_names":["entry"]})"}) {
+                                     R"({"source_names":["entry"]})",
+                                     R"({"unstable_source_only":false,"unstable_source_only":false})",
+                                     R"({"unstable_source_only":"false"})",
+                                     R"({"unstable_source_only":0})",
+                                     R"({"unstable_source_only":falsex})",
+                                     R"({"unstable_source_only":)",
+                                     R"({"unstable_source_only":false,"source_names":[]})"}) {
         const int before = lines(counter);
         write(jobs / "501.request.json", request);
         write(jobs / "501" / "nodus-row-tool-product.receipt",
@@ -197,6 +203,19 @@ int main() {
         assert(e.has_result && e.result.payload == (uint64_t)CompileStatus::CompileFailed);
         assert(lines(counter) == before); // no driver, importer, build or load
         assert(fs::exists(jobs / "501" / "nodus-row-tool-product.receipt"));
+    }
+    // Explicit false is the stable-row mode, including escaped field spelling.
+    for (const std::string request : {R"({"unstable_source_only":false})",
+                                     R"({"unstable\u005fsource_only":false})"}) {
+        const int before = lines(counter);
+        write(jobs / "501.request.json", request); // valid cached row from above
+        auto stable_cfg = cfg; stable_cfg.adopt = false;
+        TuringCompileHost host(stable_cfg); Peer p = host.peer();
+        Loan loan; loan.work = {501, 10, 1, 5}; loan.generation = 1; loan.host = 7; loan.deadline = 1000;
+        assert(p.exchange(&loan).accepted_generation == 1);
+        auto e = p.exchange(nullptr);
+        assert(e.has_result && e.result.payload == (uint64_t)CompileStatus::ExistingProduct);
+        assert(lines(counter) == before);
     }
     // Cancellation: shutdown kills a 10 s child promptly.
     {

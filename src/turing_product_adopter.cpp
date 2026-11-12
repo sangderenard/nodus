@@ -165,7 +165,9 @@ bool resolve_product_file(const fs::path& product_root,
     return true;
 }
 
-bool top_level_json_value(const std::string& text, const std::string& key, size_t* value_pos) {
+bool top_level_json_value(const std::string& text, const std::string& key, size_t* value_pos,
+                          size_t* occurrences = nullptr) {
+    if (occurrences) *occurrences = 0;
     int depth = 0;
     for (size_t pos = 0; pos < text.size();) {
         if (text[pos] == '{' || text[pos] == '[') { ++depth; ++pos; continue; }
@@ -201,13 +203,17 @@ bool top_level_json_value(const std::string& text, const std::string& key, size_
         size_t after = text.find_first_not_of(" \t\r\n", pos + 1);
         if (depth == 1 && token == key && after != std::string::npos && text[after] == ':') {
             after = text.find_first_not_of(" \t\r\n", after + 1);
-            if (after == std::string::npos) return false;
-            *value_pos = after;
-            return true;
+            if (after == std::string::npos) {
+                if (occurrences) ++*occurrences;
+                return false;
+            }
+            if (!occurrences || *occurrences == 0) *value_pos = after;
+            if (!occurrences) return true;
+            ++*occurrences;
         }
         ++pos;
     }
-    return false;
+    return occurrences && *occurrences != 0;
 }
 
 bool json_string_field(const std::string& text, const std::string& key, std::string* out) {
@@ -566,12 +572,13 @@ extern "C" int gp_turing_row_tool_request_has_source_mode(const char* request_js
     if (!request_json) return 0;
     std::ifstream in(request_json, std::ios::binary);
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    size_t pos = 0;
-    // Presence, not truthiness: malformed/duplicate/mixed-mode requests must
-    // never revive an unrelated runnable receipt. Legacy row requests have
-    // neither field and retain their existing-product fast path.
-    return top_level_json_value(text, "unstable_source_only", &pos) ||
-           top_level_json_value(text, "source_names", &pos);
+    size_t pos = 0, flags = 0;
+    if (top_level_json_value(text, "source_names", &pos)) return 1;
+    const bool found = top_level_json_value(text, "unstable_source_only", &pos, &flags);
+    if (!found && flags == 0) return 0; // legacy row request
+    // A single explicit false has the same stable-row semantics as Python.
+    // True, malformed and duplicate flags cannot revive an unrelated receipt.
+    return !found || flags != 1 || !json_literal_field(text, "unstable_source_only", "false");
 }
 
 extern "C" int gp_turing_row_tool_compile_only(

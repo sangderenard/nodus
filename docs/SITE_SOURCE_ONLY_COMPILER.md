@@ -40,9 +40,10 @@ auto-adoption-disabled hosts treat this as a compiled/runnable row. A forged
 source manifest marked loadable, or accompanied by an adoption receipt, fails.
 `compile_and_load` still requires return 1, and the adopter only accepts the
 original row-product schema. Existing native status numbers do not change. Before the existing-product fast
-path, any request containing a source-mode field is refused if a row receipt
-already exists (including escaped field names and duplicate-mode fields).
-Legacy row requests without source-mode fields keep their restart behavior.
+path, source-only or malformed-mode requests are refused if a row receipt already
+exists (including escaped field names and duplicate-mode fields). Legacy row
+requests and a single explicit `unstable_source_only: false` without
+`source_names` keep their restart behavior.
 The native source-only manifest check requires `buffer_abi: null` and explicit
 `loadable: false`.
 

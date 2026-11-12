@@ -32,7 +32,8 @@ typedef struct GP_TuringCompileCancel GP_TuringCompileCancel;
 extern "C" {
 #endif
 
-// Presence of source-only request fields forbids the existing-row receipt shortcut.
+// Source-only, malformed or duplicate mode fields forbid the existing-row shortcut.
+// One explicit unstable_source_only:false without source_names remains a stable row.
 int gp_turing_row_tool_request_has_source_mode(const char* request_json);
 
 // First half of compile_and_load: validate, run the driver, require the
