@@ -229,3 +229,18 @@ without dropping blocks under backpressure, maximum queue2303frames. Full
 source/canvas/RTP/router/Subscription/sink path drained93959 subscribed frames,
 including28byte tail, with no receiver loss. Startup packets before subscription
 remain excluded, as in the EOF test above. No real audio output or live deploy.
+
+## Owned jukebox startup gate
+
+The optional last CLI argument `wait-for-start=1` holds the existing file row
+before its first frame. Rows announce their native NRAD source port and PCM
+source port/SSRC, then the CLI waits for exactly `START\n` on stdin. An owned
+receiver can therefore pin the actual stream and bind before releasing playback.
+EOF on stdin refuses the launch. Existing callers without the argument retain
+existing behavior. The held source still initializes its SDL stream; unattended
+jukebox callers explicitly set SDL_AUDIODRIVER=dummy and use the separate PA sink
+only under its own explicit device control.
+
+This source change has not yet completed a native rebuild: the configured build
+stalled during its project/glob phase. Do not deploy it as a verified binary.
+The integration proof lives in Turing tools/test_nodus_radio_jukebox_native.py.

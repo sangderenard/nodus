@@ -20,9 +20,9 @@ std::wstring path_from_utf8(const char* source) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 5 || argc > 11) {
+    if (argc < 5 || argc > 12) {
         std::fprintf(stderr,
-            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port]\n");
+            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port] [wait-for-start=0]\n");
         return 2;
     }
     const int port = std::atoi(argv[4]);
@@ -44,6 +44,8 @@ int main(int argc, char** argv) {
     }
     const int pcm_port = argc > 10 ? std::atoi(argv[10]) : 0;
     if (argc > 10 && (pcm_port < 1 || pcm_port > 65535 || !nodus_headless_radio_pcm_configure(static_cast<uint16_t>(pcm_port)))) return 2;
+    const bool wait_for_start = argc > 11 && std::atoi(argv[11]) == 1;
+    if (wait_for_start && (!pcm_port || !nodus_headless_radio_hold(1))) return 2;
     NodusHeadlessGraph* graph = nodus_headless_create();
     if (!graph) return 1;
     GP_CanvasModuleDesc module{};
@@ -63,6 +65,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Radio table construction or Free launch failed\n");
         nodus_headless_destroy(graph);
         return 1;
+    }
+    if (wait_for_start) {
+        std::puts("radio_waiting_for_start=1"); std::fflush(stdout);
+        char command[16]{};
+        if (!std::fgets(command, sizeof(command), stdin) || std::strcmp(command, "START\n")) {
+            nodus_headless_destroy(graph); return 2;
+        }
+        nodus_headless_radio_hold(0);
     }
     std::signal(SIGINT, on_signal);
     std::printf("Radio: one Free table, source=%s, udp://%s:%d, bands=%d\n",

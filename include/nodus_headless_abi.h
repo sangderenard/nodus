@@ -152,6 +152,8 @@ typedef struct NodusRadioStatus {
 NODUS_HEADLESS_API int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int32_t loop);
 // Opt-in private PCM RTP sender; configure before binding rows, then bind its
 // canonical canvas output FIFO before launching. Requires file source, hop 256.
+// Hold source advancement until a trusted receiver has pinned the announced stream.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_hold(int32_t held);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_configure(uint16_t loopback_port);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, uint64_t* dropped);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module_idx);

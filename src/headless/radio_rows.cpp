@@ -47,6 +47,7 @@ struct Config {
 
 struct Shared {
     Config config;
+    std::atomic<bool> held{false};
     NodusHeadlessGraph* pcm_graph = nullptr;
     std::atomic<uint64_t> pcm_dropped{0};
     std::atomic<uint64_t> pcm_emitted{0};
@@ -154,6 +155,10 @@ public:
     void tick(double, HostAPI&) override {}
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext& ctx) override {
+        if (shared_->held.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ctx.succeeded = false; return;
+        }
         if (!scope_ || !ctx.stack.raw) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             ctx.succeeded = false;
@@ -497,6 +502,13 @@ extern "C" int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int
         [shared] { return ToolRegistry::Factory::result_type(new RadioSource(shared), [](ITool* p) { delete p; }); })) ? 1 : 0;
 }
 
+extern "C" int32_t nodus_headless_radio_hold(int32_t held) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!configured || configured->config.wav.empty()) return 0;
+    configured->held.store(held != 0);
+    return 1;
+}
+
 extern "C" int32_t nodus_headless_radio_pcm_configure(uint16_t port) {
     std::lock_guard<std::mutex> lock(config_mutex);
     if (!configured || !port || configured->config.wav.empty() || configured->running.load() ||
@@ -537,6 +549,7 @@ extern "C" int32_t nodus_headless_radio_status(NodusRadioStatus* out_status) {
     return 1;
 }
 #else
+extern "C" int32_t nodus_headless_radio_hold(int32_t) { return 0; }
 extern "C" int32_t nodus_headless_radio_configure(
     const wchar_t*, const wchar_t*, const char*, uint16_t,
     uint32_t, uint32_t, uint32_t, float, float) { return 0; }
