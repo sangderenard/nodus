@@ -549,6 +549,34 @@ static void test_contract_port_engine_reconnect_and_loan_ticks() {
     std::printf("test_contract_port_engine_reconnect_and_loan_ticks: OK\n");
 }
 
+static void test_tcp_stream_row_registration() {
+    SOCKET probe=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    REQUIRE(probe!=INVALID_SOCKET);
+    sockaddr_in address{};address.sin_family=AF_INET;
+    address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);address.sin_port=0;
+    REQUIRE(bind(probe,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0);
+#ifdef _WIN32
+    int address_len=sizeof(address);
+#else
+    socklen_t address_len=sizeof(address);
+#endif
+    REQUIRE(getsockname(probe,reinterpret_cast<sockaddr*>(&address),&address_len)==0);
+    const auto port=ntohs(address.sin_port);
+    nodus::contracts::WireSocket::close_socket(probe);
+    constexpr const char* id="nodus.tcp.byte_stream.headless.proof";
+    for(int round=0;round<2;round++){
+        auto* graph=nodus_headless_create();REQUIRE(graph);
+        REQUIRE(nodus_headless_register_tcp_byte_stream(graph,id,port,1024,2));
+        GP_CanvasModuleDesc desc{};desc.w=desc.h=64;
+        const auto module=nodus_headless_add_module(graph,&desc);
+        REQUIRE(module>=0);
+        REQUIRE(nodus_headless_bind_plugin_tool(graph,module,id)>=0);
+        REQUIRE(nodus_headless_step(graph,1.0/60.0));
+        nodus_headless_destroy(graph);
+    }
+    std::printf("test_tcp_stream_row_registration: OK\n");
+}
+
 int main() {
     {
         NodusHeadlessGraph* scheduler = nodus_headless_create();
@@ -569,5 +597,6 @@ int main() {
     test_unregistered_plugin_row_is_refused();
     test_contract_port_loopback_and_persistence();
     test_contract_port_engine_reconnect_and_loan_ticks();
+    test_tcp_stream_row_registration();
     return 0;
 }

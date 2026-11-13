@@ -1,4 +1,5 @@
 #include "gpu_shader_job_tool.h"
+#include "kernel_library_session.h"
 #include "kernel_pipeline_tool.h"
 #include "common/tensors/abstraction/kpath/kpath_raster.h"
 #include "tensor_state_library_tool.h"
@@ -82,17 +83,17 @@ int main(int argc,char** argv){
         std::memcpy(material_shader.data(),material_bytes.data(),material_bytes.size());
     }
 
-    auto library_row=tool_registry_global().create("nodus.tensor.state.library");
-    if(!library_row)return 3;
-    library_row->initialize({});
-    auto* library=dynamic_cast<nodus::gpu::TensorStateLibraryTool*>(library_row.get());
+    nodus::gpu::KernelLibrarySession session(tool_registry_global());
+    if(!session)return 3;
+    auto& library_row=session.library_row();
+    auto* library=&session.library();
     if(!library||library->device_count()==0)return 3;
     std::array<std::uint64_t,12> card_request{};
     card_request[0]=1;card_request[1]=card;card_request[2]=1907;
     card_request[4]=card_request[5]=card_request[6]=card_request[7]=64<<20;
     const std::uint64_t dummy_shape[1]={1};
     const auto dummy=nodus_tensor_create(NODUS_DTYPE_U64,1,dummy_shape);
-    if(!request_library(*library_row,card_request,dummy))return 4;
+    if(!request_library(library_row,card_request,dummy))return 4;
 
     // Binding order is each Turing product's published argument order,
     // followed by its outputs and element-count control.
@@ -137,7 +138,7 @@ int main(int argc,char** argv){
         }
     }
     for(std::size_t i=0;i<state.size();i++)
-        if(!put(*library_row,base+i,state[i]))return 5;
+        if(!put(library_row,base+i,state[i]))return 5;
 
     nodus::gpu::GpuShaderJobContract contract;
     contract.id="nodus.shader.turing.wave."+kind;
@@ -148,8 +149,7 @@ int main(int argc,char** argv){
     contract.writable.assign(feeds+outputs+1,0);
     for(std::size_t i=feeds;i<feeds+outputs;i++)contract.writable[i]=1;
     contract.local_size_x=64;contract.maximum_invocations=lanes;
-    if(!nodus::gpu::register_gpu_shader_job(tool_registry_global(),*library,
-                                             contract))return 6;
+    if(!session.register_shader(contract))return 6;
     nodus::gpu::GpuShaderJobContract material;
     if(joined){
         material.id="nodus.shader.turing.wave.aperture_material.joined";
@@ -162,15 +162,13 @@ int main(int argc,char** argv){
         material.writable.assign(11,0);
         material.writable[8]=material.writable[9]=1;
         material.local_size_x=64;material.maximum_invocations=lanes;
-        if(!nodus::gpu::register_gpu_shader_job(tool_registry_global(),*library,
-                                                 material))return 12;
+        if(!session.register_shader(material))return 12;
     }
     for(std::size_t device=0;device<library->device_count();device++){
         const auto suffix=".vulkan."+std::to_string(device);
         const auto pipeline_id="nodus.pipeline.turing.wave.angular_material."+
                                std::to_string(device);
-        if(joined&&!nodus::gpu::register_kernel_pipeline(
-            tool_registry_global(),pipeline_id,
+        if(joined&&!session.register_pipeline(pipeline_id,
             {{contract.id+suffix,nodus::gpu::TensorStateLibraryTool::ExecutionApi::Vulkan,
               contract.program_id},
              {material.id+suffix,nodus::gpu::TensorStateLibraryTool::ExecutionApi::Vulkan,
@@ -286,6 +284,5 @@ int main(int argc,char** argv){
                  <<" stages="<<(joined?2:1)<<" verified=1\n";
     }
     nodus_tensor_destroy(dummy);
-    library_row->shutdown();
     return 0;
 }
