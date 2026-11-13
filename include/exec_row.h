@@ -22,6 +22,8 @@
 //   argument -c                        any number, in order
 //   directory C:/scratch/exec          the working directory, outside the core
 //   most 2                             children working at once (2 when left out)
+//   mode stream                        keep one child's stdin open across spans; no return tensor
+//   queue_bytes 1048576                maximum pending input bytes in stream mode
 //
 // Blank lines and lines that start with '#' are skipped. Anything else stops the reading with the line named.
 #pragma once
@@ -37,7 +39,7 @@
 namespace nodus::exec {
 
 inline constexpr uint32_t kRowSettingsMagic = 0x57525845u;   // "EXRW"
-inline constexpr uint32_t kRowSettingsVersion = 1;
+inline constexpr uint32_t kRowSettingsVersion = 2;
 inline constexpr uint32_t kRowSettingsLimit = 1u << 16;      // longest string and most arguments a saved form may hold
 
 struct RowSettings {
@@ -45,6 +47,8 @@ struct RowSettings {
     std::vector<std::string> arguments;   // it must read standard input to the end and write its result to standard output
     std::string working_dir;              // outside the core
     uint32_t most_at_once = 2;            // children working at the same time; further spans wait their turn in order
+    bool stream = false;                   // one child receives successive spans without stdin EOF
+    uint32_t queue_bytes = 1u << 20;      // bounded pending input for a streaming child
 };
 
 inline bool write_string(OutputArchive& out, const std::string& text) {
@@ -64,12 +68,14 @@ inline bool write_settings(OutputArchive& out, const RowSettings& settings) {
     if (!out.write(head, sizeof(head)) || !write_string(out, settings.program)) return false;
     for (const std::string& argument : settings.arguments)
         if (!write_string(out, argument)) return false;
-    return write_string(out, settings.working_dir) && out.write(&settings.most_at_once, sizeof(settings.most_at_once));
+    const uint32_t stream = settings.stream ? 1u : 0u;
+    return write_string(out, settings.working_dir) && out.write(&settings.most_at_once, sizeof(settings.most_at_once)) &&
+           out.write(&stream, sizeof(stream)) && out.write(&settings.queue_bytes, sizeof(settings.queue_bytes));
 }
 
 inline bool read_settings(InputArchive& in, RowSettings& settings) {
     uint32_t head[3] = {0, 0, 0};
-    if (!in.read(head, sizeof(head)) || head[0] != kRowSettingsMagic || head[1] != kRowSettingsVersion ||
+    if (!in.read(head, sizeof(head)) || head[0] != kRowSettingsMagic || (head[1] != 1 && head[1] != kRowSettingsVersion) ||
         head[2] > kRowSettingsLimit)
         return false;
     RowSettings read;
@@ -79,6 +85,12 @@ inline bool read_settings(InputArchive& in, RowSettings& settings) {
         if (!read_string(in, argument)) return false;
     if (!read_string(in, read.working_dir) || !in.read(&read.most_at_once, sizeof(read.most_at_once))) return false;
     if (read.most_at_once == 0) read.most_at_once = 1;
+    if (head[1] == kRowSettingsVersion) {
+        uint32_t stream = 0;
+        if (!in.read(&stream, sizeof(stream)) || stream > 1 || !in.read(&read.queue_bytes, sizeof(read.queue_bytes)) ||
+            read.queue_bytes == 0) return false;
+        read.stream = stream != 0;
+    }
     settings = std::move(read);
     return true;
 }
@@ -143,6 +155,18 @@ inline bool read_declared_rows(const std::string& path, std::vector<DeclaredRow>
         else if (key == "program") row.settings.program = value;
         else if (key == "argument") row.settings.arguments.push_back(value);
         else if (key == "directory") row.settings.working_dir = value;
+        else if (key == "mode") {
+            if (value != "span" && value != "stream") { why = where + "'mode' is span or stream"; return false; }
+            row.settings.stream = value == "stream";
+        }
+        else if (key == "queue_bytes") {
+            char* end = nullptr;
+            const unsigned long count = std::strtoul(value.c_str(), &end, 10);
+            if (!end || *end != '\0' || count == 0 || count > (64ul << 20)) {
+                why = where + "'queue_bytes' is from 1 to 67108864"; return false;
+            }
+            row.settings.queue_bytes = static_cast<uint32_t>(count);
+        }
         else if (key == "most") {
             char* end = nullptr;
             const unsigned long most = std::strtoul(value.c_str(), &end, 10);
