@@ -801,13 +801,25 @@ class CanvasHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def run_server(host: str, port: int, width: int, height: int, step_dt: float,
                canvas_path: Optional[pathlib.Path] = None,
                plugin_paths: tuple[pathlib.Path, ...] = (),
-               attach: tuple[str, int, pathlib.Path] | None = None) -> int:
+               attach: tuple[str, int, pathlib.Path] | None = None,
+               attach_wait: float = 0.0) -> int:
     mirror = None
     if attach is not None:
         if host not in ("127.0.0.1", "localhost"):
             raise ValueError("an attached UI feed must bind to loopback")
         mirror = ConsoleMirror(*attach, width, height, step_dt, plugin_paths)
-        backend = mirror.backend_for(mirror.snapshot())
+        from nodus_graph.console_client import ConsoleError
+        deadline = time.monotonic() + attach_wait
+        while True:
+            try:
+                backend = mirror.backend_for(mirror.snapshot())
+                break
+            except (FileNotFoundError, ConsoleError) as error:
+                if time.monotonic() >= deadline or (isinstance(error, ConsoleError)
+                        and not (str(error).startswith("cannot connect to console:")
+                                 or str(error).startswith("console read failed:"))):
+                    raise
+                time.sleep(0.5)
     else:
         backend = CanvasBackend(width, height, step_dt=step_dt, canvas_path=canvas_path,
                                 plugin_paths=plugin_paths)
@@ -958,6 +970,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--step-dt", type=float, default=1.0 / 60.0, help="Simulation step size in seconds")
     parser.add_argument("--attach-console", help="Read-only managed canvas console at 127.0.0.1:PORT")
     parser.add_argument("--console-token-file", type=pathlib.Path, help="Managed console token file for --attach-console")
+    parser.add_argument("--attach-wait", type=float, default=0,
+                        help="Seconds to wait for an attached managed console to start")
     parser.add_argument(
         "--canvas", type=pathlib.Path,
         help="Load an existing native CANVAS graph before serving frames",
@@ -972,6 +986,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     if args.mode == "server":
+        if not 0 <= args.attach_wait <= 600:
+            raise ValueError("--attach-wait must be 0 to 600 seconds")
         attach = None
         if args.attach_console is not None:
             if args.canvas is not None or args.console_token_file is None:
@@ -982,7 +998,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             attach = (host, int(port), args.console_token_file)
         return run_server(
             args.host, args.port, args.width, args.height, args.step_dt,
-            args.canvas, tuple(path.resolve() for path in args.plugin), attach,
+            args.canvas, tuple(path.resolve() for path in args.plugin), attach, args.attach_wait,
         )
     return run_pygame_demo(args.width, args.height)
 
