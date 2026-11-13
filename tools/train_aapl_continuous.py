@@ -12,14 +12,17 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nodus_graph import Graph, compile_row_product_graph
 from tools.compile_tensor_network_row import request
+from tools.live_market_frames import current_row, matured_rows, timestamp
 from tools.replay_tensor_network_stock import STOCK, _series, causal_rows, infer
 from tools.run_canvas import ConsoleServer
 from tools.train_aapl_qualified_row import PolicyNetwork, scaled, target_for, window_results
@@ -78,6 +81,27 @@ def _save_weights(network: PolicyNetwork, path: Path, dataset_sha256: str, epoch
     os.replace(temporary, path)
 
 
+def _observations(path: Path, current: dict | None = None) -> list[dict]:
+    frames = json.loads(path.read_text(encoding="utf-8"))["frames"] if path.is_file() else []
+    if not isinstance(frames, list):
+        raise ValueError("live observations are invalid")
+    if current is None:
+        return frames
+    hour = timestamp(current["decision_bar"]).replace(minute=0, second=0, microsecond=0)
+    if any(timestamp(frame["t"]).replace(minute=0, second=0, microsecond=0) == hour
+           for frame in frames):
+        return frames
+    frames = (frames + [{"t": current["decision_bar"],
+                         "features": current["features"].tolist()}])[-256:]
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump({"frames": frames}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    return frames
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--canvas", type=Path, required=True)
@@ -93,10 +117,16 @@ def main() -> int:
     parser.add_argument("--autosave-seconds", type=float, default=60)
     parser.add_argument("--validation-epochs", type=int, default=100)
     parser.add_argument("--report-seconds", type=float, default=2)
+    parser.add_argument("--market-owner", default="admin")
+    parser.add_argument("--accounts-db", type=Path)
+    parser.add_argument("--secrets-dir", type=Path)
+    parser.add_argument("--market-poll-seconds", type=float, default=60)
     args = parser.parse_args()
     if (args.rate <= 0 or args.autosave_seconds <= 0 or args.validation_epochs < 1
-            or args.report_seconds <= 0):
+            or args.report_seconds <= 0 or args.market_poll_seconds < 15):
         parser.error("rate, autosave interval, validation epochs and report interval must be positive")
+    if (args.accounts_db is None) != (args.secrets_dir is None):
+        parser.error("provide both --accounts-db and --secrets-dir for live market intake")
     _native_pair()
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
@@ -107,7 +137,16 @@ def main() -> int:
     sys.path.insert(0, str(args.turing_root.resolve()))
     sys.path.insert(0, str(args.turing_root.resolve() / "examples"))
     from src.common.tensors import AbstractTensor as AT
-    from meowdoku import paper_arena, paper_mock, paper_policies, qualification_runs
+    from meowdoku import (alpaca_credentials, market_data, paper_arena, paper_mock,
+                         paper_policies, qualification_runs)
+
+    market_owner = None
+    if args.accounts_db is not None:
+        with sqlite3.connect(args.accounts_db) as accounts:
+            found = accounts.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE",
+                                     (args.market_owner,)).fetchone()
+        if found and alpaca_credentials.configured(args.secrets_dir, found[0]):
+            market_owner = found[0]
 
     history_bytes = args.history_file.read_bytes()
     history = json.loads(history_bytes)
@@ -125,6 +164,14 @@ def main() -> int:
     network = PolicyNetwork(AT, seed=0)
     checkpoint = args.output / "latest.npz"
     epoch = _load_weights(network, checkpoint, dataset_sha256)
+    observation_path = args.output / "live-observations.json"
+    observations = _observations(observation_path)
+    live_x = np.empty((0, 6), dtype=np.float64)
+    live_targets = np.empty((0, 3), dtype=np.float64)
+    live_count = 0
+    live_status = "waiting" if market_owner is not None else "unavailable"
+    live_at = None
+    rng = np.random.default_rng(0x4E4F445553 + epoch)
     with qualification_runs.publishing(args.publish_db, market="AAPL + SPY + BTC/USD",
                                        model="Nodus continuous 6→4→3", worker=args.worker,
                                        planned_epochs=0) as (db, run_id):
@@ -155,11 +202,43 @@ def main() -> int:
                               "pid": os.getpid(), "console_port": port}), flush=True)
             qualification_runs.progress(db, run_id, phase="training", completed_epochs=epoch)
             last_report = last_save = time.monotonic()
+            last_market_poll = float("-inf")
             while not _stop:
-                loss = network.step(x, targets)
+                now = time.monotonic()
+                if market_owner is not None and now - last_market_poll >= args.market_poll_seconds:
+                    last_market_poll = now
+                    try:
+                        recent = market_data.history(args.secrets_dir, market_owner, STOCK)
+                        latest = market_data.now(args.secrets_dir, market_owner, STOCK)
+                        current, live_status = current_row(
+                            recent, latest, paper_policies, now=datetime.now(timezone.utc))
+                        if current is not None:
+                            live_at = current["decision_bar"]
+                            observations = _observations(observation_path, current)
+                            infer(graph, [current, current], network.weights())
+                        if observations:
+                            live_x, live_targets, live_count = matured_rows(
+                                recent, observations, now=datetime.now(timezone.utc))
+                    except (market_data.MarketError, alpaca_credentials.CredentialError,
+                            ValueError, KeyError, OSError):
+                        live_status = "unavailable"
+                mixed = live_status == "current" and live_count > 0
+                if mixed:
+                    history_ids = rng.choice(len(x), size=32, replace=False)
+                    live_ids = rng.choice(live_count, size=32, replace=live_count < 32)
+                    batch_x = np.concatenate((x[history_ids], live_x[live_ids]))
+                    batch_targets = np.concatenate((targets[history_ids], live_targets[live_ids]))
+                    loss = network.step(batch_x, batch_targets, learning_rate=0.01)
+                else:
+                    loss = network.step(x, targets)
                 epoch += 1
                 console.service(graph)
                 now = time.monotonic()
+                if now - last_report >= args.report_seconds:
+                    qualification_runs.live_state(db, run_id, source=live_status,
+                                                  observed_at=live_at, matured_frames=live_count,
+                                                  historical_batch=32 if mixed else len(x),
+                                                  live_batch=32 if mixed else 0)
                 if epoch % args.validation_epochs == 0:
                     qualification_runs.progress(db, run_id, phase="validation", completed_epochs=epoch,
                                                 epoch=epoch, loss=loss)
