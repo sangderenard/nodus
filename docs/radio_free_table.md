@@ -111,6 +111,11 @@ writer emits float32; SDL's WAV conversion supports the real emitted format.
 
 ## Opt-in PCM backend output
 
+The later stack-connected FFmpeg/HLS exit is documented in
+`docs/FFMPEG_EXEC_STREAM_2026-11-13.md`. Its `radio.pcm_s16le` row converts the
+source's PCM stack value to a byte tensor for the declared exec row while the
+existing RTP row continues to use the canonical FIFO.
+
 A final CLI argument selects a **separate private PCM destination**:
 
 ```powershell
