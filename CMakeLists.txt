@@ -552,6 +552,7 @@ add_test(NAME edge_runtime_abi_test COMMAND edge_runtime_abi_test)
 add_library(nodus_headless SHARED
   src/headless/nodus_headless_abi.cpp
   src/headless/radio_rows.cpp
+  src/headless/pcm_playback.cpp
 )
 target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
 target_include_directories(nodus_headless PUBLIC
@@ -633,6 +634,11 @@ add_executable(nodus_radio tools/nodus_radio.cpp)
 target_include_directories(nodus_radio PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(nodus_radio PRIVATE nodus_headless)
 target_compile_features(nodus_radio PRIVATE cxx_std_20)
+
+add_executable(nodus_pcm_playback tools/nodus_pcm_playback.cpp)
+target_include_directories(nodus_pcm_playback PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(nodus_pcm_playback PRIVATE nodus_headless)
+target_compile_features(nodus_pcm_playback PRIVATE cxx_std_20)
 
 # Loads a real bridge-generated canvas (turing's nodus_canvas_kpn.py output)
 # headlessly, validates its computed output against an independent Python

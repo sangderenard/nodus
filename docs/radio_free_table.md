@@ -195,3 +195,37 @@ sent376 blocks; the subscription starts after readiness discovery and the
 first eight precede it, so this does not claim full-source startup delivery.
 Test: Turing tools/test_nodus_radio_pcm_end.py, with the four native binary
 arguments. No speaker used and no live service restarted/deployed.
+
+### Explicit process-owned PA sink
+
+`nodus_pcm_playback --device <SDL ID, or 0 for default>` consumes raw stereo
+signed16 little-endian48kHz PCM from stdin. Launching it is the explicit device
+opening action. It has no network listener and captures no system audio.
+
+The separate process is deliberate: the current headless scheduler still uses
+a process-global canvas. The sink owns one graph, its bounded `audio.pa.pcm`
+canonical FIFO, and an `audio.pa.sdl_output` row. It cannot replace the server's
+active canvas. EOF drains that stream; terminating the child cancels only that
+owner's sink. The host must authorize the user, source and output device before
+launch. This executable is not a substitute for account authorization.
+
+FIFO capacity16 blocks, no overflow dropping (`top_k=0`), publisher backpressure
+with a3-second failure bound. SDL input queue is bounded to2048frames plus one
+256frame block. Playback begins after1024frames or an explicitly finished short
+stream. Hardware-clock correction uses a0.5s momentum filter, +/-0.5% rate cap,
+0.2%/second slew and SDL's own frequency-ratio resampler. PCM is not duplicated
+or invented to cover loss. EOF flushes the SDL stream and allows two actual
+device buffer periods after stream drain before closing the device.
+
+`pcm_sink_done` reports accepted frames, maximum queued frames, frequency ratio,
+publisher backpressure and empty-stream transitions. Empty-stream transitions
+are a starvation diagnostic, not a measurement of audible hardware underruns.
+There is no promise of zero latency or glitch-free real hardware without an
+audible/device-specific qualification run.
+
+Silent SDL-dummy verification:5127frames including a seven-frame tail drained;
+user cancellation released the owned process; an eager96000frame source drained
+without dropping blocks under backpressure, maximum queue2303frames. Full
+source/canvas/RTP/router/Subscription/sink path drained93959 subscribed frames,
+including28byte tail, with no receiver loss. Startup packets before subscription
+remain excluded, as in the EOF test above. No real audio output or live deploy.

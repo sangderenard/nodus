@@ -263,6 +263,13 @@ NODUS_HEADLESS_API int32_t nodus_headless_push_token_ex(
     NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
     NodusHeadlessPublishResult* out_result);
 // Native source rows may publish onto a declared output using the same edge
+// Explicit process-owned PA consumer. Blocking raw stereo s16le/48000 stdin
+// until EOF; starts a device only when invoked. Run in its own process because
+// the current headless scheduler has process-global canvas ownership.
+// device_id=0 selects SDL's default playback device. No network listener.
+NODUS_HEADLESS_API int32_t nodus_headless_pcm_playback_stdin(uint32_t device_id);
+
+// Native source rows may publish onto a declared output using the same edge
 // transport. Declare/configure all ports before launching persistent workers.
 NODUS_HEADLESS_API int32_t nodus_headless_publish_output_token(
     NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
