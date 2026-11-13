@@ -21,7 +21,7 @@ the graph, reads the output handle, and compares it with the same eager
 AbstractTensor network.
 
 Measured on Windows, 2026-11-13, against Turing `9d96173c` and the installed
-Nodus `free-runtime-build` headless DLL: adoption reported receipt validated,
+Nodus `free-runtime-build` headless DLL from source `bd6003f`: adoption reported receipt validated,
 wrapper imported, wrapper staged, plugin loaded; output shape `(2, 3)`;
 maximum absolute difference `5.551115123125783e-17`. This is a local Nodus
 graph proof, not a live Meowdoku row or a trained market model.
