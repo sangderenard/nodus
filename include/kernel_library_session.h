@@ -2,6 +2,7 @@
 
 #include "gpu_shader_job_tool.h"
 #include "fftfree_tool.h"
+#include "wave_t4_state_tool.h"
 #include "kernel_pipeline_tool.h"
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
@@ -68,6 +69,13 @@ public:
         if(!library_||registry_.find("nodus.fftfree")||
            !register_fftfree_tool(registry_,*library_,dll))return false;
         registered_.push_back("nodus.fftfree");
+        return true;
+    }
+
+    bool register_wave_t4(const std::string& dll){
+        if(!library_||registry_.find("nodus.wave.t4.state")||
+           !register_wave_t4_state_tool(registry_,*library_,dll))return false;
+        registered_.push_back("nodus.wave.t4.state");
         return true;
     }
 
