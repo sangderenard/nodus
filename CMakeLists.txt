@@ -365,12 +365,15 @@ add_library(nodus_tensor_core SHARED
   src/common/tensors/abstraction/tensor_calculator_bridge.cpp
   src/common/thread_pool.cpp
   src/mem_backend_host.cpp
+  src/mem_backend_opengl.cpp
   src/spirv_translation.cpp
   src/kernels/kernel_spirv.cpp
   src/kernels/kernel_ir_text.cpp
   # Device execution for assembled modules -- lives beside the assembler so a
   # host that can produce a kernel can also run it.
   src/kernels/kernel_vulkan.cpp
+  # Borrowed-current-context GL packaging used inside native GPU tool rows.
+  src/kernels/kernel_opengl.cpp
   # CPU execution of the same KernelIR -- the reference the device result is
   # checked against, and the only numeric check available without a device.
   src/kernels/kernel_eigen.cpp
@@ -413,9 +416,15 @@ add_library(canvas_tables SHARED
   # placeholder to keep CMake syntax valid; real sources appended by include(cmake/auto_sources.cmake)
 )
 target_link_libraries(canvas_tables PUBLIC nodus_tensor_core)
+if(CMAKE_DL_LIBS)
+  target_link_libraries(canvas_tables PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 add_library(canvas_tables_static STATIC)
 target_link_libraries(canvas_tables_static PUBLIC nodus_tensor_core)
+if(CMAKE_DL_LIBS)
+  target_link_libraries(canvas_tables_static PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
 add_executable(edge_reader_registry_test
   tests/edge_reader_registry_test.cpp
@@ -527,11 +536,8 @@ target_include_directories(edge_tensor_fifo_compile_check PRIVATE
 
 add_library(nodus_runtime SHARED
   src/runtime/edge_runtime_abi.cpp
-  src/mem_backend_host.cpp
-  src/spirv_translation.cpp
-  src/kernels/kernel_spirv.cpp
-  src/kernels/kernel_ir_text.cpp
 )
+target_link_libraries(nodus_runtime PUBLIC nodus_tensor_core)
 target_compile_definitions(nodus_runtime PRIVATE NODUS_RUNTIME_BUILD=1)
 target_include_directories(nodus_runtime PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -625,6 +631,20 @@ add_executable(nodus_headless_demo tools/nodus_headless_demo.cpp)
 target_include_directories(nodus_headless_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_demo PRIVATE nodus_headless)
 target_compile_features(nodus_headless_demo PUBLIC cxx_std_20)
+
+# The job-scoped frame sink must publish exact compressed bytes once and
+# refuse a replay of the same generation.
+add_executable(frame_artifact_file_tool_test tests/frame_artifact_file_tool_test.cpp)
+target_include_directories(frame_artifact_file_tool_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(frame_artifact_file_tool_test PRIVATE canvas_tables_static nodus_tensor_core)
+target_compile_features(frame_artifact_file_tool_test PUBLIC cxx_std_20)
+
+add_executable(frame_compression_pipeline_test tests/frame_compression_pipeline_test.cpp)
+target_include_directories(frame_compression_pipeline_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(frame_compression_pipeline_test PRIVATE canvas_tables_static nodus_tensor_core)
+target_compile_features(frame_compression_pipeline_test PUBLIC cxx_std_20)
 
 # Loads a real bridge-generated canvas (turing's nodus_canvas_kpn.py output)
 # headlessly, validates its computed output against an independent Python
@@ -1341,6 +1361,139 @@ add_executable(test_vulkan_dispatch
 target_link_libraries(test_vulkan_dispatch PRIVATE nodus_tensor_core)
 target_compile_features(test_vulkan_dispatch PRIVATE cxx_std_20)
 add_test(NAME vulkan_dispatch_test COMMAND test_vulkan_dispatch)
+
+# Explicit hardware integration entry for the authored Spectral ray stages.
+# Artifact paths are supplied by the caller; this is not an automatic CTest.
+add_executable(test_spectral_exact_lens_vulkan
+  tests/spectral_exact_lens_vulkan_test.cpp)
+target_link_libraries(test_spectral_exact_lens_vulkan PRIVATE canvas_tables_static)
+target_compile_features(test_spectral_exact_lens_vulkan PRIVATE cxx_std_20)
+add_executable(test_spectral_t3_vulkan tests/spectral_t3_vulkan_test.cpp)
+target_link_libraries(test_spectral_t3_vulkan PRIVATE nodus_tensor_core)
+target_compile_features(test_spectral_t3_vulkan PRIVATE cxx_std_20)
+add_executable(test_spectral_t5_vulkan tests/spectral_t5_vulkan_test.cpp)
+target_link_libraries(test_spectral_t5_vulkan PRIVATE canvas_tables_static)
+target_compile_features(test_spectral_t5_vulkan PRIVATE cxx_std_20)
+
+# Inventory/selection failures are tested with fake Vulkan entry points. These
+# tests never submit or compile shaders and do not depend on a physical GPU.
+if(Vulkan_FOUND)
+  add_executable(test_vulkan_device_query
+    tests/vulkan_device_query_test.cpp
+    src/kernels/kernel_vulkan.cpp
+  )
+  target_include_directories(test_vulkan_device_query PRIVATE include src)
+  target_compile_definitions(test_vulkan_device_query PRIVATE NODUS_HAVE_VULKAN=1)
+  target_link_libraries(test_vulkan_device_query PRIVATE Vulkan::Vulkan)
+  target_compile_features(test_vulkan_device_query PRIVATE cxx_std_20)
+  add_test(NAME vulkan_device_query_test COMMAND test_vulkan_device_query)
+  set_tests_properties(vulkan_device_query_test PROPERTIES LABELS "cpu;vulkan-mock")
+endif()
+
+add_executable(test_vulkan_unavailable
+  tests/vulkan_unavailable_test.cpp
+  src/kernels/kernel_vulkan.cpp
+)
+target_include_directories(test_vulkan_unavailable PRIVATE include src)
+target_compile_features(test_vulkan_unavailable PRIVATE cxx_std_20)
+add_test(NAME vulkan_unavailable_test COMMAND test_vulkan_unavailable)
+set_tests_properties(vulkan_unavailable_test PROPERTIES LABELS "cpu")
+
+# No GL/device calls: injected call recorder + mock Nodus context registry.
+add_executable(test_opengl_compute_package
+  tests/opengl_compute_package_test.cpp
+  src/kernels/kernel_opengl.cpp
+)
+target_include_directories(test_opengl_compute_package PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_opengl_compute_package PRIVATE cxx_std_20)
+target_link_libraries(test_opengl_compute_package PRIVATE nodus_tensor_core)
+add_test(NAME opengl_compute_package_test COMMAND test_opengl_compute_package)
+
+# Actual shared memory registry with CPU-injected OpenGL storage procedures.
+# No context creation, hardware query, shader link, dispatch, or rendering.
+add_executable(test_mem_backend_opengl tests/mem_backend_opengl_test.cpp)
+target_include_directories(test_mem_backend_opengl PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_mem_backend_opengl PRIVATE cxx_std_20)
+target_link_libraries(test_mem_backend_opengl PRIVATE nodus_tensor_core)
+add_test(NAME mem_backend_opengl_test COMMAND test_mem_backend_opengl)
+set_tests_properties(mem_backend_opengl_test PROPERTIES LABELS "cpu")
+
+# Actual native contract FIFO/tool stack with GL entrypoints call-recorded.
+add_executable(test_opengl_gpu_row
+  tests/opengl_gpu_row_test.cpp src/kernels/kernel_opengl.cpp src/tool_registry.cpp)
+target_include_directories(test_opengl_gpu_row PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_opengl_gpu_row PRIVATE cxx_std_20)
+target_link_libraries(test_opengl_gpu_row PRIVATE nodus_runtime nodus_tensor_core)
+add_test(NAME opengl_gpu_row_test COMMAND test_opengl_gpu_row)
+add_executable(test_contract_protected_loan tests/contract_protected_loan_test.cpp)
+target_include_directories(test_contract_protected_loan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_contract_protected_loan PRIVATE cxx_std_20)
+target_link_libraries(test_contract_protected_loan PRIVATE nodus_runtime)
+add_test(NAME contract_protected_loan_test COMMAND test_contract_protected_loan)
+
+# Real canonical manager-lane graph and typed FIFO transport; GL is call-recorded.
+add_executable(test_opengl_gpu_threadmanager
+  tests/opengl_gpu_threadmanager_test.cpp src/kernels/kernel_opengl.cpp)
+target_link_libraries(test_opengl_gpu_threadmanager PRIVATE canvas_tables_static)
+target_compile_features(test_opengl_gpu_threadmanager PRIVATE cxx_std_20)
+add_test(NAME opengl_gpu_threadmanager_test COMMAND test_opengl_gpu_threadmanager)
+set_tests_properties(opengl_compute_package_test opengl_gpu_row_test
+  contract_protected_loan_test opengl_gpu_threadmanager_test
+  PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-row")
+
+# Protected native process owner is separate from the service's GL linkage.
+# This CPU test launches only its own no-GL fixture child. The actual worker
+# is built but is never registered as an automatic hardware integration test.
+if(WIN32)
+  add_library(nodus_protected_opengl STATIC
+    src/kernels/opengl_protected_process.cpp
+    src/kernels/opengl_protected_child.cpp)
+  target_include_directories(nodus_protected_opengl PUBLIC include PRIVATE src)
+  target_compile_features(nodus_protected_opengl PUBLIC cxx_std_20)
+  target_link_libraries(nodus_protected_opengl PRIVATE bcrypt)
+  add_executable(nodus_opengl_link_worker
+    src/kernels/opengl_link_worker_main.cpp
+    src/kernels/opengl_protected_wgl.cpp
+    src/kernels/kernel_opengl.cpp)
+  target_include_directories(nodus_opengl_link_worker PRIVATE include src)
+  target_link_libraries(nodus_opengl_link_worker PRIVATE nodus_protected_opengl
+    nodus_tensor_core opengl32 user32 gdi32)
+  # Explicit development entry; never registered as an automatic real-GPU test.
+  add_executable(nodus_opengl_link_once src/opengl_link_once.cpp src/kernels/kernel_opengl.cpp)
+  target_include_directories(nodus_opengl_link_once PRIVATE include src)
+  target_link_libraries(nodus_opengl_link_once PRIVATE nodus_protected_opengl canvas_tables_static)
+  add_executable(test_opengl_protected_process tests/opengl_protected_process_test.cpp
+    src/kernels/opengl_protected_process.cpp src/kernels/opengl_protected_child.cpp)
+  target_include_directories(test_opengl_protected_process PRIVATE include src)
+  target_compile_definitions(test_opengl_protected_process PRIVATE NODUS_PROTECTED_PROCESS_TEST_HOOKS=1)
+  target_link_libraries(test_opengl_protected_process PRIVATE bcrypt)
+  add_test(NAME opengl_protected_process_test COMMAND test_opengl_protected_process)
+  set_tests_properties(opengl_protected_process_test PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-process-containment")
+  add_executable(test_opengl_protected_row_threadmanager
+    tests/opengl_protected_row_threadmanager_test.cpp src/kernels/kernel_opengl.cpp)
+  target_link_libraries(test_opengl_protected_row_threadmanager PRIVATE
+    nodus_protected_opengl canvas_tables_static)
+  target_include_directories(test_opengl_protected_row_threadmanager PRIVATE include src)
+  add_test(NAME opengl_protected_row_threadmanager_test COMMAND test_opengl_protected_row_threadmanager)
+  set_tests_properties(opengl_protected_row_threadmanager_test PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-row;gpu-process-containment")
+  # Supplied inventory only: factory/config and contract registration, no query
+  # or GPU work. Uses the same canvas/static registry image as the caller.
+  add_library(nodus_gpu_inventory_rows STATIC src/gpu_inventory_rows.cpp)
+  target_include_directories(nodus_gpu_inventory_rows PUBLIC include)
+  target_link_libraries(nodus_gpu_inventory_rows PUBLIC canvas_tables_static nodus_protected_opengl)
+  target_compile_features(nodus_gpu_inventory_rows PUBLIC cxx_std_20)
+  add_executable(test_gpu_inventory_rows tests/gpu_inventory_rows_test.cpp src/kernels/kernel_opengl.cpp)
+  target_link_libraries(test_gpu_inventory_rows PRIVATE nodus_gpu_inventory_rows)
+  add_test(NAME gpu_inventory_rows_test COMMAND test_gpu_inventory_rows)
+  set_tests_properties(gpu_inventory_rows_test PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-row;registry")
+  add_executable(test_contract_registry_transaction tests/contract_registry_transaction_test.cpp
+    src/contract_negotiator_registry.cpp src/tool_registry.cpp)
+  target_include_directories(test_contract_registry_transaction PRIVATE include)
+  target_link_libraries(test_contract_registry_transaction PRIVATE nodus_runtime nodus_tensor_core)
+  target_compile_features(test_contract_registry_transaction PRIVATE cxx_std_20)
+  add_test(NAME contract_registry_transaction_test COMMAND test_contract_registry_transaction)
+  set_tests_properties(contract_registry_transaction_test PROPERTIES TIMEOUT 30 LABELS "cpu;registry;allocation-faults")
+endif()
 
 # Persistent Vulkan shader rows communicating through the ordinary FIFO ABI.
 add_executable(test_vulkan_ssbo_fifo

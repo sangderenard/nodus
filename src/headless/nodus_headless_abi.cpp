@@ -835,6 +835,12 @@ extern "C" int32_t nodus_headless_get_persistent_workers(
     return gp_canvas_get_persistent_workers(g->ctx, out_enabled);
 }
 
+extern "C" int32_t nodus_headless_set_parallel_worker_limit(
+    NodusHeadlessGraph* g, int32_t limit) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_set_parallel_worker_limit(g->ctx, limit);
+}
+
 extern "C" int32_t nodus_headless_declare_input_port(NodusHeadlessGraph* g, const char* name, int32_t module_idx, int32_t row_idx, int32_t token_bytes) {
     auto config = default_fifo_config(token_bytes);
     return nodus_headless_declare_input_port_ex(g, name, module_idx, row_idx, &config);

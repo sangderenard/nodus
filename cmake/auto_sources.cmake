@@ -9,6 +9,14 @@ file(GLOB_RECURSE NODUS_CANVAS_SOURCES CONFIGURE_DEPENDS
 )
 
 if(NODUS_CANVAS_SOURCES)
+  # Dedicated protected-host and CLI targets must not contribute extra process
+  # owners, WGL plumbing or entry points to the canvas amalgam.
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]opengl_link_once\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]kernels[/\\\\]opengl_link_worker_main\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]kernels[/\\\\]opengl_protected_(process|child|wgl)\\.cpp$")
+  # Optional inventory-to-row registration links the native protected provider
+  # as its own target; do not fold it back into the canvas dependency layer.
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]gpu_inventory_rows\\.cpp$")
   # Runtime-only ABI sources have their own dependency-minimal targets and
   # must not be pulled back into the canvas amalgam by the broad legacy glob.
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]runtime[/\\\\]")
@@ -30,10 +38,12 @@ if(NODUS_CANVAS_SOURCES)
   # each got their own registry/backend instance, so a tensor handle created
   # on one side silently failed to resolve on the other. See
   # research/12_substrate_blocker.md for the diagnosis.
-  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]tensors[/\\\\]abstraction[/\\\\](tensor_registry|in_memory_backend|abstract_tensor|abstract_tensor_pool|tensor_math|tensor_calculator_bridge)\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]tensors[/\\\\]abstraction[/\\\\](tensor_registry|in_memory_backend|tensor_abi|abstract_tensor|abstract_tensor_pool|tensor_math|tensor_calculator_bridge)\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]thread_pool\\.cpp$")
-  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]mem_backend_host\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]mem_backend_(host|opengl)\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]spirv_translation\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]kernels[/\\\\](kernel_spirv|kernel_ir_text|kernel_vulkan|kernel_opengl|kernel_eigen)\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\](vocabulary_actualizer|artifact_importer|generic_object)\\.cpp$")
   # kernel_torch.cpp and mem_backend_torch.cpp include <torch/torch.h> unconditionally.
   # A NODUS_ENABLE_TORCH=OFF image (the Torch-free service build) leaves them out;
   # the Torch build keeps them. Both configurations must build.

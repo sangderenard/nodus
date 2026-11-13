@@ -190,6 +190,8 @@ public:
     Mode mode() const;
     void set_persistent_workers(bool enabled);
     bool persistent_workers() const;
+    void set_parallel_worker_limit(size_t count);
+    size_t parallel_worker_limit() const;
     void set_module_tool_stack_default_type(ValueTypeId tid);
     ValueTypeId module_tool_stack_default_type() const;
 
@@ -347,6 +349,7 @@ private:
 
     std::atomic<Mode> mode_{Mode::Scheduled};
     std::atomic<bool> persistent_workers_{true};
+    std::atomic<size_t> parallel_worker_limit_{0}; // 0 selects the existing automatic limit.
     std::atomic<bool> running_{false};
     std::thread worker_;
 

@@ -612,6 +612,22 @@ extern "C" int gp_canvas_get_persistent_workers(GP_CanvasContext* ctx_, int* out
     return 1;
 }
 
+extern "C" int gp_canvas_set_parallel_worker_limit(GP_CanvasContext* ctx_, int limit) {
+    if (!ctx_ || limit < 0) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->thread_mgr) return 0;
+    c->thread_mgr->set_parallel_worker_limit(static_cast<size_t>(limit));
+    return 1;
+}
+
+extern "C" int gp_canvas_get_parallel_worker_limit(GP_CanvasContext* ctx_, int* out_limit) {
+    if (!ctx_ || !out_limit) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->thread_mgr) return 0;
+    *out_limit = static_cast<int>(c->thread_mgr->parallel_worker_limit());
+    return 1;
+}
+
 extern "C" int gp_canvas_wait_for_thread_manager(GP_CanvasContext* ctx_) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
