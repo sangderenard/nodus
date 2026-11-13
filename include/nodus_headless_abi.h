@@ -222,6 +222,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_persistent_workers(
     NodusHeadlessGraph* g, int32_t enabled);
 NODUS_HEADLESS_API int32_t nodus_headless_get_persistent_workers(
     NodusHeadlessGraph* g, int32_t* out_enabled);
+NODUS_HEADLESS_API int32_t nodus_headless_set_parallel_worker_limit(
+    NodusHeadlessGraph* g, int32_t limit);
 
 // Compiler/tool and tensor services exposed by this same runtime image. This
 // keeps plugin registration and ValueType ids in the registry instance used

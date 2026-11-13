@@ -511,6 +511,9 @@ int gp_canvas_get_thread_manager_mode(GP_CanvasContext* ctx, int* out_mode);
 // 0 creates and joins parallel workers on each tick.
 int gp_canvas_set_persistent_workers(GP_CanvasContext* ctx, int enabled);
 int gp_canvas_get_persistent_workers(GP_CanvasContext* ctx, int* out_enabled);
+// Maximum number of persistent parallel lanes; 0 restores automatic sizing.
+int gp_canvas_set_parallel_worker_limit(GP_CanvasContext* ctx, int limit);
+int gp_canvas_get_parallel_worker_limit(GP_CanvasContext* ctx, int* out_limit);
 int gp_canvas_wait_for_thread_manager(GP_CanvasContext* ctx);
 int gp_canvas_get_thread_manager_paused(GP_CanvasContext* ctx, int* out_paused);
 int gp_canvas_set_thread_manager_paused(GP_CanvasContext* ctx, int paused);

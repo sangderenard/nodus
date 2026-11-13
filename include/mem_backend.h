@@ -154,9 +154,13 @@ typedef struct {
     uintptr_t gl_context_id;
 } gp_mem_backend_gl_params_t;
 
-// Vulkan backend params. device_index is the raw vkEnumeratePhysicalDevices
-// ordinal. UINT32_MAX selects the first compute-capable device. Device-local
-// allocations use staging for host transfers.
+// Vulkan backend params. device_index is the RAW vkEnumeratePhysicalDevices
+// ordinal (including devices without compute queues), NOT a display, DXGI,
+// CUDA or Win32_VideoController index. UINT32_MAX selects the first compute
+// device. Enumerate with nodus::kernels::enumerate_vulkan_devices first.
+// GP_VULKAN_ALLOC_DEVICE_LOCAL makes buffers allocated from this context use
+// device-local memory. Host transfers use staging; map may be unavailable.
+// There is no automatic retry on another device or workload replay.
 enum { GP_VULKAN_ALLOC_DEVICE_LOCAL = 1u };
 typedef struct {
     uint32_t device_index;
@@ -198,6 +202,8 @@ int gp_mem_backend_pin_fixed_cpu_buffer(gp_mem_backend_handle_t h);
 // Create a persistent Vulkan device/context backend. Allocations made through
 // its vtable are storage-buffer-capable and remain valid across dispatches.
 gp_mem_backend_handle_t gp_mem_backend_create_vulkan(const gp_mem_backend_vulkan_params_t* params);
+// Last Vulkan creation failure on this thread; valid until the next creation.
+// The returned string is owned by Nodus. No exception crosses this C boundary.
 const char* gp_mem_backend_vulkan_last_error(void);
 gp_mem_backend_handle_t gp_mem_backend_create_from_params(GP_MemBackendType type, const void* params, size_t params_size);
 // Filesystem-backed backend: stores buffers as files under `base_dir`.

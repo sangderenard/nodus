@@ -407,6 +407,11 @@ extern "C" int gp_mem_backend_pin_fixed_cpu_buffer(gp_mem_backend_handle_t h) {
 
 extern "C" gp_mem_backend_handle_t gp_mem_backend_create_from_params(
     GP_MemBackendType type, const void* params, size_t params_size) {
+    // A GLuint and context-id blob cannot establish an owning lane, current
+    // context callbacks, verified extent, or deletion lifetime. Use the native
+    // gp_mem_backend_create_opengl API instead of a non-functional generic
+    // handle whose host-copy callbacks would interpret a GL name as a pointer.
+    if (type == GP_MEM_BACKEND_OPENGL) return nullptr;
     if (type == GP_MEM_BACKEND_CPU) {
         size_t bytes = 0;
         if (params && params_size >= sizeof(gp_mem_backend_cpu_params_t)) {
@@ -633,6 +638,19 @@ extern "C" gp_mem_backend_handle_t gp_mem_backend_create_filesystem(const char* 
 
 extern "C" void gp_mem_backend_release(gp_mem_backend_handle_t h) {
     if (!h) return;
+    // OpenGL deletion can fail or arrive on the wrong manager lane. The
+    // backend's checked release owns unregistering ONLY after verified cleanup;
+    // erasing first would discard the sole retryable ownership identity.
+    const gp_mem_backend_vtable_t* gl_release = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_vt_mu);
+        const auto type = g_handle_types.find(h);
+        const auto vt = g_handle_vtables.find(h);
+        if (type != g_handle_types.end() && type->second == GP_MEM_BACKEND_OPENGL &&
+            vt != g_handle_vtables.end() && vt->second && vt->second->free)
+            gl_release = vt->second;
+    }
+    if (gl_release) { gl_release->free(h); return; }
     const gp_mem_backend_vtable_t* registered_vtable = nullptr;
     int t = -1;
     bool is_backend_context = false;
@@ -882,6 +900,12 @@ static gp_mem_backend_handle_t fs_import_buffer_from_path(const std::string &pat
 // Write a simple manifest (one entry per line): <path> <size>\n
 extern "C" int gp_mem_backend_write_manifest(const char* manifest_path, gp_mem_backend_handle_t* chunk_handles, size_t count) {
     if (!manifest_path || (!chunk_handles && count != 0)) return 0;
+    // This format contains filesystem paths, not arbitrary native resources.
+    // A GL name, Vulkan buffer or CPU pointer is not a C string and cannot be
+    // persisted/imported as one. Refuse the whole batch before opening output.
+    for (size_t i = 0; i < count; ++i) {
+        if (gp_mem_backend_get_vtable(chunk_handles[i]) != &g_fs_vtable) return 0;
+    }
     std::ofstream out(manifest_path, std::ios::binary);
     if (!out.is_open()) return 0;
     for (size_t i = 0; i < count; ++i) {
