@@ -165,7 +165,9 @@ bool resolve_product_file(const fs::path& product_root,
     return true;
 }
 
-bool top_level_json_value(const std::string& text, const std::string& key, size_t* value_pos) {
+bool top_level_json_value(const std::string& text, const std::string& key, size_t* value_pos,
+                          size_t* occurrences = nullptr) {
+    if (occurrences) *occurrences = 0;
     int depth = 0;
     for (size_t pos = 0; pos < text.size();) {
         if (text[pos] == '{' || text[pos] == '[') { ++depth; ++pos; continue; }
@@ -176,7 +178,23 @@ bool top_level_json_value(const std::string& text, const std::string& key, size_
         std::string token;
         for (; pos < text.size(); ++pos) {
             const char c = text[pos];
-            if (escaped) { token.push_back(c); escaped = false; continue; }
+            if (escaped) {
+                // JSON permits escaped ASCII in field names; source-mode guards
+                // must recognize e.g. unstable\u005fsource_only as the same key.
+                if (c == 'u' && pos + 4 < text.size()) {
+                    unsigned value = 0; bool valid = true;
+                    for (size_t i = 1; i <= 4; ++i) {
+                        const char h = text[pos + i];
+                        const int digit = h >= '0' && h <= '9' ? h - '0' :
+                            h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                        if (digit < 0) { valid = false; break; }
+                        value = value * 16 + static_cast<unsigned>(digit);
+                    }
+                    if (valid && value <= 127) { token.push_back(static_cast<char>(value)); pos += 4; }
+                    else token.push_back(c);
+                } else token.push_back(c);
+                escaped = false; continue;
+            }
             if (c == '\\') { escaped = true; continue; }
             if (c == '"') break;
             token.push_back(c);
@@ -185,13 +203,17 @@ bool top_level_json_value(const std::string& text, const std::string& key, size_
         size_t after = text.find_first_not_of(" \t\r\n", pos + 1);
         if (depth == 1 && token == key && after != std::string::npos && text[after] == ':') {
             after = text.find_first_not_of(" \t\r\n", after + 1);
-            if (after == std::string::npos) return false;
-            *value_pos = after;
-            return true;
+            if (after == std::string::npos) {
+                if (occurrences) ++*occurrences;
+                return false;
+            }
+            if (!occurrences || *occurrences == 0) *value_pos = after;
+            if (!occurrences) return true;
+            ++*occurrences;
         }
         ++pos;
     }
-    return false;
+    return occurrences && *occurrences != 0;
 }
 
 bool json_string_field(const std::string& text, const std::string& key, std::string* out) {
@@ -207,6 +229,14 @@ bool json_string_field(const std::string& text, const std::string& key, std::str
         value.push_back(c);
     }
     return false;
+}
+
+bool json_literal_field(const std::string& text, const std::string& key, const std::string& literal) {
+    size_t pos = 0;
+    if (!top_level_json_value(text, key, &pos) || text.compare(pos, literal.size(), literal) != 0) return false;
+    const size_t end = pos + literal.size();
+    return end == text.size() || std::isspace(static_cast<unsigned char>(text[end])) ||
+           text[end] == ',' || text[end] == '}';
 }
 
 bool json_true_field(const std::string& text, const std::string& key) {
@@ -538,6 +568,19 @@ extern "C" int gp_turing_product_adopt_and_load(
     return 1;
 }
 
+extern "C" int gp_turing_row_tool_request_has_source_mode(const char* request_json) {
+    if (!request_json) return 0;
+    std::ifstream in(request_json, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    size_t pos = 0, flags = 0;
+    if (top_level_json_value(text, "source_names", &pos)) return 1;
+    const bool found = top_level_json_value(text, "unstable_source_only", &pos, &flags);
+    if (!found && flags == 0) return 0; // legacy row request
+    // A single explicit false has the same stable-row semantics as Python.
+    // True, malformed and duplicate flags cannot revive an unrelated receipt.
+    return !found || flags != 1 || !json_literal_field(text, "unstable_source_only", "false");
+}
+
 extern "C" int gp_turing_row_tool_compile_only(
     const char* python_executable,
     const char* nodus_root,
@@ -573,6 +616,23 @@ extern "C" int gp_turing_row_tool_compile_only(
         std::cerr << "turing_product_adopter: " << error << "\n";
         copy_out(error, out_error, out_error_cap);
         return cancelled ? 2 : 0;
+    }
+    // Source-only emission is deliberately not an adoptable row product.
+    // Keep it distinct even when the host was configured to auto-adopt.
+    {
+        std::ifstream in(product / "nodus-row-tool-product.json", std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::string schema, state;
+        if (json_string_field(text, "schema", &schema) && schema == "nodus-turing-source-only-product-v1") {
+            if (!json_true_field(text, "unstable_source_only") || !json_literal_field(text, "loadable", "false") ||
+                !json_literal_field(text, "buffer_abi", "null") ||
+                !json_string_field(text, "state", &state) || state != "emitted-not-built" ||
+                fs::exists(product / "nodus-row-tool-product.receipt")) {
+                copy_out("invalid source-only emission manifest", out_error, out_error_cap);
+                return 0;
+            }
+            return 3;
+        }
     }
     if (!fs::is_regular_file(product / "nodus-row-tool-product.receipt")) {
         std::cerr << "turing_product_adopter: compiler completed without a product receipt\n";
