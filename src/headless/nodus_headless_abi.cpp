@@ -465,6 +465,8 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
 
     std::vector<TrailerEdge> trailer_edges;
     std::vector<TrailerPort> trailer_ports;
+    struct ModulePolicy { int32_t module; int32_t exec; int32_t stack; };
+    std::vector<ModulePolicy> trailer_policies;
     std::vector<nodus::contracts::CanvasContractPorts::Record> trailer_contract_ports;
     {
         std::ifstream ifs(path);
@@ -494,7 +496,23 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
                 std::getline(ss, tp.name);
                 if (!tp.name.empty() && tp.name[0] == ' ') tp.name.erase(0, 1);
                 trailer_ports.push_back(std::move(tp));
+            } else if (tag == "MODULE_POLICY") {
+                ModulePolicy policy{};
+                if (!(ss >> policy.module >> policy.exec >> policy.stack) ||
+                    policy.exec < -1 || policy.exec > 3 || policy.stack < 0 || policy.stack > 2) {
+                    std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                    return 0;
+                }
+                trailer_policies.push_back(policy);
             }
+        }
+    }
+
+    for (const auto& policy : trailer_policies) {
+        if (!nodus_headless_set_module_exec_mode(g, policy.module, policy.exec) ||
+            !nodus_headless_set_module_stack_contract(g, policy.module, policy.stack)) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot restore MODULE_POLICY %d\n", policy.module);
+            return 0;
         }
     }
 
@@ -574,6 +592,14 @@ extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* p
         return l.pb->declaration_order < r.pb->declaration_order;
     });
     std::ostringstream trailer;
+    const int32_t module_count = nodus_headless_get_module_count(g);
+    for (int32_t module = 0; module < module_count; ++module) {
+        int32_t exec = -1;
+        int32_t stack = 2;
+        if (!nodus_headless_get_module_exec_mode(g, module, &exec) ||
+            !nodus_headless_get_module_stack_contract(g, module, &stack)) return 0;
+        trailer << "MODULE_POLICY " << module << " " << exec << " " << stack << "\n";
+    }
     for (const auto& e : g->edges) {
         if (!e.configured) continue;
         NodusHeadlessFifoConfig c{};
@@ -691,6 +717,16 @@ extern "C" int32_t nodus_headless_get_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract) {
     if (!g || !g->ctx) return 0;
     return gp_canvas_get_module_stack_contract(g->ctx, module_idx, out_contract);
+}
+
+extern "C" int32_t nodus_headless_set_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t mode) {
+    return g && g->ctx ? gp_canvas_set_module_exec_mode(g->ctx, module_idx, mode) : 0;
+}
+
+extern "C" int32_t nodus_headless_get_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_mode) {
+    return g && g->ctx ? gp_canvas_get_module_exec_mode(g->ctx, module_idx, out_mode) : 0;
 }
 
 extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id) {
@@ -885,6 +921,20 @@ extern "C" int32_t nodus_headless_push_token_ex(
     if (dropped) {
         push_event(g, NODUS_EVT_OVERFLOW, it->second.module_idx, it->second.edge_idx);
     }
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_publish_output_token(
+    NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* out_result) {
+    if (out_result) *out_result = NodusHeadlessPublishResult{};
+    if (!g || !g->table || !port_name || !bytes) return 0;
+    auto it = g->output_ports.find(port_name);
+    if (it == g->output_ports.end() || len != static_cast<size_t>(it->second.config.token_bytes)) return 0;
+    int32_t dropped = 0;
+    const int32_t ok = gp_table_edge_publish(g->table, it->second.edge_idx, it->second.key,
+        bytes, static_cast<int32_t>(len), &dropped);
+    if (out_result) { out_result->accepted = ok != 0; out_result->dropped = dropped != 0; }
     return 1;
 }
 

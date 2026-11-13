@@ -432,6 +432,165 @@ bool ThreadManager::wait_for_submitted_ticks() {
     return processed_ >= target;
 }
 
+bool ThreadManager::free_request_matches(const TickRequest& req) const {
+    if (!free_request_) return false;
+    const auto& old = *free_request_;
+    if (old.root_table != req.root_table || old.dt != req.dt ||
+        old.modules.size() != req.modules.size() || old.edges.size() != req.edges.size() ||
+        old.stages.size() != req.stages.size()) return false;
+    for (size_t i = 0; i < req.modules.size(); ++i) {
+        const auto& a = old.modules[i];
+        const auto& b = req.modules[i];
+        if (a.module_idx != b.module_idx || a.table != b.table || a.in_count != b.in_count ||
+            a.out_count != b.out_count || a.sim_enabled != b.sim_enabled ||
+            a.module_skip != b.module_skip || a.exec_skip_count != b.exec_skip_count ||
+            a.exec_mode != b.exec_mode || a.stack_contract != b.stack_contract) return false;
+    }
+    for (size_t i = 0; i < req.edges.size(); ++i) {
+        const auto& a = old.edges[i];
+        const auto& b = req.edges[i];
+        if (a.edge_idx != b.edge_idx || a.type_id != b.type_id ||
+            a.a_module != b.a_module || a.a_contact_idx != b.a_contact_idx ||
+            a.b_module != b.b_module || a.b_contact_idx != b.b_contact_idx) return false;
+    }
+    for (size_t i = 0; i < req.stages.size(); ++i) {
+        const auto& a = old.stages[i];
+        const auto& b = req.stages[i];
+        if (a.module_idx != b.module_idx || a.stage != b.stage || a.table != b.table ||
+            a.out_rgba != b.out_rgba || a.out_pitch != b.out_pitch ||
+            a.width != b.width || a.height != b.height || a.cache_mu != b.cache_mu) return false;
+    }
+    return true;
+}
+
+bool ThreadManager::free_tables_have_pending_ops(const TickRequest& req) const {
+    if (req.root_table && gp_table_has_pending_ops(req.root_table)) return true;
+    for (const auto& mod : req.modules) {
+        if (mod.exec_mode == ExecMode::Free && mod.table && gp_table_has_pending_ops(mod.table)) return true;
+    }
+    return false;
+}
+
+void ThreadManager::stop_free_workers() {
+    free_running_.store(false, std::memory_order_release);
+    for (auto& worker : free_workers_) if (worker.joinable()) worker.join();
+    free_workers_.clear();
+    free_request_.reset();
+}
+
+void ThreadManager::start_free_workers(const TickRequest& req) {
+    std::vector<int> indices;
+    for (size_t i = 0; i < req.modules.size(); ++i) {
+        const auto& mod = req.modules[i];
+        if (mod.exec_mode == ExecMode::Free && mod.table && !mod.module_skip)
+            indices.push_back(static_cast<int>(i));
+    }
+    if (indices.empty()) return;
+    free_request_ = std::make_shared<TickRequest>(req);
+    struct InputChannel { int edge; uint64_t reader; int count; };
+    struct ChannelSet {
+        int module = -1;
+        GP_TableContext* table = nullptr;
+        std::vector<InputChannel> inputs;
+        std::vector<std::pair<int, int>> outputs;
+    };
+    std::vector<ChannelSet> channels;
+    channels.reserve(indices.size());
+    GP_CanvasContext* canvas = gp_canvas_get_singleton();
+    for (int idx : indices) {
+        ChannelSet set;
+        set.module = idx;
+        set.table = req.root_table ? req.root_table : req.modules[static_cast<size_t>(idx)].table;
+        if (graph_runtime_ && idx < static_cast<int>(graph_runtime_->module_io_rows.size())) {
+            for (const auto& row : graph_runtime_->module_io_rows[static_cast<size_t>(idx)]) {
+                if (row.kind != ModuleRowKind::Input && row.kind != ModuleRowKind::Output) continue;
+                for (int ai = 0; ai < std::max(1, row.attachment_count); ++ai) {
+                    const int contact = row.contact_idx + ai;
+                    int edge_idx = -1;
+                    for (const auto& edge : req.edges) {
+                        if (row.kind == ModuleRowKind::Input && edge.b_module == idx && edge.b_contact_idx == contact) {
+                            edge_idx = edge.edge_idx;
+                            break;
+                        }
+                        if (row.kind == ModuleRowKind::Output && edge.a_module == idx && edge.a_contact_idx == contact) {
+                            edge_idx = edge.edge_idx;
+                            break;
+                        }
+                    }
+                    if (edge_idx < 0 && canvas && set.table) {
+                        const uint64_t port_key = gp_canvas_get_tool_row_id(canvas, idx, contact);
+                        if (port_key) gp_table_edge_index_for_key(set.table, port_key, &edge_idx);
+                    }
+                    if (edge_idx < 0) continue;
+                    if (row.kind == ModuleRowKind::Input) {
+                        uint64_t reader = canvas_contact_key(idx, contact);
+                        if (!reader) reader = 0x8000000000000000ull;
+                        auto found = std::find_if(set.inputs.begin(), set.inputs.end(), [&](const auto& entry) {
+                            return entry.edge == edge_idx && entry.reader == reader;
+                        });
+                        if (found == set.inputs.end()) set.inputs.push_back({edge_idx, reader, 1});
+                        else ++found->count;
+                    } else {
+                        auto found = std::find_if(set.outputs.begin(), set.outputs.end(), [&](const auto& entry) {
+                            return entry.first == edge_idx;
+                        });
+                        if (found == set.outputs.end()) set.outputs.emplace_back(edge_idx, 1);
+                        else ++found->second;
+                    }
+                }
+            }
+        }
+        channels.push_back(std::move(set));
+    }
+    // Register every reader before any producer starts. This preserves seed
+    // tokens and avoids a producer outrunning a late first subscription.
+    for (const auto& set : channels) {
+        for (const auto& input : set.inputs)
+            gp_table_edge_subscribe_ex(set.table, input.edge, input.reader, /*start_at_head=*/0);
+    }
+    free_running_.store(true, std::memory_order_release);
+    for (auto& set : channels) {
+        free_workers_.emplace_back([this, set = std::move(set), snapshot = free_request_]() {
+            TickRequest local = *snapshot;
+            auto channels_ready = [&]() {
+                for (const auto& input : set.inputs) {
+                    int32_t unread = 0;
+                    if (!gp_table_edge_unread(set.table, input.edge, input.reader, &unread) || unread < input.count)
+                        return false;
+                }
+                for (const auto& output : set.outputs) {
+                    if (!gp_table_edge_can_publish(set.table, output.first, output.second))
+                        return false;
+                }
+                return true;
+            };
+            uint32_t batch_size = 1;
+            for (;;) {
+                const auto batch_start = std::chrono::steady_clock::now();
+                uint32_t executed = 0;
+                // A lifecycle check once per bounded batch, never a manager
+                // handoff or an added check at the FIFO transfer.
+                for (uint32_t batch = 0; batch < batch_size; ++batch) {
+                    if (!channels_ready()) break;
+                    ++local.tick_id;
+                    execute_module_iteration(local, set.module);
+                    ++executed;
+                }
+                if (!free_running_.load(std::memory_order_acquire)) break;
+                if (executed == 0) {
+                    batch_size = 1;
+                    std::this_thread::yield();
+                    continue;
+                }
+                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - batch_start).count();
+                const uint64_t per_row_us = std::max<uint64_t>(1, static_cast<uint64_t>(std::max<int64_t>(1, elapsed)) / executed);
+                batch_size = static_cast<uint32_t>(std::clamp<uint64_t>(50000 / per_row_us, 1, 8192));
+            }
+        });
+    }
+}
+
 void ThreadManager::run_loop() {
     for (;;) {
         TickRequest req;
@@ -443,10 +602,12 @@ void ThreadManager::run_loop() {
             queue_.pop_front();
         }
 
-        // For now both modes execute the same per-tick work; the mode flag is
-        // reserved for upcoming scheduling semantics (free-spinning vs imposed
-        // deterministic schedule).
-        run_scheduled_tick(req);
+        const bool preserve_free = free_request_matches(req) && !free_tables_have_pending_ops(req);
+        if (!preserve_free) stop_free_workers();
+        TickRequest scheduled = req;
+        for (auto& mod : scheduled.modules) if (mod.exec_mode == ExecMode::Free) mod.module_skip = 1;
+        run_scheduled_tick(scheduled, preserve_free);
+        if (!preserve_free) start_free_workers(req);
 
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -461,6 +622,10 @@ void ThreadManager::run_loop() {
         }
         // Build and publish per-table network snapshots (manager thread only).
         for (const auto& mod : req.modules) {
+            // The snapshot API is manager-lane only and has no read lock.
+            // A FREE table owns its table continuously; retain its last safe
+            // snapshot until an explicit quiescent graph edit.
+            if (mod.exec_mode == ExecMode::Free && free_running_.load(std::memory_order_acquire)) continue;
             GP_TableContext* t = mod.table;
             if (!t) continue;
             int32_t node_count = 0, edge_count = 0; uint64_t stamp = 0;
@@ -486,6 +651,7 @@ void ThreadManager::run_loop() {
         }
         cv_done_.notify_all();
     }
+    stop_free_workers();
 }
 
 // Reader-table bridge implementation
@@ -516,217 +682,14 @@ bool ThreadManager::get_module_timing(int module_idx, ModuleTiming* out) const {
     if (module_idx < 0 || static_cast<size_t>(module_idx) >= module_ledger_.size()) return false;
     const auto &ledger = module_ledger_[static_cast<size_t>(module_idx)];
     out->run_count = ledger.run_count.load(std::memory_order_relaxed);
-    // convert microseconds back to seconds
-    uint64_t last_us = ledger.last_run_wall_time_us.load(std::memory_order_relaxed);
-    uint64_t total_us = ledger.total_run_wall_time_us.load(std::memory_order_relaxed);
-    out->last_run_wall_time = static_cast<double>(last_us) / 1e6;
-    out->total_run_wall_time = static_cast<double>(total_us) / 1e6;
+    const uint64_t last_ns = ledger.last_run_wall_time_ns.load(std::memory_order_relaxed);
+    const uint64_t total_ns = ledger.total_run_wall_time_ns.load(std::memory_order_relaxed);
+    out->last_run_wall_time = static_cast<double>(last_ns) / 1e9;
+    out->total_run_wall_time = static_cast<double>(total_ns) / 1e9;
     return true;
 }
 
-void ThreadManager::run_scheduled_tick(const TickRequest& req) {
-        // Apply any queued UI ops on each module's table before building the successor
-        // adjacency. This ensures UI-side edits are applied on the manager thread
-        // and will be visible to scheduling logic in this tick.
-        for (const auto& m : req.modules) {
-            if (m.table) gp_table_apply_pending_ops(reinterpret_cast<GP_TableContext*>(m.table));
-        }
-        if (req.root_table) {
-            gp_table_apply_pending_ops(req.root_table);
-        }
-
-        // Build successor adjacency from edges (writer -> reader modules) using
-    // module vector indices as canonical ids.
-    int N = static_cast<int>(req.modules.size());
-    std::vector<std::vector<int>> succ(N);
-    // Note: GUI-originated events for bound ports are published into root
-    // table FIFOs (pointer-mode). They are consumed during the normal per-row
-    // FIFO consumption below; the legacy canvas pop-queue path was removed.
-    for (const auto& e : req.edges) {
-        if (e.a_module >= 0 && e.a_module < N && e.b_module >= 0 && e.b_module < N) {
-            succ[e.a_module].push_back(e.b_module);
-        }
-    }
-
-        // Special-case: consume root-table FIFO samples targeted at the canvas
-        // synthetic root-reflection module and use them to update the canonical
-        // subgroup toolbar RGBA values. We expect producers to publish 4-float
-        // RGBA samples to the root-edge consuming the toolbar contact index.
-        if (req.root_table) {
-            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-            int root_mod = gp_canvas_get_root_module_idx();
-            if (canvas_single && root_mod >= 0) {
-                for (const auto &e : req.edges) {
-                    // consume samples for edges where either endpoint is the synthetic root module
-                    int edge_idx = e.edge_idx;
-                    int contact_idx = -1;
-                    if (e.b_module == root_mod) contact_idx = e.b_contact_idx;
-                    else if (e.a_module == root_mod) contact_idx = e.a_contact_idx;
-                    else continue;
-                    uint64_t reader_key = canvas_contact_key(root_mod, contact_idx);
-                    if (reader_key == 0) reader_key = 0x8000000000000000ull;
-                    gp_table_edge_subscribe_ex(req.root_table, edge_idx, reader_key, /*start_at_head=*/1);
-                    int32_t unread = 0;
-                    gp_table_edge_unread(req.root_table, edge_idx, reader_key, &unread);
-                            if (unread > 0) {
-                                // Determine edge stride (cache if available).
-                        int stride = 0;
-                        auto itc = edge_stride_cache_.find(edge_idx);
-                        if (itc != edge_stride_cache_.end()) stride = itc->second;
-                        else {
-                                GP_TableEdgeTensorSpecTyped spec{};
-                                if (gp_table_edge_get_tensor_spec(req.root_table, edge_idx, &spec)) {
-                                    stride = 1;
-                                    for (int di = 0; di < spec.dim_count; ++di) stride *= std::max(1, spec.dims[di]);
-                                } else stride = 1;
-                            edge_stride_cache_[edge_idx] = stride;
-                        }
-
-                        int subgroup_idx = contact_idx;
-                        const int toolbar_base = kModuleFrameContactBase + kModuleExtraLedCount * kModuleExtraLedRows;
-                        if (contact_idx >= toolbar_base && contact_idx < toolbar_base + kModuleExtraLedCount) {
-                            subgroup_idx = contact_idx - toolbar_base;
-                        }
-
-                        auto almost_equal = [](float a, float b) {
-                            return std::fabs(a - b) <= 1e-6f;
-                        };
-
-                        if (stride == 4) {
-                            float sample[4] = {0.0f,0.0f,0.0f,0.0f};
-                            int32_t written = 0;
-                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample, static_cast<int32_t>(4 * sizeof(float)), &written) && written >= static_cast<int32_t>(4 * sizeof(float))) {
-                                float rgba[4];
-                                int32_t written2 = 0;
-                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, rgba, static_cast<int32_t>(4 * sizeof(float)), &written2) && written2 >= static_cast<int32_t>(4 * sizeof(float))) {
-                                    bool changed = false;
-                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
-                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
-                                    else {
-                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
-                                    }
-                                    if (changed) {
-                                        printf("ThreadManager: consumed full sample for edge %d contact=%d mapped_subgroup=%d\n", edge_idx, contact_idx, subgroup_idx);
-                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
-                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
-                                    }
-                                }
-                            }
-                        } else if (stride == 1) {
-                            // Assemble RGBA from successive single-float samples.
-                            while (true) {
-                                // First check for pointer-mode events on stride-1 assembly pathway.
-                                void* maybe_p = nullptr;
-                                if (edge_stride_allows_pointer(req.root_table, edge_idx) &&
-                                    gp_table_edge_consume_ptr(req.root_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p)) {
-                                    // consumed a pointer EventPayload
-                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
-                                    void* pa = ep->pending;
-                                    if (canvas_single) {
-                                        // clear the originating frame ptrs (both send/receive)
-                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
-                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
-                                        // invoke and free the pending action
-                                        gp_canvas_invoke_pending_action(canvas_single, pa);
-                                        gp_canvas_free_pending_action(canvas_single, pa);
-                                    }
-                                    delete ep;
-                                    continue; // continue consuming until FIFO empty
-                                }
-                                int32_t written = 0;
-                                float s[1] = {0.0f};
-                                if (!(gp_table_edge_consume(req.root_table, edge_idx, reader_key, s, static_cast<int32_t>(sizeof(float)), &written) && written == static_cast<int32_t>(sizeof(float)))) break;
-                                auto &buf = edge_assemble_buf_[edge_idx];
-                                buf.push_back(s[0]);
-                                if (buf.size() >= 4) {
-                                    float rgba[4] = {buf[0], buf[1], buf[2], buf[3]};
-                                    bool changed = false;
-                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
-                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
-                                    else {
-                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
-                                    }
-                                    if (changed) {
-                                        printf("ThreadManager: assembled RGBA from stride-1 for edge %d contact=%d mapped_subgroup=%d\n", edge_idx, contact_idx, subgroup_idx);
-                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
-                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
-                                    }
-                                    // remove consumed values
-                                    if (buf.size() > 4) {
-                                        std::vector<float> leftover(buf.begin() + 4, buf.end());
-                                        buf.swap(leftover);
-                                    } else buf.clear();
-                                }
-                            }
-                        } else {
-                            // Fallback: attempt to read stride (if >4 we ignore extras) and apply first 4 components.
-                            int cap = std::max(1, std::min(4, stride));
-                            std::vector<float> sample(cap, 0.0f);
-                            int32_t written = 0;
-                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample.data(), static_cast<int32_t>(cap * sizeof(float)), &written) && written > 0) {
-                                // consume only if we can read the full stride
-                                std::vector<float> consumed(stride, 0.0f);
-                                int32_t consumed_written = 0;
-                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, consumed.data(), static_cast<int32_t>(stride * sizeof(float)), &consumed_written) && consumed_written == static_cast<int32_t>(stride * sizeof(float))) {
-                                    float rgba[4] = {0.0f,0.0f,0.0f,1.0f};
-                                    for (int i = 0; i < std::min(4, stride); ++i) rgba[i] = consumed[i];
-                                    bool changed = false;
-                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
-                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
-                                    else {
-                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
-                                    }
-                                    if (changed) {
-                                        printf("ThreadManager: consumed stride-%d sample for edge %d contact=%d mapped_subgroup=%d\n", stride, edge_idx, contact_idx, subgroup_idx);
-                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
-                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-    // Prefer topological order when acyclic, otherwise use ASAP/ALAP slack heuristic.
-    bool acyclic = true;
-    std::vector<int> order = topo_kahn(succ);
-    if (order.empty()) {
-        acyclic = false;
-        // cyclic: compute asap/alap and order by slack
-        auto asap = compute_asap_iter(N, succ);
-        int max_asap = 0; for (int v : asap) max_asap = std::max(max_asap, v);
-        int makespan = max_asap + N;
-        auto alap = compute_alap_iter(N, succ, makespan);
-        struct Node { int idx; int slack; int a; };
-        std::vector<Node> nodes; nodes.reserve(N);
-        for (int i = 0; i < N; ++i) nodes.push_back({i, alap[i] - asap[i], asap[i]});
-        std::sort(nodes.begin(), nodes.end(), [](const Node& A, const Node& B){
-            if (A.slack != B.slack) return A.slack < B.slack;
-            return A.a < B.a;
-        });
-        order.clear(); order.reserve(N);
-        for (auto &n : nodes) order.push_back(n.idx);
-    }
-
-    // Execute modules in chosen order.
-    // First, execute any stage tasks so their streamed samples arrive into
-    // tables before table steps run in this tick. Stage tasks may write
-    // into canvas-provided cache buffers (protected by optional mutex).
-    for (const auto &st : req.stages) {
-        if (!st.stage) continue;
-        uint64_t batch_id = static_cast<uint64_t>(std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count());
-        if (st.cache_mu) {
-            std::lock_guard<std::mutex> lk(*st.cache_mu);
-            gp_stage_perform_tick(reinterpret_cast<GP_StageContext*>(st.stage), st.table, batch_id, nullptr, st.out_rgba, st.out_pitch, st.width, st.height);
-        } else {
-            gp_stage_perform_tick(reinterpret_cast<GP_StageContext*>(st.stage), st.table, batch_id, nullptr, st.out_rgba, st.out_pitch, st.width, st.height);
-        }
-    }
-    // Per-module, row-sequential, stack-based tool pipeline execution
-    // For each module, wire up IO row metadata and FIFO consume/publish
-    auto execute_module = [&](int mod_idx) {
+void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx) {
         if (mod_idx < 0 || mod_idx >= (int)req.modules.size()) return;
         const auto& mod = req.modules[static_cast<size_t>(mod_idx)];
         // Skip modules that have no table or are marked to skip entirely by canvas UI
@@ -805,13 +768,21 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         RawStackFrame* module_stack = (mod.module_idx >= 0) ? ensure_module_tool_stack(mod.module_idx) : nullptr;
         if (!module_stack) return;
         ValueTypeId stack_default_type = module_tool_stack_default_type();
-        const ValueType* stack_type_info = ValueTypeRegistry::global().get(stack_default_type);
-        size_t stack_elem_size = (stack_type_info && stack_type_info->size > 0) ? stack_type_info->size : sizeof(double);
+        static const ValueTypeId scalar_type = ValueTypeRegistry::global().builtin(VT_FLOAT64);
+        const bool scalar_stack = mod.stack_contract == ModuleStackContract::ScalarF32 &&
+            stack_default_type == scalar_type;
+        const ValueType* stack_type_info = scalar_stack ? nullptr : ValueTypeRegistry::global().get(stack_default_type);
+        size_t stack_elem_size = scalar_stack ? sizeof(double) :
+            (stack_type_info && stack_type_info->size > 0 ? stack_type_info->size : sizeof(double));
         reset_module_tool_stack(*module_stack);
         std::vector<float> stack_snapshot;
         auto push_value = [&](float value) {
             double dv = static_cast<double>(value);
-            raw_stack_push_typed(*module_stack, &dv, stack_default_type);
+            if (scalar_stack) {
+                raw_stack_push_known_type(*module_stack, &dv, stack_default_type, sizeof(dv));
+            } else {
+                raw_stack_push_typed(*module_stack, &dv, stack_default_type);
+            }
         };
         auto pop_value = [&]() -> float {
             if (!module_stack || module_stack->byte_count == 0) {
@@ -820,13 +791,18 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
 #endif
                 return 0.0f;
             }
-            ValueTypeId top_tid = kInvalidValueTypeId;
-            if (!raw_stack_peek_type(*module_stack, top_tid) || top_tid != stack_default_type) {
-                return 0.0f;
+            if (!scalar_stack) {
+                ValueTypeId top_tid = kInvalidValueTypeId;
+                if (!raw_stack_peek_type(*module_stack, top_tid) || top_tid != stack_default_type) {
+                    return 0.0f;
+                }
             }
             size_t before = module_stack->byte_count / (stack_elem_size ? stack_elem_size : 1);
             double dv = 0.0;
-            if (!raw_stack_pop_typed(*module_stack, &dv, stack_default_type)) {
+            const int popped = scalar_stack
+                ? raw_stack_pop_known_type(*module_stack, &dv, stack_default_type, sizeof(dv), false)
+                : raw_stack_pop_typed(*module_stack, &dv, stack_default_type);
+            if (!popped) {
                 return 0.0f;
             }
 #if defined(NODUS_MODULE_ACTIVITY_DEBUG) && (NODUS_MODULE_ACTIVITY_DEBUG != 0)
@@ -882,7 +858,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         GP_TableContext* fifo_table = req.root_table ? req.root_table : mod.table;
         // Optional timing measurement for this module execution
         bool _tm_measured = false;
-        double _tm_last_run_secs = 0.0;
+        uint64_t _tm_last_run_ns = 0;
         bool _tm_enabled = timing_enabled_.load(std::memory_order_relaxed);
         std::chrono::high_resolution_clock::time_point _tm_start;
         if (_tm_enabled) {
@@ -1538,7 +1514,8 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
         canvas_set_module_stack_tail(mod_idx, tail_ptr, static_cast<int>(stack_snapshot.size()));
         if (_tm_enabled) {
             auto _tm_end = std::chrono::high_resolution_clock::now();
-            _tm_last_run_secs = std::chrono::duration<double>(_tm_end - _tm_start).count();
+            _tm_last_run_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                _tm_end - _tm_start).count());
             _tm_measured = true;
         }
         if (mod.module_idx >= 0) {
@@ -1556,14 +1533,217 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req) {
                 ledger.tool_cycle = tool_cycle;
             }
             if (_tm_measured) {
-                // store times as integer microseconds to allow atomic fetch_add
-                uint64_t us = static_cast<uint64_t>(std::lround(_tm_last_run_secs * 1e6));
                 ledger.run_count.fetch_add(1, std::memory_order_relaxed);
-                ledger.last_run_wall_time_us.store(us, std::memory_order_relaxed);
-                ledger.total_run_wall_time_us.fetch_add(us, std::memory_order_relaxed);
+                ledger.last_run_wall_time_ns.store(_tm_last_run_ns, std::memory_order_relaxed);
+                ledger.total_run_wall_time_ns.fetch_add(_tm_last_run_ns, std::memory_order_relaxed);
             }
         }
-    };
+}
+
+void ThreadManager::run_scheduled_tick(const TickRequest& req, bool preserve_free_tables) {
+        // Apply any queued UI ops on each module's table before building the successor
+        // adjacency. This ensures UI-side edits are applied on the manager thread
+        // and will be visible to scheduling logic in this tick.
+        for (const auto& m : req.modules) {
+            if (m.table && !(preserve_free_tables && m.exec_mode == ExecMode::Free))
+                gp_table_apply_pending_ops(reinterpret_cast<GP_TableContext*>(m.table));
+        }
+        if (req.root_table && !preserve_free_tables) {
+            gp_table_apply_pending_ops(req.root_table);
+        }
+
+        // Build successor adjacency from edges (writer -> reader modules) using
+    // module vector indices as canonical ids.
+    int N = static_cast<int>(req.modules.size());
+    std::vector<std::vector<int>> succ(N);
+    // Note: GUI-originated events for bound ports are published into root
+    // table FIFOs (pointer-mode). They are consumed during the normal per-row
+    // FIFO consumption below; the legacy canvas pop-queue path was removed.
+    for (const auto& e : req.edges) {
+        if (e.a_module >= 0 && e.a_module < N && e.b_module >= 0 && e.b_module < N) {
+            succ[e.a_module].push_back(e.b_module);
+        }
+    }
+
+        // Special-case: consume root-table FIFO samples targeted at the canvas
+        // synthetic root-reflection module and use them to update the canonical
+        // subgroup toolbar RGBA values. We expect producers to publish 4-float
+        // RGBA samples to the root-edge consuming the toolbar contact index.
+        if (req.root_table) {
+            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+            int root_mod = gp_canvas_get_root_module_idx();
+            if (canvas_single && root_mod >= 0) {
+                for (const auto &e : req.edges) {
+                    // consume samples for edges where either endpoint is the synthetic root module
+                    int edge_idx = e.edge_idx;
+                    int contact_idx = -1;
+                    if (e.b_module == root_mod) contact_idx = e.b_contact_idx;
+                    else if (e.a_module == root_mod) contact_idx = e.a_contact_idx;
+                    else continue;
+                    uint64_t reader_key = canvas_contact_key(root_mod, contact_idx);
+                    if (reader_key == 0) reader_key = 0x8000000000000000ull;
+                    gp_table_edge_subscribe_ex(req.root_table, edge_idx, reader_key, /*start_at_head=*/1);
+                    int32_t unread = 0;
+                    gp_table_edge_unread(req.root_table, edge_idx, reader_key, &unread);
+                            if (unread > 0) {
+                                // Determine edge stride (cache if available).
+                        int stride = 0;
+                        auto itc = edge_stride_cache_.find(edge_idx);
+                        if (itc != edge_stride_cache_.end()) stride = itc->second;
+                        else {
+                                GP_TableEdgeTensorSpecTyped spec{};
+                                if (gp_table_edge_get_tensor_spec(req.root_table, edge_idx, &spec)) {
+                                    stride = 1;
+                                    for (int di = 0; di < spec.dim_count; ++di) stride *= std::max(1, spec.dims[di]);
+                                } else stride = 1;
+                            edge_stride_cache_[edge_idx] = stride;
+                        }
+
+                        int subgroup_idx = contact_idx;
+                        const int toolbar_base = kModuleFrameContactBase + kModuleExtraLedCount * kModuleExtraLedRows;
+                        if (contact_idx >= toolbar_base && contact_idx < toolbar_base + kModuleExtraLedCount) {
+                            subgroup_idx = contact_idx - toolbar_base;
+                        }
+
+                        auto almost_equal = [](float a, float b) {
+                            return std::fabs(a - b) <= 1e-6f;
+                        };
+
+                        if (stride == 4) {
+                            float sample[4] = {0.0f,0.0f,0.0f,0.0f};
+                            int32_t written = 0;
+                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample, static_cast<int32_t>(4 * sizeof(float)), &written) && written >= static_cast<int32_t>(4 * sizeof(float))) {
+                                float rgba[4];
+                                int32_t written2 = 0;
+                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, rgba, static_cast<int32_t>(4 * sizeof(float)), &written2) && written2 >= static_cast<int32_t>(4 * sizeof(float))) {
+                                    bool changed = false;
+                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
+                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
+                                    else {
+                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
+                                    }
+                                    if (changed) {
+                                        printf("ThreadManager: consumed full sample for edge %d contact=%d mapped_subgroup=%d\n", edge_idx, contact_idx, subgroup_idx);
+                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
+                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+                                    }
+                                }
+                            }
+                        } else if (stride == 1) {
+                            // Assemble RGBA from successive single-float samples.
+                            while (true) {
+                                // First check for pointer-mode events on stride-1 assembly pathway.
+                                void* maybe_p = nullptr;
+                                if (edge_stride_allows_pointer(req.root_table, edge_idx) &&
+                                    gp_table_edge_consume_ptr(req.root_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p)) {
+                                    // consumed a pointer EventPayload
+                                    EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
+                                    void* pa = ep->pending;
+                                    if (canvas_single) {
+                                        // clear the originating frame ptrs (both send/receive)
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 1, ep->frame_idx, nullptr);
+                                        gp_canvas_set_module_frame_ptr(canvas_single, ep->src_module, 0, ep->frame_idx, nullptr);
+                                        // invoke and free the pending action
+                                        gp_canvas_invoke_pending_action(canvas_single, pa);
+                                        gp_canvas_free_pending_action(canvas_single, pa);
+                                    }
+                                    delete ep;
+                                    continue; // continue consuming until FIFO empty
+                                }
+                                int32_t written = 0;
+                                float s[1] = {0.0f};
+                                if (!(gp_table_edge_consume(req.root_table, edge_idx, reader_key, s, static_cast<int32_t>(sizeof(float)), &written) && written == static_cast<int32_t>(sizeof(float)))) break;
+                                auto &buf = edge_assemble_buf_[edge_idx];
+                                buf.push_back(s[0]);
+                                if (buf.size() >= 4) {
+                                    float rgba[4] = {buf[0], buf[1], buf[2], buf[3]};
+                                    bool changed = false;
+                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
+                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
+                                    else {
+                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
+                                    }
+                                    if (changed) {
+                                        printf("ThreadManager: assembled RGBA from stride-1 for edge %d contact=%d mapped_subgroup=%d\n", edge_idx, contact_idx, subgroup_idx);
+                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
+                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+                                    }
+                                    // remove consumed values
+                                    if (buf.size() > 4) {
+                                        std::vector<float> leftover(buf.begin() + 4, buf.end());
+                                        buf.swap(leftover);
+                                    } else buf.clear();
+                                }
+                            }
+                        } else {
+                            // Fallback: attempt to read stride (if >4 we ignore extras) and apply first 4 components.
+                            int cap = std::max(1, std::min(4, stride));
+                            std::vector<float> sample(cap, 0.0f);
+                            int32_t written = 0;
+                            if (gp_table_edge_peek(req.root_table, edge_idx, reader_key, sample.data(), static_cast<int32_t>(cap * sizeof(float)), &written) && written > 0) {
+                                // consume only if we can read the full stride
+                                std::vector<float> consumed(stride, 0.0f);
+                                int32_t consumed_written = 0;
+                                if (gp_table_edge_consume(req.root_table, edge_idx, reader_key, consumed.data(), static_cast<int32_t>(stride * sizeof(float)), &consumed_written) && consumed_written == static_cast<int32_t>(stride * sizeof(float))) {
+                                    float rgba[4] = {0.0f,0.0f,0.0f,1.0f};
+                                    for (int i = 0; i < std::min(4, stride); ++i) rgba[i] = consumed[i];
+                                    bool changed = false;
+                                    auto it = last_applied_rgba_subgroup_.find(subgroup_idx);
+                                    if (it == last_applied_rgba_subgroup_.end()) changed = true;
+                                    else {
+                                        for (int i = 0; i < 4; ++i) if (!almost_equal(it->second[i], rgba[i])) { changed = true; break; }
+                                    }
+                                    if (changed) {
+                                        printf("ThreadManager: consumed stride-%d sample for edge %d contact=%d mapped_subgroup=%d\n", stride, edge_idx, contact_idx, subgroup_idx);
+                                        gp_canvas_set_subgroup_toolbar_rgba_at(canvas_single, subgroup_idx, rgba);
+                                        last_applied_rgba_subgroup_[subgroup_idx] = {rgba[0], rgba[1], rgba[2], rgba[3]};
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    // Prefer topological order when acyclic, otherwise use ASAP/ALAP slack heuristic.
+    bool acyclic = true;
+    std::vector<int> order = topo_kahn(succ);
+    if (order.empty()) {
+        acyclic = false;
+        // cyclic: compute asap/alap and order by slack
+        auto asap = compute_asap_iter(N, succ);
+        int max_asap = 0; for (int v : asap) max_asap = std::max(max_asap, v);
+        int makespan = max_asap + N;
+        auto alap = compute_alap_iter(N, succ, makespan);
+        struct Node { int idx; int slack; int a; };
+        std::vector<Node> nodes; nodes.reserve(N);
+        for (int i = 0; i < N; ++i) nodes.push_back({i, alap[i] - asap[i], asap[i]});
+        std::sort(nodes.begin(), nodes.end(), [](const Node& A, const Node& B){
+            if (A.slack != B.slack) return A.slack < B.slack;
+            return A.a < B.a;
+        });
+        order.clear(); order.reserve(N);
+        for (auto &n : nodes) order.push_back(n.idx);
+    }
+
+    // Execute modules in chosen order.
+    // First, execute any stage tasks so their streamed samples arrive into
+    // tables before table steps run in this tick. Stage tasks may write
+    // into canvas-provided cache buffers (protected by optional mutex).
+    for (const auto &st : req.stages) {
+        if (!st.stage) continue;
+        uint64_t batch_id = static_cast<uint64_t>(std::chrono::duration<double>(std::chrono::high_resolution_clock::now().time_since_epoch()).count());
+        if (st.cache_mu) {
+            std::lock_guard<std::mutex> lk(*st.cache_mu);
+            gp_stage_perform_tick(reinterpret_cast<GP_StageContext*>(st.stage), st.table, batch_id, nullptr, st.out_rgba, st.out_pitch, st.width, st.height);
+        } else {
+            gp_stage_perform_tick(reinterpret_cast<GP_StageContext*>(st.stage), st.table, batch_id, nullptr, st.out_rgba, st.out_pitch, st.width, st.height);
+        }
+    }
+    // Per-module, row-sequential, stack-based tool pipeline execution
+    // For each module, wire up IO row metadata and FIFO consume/publish
+    auto execute_module = [&](int mod_idx) { execute_module_iteration(req, mod_idx); };
 
     auto run_sequential = [&]() {
         for (int mod_idx : order) {

@@ -491,6 +491,11 @@ int gp_canvas_get_module_row(GP_CanvasContext* ctx, int module_idx, int row_idx,
 // `contract` is ModuleStackContract (thread_manager.h).
 int gp_canvas_set_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int contract);
 int gp_canvas_get_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int* out_contract);
+// Per-module execution mode: -1 inherits the canvas choice, 0 sequential,
+// 1 pooled, 2 slip, 3 independent Free table worker. Set before stepping or
+// at a quiescent graph-edit boundary.
+int gp_canvas_set_module_exec_mode(GP_CanvasContext* ctx, int module_idx, int mode);
+int gp_canvas_get_module_exec_mode(GP_CanvasContext* ctx, int module_idx, int* out_mode);
 int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
 
 // Thread manager / scheduler mode (0 = free-spinning, 1 = scheduled).

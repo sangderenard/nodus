@@ -551,6 +551,8 @@ add_test(NAME edge_runtime_abi_test COMMAND edge_runtime_abi_test)
 # ThreadManager, but exports only its own narrow nodus_headless_* surface.
 add_library(nodus_headless SHARED
   src/headless/nodus_headless_abi.cpp
+  src/headless/radio_rows.cpp
+  src/headless/pcm_playback.cpp
 )
 target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
 target_include_directories(nodus_headless PUBLIC
@@ -561,7 +563,7 @@ target_include_directories(nodus_headless PUBLIC
 target_link_libraries(nodus_headless PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
   # contract ports: loopback listener and socket adapters (include/contract_listener.h)
-  target_link_libraries(nodus_headless PRIVATE ws2_32)
+  target_link_libraries(nodus_headless PRIVATE ws2_32 SDL3::SDL3)
   # The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
   # refers to that object, so from the static library the linker would leave it out; this keeps it in.
   target_link_options(nodus_headless PRIVATE "/INCLUDE:nodus_exec_row_source")
@@ -625,6 +627,18 @@ add_executable(nodus_headless_demo tools/nodus_headless_demo.cpp)
 target_include_directories(nodus_headless_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_demo PRIVATE nodus_headless)
 target_compile_features(nodus_headless_demo PUBLIC cxx_std_20)
+
+# Native Radio: one headless table containing its ordered capture/fftfree and
+# UDP rows, executed by the independent Free table worker.
+add_executable(nodus_radio tools/nodus_radio.cpp)
+target_include_directories(nodus_radio PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(nodus_radio PRIVATE nodus_headless)
+target_compile_features(nodus_radio PRIVATE cxx_std_20)
+
+add_executable(nodus_pcm_playback tools/nodus_pcm_playback.cpp)
+target_include_directories(nodus_pcm_playback PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(nodus_pcm_playback PRIVATE nodus_headless)
+target_compile_features(nodus_pcm_playback PRIVATE cxx_std_20)
 
 # Loads a real bridge-generated canvas (turing's nodus_canvas_kpn.py output)
 # headlessly, validates its computed output against an independent Python
@@ -927,6 +941,16 @@ add_executable(test_thread_manager_affinity tests/thread_manager_affinity_test.c
 target_link_libraries(test_thread_manager_affinity PRIVATE canvas_tables_static)
 target_compile_features(test_thread_manager_affinity PRIVATE cxx_std_20)
 add_test(NAME thread_manager_affinity_test COMMAND test_thread_manager_affinity)
+add_executable(test_thread_manager_free tests/thread_manager_free_test.cpp)
+target_link_libraries(test_thread_manager_free PRIVATE canvas_tables_static)
+target_compile_features(test_thread_manager_free PRIVATE cxx_std_20)
+add_test(NAME thread_manager_free_test COMMAND test_thread_manager_free)
+add_executable(edge_fifo_concurrent_backpressure_test tests/edge_fifo_concurrent_backpressure_test.cpp)
+target_link_libraries(edge_fifo_concurrent_backpressure_test PRIVATE canvas_tables_static)
+target_compile_features(edge_fifo_concurrent_backpressure_test PRIVATE cxx_std_20)
+add_test(NAME edge_fifo_concurrent_backpressure_test COMMAND edge_fifo_concurrent_backpressure_test)
+set_tests_properties(edge_fifo_concurrent_backpressure_test PROPERTIES TIMEOUT 15)
+set_tests_properties(thread_manager_free_test PROPERTIES TIMEOUT 30 LABELS "cpu;scheduler")
 set_tests_properties(thread_manager_affinity_test PROPERTIES TIMEOUT 30 LABELS "cpu;scheduler")
 if(WIN32)
   set_tests_properties(thread_manager_test thread_manager_affinity_test PROPERTIES

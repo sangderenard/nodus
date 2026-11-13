@@ -231,13 +231,14 @@ inline void raw_stack_reset(RawStackFrame& frame) {
     frame.byte_count = 0;
 }
 
-// Push a single typed element onto the raw stack. Returns 1 on success, 0 otherwise.
-inline int raw_stack_push_typed(RawStackFrame& frame, const void* in, ValueTypeId type_id) {
+// The caller has already resolved the declared stack element type. This is
+// suitable for a homogeneous module contract; mixed stacks use the checked
+// typed entry points below.
+inline int raw_stack_push_known_type(RawStackFrame& frame, const void* in,
+                                     ValueTypeId type_id, size_t needed) {
     if (!frame.types_per_byte || !in) return 0;
-    const ValueType* vt = ValueTypeRegistry::global().get(type_id);
-    if (!vt) return 0;
-    size_t needed = vt->size;
-    if (frame.byte_count + needed > frame.byte_capacity) return 0;
+    if (needed == 0 || frame.byte_count > frame.byte_capacity ||
+        needed > frame.byte_capacity - frame.byte_count) return 0;
     // If frame is backed by a mem backend with copy hooks, perform optimized copy
     if (frame.backend) {
         const gp_mem_backend_vtable_t* bvt = gp_mem_backend_get_vtable(frame.backend);
@@ -256,6 +257,12 @@ inline int raw_stack_push_typed(RawStackFrame& frame, const void* in, ValueTypeI
         return 1;
     }
     return 0; // without backend we no longer maintain a host heap buffer
+}
+
+// Push a single typed element onto the raw stack. Returns 1 on success, 0 otherwise.
+inline int raw_stack_push_typed(RawStackFrame& frame, const void* in, ValueTypeId type_id) {
+    const ValueType* vt = ValueTypeRegistry::global().get(type_id);
+    return vt ? raw_stack_push_known_type(frame, in, type_id, vt->size) : 0;
 }
 
 // Attach/get backend for a RawStackFrame
@@ -333,16 +340,19 @@ extern "C" inline int gp_raw_stack_frame_swap_backend(RawStackFrame* frame, gp_m
     return 1;
 }
 
-// Pop a single typed element from the raw stack into out. Returns 1 on success, 0 otherwise.
-inline int raw_stack_pop_typed(RawStackFrame& frame, void* out, ValueTypeId type_id) {
+// Pop a declared homogeneous element. The optional mask validation is for
+// protective execution and mixed-type stacks; bounds and backend copies are
+// checked in both modes.
+inline int raw_stack_pop_known_type(RawStackFrame& frame, void* out,
+                                    ValueTypeId type_id, size_t needed,
+                                    bool validate_mask) {
     if (!frame.types_per_byte || !out) return 0;
-    const ValueType* vt = ValueTypeRegistry::global().get(type_id);
-    if (!vt) return 0;
-    size_t needed = vt->size;
-    if (frame.byte_count < needed) return 0;
+    if (needed == 0 || frame.byte_count > frame.byte_capacity || frame.byte_count < needed) return 0;
     size_t start = frame.byte_count - needed;
-    for (size_t i = 0; i < needed; ++i) {
-        if (frame.types_per_byte[start + i] != type_id) return 0;
+    if (validate_mask) {
+        for (size_t i = 0; i < needed; ++i) {
+            if (frame.types_per_byte[start + i] != type_id) return 0;
+        }
     }
     // If backend attached and has copy_from_backend, use it
     if (frame.backend) {
@@ -361,6 +371,12 @@ inline int raw_stack_pop_typed(RawStackFrame& frame, void* out, ValueTypeId type
         return 1;
     }
     return 0; // no host heap storage without backend
+}
+
+// Pop a single typed element from the raw stack into out. Returns 1 on success, 0 otherwise.
+inline int raw_stack_pop_typed(RawStackFrame& frame, void* out, ValueTypeId type_id) {
+    const ValueType* vt = ValueTypeRegistry::global().get(type_id);
+    return vt ? raw_stack_pop_known_type(frame, out, type_id, vt->size, true) : 0;
 }
 
 // Push up to n elements (typed) using single memcpy. Returns number pushed.
