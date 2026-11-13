@@ -29,19 +29,29 @@ private: bool market_; ContractNegotiator* mailman_=nullptr;
 // ContractNegotiator instances; no global singleton or ray-specific transport is created.
 inline bool register_negotiator_tools(ToolRegistry& registry, ContractNegotiator& mailman,
                                    const std::string& prefix) {
-    if(prefix.empty() || registry.find(prefix+".market") || registry.find(prefix+".worker")) return false;
-    for(bool market : {true,false}){
+    // Allocate every rollback key before publishing the first factory. The
+    // registry is configured on a stopped graph, not concurrently mutated.
+    const std::string market_id=prefix+".market",worker_id=prefix+".worker";
+    if(prefix.empty() || registry.find(market_id) || registry.find(worker_id)) return false;
+    bool market_attempted=false,worker_attempted=false;
+    auto rollback=[&] {
+        // register_tool can throw after insertion (for example its diagnostics).
+        // These names were absent before this transaction; never erase a
+        // pre-existing entry or alias when registration is refused.
+        if(worker_attempted)registry.unregister_tool(worker_id);
+        if(market_attempted)registry.unregister_tool(market_id);
+    };
+    try {for(bool market : {true,false}){
         ToolRegistry::Entry entry;
-        entry.id=prefix+(market?".market":".worker");
+        entry.id=market?market_id:worker_id;
         entry.name=market?"Contract market":"Producer mailman";
         entry.factory=[&mailman,market](){
             return std::unique_ptr<ITool,std::function<void(ITool*)>>(
                 new NegotiatorTool(market,&mailman),[](ITool* tool){delete tool;});
         };
-        if(!registry.register_tool(std::move(entry))){
-            registry.unregister_tool(prefix+".market");return false;
-        }
-    }
+        (market?market_attempted:worker_attempted)=true;
+        if(!registry.register_tool(std::move(entry))){rollback();return false;}
+    }} catch(...) {rollback();throw;}
     return true;
 }
 } // namespace nodus::contracts

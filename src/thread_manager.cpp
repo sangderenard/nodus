@@ -366,6 +366,14 @@ bool ThreadManager::persistent_workers() const {
     return persistent_workers_.load(std::memory_order_relaxed);
 }
 
+void ThreadManager::set_parallel_worker_limit(size_t count) {
+    parallel_worker_limit_.store(count, std::memory_order_relaxed);
+}
+
+size_t ThreadManager::parallel_worker_limit() const {
+    return parallel_worker_limit_.load(std::memory_order_relaxed);
+}
+
 void ThreadManager::ensure_pool_workers(size_t count) {
     // Called only by the manager lane, between parallel ticks.
     while (pool_workers_.size() < count) {
@@ -1776,6 +1784,8 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req, bool preserve_fre
         int hw = static_cast<int>(std::thread::hardware_concurrency());
         if (hw <= 0) hw = 1;
         int thread_count = std::min(hw, std::max(1, static_cast<int>(order.size())));
+        const auto limit = parallel_worker_limit();
+        if (limit) thread_count = std::min(thread_count, static_cast<int>(std::min<size_t>(limit, std::numeric_limits<int>::max())));
         std::mutex ready_mu;
         std::condition_variable ready_cv;
         std::atomic<int> remaining(static_cast<int>(order.size()));

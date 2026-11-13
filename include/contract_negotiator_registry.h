@@ -14,6 +14,11 @@ namespace nodus::contracts {
 // 60; an existing pair is returned whatever it has). A nonzero value on an existing
 // pair whose loan length differs throws std::runtime_error naming both lengths.
 ContractNegotiator& acquire(const std::string& prefix, size_t capacity, uint64_t loan_ticks = 0);
+// Create a new process-owned pair with a domain eligibility policy. Refuses an
+// existing prefix rather than replacing its policy or retained work. Ordinary
+// acquire/load may subsequently find this pair without changing its Offer.
+ContractNegotiator& create_with_offer(const std::string& prefix, size_t capacity,
+    ContractNegotiator::Offer offer, uint64_t loan_ticks = 60);
 ContractNegotiator* find(const std::string& prefix);
 // Unregisters both tool ids, destroys the negotiator; false if unknown.
 // No bound row instance may execute after release.
