@@ -68,6 +68,15 @@ Logs: `C:/Users/alber/nodus-build/wave-joined-angular-material-512.log` and
 host-observed dispatch durations for these arithmetic products, not a T4
 arena propagation time or an estimate of a full ray exposure.
 
+An optional final argument writes the verified device-0 complex field as a
+512×512 PNG in user build space. The trial image is
+`C:/Users/alber/nodus-build/nodus-joined-wave-field.png`; red encodes signed
+real amplitude, green signed imaginary amplitude, and blue normalized power.
+The test fixture deliberately varies input values across cells, creating
+diagonal bands. This is an actual Nodus output tensor visualization, not a
+scene photograph or diffraction result. Its run receipt is
+`C:/Users/alber/nodus-build/wave-joined-angular-material-image-512.log`.
+
 The remaining handoff is explicit: a ray-stage work token must identify its
 T4 branch and arena field in the state library, execute the existing fftfree
 and aperture/transfer sequence around these arithmetic rows, and return the

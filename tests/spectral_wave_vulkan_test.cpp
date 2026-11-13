@@ -1,8 +1,10 @@
 #include "gpu_shader_job_tool.h"
 #include "kernel_pipeline_tool.h"
+#include "common/tensors/abstraction/kpath/kpath_raster.h"
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -11,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <span>
 #include <vector>
 
 namespace {
@@ -55,7 +58,8 @@ bool put(ITool& tool,std::uint64_t address,const std::vector<std::uint32_t>& val
 }
 
 int main(int argc,char** argv){
-    const bool joined=argc==4&&std::string(argv[1])=="angular_propagating";
+    const bool joined=(argc==4||argc==5)&&
+        std::string(argv[1])=="angular_propagating";
     if(argc!=3&&!joined)return 2;
     const std::string kind=argv[1];
     const std::size_t feeds=kind=="angular_propagating"?7:
@@ -253,6 +257,29 @@ int main(int argc,char** argv){
                    std::abs(std::bit_cast<float>(im[lane])-want_im)>2e-5f)
                     return 15;
             }
+        }
+        if(joined&&argc==5&&device==0){
+            const auto* re=static_cast<const std::uint32_t*>(final_re.data());
+            const auto* im=static_cast<const std::uint32_t*>(final_im.data());
+            float peak=0.f;
+            for(std::size_t lane=0;lane<lanes;lane++)
+                peak=std::max(peak,std::hypot(std::bit_cast<float>(re[lane]),
+                                              std::bit_cast<float>(im[lane])));
+            if(!(peak>0.f))return 16;
+            std::vector<std::uint8_t> pixels(lanes*3);
+            for(std::size_t lane=0;lane<lanes;lane++){
+                const float real=std::bit_cast<float>(re[lane])/peak;
+                const float imag=std::bit_cast<float>(im[lane])/peak;
+                const auto channel=[](float value){return static_cast<std::uint8_t>(
+                    std::clamp(value,0.f,1.f)*255.f);};
+                pixels[3*lane]=channel(.5f+.5f*real);
+                pixels[3*lane+1]=channel(.5f+.5f*imag);
+                pixels[3*lane+2]=channel(real*real+imag*imag);
+            }
+            if(!nodus::tensors::kpath::write_png_rgb_u8(
+                   argv[4],512,512,
+                   std::span<const std::uint8_t>(pixels.data(),pixels.size())))
+                return 17;
         }
         std::cout<<"wave_kind="<<kind<<" device="<<device<<" lanes="<<lanes
                  <<" dispatch_ms="<<(joined?receipt[12]+receipt[21]:receipt[3])*1e-6
