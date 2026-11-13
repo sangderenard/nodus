@@ -1,0 +1,50 @@
+# Compiled wave math through the Nodus GPU row
+
+**2026-11-13 UTC.** Spectral T4 owns the physical equations and arena state in
+`spectral-analyzer/csrc/kernels/wave_t4.cpp`. Turing's
+`src/compiler/spectral_wave_laws.py` now authors four of those arithmetic sites
+as SymPy laws and compiles them through AbstractTensor/SSA into native f64 batch
+pieces and deployable f32 SPIR-V products. These products do not replace T4's
+fftfree transforms, arena scheduling, or continuation state.
+
+| Product | T4 source site | Input domain |
+|---|---|---|
+| `angular_propagating` | `FftfreeExecutor::transfer_for`, propagating `kz2 >= 0` and complex multiply | positive wavelength and nonnegative `kz2`; direction ±1 |
+| `angular_evanescent` | same transfer table, `kz2 < 0` | `gap = -kz2 > 0`; decay applies in either direction |
+| `aperture_material` | `aperture_material_exact` | closed material pixels only; positive wavelength/distance, nonnegative imaginary index |
+| `jones_interface` | `rigid_interface_exact` complex 2×2 multiply | coordinate map and source sampling are owned by the caller |
+
+Generate the four validated GPU products in user build space from the Turing
+review branch:
+
+```powershell
+python -m src.compiler.spectral_wave_laws --output C:\Users\alber\nodus-build\wave-kernel-artifacts
+```
+
+Each product directory contains the `.spv`, deployable shader record, source,
+and validation manifest. The native Nodus test consumes those compiled SPIR-V
+products through `GpuShaderJobTool` and `TensorStateLibraryTool`, using the
+product's feed, output, and control binding order. It checks every output in a
+512×512 plane on each of the three enumerated Vulkan devices. Receipts are in
+`C:/Users/alber/nodus-build/wave-<kind>-512.log`:
+
+| Kernel | GPU 0 first dispatch | GPU 1 | GPU 2 |
+|---|---:|---:|---:|
+| propagating | 24.778 ms | 15.362 ms | 8.540 ms |
+| evanescent | 15.621 ms | 8.360 ms | 7.326 ms |
+| aperture material | 18.105 ms | 10.802 ms | 8.325 ms |
+| Jones interface | 1.437 ms | 1.183 ms | 1.644 ms |
+
+These are first-dispatch host timings, not sustained kernel throughput or GPU
+occupancy. Every row reported `lanes=262144 verified=1`. The independent
+f64 LLVM gate and f32 SPIR-V assembly/validation gate in Turing each pass for
+all four laws. The GPU trial compares against the T4 arithmetic at f32
+precision, not bit parity with T4's cached f64 transfer table.
+
+To continue toward a T4 production row, keep the existing fftfree forward and
+inverse transforms, the source's cache/transfer ordering, aperture mask and
+power accounting, Jones coordinate mapping, and bounded arena state. The
+source's separated-arena energy and polarization xfails remain. A thick-lens
+aperture run must carry the actual branch handle and Jones state through T1–T3
+before this math can claim correct optical continuation. The new shader rows
+are kernel products and a Nodus execution proof, not that completed pipeline.

@@ -1369,6 +1369,11 @@ add_executable(test_spectral_exact_lens_vulkan
   tests/spectral_exact_lens_vulkan_test.cpp)
 target_link_libraries(test_spectral_exact_lens_vulkan PRIVATE canvas_tables_static)
 target_compile_features(test_spectral_exact_lens_vulkan PRIVATE cxx_std_20)
+
+add_executable(test_spectral_wave_vulkan
+  tests/spectral_wave_vulkan_test.cpp)
+target_link_libraries(test_spectral_wave_vulkan PRIVATE canvas_tables_static)
+target_compile_features(test_spectral_wave_vulkan PRIVATE cxx_std_20)
 add_executable(test_spectral_t3_vulkan tests/spectral_t3_vulkan_test.cpp)
 target_link_libraries(test_spectral_t3_vulkan PRIVATE nodus_tensor_core)
 target_compile_features(test_spectral_t3_vulkan PRIVATE cxx_std_20)
