@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu_shader_job_tool.h"
+#include "fftfree_tool.h"
 #include "kernel_pipeline_tool.h"
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
@@ -60,6 +61,13 @@ public:
         if(!library_||registry_.find(id)||
            !register_kernel_pipeline(registry_,id,std::move(components)))return false;
         registered_.push_back(std::move(id));
+        return true;
+    }
+
+    bool register_fftfree(const std::string& dll){
+        if(!library_||registry_.find("nodus.fftfree")||
+           !register_fftfree_tool(registry_,*library_,dll))return false;
+        registered_.push_back("nodus.fftfree");
         return true;
     }
 
