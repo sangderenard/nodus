@@ -103,6 +103,8 @@ public:
     GpuLoan borrow_gpu(std::uint64_t card,std::uint64_t address,
                        std::size_t device,bool writable);
     CpuLoan borrow_cpu(std::uint64_t card,std::uint64_t address,bool writable);
+    std::optional<TensorStateLibrary::Spec> describe_state(
+        std::uint64_t card,std::uint64_t address) const;
     struct Candidate { std::uint64_t base=0, fields=0; };
     static_assert(sizeof(Candidate)==2*sizeof(std::uint64_t));
     struct ResidencyChoice {

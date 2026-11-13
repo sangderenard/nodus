@@ -350,6 +350,14 @@ TensorStateLibraryTool::CpuLoan TensorStateLibraryTool::borrow_cpu(
        owner->second!=card)return {};
     return CpuLoan(library_->lease_cpu(address,writable));
 }
+std::optional<TensorStateLibrary::Spec> TensorStateLibraryTool::describe_state(
+    std::uint64_t card,std::uint64_t address) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto owner=address_card_.find(address);
+    if(!library_||!cards_.count(card)||owner==address_card_.end()||
+       owner->second!=card)return {};
+    return library_->describe(address);
+}
 std::uint64_t TensorStateLibraryTool::resident_bytes(
     std::uint64_t card,std::uint64_t address,std::size_t device) const {
     std::lock_guard<std::mutex> lock(mutex_);

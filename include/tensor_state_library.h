@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -242,6 +243,13 @@ public:
             result.vram.push_back(banks_[i]->stats());
         }
         return result;
+    }
+
+    std::optional<Spec> describe(std::uint64_t address) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found=entries_.find(address);
+        if(found==entries_.end())return {};
+        return found->second.spec;
     }
 
 private:

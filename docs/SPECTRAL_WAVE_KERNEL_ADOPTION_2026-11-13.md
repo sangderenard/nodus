@@ -83,3 +83,16 @@ and aperture/transfer sequence around these arithmetic rows, and return the
 authored continuation state to T3/T5. The current joined schedule proves
 ordered complex-field ownership within Nodus; it does not yet supply the
 T3-to-T4 ray/field conversion or the completed image contract.
+
+### Existing multi-reader edge for wave receipts
+
+`EdgeTensorFifo` already has 64 independent subscriber cursors. A table edge
+exposes `gp_table_edge_subscribe_ex` and keyed consume operations; with
+`top_k == 0`, the slowest subscribed reader holds the lossless write frontier.
+`top_k > 0` explicitly advances lagging cursors and reports a drop. Wave
+continuation receipts can therefore fan out on the existing typed edge to a
+continuation row and observers without a second queue or duplicated field
+tensor. The FIFO owns the receipt bytes, not the tensor-library state named by
+an address in the receipt. State removal must follow the continuation contract
+and every required reader's completion; FIFO consumption alone cannot be used
+as a state-lifetime lease.
