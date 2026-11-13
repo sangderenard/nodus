@@ -53,3 +53,17 @@ The row never waits for FFmpeg's stdin. `queue_bytes` caps bytes queued or curre
 The present Radio PCM RTP exit pulls `PcmBlock` from the headless graph and sends network-order L16 in RTP over UDP. It does **not** presently yield little-endian U8 tensors to this row. A graph adapter or an existing receiver must convert that source to the declared `s16le` input format before wiring the Radio feed to `exec.radio.hls`. This change proves the continuous process and encoder output path; it does not claim the Radio-to-HLS graph edge or browser playback is connected.
 
 Tested with `tools/exec_row/exec_row_test.cpp` and the installed FFmpeg, using several PCM tensors on one open child process. Existing compressor span behavior remains covered by the same test.
+
+## Stack-connected Radio follow-up
+
+`nodus_radio` now accepts a final `hls=1` argument after `wait-for-start`. When the host declares `exec.radio.hls`, its one Free table uses these rows in order:
+
+```text
+radio.file_output -> radio.pcm_s16le -> radio.udp_broadcast -> radio.pcm_rtp -> exec.radio.hls
+```
+
+The source puts its actual float32 PCM block in the same stack frame as its spectrum data. `radio.pcm_s16le` converts and quantizes the samples into a U8 tensor, places that tensor beneath the spectrum pointer, and leaves the pointer on top for the existing UDP spectrum row. The RTP row still consumes its original canonical PCM FIFO. After the spectrum pointer is consumed, the declared exec row copies the tensor bytes to FFmpeg's open stdin. The conversion row destroys its owned tensor on the next tick, after the exec row has copied it. No second PCM FIFO or Python conversion path is involved.
+
+The optional HLS mode requires the file source and PCM port. The `NODUS_EXEC_ROWS` and `NODUS_EXEC_CORE_ROOTS` environment variables must be set before `nodus_radio.exe` starts, because row registration occurs when the headless image loads. The normal Radio CLI and RTP route remain valid without the final HLS argument.
+
+`tools/test_radio_hls_stack.py` generated a five-second 48 kHz WAV, ran the real Nodus canvas with SDL dummy audio, and checked that HLS appeared while the child was still running. FFprobe identified AAC, 48 kHz, two channels in a generated transport stream segment. The same run received 938 RTP packets and reported zero native PCM drops. The test does not configure Apache or browser playback.

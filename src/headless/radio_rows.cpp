@@ -1,6 +1,8 @@
 #include "nodus_headless_abi.h"
 #include "tool_api.h"
 #include "tool_registry.h"
+#include "common/tensors/abstraction/tensor_abi.h"
+#include "common/tensors/abstraction/abstract_tensor_handle.h"
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -77,6 +79,7 @@ struct RadioFrame {
     uint64_t captured_frames = 0;
     float rms = 0;
     std::array<float, kMaxBands> power{};
+    PcmBlock pcm{}; // Same captured samples, made available to a stack conversion row.
     bool terminal = false; // Internal row control, never part of NRAD.
 };
 
@@ -164,6 +167,7 @@ public:
             ctx.succeeded = false;
             return;
         }
+        frame_.pcm.frames = 0;
         if (!shared_->config.wav.empty()) {
             if (!stream_ || !feed_) { shared_->running.store(0); std::this_thread::sleep_for(std::chrono::milliseconds(2)); ctx.succeeded = false; return; }
             const size_t hop = shared_->config.fft_size / shared_->config.overlap;
@@ -205,6 +209,7 @@ public:
                 block.frames = static_cast<uint32_t>(count);
                 block.first_frame = frame_count_(scope_) - count;
                 std::copy_n(samples_.data() + position_, count * 2, block.stereo.data());
+                frame_.pcm = block;
                 NodusHeadlessPublishResult result{};
                 if (!nodus_headless_publish_output_token(shared_->pcm_graph, kPcmPort, &block, sizeof(block), &result) ||
                     !result.accepted || result.dropped) shared_->pcm_dropped.fetch_add(1);
@@ -262,6 +267,52 @@ private:
     scope_free_fn free_ = nullptr;
     uint64_t last_emitted_ = 0;
     RadioFrame frame_{};
+};
+
+// Stack bridge: the RadioFrame pointer stays on top for the spectrum exit;
+// an s16le byte tensor sits beneath it for a later declared exec row.
+class RadioPcmS16le final : public ITool {
+public:
+    ~RadioPcmS16le() noexcept override { shutdown(); }
+    const char* id_cstr() const noexcept override { return "radio.pcm_s16le"; }
+    const char* name_cstr() const noexcept override { return "Radio PCM s16le"; }
+    void initialize(const ToolInitContext&) override {}
+    void shutdown() override { if (owned_) { nodus_tensor_destroy(owned_); owned_ = 0; } }
+    void tick(double, HostAPI&) override {}
+    void render(RenderContext&) override {}
+    void execute_stack(ToolStackContext& ctx) override {
+        if (!ctx.stack.raw) { ctx.succeeded = false; return; }
+        shutdown(); // The previous tick's exec row has already copied its bytes.
+        void* value = nullptr;
+        const auto pointer_type = ValueTypeRegistry::global().builtin(VT_VOID_PTR);
+        if (!raw_stack_pop_typed(*ctx.stack.raw, &value, pointer_type)) { ctx.succeeded = false; return; }
+        const auto* frame = static_cast<const RadioFrame*>(value);
+        if (!frame || frame->magic != kFrameMagic || frame->pcm.frames > 256 ||
+            (frame->pcm.frames && frame->pcm.sample_rate != 48000)) {
+            raw_stack_push_typed(*ctx.stack.raw, &value, pointer_type);
+            ctx.succeeded = false; return;
+        }
+        if (frame->pcm.frames && !frame->terminal) {
+            const uint64_t shape[1] = {static_cast<uint64_t>(frame->pcm.frames) * 4};
+            owned_ = nodus_tensor_create(NODUS_DTYPE_U8, 1, shape);
+            if (!owned_) { raw_stack_push_typed(*ctx.stack.raw, &value, pointer_type); ctx.succeeded = false; return; }
+            std::array<uint8_t, 1024> pcm{};
+            for (size_t i = 0; i < frame->pcm.frames * 2; ++i) {
+                const float sample = std::clamp(frame->pcm.stereo[i], -1.0f, 1.0f);
+                const uint16_t word = static_cast<uint16_t>(static_cast<int16_t>(std::lround(sample * 32767.0f)));
+                pcm[i * 2] = static_cast<uint8_t>(word);
+                pcm[i * 2 + 1] = static_cast<uint8_t>(word >> 8);
+            }
+            if (nodus_tensor_write(owned_, 0, pcm.data(), shape[0]) != static_cast<int64_t>(shape[0]) ||
+                !raw_stack_push_abstract_tensor(*ctx.stack.raw, {owned_})) {
+                shutdown(); raw_stack_push_typed(*ctx.stack.raw, &value, pointer_type);
+                ctx.succeeded = false; return;
+            }
+        }
+        if (!raw_stack_push_typed(*ctx.stack.raw, &value, pointer_type)) ctx.succeeded = false;
+    }
+private:
+    uint64_t owned_ = 0;
 };
 
 class RadioUdp final : public ITool {
@@ -516,18 +567,26 @@ extern "C" int32_t nodus_headless_radio_pcm_configure(uint16_t port) {
     auto shared = configured;
     if (!tool_registry_global().register_tool(entry("radio.pcm_rtp", "Radio PCM RTP",
         [shared] { return ToolRegistry::Factory::result_type(new RadioPcmUdp(shared), [](ITool* p) { delete p; }); }))) return 0;
+    if (!tool_registry_global().register_tool(entry("radio.pcm_s16le", "Radio PCM s16le",
+        [] { return ToolRegistry::Factory::result_type(new RadioPcmS16le(), [](ITool* p) { delete p; }); }))) {
+        tool_registry_global().unregister_tool("radio.pcm_rtp");
+        return 0;
+    }
     configured->config.pcm_port = port;
     return 1;
 }
-extern "C" int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module) {
+extern "C" int32_t nodus_headless_radio_pcm_bind_at(NodusHeadlessGraph* graph, int32_t module, int32_t row) {
     std::lock_guard<std::mutex> lock(config_mutex);
-    if (!configured || !configured->config.pcm_port || configured->captured.load()) return 0;
+    if (!configured || !configured->config.pcm_port || configured->captured.load() || row < 0) return 0;
     NodusHeadlessFifoConfig fifo{};
     fifo.token_bytes = sizeof(PcmBlock); fifo.slots = 16; fifo.top_k = 8;
     fifo.type_id = -1; fifo.layout = 2; fifo.dtype = 0; fifo.backend_type = GP_MEM_BACKEND_CPU;
-    if (!nodus_headless_declare_output_port_ex(graph, kPcmPort, module, 2, &fifo, 1)) return 0;
+    if (!nodus_headless_declare_output_port_ex(graph, kPcmPort, module, row, &fifo, 1)) return 0;
     configured->pcm_graph = graph;
     return 1;
+}
+extern "C" int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module) {
+    return nodus_headless_radio_pcm_bind_at(graph, module, 2);
 }
 
 extern "C" int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, uint64_t* dropped) {
