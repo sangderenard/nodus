@@ -117,7 +117,26 @@ def main() -> None:
     parser.add_argument("--history-file", type=Path, required=True)
     parser.add_argument("--turing-root", type=Path, required=True)
     parser.add_argument("--native-nodus-root", type=Path)
+    parser.add_argument("--publish-db", type=Path,
+                        help="shared Meowdoku paper_arena.sqlite for public progress")
+    parser.add_argument("--worker", default="local-training-worker")
     args = parser.parse_args()
+    if args.publish_db is None:
+        return _run(args, None)
+    sys.path.insert(0, str(args.turing_root.resolve() / "examples"))
+    from meowdoku import qualification_runs
+    with qualification_runs.publishing(args.publish_db, market="AAPL + SPY + BTC/USD",
+                                       model="AbstractTensor 6→4→3", worker=args.worker,
+                                       planned_epochs=len(SEEDS) * MAX_EPOCHS) as (db, run_id):
+        _run(args, (qualification_runs, db, run_id))
+
+
+def _run(args, publish) -> None:
+    def announce(phase: str, completed: int, **metrics) -> None:
+        if publish is not None:
+            module, db, run_id = publish
+            module.progress(db, run_id, phase=phase, completed_epochs=completed, **metrics)
+
     output, turing_root = args.output.resolve(), args.turing_root.resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("training output directory must be fresh")
@@ -145,10 +164,14 @@ def main() -> None:
 
     candidates = []
     selected = None
+    completed = 0
     for seed in SEEDS:
         network = PolicyNetwork(AT, seed)
         for epoch in range(1, MAX_EPOCHS + 1):
             loss = network.step(x, target)
+            completed += 1
+            if epoch % 5 == 0 and epoch not in CHECK_EPOCHS:
+                announce("training", completed, seed=seed, epoch=epoch, loss=loss)
             if epoch not in CHECK_EPOCHS:
                 continue
             scores = network.values(validation_rows)
@@ -163,6 +186,8 @@ def main() -> None:
                          "validation_mean_return_on_order_cap": str(mean),
                          "validation_passed": passed, "validation_windows": windows}
             candidates.append(candidate)
+            announce("validation", completed, seed=seed, epoch=epoch, loss=loss,
+                     validation_mean=float(mean), validation_passed=passed)
             if selected is None or mean > selected[0]:
                 selected = (mean, network.weights(), candidate)
             if passed:
@@ -173,6 +198,7 @@ def main() -> None:
     assert selected is not None
     _, weights, chosen = selected
     np.savez(output / "weights.npz", **weights)
+    announce("compiling", completed)
 
     nodus_root = Path(__file__).resolve().parents[1]
     native_root = (args.native_nodus_root or nodus_root).resolve()
@@ -198,6 +224,7 @@ def main() -> None:
         if loaded_id:
             graph.unload_plugin(loaded_id)
     product_hash = hashlib.sha256((Path(row_request["output_dir"]) / "nodus-row-tool-product.json").read_bytes()).hexdigest()
+    announce("holdout", completed)
     holdout_pnls, holdout_windows = window_results(
         holdout_rows, holdout_scores, stock_close, paper_arena, paper_mock,
         dataset_hash, product_hash, compiled=True)
@@ -208,7 +235,8 @@ def main() -> None:
             "kind": "compiled", "source": {"ref": "product:" + product_hash}})
         qualification = paper_arena.record_historical_qualification(
             judge_db, OWNER, bot["id"], "cautious", dataset_hash, holdout_pnls,
-            [window["sell_fills"] for window in holdout_windows], margin=MARGIN)
+            [window["sell_fills"] for window in holdout_windows],
+            validation_passed=chosen["validation_passed"], margin=MARGIN)
     finally:
         judge_db.close()
     report = {"schema": "nodus-aapl-training-qualification-v1", "dataset_sha256": dataset_hash,
@@ -220,6 +248,15 @@ def main() -> None:
               "holdout_windows": holdout_windows, "qualification": qualification,
               "adoption": adoption, "venue": "internal_mock"}
     (output / "qualification.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if publish is not None:
+        module, db, run_id = publish
+        module.finish(db, run_id, status="passed_historical" if qualification["passed"]
+                      else "unqualified", result={
+                          "dataset_sha256": dataset_hash,
+                          "validation_passed": chosen["validation_passed"],
+                          "holdout_passed": qualification["passed"],
+                          "holdout_mean_return_on_order_cap": qualification["mean_net_return"],
+                          "holdout_window_pnl_usd": holdout_pnls})
     print(json.dumps({"chosen_seed": chosen["seed"], "chosen_epoch": chosen["epoch"],
                       "validation_passed": chosen["validation_passed"],
                       "holdout_passed": qualification["passed"],

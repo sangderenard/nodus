@@ -108,6 +108,16 @@ changes require a fresh future holdout for an honest admission decision.
 These are internal mock fills, not Alpaca paper executions or evidence of
 future profit.
 
+The trainer can publish progress to Meowdoku's shared paper-arena SQLite file
+with `--publish-db <paper_arena.sqlite> --worker <instance-name>`. It emits an
+epoch count every five epochs, a validation checkpoint at epochs 20/40/80/160,
+and compile and holdout phases. The public spectator route and Markets page
+read only sanitized progress; the worker retains weights and full receipts in
+its own output directory. A scratch published run on 2026-11-13 completed
+480 epochs in about 19 seconds and remained unqualified. This proves local
+publication, not live deployment or distributed gradient updates. The
+current run is deliberately bounded; it cannot promise a profitable model.
+
 Run with a fresh output directory and the server's restricted state secrets
 directory. The account ID is the credential owner; it is not used as the mock
 strategy owner, which exists only in the scratch database:
