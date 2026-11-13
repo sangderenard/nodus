@@ -110,7 +110,7 @@ public:
     Child& operator=(const Child&) = delete;
     ~Child() { stop(); }
 
-    bool start(const Program& program, std::string& why) {
+    bool start(const Program& program, std::string& why, bool discard_output = false) {
         stop();
         why = refusal(program);
         if (!why.empty()) return false;
@@ -162,6 +162,7 @@ public:
         CloseHandle(made.hThread);
         process_ = made.hProcess;
         input_done_ = false;
+        discard_output_ = discard_output;
         reader_ = std::thread([this] { read_loop(); });
         writer_ = std::thread([this] { write_loop(); });
         return true;
@@ -170,8 +171,26 @@ public:
     // Queue bytes for the child's input. Returns at once.
     void send(std::string bytes) {
         if (bytes.empty()) return;
-        { std::lock_guard<std::mutex> lock(mutex_); to_child_.push_back(std::move(bytes)); }
+        { std::lock_guard<std::mutex> lock(mutex_); pending_bytes_ += bytes.size(); to_child_.push_back(std::move(bytes)); }
         wake_.notify_all();
+    }
+
+    // A continuous row queues one tick's chunks atomically and never blocks on a slow child.
+    bool try_send_many(std::vector<std::string>& chunks, size_t limit) {
+        if (!running()) return false;
+        size_t total = 0;
+        for (const std::string& chunk : chunks) {
+            if (chunk.size() > limit - total) return false;
+            total += chunk.size();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (input_done_ || pending_bytes_ > limit - total) return false;
+            pending_bytes_ += total;
+            for (std::string& chunk : chunks) if (!chunk.empty()) to_child_.push_back(std::move(chunk));
+        }
+        wake_.notify_all();
+        return true;
     }
 
     // After everything sent has been written, the child sees end of input.
@@ -221,6 +240,7 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         to_child_.clear();
         from_child_.clear();
+        pending_bytes_ = 0;
         output_closed_ = false;
     }
 
@@ -241,6 +261,7 @@ private:
                 if (!WriteFile(input_, chunk.data() + at, want, &wrote, nullptr)) return;      // the child is gone
                 at += wrote;
             }
+            { std::lock_guard<std::mutex> lock(mutex_); pending_bytes_ -= chunk.size(); }
         }
         std::lock_guard<std::mutex> lock(handles_);
         if (input_) { CloseHandle(input_); input_ = nullptr; }         // end of input for the child
@@ -252,7 +273,7 @@ private:
             DWORD got = 0;
             if (!ReadFile(output_, buffer, sizeof(buffer), &got, nullptr) || got == 0) break;
             std::lock_guard<std::mutex> lock(mutex_);
-            from_child_.append(buffer, got);
+            if (!discard_output_) from_child_.append(buffer, got);
         }
         output_closed_ = true;
     }
@@ -264,7 +285,9 @@ private:
     std::condition_variable wake_;
     std::deque<std::string> to_child_;
     std::string from_child_;
+    size_t pending_bytes_ = 0;
     bool input_done_ = false;
+    bool discard_output_ = false;
     std::atomic<bool> output_closed_{false};
 };
 
