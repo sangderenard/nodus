@@ -36,6 +36,7 @@ Run from the Nodus repository root with the paired native build available:
 
 ```powershell
 $env:NODUS_HEADLESS_LIB='C:\Users\alber\nodus-build\free-runtime-build\Release\nodus_headless.dll'
+$env:NODUS_TENSOR_CORE='C:\Users\alber\nodus-build\free-runtime-build\Release\nodus_tensor_core.dll'
 python -m tools.prove_tensor_network_row C:\Users\alber\nodus-tensor-network-row-proof --turing-root C:\dev\Powershell\turing --native-nodus-root C:\Users\alber\nodus-build\free-runtime-src
 ```
 
@@ -124,5 +125,31 @@ strategy owner, which exists only in the scratch database:
 
 ```powershell
 $env:NODUS_HEADLESS_LIB='C:\Users\alber\nodus-build\free-runtime-build\Release\nodus_headless.dll'
+$env:NODUS_TENSOR_CORE='C:\Users\alber\nodus-build\free-runtime-build\Release\nodus_tensor_core.dll'
 python -m tools.replay_tensor_network_stock C:\Users\alber\nodus-aapl-replay-new --turing-root C:\dev\Powershell\turing --native-nodus-root C:\Users\alber\nodus-build\free-runtime-src --secrets-dir C:\dev\Powershell\srv\state\secrets --account-id 3
 ```
+
+## Live spectator replay on 2026-11-13
+
+The historical trainer was run against the already inspected one-year snapshot
+with `--publish-db C:/dev/Powershell/srv/state/sql/paper_arena.sqlite` and
+`--worker replay-inspected-20261113`. The served
+`/api/paper/qualification/live` route reported 480 training epochs, compiling,
+holdout, and an `unqualified` result. The Nodus row compiled and executed in
+the same bounded run. Its holdout P&Ls were `$0.12577`, `$0.17845`, and
+`-$0.09379`; this repeats the inspected data and is not a fresh admission test.
+
+The first two attempts crashed in the native graph after compilation with an
+older headless build. A third run exposed a DLL load error after Turing loaded
+an older `nodus_tensor_core.dll`; the next attempt used a matching pair but
+lacked the compiler driver under the staged Nodus root. The completed
+run used the current merged Nodus headers and compiler tools with matching
+native DLLs and import libraries from one build. Set both environment variables
+to DLLs from that same build before starting the trainer. The crashed spectator
+records were marked failed; the completed run is retained for the trading page.
+
+The trainer currently updates weights in Turing `AbstractTensor` and uses the
+Nodus graph for compiled inference and holdout replay. Its graph is not yet a
+managed, continuously rendered Nodus training canvas. The next topology must
+show the active training rows and feed their state to the existing spectator
+record without calling this bounded replay a continuous graph service.
