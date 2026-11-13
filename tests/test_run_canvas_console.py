@@ -1,4 +1,4 @@
-"""tools/run_canvas.py read-only admin console (protocol nodus-console/1)."""
+"""tools/run_canvas.py managed canvas console protocols."""
 
 from __future__ import annotations
 
@@ -141,6 +141,32 @@ class ConsoleTest(unittest.TestCase):
         c.close()
         last = self.stop()
         self.assertGreaterEqual(last["ticks"], 300, last)
+
+    def test_v2_ui_action_checks_revision_on_stepping_thread(self) -> None:
+        port, _ = self.start("200")
+        c = Client(port)
+        c.send(f"HELLO nodus-console/2 {TOKEN}")
+        self.assertEqual(c.line(), b"OK console messenger.nodus.txt actions\n")
+        revision, _, _, _ = c.snapshot()
+
+        def action(body):
+            payload = json.dumps(body).encode()
+            c.sock.sendall(b"ACTION %d\n" % len(payload) + payload)
+            header = c.line().split()
+            self.assertEqual(header[:2], [b"JSON", b"ACTION"])
+            return json.loads(c.f.read(int(header[2])))
+
+        changed = action({"op": "viewport", "expected_revision": revision,
+                          "width": 800, "height": 600})
+        self.assertTrue(changed["handled"])
+        clicked = action({"op": "mouse", "expected_revision": changed["revision"],
+                          "kind": "click", "x": 400, "y": 200})
+        self.assertIn("handled", clicked)
+        stale = action({"op": "viewport", "expected_revision": revision + 999,
+                        "width": 800, "height": 600})
+        self.assertEqual(stale["error"], "canvas revision changed")
+        c.close()
+        self.stop()
 
 
 if __name__ == "__main__":

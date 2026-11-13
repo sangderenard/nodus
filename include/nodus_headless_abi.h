@@ -159,6 +159,13 @@ NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, ui
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module_idx);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
+// Drive the same canvas UI handlers used by the GUI, on the graph's owning
+// thread. Mouse kinds: 0 click, 1 down, 2 up, 3 move, 4 scroll.
+NODUS_HEADLESS_API int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height);
+NODUS_HEADLESS_API int32_t nodus_headless_ui_mouse(NodusHeadlessGraph* g, int32_t kind,
+    float x, float y, float dx, float dy, int32_t button, float scroll);
+NODUS_HEADLESS_API int32_t nodus_headless_ui_key(NodusHeadlessGraph* g,
+    int32_t key, int32_t scancode, int32_t action, int32_t mods);
 // Configured edge FIFOs and named ports are persisted by
 // nodus_headless_save_file as EDGE_FIFO / PORT trailer records appended after
 // the CANVAS V4 body, and restored by nodus_headless_load_file (load returns 0
