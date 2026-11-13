@@ -76,6 +76,38 @@ budget. The $0.79526879475042 loss is one deliberately untrained probe path,
 not a backtest claim about a trained model. The snapshot digest is
 `7e0b4c2e5900ff9225bd50aeced975bc6e1aaa23a00fbbb103773a32b84a2843`.
 
+## Bounded training and historical qualification
+
+`tools/fetch_aapl_training_history.py` creates a fresh one-year public-bar
+snapshot from Alpaca IEX AAPL/SPY and BTC/USD hourly bars. BTC is fetched in
+30-day windows to stay within the historical endpoint's page limit. On
+2026-11-13 the snapshot contained 1,997 AAPL, 2,200 SPY, and 8,759 BTC bars;
+SHA-256 `8be31249c828863a831c9c90236d943f7c025b6eb5290443e33aaaa618d8d7f9`.
+It contains no credential.
+
+`tools/train_aapl_qualified_row.py` trains the exact 6-to-4-to-3 `tanh` row
+with Turing `AbstractTensor` autograd. It uses causal AAPL/SPY/BTC features
+and a next-three-bar price-move target after an estimated 0.4% round-trip
+cost. Chronological 60/20/20 train, validation, and untouched holdout splits
+avoid using future bars in training. Three seeds and four checkpoints per seed
+are bounded in advance; validation selects the checkpoint. The selected
+weights are compiled through the existing Nodus row crossing, whose scores
+are checked against eager inference before holdout mock replay. Each of three
+validation and holdout windows starts a fresh cautious mock ledger. Admission
+needs positive net P&L and a sell fill in every holdout window plus mean net
+P&L of at least 1% of the $5 maximum per-order capital. This return
+denominator is the order cap, not the $50 account budget.
+
+The 2026-11-13 run selected seed 1, epoch 80. Validation failed: window net
+P&Ls were $0.88925, -$0.49292, and $0.32989, with sell-fill counts 0/1/0.
+Untouched holdout also failed: $0.12577, $0.17845, and -$0.09379, with sell
+fills 0/0/2. The mean holdout P&L was about $0.07014, or 1.40% of the $5
+order cap, but one window lost money and two had no sell fill. The candidate
+remains unqualified. The holdout has now been inspected; further model
+changes require a fresh future holdout for an honest admission decision.
+These are internal mock fills, not Alpaca paper executions or evidence of
+future profit.
+
 Run with a fresh output directory and the server's restricted state secrets
 directory. The account ID is the credential owner; it is not used as the mock
 strategy owner, which exists only in the scratch database:

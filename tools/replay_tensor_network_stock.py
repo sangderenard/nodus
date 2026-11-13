@@ -121,7 +121,8 @@ def infer(graph: Graph, rows: list[dict], weights: dict[str, np.ndarray]) -> lis
 
 def replay(db, rows: list[dict], predictions: list[np.ndarray], paper_arena, paper_mock,
            *, dataset_sha256: str, product_sha256: str, final_mark: Decimal,
-           final_mark_bar: str) -> dict:
+           final_mark_bar: str, weights_label: str = "fixed untrained sign-of-return probe",
+           record_events: bool = True) -> dict:
     if len(rows) != len(predictions):
         raise ValueError("every decision requires one compiled prediction")
     bot = paper_arena.register_bot(db, OWNER, {
@@ -152,9 +153,10 @@ def replay(db, rows: list[dict], predictions: list[np.ndarray], paper_arena, pap
             order = {"request_id": f"historical-{index}", "strategy_id": strategy_id,
                      "symbol": STOCK, "side": action, "amount": format(amount, "f")}
             receipt = paper_mock.place(db, OWNER, order, mark)
-            paper_arena.record_activity(db, OWNER, bot["id"], "kernel", "historical mock fill",
-                                        strategy_id, json.dumps({"venue": "internal_mock", "order_id": receipt["id"],
-                                                                 "decision_bar": row["decision_bar"], "fill_bar": row["fill_bar"]}))
+            if record_events:
+                paper_arena.record_activity(db, OWNER, bot["id"], "kernel", "historical mock fill",
+                                            strategy_id, json.dumps({"venue": "internal_mock", "order_id": receipt["id"],
+                                                                     "decision_bar": row["decision_bar"], "fill_bar": row["fill_bar"]}))
         marked = paper_mock.ledger(db, OWNER, strategy_id)
         marked_quantity = sum((Decimal(item["quantity"]) for item in marked["holdings"]
                                if item["symbol"] == STOCK), Decimal(0))
@@ -171,7 +173,7 @@ def replay(db, rows: list[dict], predictions: list[np.ndarray], paper_arena, pap
     return {"schema": "nodus-paper-historical-replay-v1", "stock": STOCK,
             "venue": "internal_mock", "feed": "Alpaca IEX hourly history",
             "dataset_sha256": dataset_sha256, "product_sha256": product_sha256,
-            "weights": "fixed untrained sign-of-return probe", "risk": "cautious",
+            "weights": weights_label, "risk": "cautious",
             "strategy_id": strategy_id, "bot_id": bot["id"], "decisions": receipts,
             "ledger": final_ledger, "final_mark_bar": final_mark_bar,
             "final_mark_close": str(final_mark),
