@@ -52,6 +52,11 @@ int wmain(int argc,wchar_t** argv) {
         ProtectedProcessOptions options;options.executable=executable;options.adapter_luid={1,2,3,4,5,6,7,8};options.node_mask=1;
         options.process_memory_bytes=512ull*1024*1024;options.job_memory_bytes=512ull*1024*1024;options.wall_timeout_ms=5000;
         options.context_policy=ProtectedContextPolicy::VerifiedDefaultDc;
+        MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
+        if(!GlobalMemoryStatusEx(&memory) || memory.ullAvailPhys<options.minimum_available_memory_bytes) {
+            std::puts("SKIP: protected child requires the configured available RAM floor");
+            return 77;
+        }
         auto provider=std::make_shared<ProtectedOpenGLProcess>(options);
         auto work=std::make_shared<Work>();work->objects={{"CPU fixture object","CPU ONLY immutable source"}};
         Config config;config.host_id=501;config.context={77,forbidden_proc,forbidden_context,nullptr};config.protected_provider=provider;
