@@ -30,10 +30,11 @@ if(NODUS_CANVAS_SOURCES)
   # each got their own registry/backend instance, so a tensor handle created
   # on one side silently failed to resolve on the other. See
   # research/12_substrate_blocker.md for the diagnosis.
-  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]tensors[/\\\\]abstraction[/\\\\](tensor_registry|in_memory_backend|abstract_tensor|abstract_tensor_pool|tensor_math|tensor_calculator_bridge)\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]tensors[/\\\\]abstraction[/\\\\](tensor_registry|in_memory_backend|tensor_abi|abstract_tensor|abstract_tensor_pool|tensor_math|tensor_calculator_bridge)\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]common[/\\\\]thread_pool\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]mem_backend_host\\.cpp$")
   list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]spirv_translation\\.cpp$")
+  list(FILTER NODUS_CANVAS_SOURCES EXCLUDE REGEX "[/\\\\]src[/\\\\]kernels[/\\\\](kernel_spirv|kernel_ir_text|kernel_vulkan|kernel_eigen)\\.cpp$")
   # kernel_torch.cpp and mem_backend_torch.cpp include <torch/torch.h> unconditionally.
   # A NODUS_ENABLE_TORCH=OFF image (the Torch-free service build) leaves them out;
   # the Torch build keeps them. Both configurations must build.

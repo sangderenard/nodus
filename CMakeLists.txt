@@ -527,11 +527,8 @@ target_include_directories(edge_tensor_fifo_compile_check PRIVATE
 
 add_library(nodus_runtime SHARED
   src/runtime/edge_runtime_abi.cpp
-  src/mem_backend_host.cpp
-  src/spirv_translation.cpp
-  src/kernels/kernel_spirv.cpp
-  src/kernels/kernel_ir_text.cpp
 )
+target_link_libraries(nodus_runtime PUBLIC nodus_tensor_core)
 target_compile_definitions(nodus_runtime PRIVATE NODUS_RUNTIME_BUILD=1)
 target_include_directories(nodus_runtime PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -1365,6 +1362,29 @@ add_executable(test_vulkan_dispatch
 target_link_libraries(test_vulkan_dispatch PRIVATE nodus_tensor_core)
 target_compile_features(test_vulkan_dispatch PRIVATE cxx_std_20)
 add_test(NAME vulkan_dispatch_test COMMAND test_vulkan_dispatch)
+
+# Explicit hardware trials of the authored Spectral transport stages. Artifact
+# paths are provided by the caller; these are not automatic CTest jobs.
+add_executable(test_spectral_exact_lens_vulkan
+  tests/spectral_exact_lens_vulkan_test.cpp)
+target_link_libraries(test_spectral_exact_lens_vulkan PRIVATE canvas_tables_static)
+target_compile_features(test_spectral_exact_lens_vulkan PRIVATE cxx_std_20)
+add_executable(test_spectral_t3_vulkan tests/spectral_t3_vulkan_test.cpp)
+target_link_libraries(test_spectral_t3_vulkan PRIVATE nodus_tensor_core)
+target_compile_features(test_spectral_t3_vulkan PRIVATE cxx_std_20)
+add_executable(test_spectral_t5_vulkan tests/spectral_t5_vulkan_test.cpp)
+target_link_libraries(test_spectral_t5_vulkan PRIVATE canvas_tables_static)
+target_compile_features(test_spectral_t5_vulkan PRIVATE cxx_std_20)
+add_executable(test_tensor_state_library tests/tensor_state_library_test.cpp)
+target_link_libraries(test_tensor_state_library PRIVATE nodus_tensor_core)
+target_compile_features(test_tensor_state_library PRIVATE cxx_std_20)
+add_executable(test_vulkan_state_bank tests/vulkan_state_bank_test.cpp)
+target_link_libraries(test_vulkan_state_bank PRIVATE nodus_tensor_core)
+target_compile_features(test_vulkan_state_bank PRIVATE cxx_std_20)
+add_executable(test_vulkan_device_local_state
+  tests/vulkan_device_local_state_test.cpp)
+target_link_libraries(test_vulkan_device_local_state PRIVATE nodus_tensor_core)
+target_compile_features(test_vulkan_device_local_state PRIVATE cxx_std_20)
 
 # Persistent Vulkan shader rows communicating through the ordinary FIFO ABI.
 add_executable(test_vulkan_ssbo_fifo
