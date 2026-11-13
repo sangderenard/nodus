@@ -166,3 +166,32 @@ returned756 blocks including18 silence concealments and reported10 late packets.
 These startup/clock/end-of-stream results are not a lossless or production PA
 latency guarantee. The receiver needs caller clock/lifetime management; native
 RTP currently has no RTCP BYE/end-of-stream message. No live site deployed.
+
+### Finite-source EOF follow-up (2026-11-13)
+
+Finite file sources now publish an ordered zero-frame terminal token through
+the same canvas PCM FIFO. Its first-frame index is the exclusive sample end.
+The PCM row sends a standard compound RTCP SR/SDES/BYE on the existing RTP
+socket (RFC3550/RFC5761 mux); the SR carries that terminal sample timestamp.
+The terminal compound is attempted at most three times at20ms spacing while
+the row is alive. This is bounded best-effort UDP, not acknowledged delivery.
+Looping sources have no natural EOF; forced process termination is not a
+clean finite-source ending.
+
+ThreadManager correctly stops subsequent rows when a source refuses a step.
+Therefore a terminal internal RadioFrame control value now lets the PCM row
+drain the final FIFO and send EOF; the spectrum row consumes that control
+without emitting invented/repeated NRAD measurements. No router changes.
+
+Turing's matching receiver handles 1..256-frame L16 blocks, accepts this exact
+terminal compound from its pinned endpoint/SSRC, and stops readback at the
+declared endpoint rather than manufacturing silence after a finished file.
+This remains a private loopback experiment, not authentication or a PA device.
+
+Release nodus_radio builds. A silent real two-second+seven-frame fixture
+through the canvas/router/actual Python Subscription returned368 received
+blocks, zero loss/late/rejected/resync, final28bytes and ended=true. The source
+sent376 blocks; the subscription starts after readiness discovery and the
+first eight precede it, so this does not claim full-source startup delivery.
+Test: Turing tools/test_nodus_radio_pcm_end.py, with the four native binary
+arguments. No speaker used and no live service restarted/deployed.
