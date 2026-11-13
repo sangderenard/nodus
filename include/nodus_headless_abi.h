@@ -115,6 +115,19 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_desc(
     NodusHeadlessGraph* g, int32_t module_idx, const GP_CanvasModuleDesc* desc);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_builtin_tool(NodusHeadlessGraph* g, int32_t module_idx, int32_t tool_kind);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_plugin_tool(NodusHeadlessGraph* g, int32_t module_idx, const char* plugin_id);
+// Admit one native TCP byte-stream row into this graph's registry. The host
+// then binds its id with nodus_headless_bind_plugin_tool and connects its
+// Argument/Return contacts to ordinary typed FIFOs. The port is explicit so
+// a saved graph and its host contract can name the same loopback endpoint.
+// The row is unregistered after graph destruction.
+NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_byte_stream(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t pending_frames);
+// One-input, best-effort fan-out. Slow readers lose stale queued frames;
+// the independent table never waits for a reader or replays an old frame.
+NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_broadcast(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t max_readers);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
     NodusHeadlessGraph* g, int32_t module_idx,
     const GP_CanvasModuleRowDesc* rows, int32_t row_count);

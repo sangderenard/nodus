@@ -3,6 +3,7 @@
 #include "contract_negotiator_registry.h"
 #include "turing_compile_host_tool.h"
 #include "cron_tool.h"
+#include "tcp_byte_stream_tool.h"
 #include "nodus_headless_abi.h"
 
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
@@ -61,6 +62,7 @@ struct NodusHeadlessGraph {
     std::unordered_map<std::string, PortBinding> input_ports;
     std::unordered_map<std::string, PortBinding> output_ports;
     std::vector<EdgeBinding> edges;
+    std::vector<std::string> registered_tcp_stream_rows;
     gp_mem_backend_handle_t vulkan_backend = nullptr;
 
     std::mutex events_mu;
@@ -392,8 +394,42 @@ extern "C" void nodus_headless_destroy(NodusHeadlessGraph* g) {
     // process-owned and are deliberately NOT released here.
     g->contract_ports.clear();
     if (g->ctx) gp_canvas_destroy(g->ctx);
+    for (const auto& id : g->registered_tcp_stream_rows)
+        tool_registry_global().unregister_tool(id);
     if (g->vulkan_backend) gp_mem_backend_release(g->vulkan_backend);
     delete g;
+}
+
+extern "C" int32_t nodus_headless_register_tcp_byte_stream(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t pending_frames) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !port ||
+        maximum_frame_bytes == 0 || maximum_frame_bytes > 64ull*1024*1024 ||
+        pending_frames == 0 || pending_frames > 1024) return 0;
+    nodus::net::TcpByteStreamConfig config;
+    config.id=tool_id;config.port=port;
+    config.maximum_frame_bytes=static_cast<std::size_t>(maximum_frame_bytes);
+    config.pending_frames=pending_frames;
+    if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
+        return 0;
+    g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_register_tcp_broadcast(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t max_readers) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !port ||
+        maximum_frame_bytes == 0 || maximum_frame_bytes > 64ull*1024*1024 ||
+        max_readers == 0 || max_readers > 64) return 0;
+    nodus::net::TcpByteStreamConfig config;
+    config.id=tool_id;config.port=port;
+    config.maximum_frame_bytes=static_cast<std::size_t>(maximum_frame_bytes);
+    config.pending_frames=1;config.broadcast_readers=max_readers;
+    if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
+        return 0;
+    g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
 }
 
 namespace {
