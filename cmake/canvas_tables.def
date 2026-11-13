@@ -43,6 +43,7 @@ EXPORTS
     gp_canvas_get_module_frame_ptr
     gp_canvas_get_module_frame_ptr_for_contact
     gp_canvas_get_module_node_id
+    gp_canvas_get_module_stack_tail
     gp_canvas_get_module_uuid
     gp_canvas_get_offset
     gp_canvas_get_overlay_port_uuids
@@ -108,6 +109,7 @@ EXPORTS
     gp_canvas_set_overlay_button_callback
     gp_canvas_set_overlay_meta
     gp_canvas_set_size
+    gp_canvas_set_module_stack_tail
     gp_canvas_set_subgroup_toolbar_rgba
     gp_canvas_set_subgroup_toolbar_rgba_at
     gp_canvas_set_table_tool_number
