@@ -31,7 +31,7 @@ The adapter always sets ``ssa_composition`` true.  It never links SSA itself.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import dataclasses
 import hashlib
 import json
@@ -40,6 +40,9 @@ import pickle
 import re
 import subprocess
 import sys
+import tempfile
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -149,6 +152,7 @@ class RowToolRequest:
         default_factory=dict
     )
     allow_uncompiled: bool = True
+    site_artifact_context: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RowToolRequest":
@@ -224,6 +228,7 @@ class RowToolRequest:
             ssa_composition_directory=composition_directory,
             ssa_composition_options=composition_options,
             allow_uncompiled=bool(value.get("allow_uncompiled", True)),
+            site_artifact_context=value.get("site_artifact_context"),
         )
 
 
@@ -756,7 +761,195 @@ class TuringBoundary:
         )
 
 
+# Existing compiler configuration knobs, scoped to the isolated site job process.
+_SITE_DIRECTORIES = {
+    "TURING_COMPILER_ARTIFACT_ROOT": "compiler-artifacts",
+    "TURING_IDENTITY_SPILL_DIR": "identity-spill",
+    "TURING_SYMPY_DUAL_IR_CACHE_DIR": "sympy-dual-ir",
+    "TURING_HOST_SSA_CACHE": "host-ssa",
+    "TURING_LAW_NATIVE_CACHE": "native-laws",
+    "TURING_LAW_MODULE_CACHE_DIR": "law-modules",
+    "TURING_ACCELERATOR_CACHE_DIR": "accelerators",
+    "TURING_GLSL_CACHE_DIR": "glsl",
+    "TURING_COMPILER_USAGE_TRACE_ROOT": "usage-traces",
+    "TMP": "tmp", "TEMP": "tmp", "TMPDIR": "tmp",
+}
+
+
+def _site_context(request: RowToolRequest) -> dict[str, Any] | None:
+    context = request.site_artifact_context
+    if context is None:
+        return None
+    if not isinstance(context, Mapping):
+        raise ValueError("site_artifact_context must be an object")
+    owner = context.get("owner_id")
+    if type(owner) is not int or owner <= 0:
+        raise ValueError("site artifact owner_id must be a positive integer")
+    workspace = context.get("workspace_id")
+    if not isinstance(workspace, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", workspace):
+        raise ValueError("site artifact workspace_id must be an existing lease ID")
+    job = context.get("job_id")
+    if not isinstance(job, str) or not job.strip():
+        raise ValueError("site artifact job_id is required")
+    raw_directory = context.get("job_directory")
+    if not isinstance(raw_directory, str) or not Path(raw_directory).is_absolute():
+        raise ValueError("site artifact job_directory must be absolute")
+    output = request.output_dir.resolve()
+    if output != Path(raw_directory).resolve():
+        raise ProductError("site output_dir must equal its ledger job_directory")
+    forbidden = [Path(__file__).resolve().parents[1]]
+    if request.turing_root is not None:
+        forbidden.append(request.turing_root.resolve())
+    if any(output.is_relative_to(root) for root in forbidden) or any(
+        (parent / ".git").exists() for parent in (output, *output.parents)
+    ):
+        raise ProductError("site artifacts must be outside repository worktrees")
+    if request.ssa_composition_directory is not None:
+        _product_relative(output, request.ssa_composition_directory)
+    # Existing links/junctions must not redirect writes out of this job.
+    if output.exists():
+        for path in output.rglob("*"):
+            _product_relative(output, path)
+            if path.name == ".git":
+                raise ProductError("site artifact directory contains a repository")
+    return {"owner_id": owner, "workspace_id": workspace, "job_id": job,
+            "job_directory": str(output)}
+
+
+@contextmanager
+def _site_compiler_diagnostics(output: Path):
+    """Capture Python, CRT and inherited child output in this isolated process."""
+    work = output / "compiler-work"
+    work.mkdir(parents=True, exist_ok=True)
+    paths = [work / "stdout.log", work / "stderr.log"]
+    for path in paths:
+        _product_relative(output, path)
+    # Python streams can be wrappers (including pytest capture); preserve those
+    # separately from the process descriptors that native tools inherit.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    windows = None
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        windows = ctypes.WinDLL("kernel32", use_last_error=True)
+        windows.GetStdHandle.argtypes = [wintypes.DWORD]
+        windows.GetStdHandle.restype = wintypes.HANDLE
+        windows.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+        windows.SetStdHandle.restype = wintypes.BOOL
+
+        def set_handle(number, handle):
+            if not windows.SetStdHandle(number, handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+    saved = []
+    with ExitStack() as stack:
+        streams = [stack.enter_context(path.open("a", encoding="utf-8", buffering=1))
+                   for path in paths]
+        try:
+            for descriptor, stream, handle_number in zip((1, 2), streams, (-11, -12)):
+                duplicate = os.dup(descriptor)
+                inheritable = os.get_inheritable(descriptor)
+                handle = windows.GetStdHandle(handle_number) if windows is not None else None
+                handle_matches_fd = (windows is not None and
+                                     handle == msvcrt.get_osfhandle(descriptor))
+                saved.append((descriptor, duplicate, inheritable, handle_number,
+                              handle, handle_matches_fd))
+                os.dup2(stream.fileno(), descriptor, inheritable=True)
+                if windows is not None:
+                    set_handle(handle_number, msvcrt.get_osfhandle(descriptor))
+            with redirect_stdout(streams[0]), redirect_stderr(streams[1]):
+                try:
+                    yield
+                except BaseException:
+                    traceback.print_exc(file=streams[1])
+                    raise
+                finally:
+                    streams[0].flush()
+                    streams[1].flush()
+        finally:
+            # Restore before closing the log streams or returning to CLI output.
+            restore_error = None
+            for descriptor, duplicate, inheritable, handle_number, handle, matches_fd in reversed(saved):
+                try:
+                    os.dup2(duplicate, descriptor, inheritable=inheritable)
+                    if windows is not None:
+                        set_handle(handle_number, msvcrt.get_osfhandle(descriptor)
+                                   if matches_fd else handle)
+                except OSError as error:
+                    restore_error = restore_error or error
+                finally:
+                    os.close(duplicate)
+            if restore_error is not None:
+                raise restore_error
+
+
+@contextmanager
+def _site_compiler_environment(output: Path):
+    previous = {key: os.environ.get(key)
+                for key in (*_SITE_DIRECTORIES, "PYTHONDONTWRITEBYTECODE")}
+    old_tempdir = tempfile.tempdir
+    old_bytecode = sys.dont_write_bytecode
+    try:
+        for key, relative in _SITE_DIRECTORIES.items():
+            directory = output / "compiler-work" / relative
+            _product_relative(output, directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            os.environ[key] = str(directory)
+        tempfile.tempdir = os.environ["TMPDIR"]
+        # Imports must not create __pycache__ beside compiler sources.
+        sys.dont_write_bytecode = True
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        yield
+    finally:
+        tempfile.tempdir = old_tempdir
+        sys.dont_write_bytecode = old_bytecode
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def compile_row_tool(
+    request: RowToolRequest | Mapping[str, Any],
+    *,
+    compiler: CompilerBoundary | None = None,
+) -> dict[str, Any]:
+    """Compile a product; site callers supply trusted ledger ownership metadata.
+
+    The adapter runs in a dedicated subprocess: cwd, environment and tempfile
+    state are process-global. This metadata is not authentication; only the
+    site bridge may resolve the owner and workspace lease.
+    """
+    if not isinstance(request, RowToolRequest):
+        request = RowToolRequest.from_mapping(request)
+    context = _site_context(request)
+    if context is None:
+        return _compile_row_tool(request, compiler=compiler)
+    output = request.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    receipt = output / "site-artifact-lifecycle.json"
+    lifecycle = {"schema": "nodus-site-artifact-lifecycle-v1", **context,
+                 "started_at": datetime.now(timezone.utc).isoformat(),
+                 "state": "running", "automatic_deletion": False}
+    _write_json(receipt, lifecycle)
+    try:
+        with _site_compiler_environment(output), _site_compiler_diagnostics(output):
+            manifest = _compile_row_tool(request, compiler=compiler)
+        lifecycle["state"] = "completed" if manifest["loadable"] else "uncompiled"
+        return manifest
+    except BaseException as error:
+        lifecycle["state"] = "failed"
+        lifecycle["error"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        lifecycle["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _write_json(receipt, lifecycle)
+
+
+def _compile_row_tool(
     request: RowToolRequest | Mapping[str, Any],
     *,
     compiler: CompilerBoundary | None = None,
@@ -851,6 +1044,8 @@ def compile_row_tool(
             artifact = compiler.emit_c(module, root, entry_name=product_name)
             if not bool(getattr(artifact, "complete", False)):
                 raise ProductError(f"C emission incomplete: {getattr(artifact, 'shortfalls', ())!r}")
+            if not _IDENTIFIER.fullmatch(str(artifact.name)):
+                raise ProductError("invalid backend artifact name")
             backend_source_path = backend_dir / f"{artifact.name}.c"
             _write_text(backend_source_path, str(artifact.source))
             abi_path = backend_dir / f"{artifact.name}.nodus_buffer_abi.txt"
@@ -871,6 +1066,8 @@ def compile_row_tool(
                 raise ProductError(
                     f"LLVM emission incomplete: {getattr(artifact, 'shortfalls', ())!r}"
                 )
+            if not _IDENTIFIER.fullmatch(str(artifact.name)):
+                raise ProductError("invalid backend artifact name")
             backend_source_path = backend_dir / f"{artifact.name}.ll"
             _write_text(backend_source_path, str(artifact.llvm_ir))
             abi_path = backend_dir / f"{artifact.name}.nodus_buffer_abi.txt"
@@ -893,6 +1090,8 @@ def compile_row_tool(
                 raise ProductError(
                     f"Fortran emission incomplete: {getattr(artifact, 'shortfalls', ())!r}"
                 )
+            if not _IDENTIFIER.fullmatch(str(artifact.name)):
+                raise ProductError("invalid backend artifact name")
             backend_source_path = Path(artifact.write(backend_dir))
             candidate_api = backend_source_path.with_suffix(".api.yaml")
             if candidate_api.is_file():
@@ -923,6 +1122,14 @@ def compile_row_tool(
         if not request.allow_uncompiled:
             raise ProductError(build_error["message"])
 
+    if request.site_artifact_context is not None:
+        for path in (backend_source_path, abi_path, binary_path):
+            if path is not None:
+                _product_relative(output, path)
+
+    # Diagnostic records must include buffered output emitted during compilation.
+    sys.stdout.flush()
+    sys.stderr.flush()
     artifact_records = [
         _artifact_record(output, authored_path, "authored-source"),
         _artifact_record(output, submitted_path, "submitted-source"),
@@ -950,6 +1157,7 @@ def compile_row_tool(
     manifest = {
         "schema": PRODUCT_SCHEMA,
         "request_schema": REQUEST_SCHEMA,
+        "site_artifact_context": _site_context(request),
         "product_name": product_name,
         "backend": request.backend,
         "row_entry": request.row_entry,
