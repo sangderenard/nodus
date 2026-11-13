@@ -48,3 +48,29 @@ source's separated-arena energy and polarization xfails remain. A thick-lens
 aperture run must carry the actual branch handle and Jones state through T1–T3
 before this math can claim correct optical continuation. The new shader rows
 are kernel products and a Nodus execution proof, not that completed pipeline.
+
+## Joined wave work schedule (2026-11-13 continuation)
+
+`test_spectral_wave_vulkan` now accepts the angular-propagating product and
+the aperture-material product together. It registers both existing GPU shader
+jobs in one `KernelPipelineTool` schedule. The first row writes complex field
+planes at state-library offsets 7 and 8. The second row binds those same
+addresses as its real and imaginary inputs, then writes offsets 13 and 14.
+The schedule has two ordered receipts. It does not copy or reconstruct the
+intermediate field on the host.
+
+The 512×512 trial verified all 262,144 complex outputs against the composed
+two-operator calculation on Vulkan devices 0, 1, and 2. Combined GPU dispatch
+times reported by the two row receipts were 1.561, 1.658, and 1.766 ms in
+that run. The original single-operator mode also passed on all three devices.
+Logs: `C:/Users/alber/nodus-build/wave-joined-angular-material-512.log` and
+`C:/Users/alber/nodus-build/wave-single-angular-512.log`. These are warm
+host-observed dispatch durations for these arithmetic products, not a T4
+arena propagation time or an estimate of a full ray exposure.
+
+The remaining handoff is explicit: a ray-stage work token must identify its
+T4 branch and arena field in the state library, execute the existing fftfree
+and aperture/transfer sequence around these arithmetic rows, and return the
+authored continuation state to T3/T5. The current joined schedule proves
+ordered complex-field ownership within Nodus; it does not yet supply the
+T3-to-T4 ray/field conversion or the completed image contract.
