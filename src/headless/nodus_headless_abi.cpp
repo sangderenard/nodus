@@ -416,6 +416,22 @@ extern "C" int32_t nodus_headless_register_tcp_byte_stream(
     return 1;
 }
 
+extern "C" int32_t nodus_headless_register_tcp_broadcast(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t max_readers) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !port ||
+        maximum_frame_bytes == 0 || maximum_frame_bytes > 64ull*1024*1024 ||
+        max_readers == 0 || max_readers > 64) return 0;
+    nodus::net::TcpByteStreamConfig config;
+    config.id=tool_id;config.port=port;
+    config.maximum_frame_bytes=static_cast<std::size_t>(maximum_frame_bytes);
+    config.pending_frames=1;config.broadcast_readers=max_readers;
+    if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
+        return 0;
+    g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
+}
+
 namespace {
 
 // Trailer records appended after the CANVAS V4 body by nodus_headless_save_file.

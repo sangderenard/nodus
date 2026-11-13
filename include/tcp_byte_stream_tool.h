@@ -18,6 +18,8 @@ struct TcpByteStreamConfig {
     std::uint16_t port=0;
     std::size_t maximum_frame_bytes=4*1024*1024;
     std::size_t pending_frames=8;
+    // Zero keeps duplex single-peer mode; nonzero selects an output-only exit.
+    std::size_t broadcast_readers=0;
 };
 
 class TcpByteStreamTool final : public ITool {
@@ -25,12 +27,12 @@ public:
     explicit TcpByteStreamTool(TcpByteStreamConfig config);
     ~TcpByteStreamTool() noexcept override;
     const char* id_cstr() const noexcept override{return config_.id.c_str();}
-    const char* name_cstr() const noexcept override{return "TCP byte stream";}
+    const char* name_cstr() const noexcept override{return config_.broadcast_readers?"TCP broadcast exit":"TCP byte stream";}
     ToolCaps caps() const override{return ToolCaps::None;}
-    int32_t port_count() const override{return 2;}
+    int32_t port_count() const override{return config_.broadcast_readers?1:2;}
     ToolPortSpec port_spec(int32_t index) const override{
         if(index==0)return {ToolPortKind::Argument,1};
-        if(index==1)return {ToolPortKind::Return,1};
+        if(index==1&&!config_.broadcast_readers)return {ToolPortKind::Return,1};
         return {};
     }
     void initialize(const ToolInitContext&) override;

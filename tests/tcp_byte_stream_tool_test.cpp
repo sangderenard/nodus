@@ -102,6 +102,52 @@ int main(){
     nodus::contracts::WireSocket::close_socket(peer);
     tool->shutdown();
     free_frame(frame);
+    nodus::net::TcpByteStreamConfig broadcast_config;
+    broadcast_config.id="nodus.tcp.broadcast.proof";
+    broadcast_config.maximum_frame_bytes=1024;
+    broadcast_config.pending_frames=1;
+    broadcast_config.broadcast_readers=2;
+    assert(nodus::net::register_tcp_byte_stream(tool_registry_global(),broadcast_config));
+    auto broadcast=tool_registry_global().create(broadcast_config.id);
+    auto* exit=dynamic_cast<nodus::net::TcpByteStreamTool*>(broadcast.get());
+    assert(exit);
+    broadcast->initialize({});
+    assert(broadcast->port_count()==1);
+    assert(broadcast->port_spec(0).kind==ToolPortKind::Argument);
+    assert(broadcast->port_spec(1).count==0);
+    RawStackFrame broadcast_stack{};
+    assert(raw_stack_init_frame(broadcast_stack,4096));
+    ToolStackContext broadcast_context{};broadcast_context.stack.raw=&broadcast_stack;
+    std::array<SOCKET,2> readers{};
+    for(std::size_t i=0;i<readers.size();i++){
+        readers[i]=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+        assert(readers[i]!=INVALID_SOCKET);
+        assert(setsockopt(readers[i],SOL_SOCKET,SO_RCVTIMEO,
+            reinterpret_cast<const char*>(&receive_timeout_ms),sizeof(receive_timeout_ms))==0);
+        address.sin_port=htons(exit->listen_port());
+        assert(connect(readers[i],reinterpret_cast<sockaddr*>(&address),sizeof(address))==0);
+        auto greeting=hello;greeting.result.loan.work.engine=100+i;
+        const auto encoded=nodus::contracts::WireSocket::encode(greeting);
+        assert(send_all(readers[i],encoded.data(),encoded.size()));
+    }
+    for(int i=0;i<100;i++)broadcast->execute_stack(broadcast_context);
+    const std::array<std::uint8_t,6> picture{'f','r','a','m','e','1'};
+    const std::uint64_t picture_shape[1]={picture.size()};
+    const auto picture_tensor=nodus_tensor_create(NODUS_DTYPE_U8,1,picture_shape);
+    assert(picture_tensor&&nodus_tensor_write(picture_tensor,0,picture.data(),picture.size())==6);
+    assert(raw_stack_push_abstract_tensor(broadcast_stack,{picture_tensor}));
+    broadcast->execute_stack(broadcast_context);
+    assert(broadcast_context.succeeded);
+    for(auto reader:readers){
+        std::array<std::uint8_t,14> bytes{};
+        assert(receive_all(reader,bytes.data(),bytes.size()));
+        assert(bytes[0]==picture.size());
+        assert(std::memcmp(bytes.data()+8,picture.data(),picture.size())==0);
+    }
+    nodus_tensor_destroy(picture_tensor);
+    for(auto reader:readers)nodus::contracts::WireSocket::close_socket(reader);
+    broadcast->shutdown();
+    free_frame(broadcast_stack);
     std::cout<<"tcp_byte_stream_roundtrip=1\n";
     return 0;
 }
