@@ -1,8 +1,10 @@
 #include "edge_reader_registry.h"
 
 #include <cassert>
+#include <atomic>
 #include <cstdint>
 #include <limits>
+#include <thread>
 
 int main() {
     EdgeReaderRegistry registry;
@@ -31,5 +33,22 @@ int main() {
     registry.unregister_reader(edge_a_reader_1);
     assert(registry.min_reader_seq(11) == std::numeric_limits<uint64_t>::max());
     assert(!registry.update_reader(edge_a_reader_1, 10));
+
+    const auto live = registry.register_reader(13);
+    std::atomic<bool> done{false};
+    std::thread publisher([&] {
+        for (uint64_t seq = 1; seq <= 100000; ++seq)
+            assert(registry.update_reader(live, seq));
+        done.store(true, std::memory_order_release);
+    });
+    uint64_t last = 0;
+    while (!done.load(std::memory_order_acquire)) {
+        const uint64_t current = registry.min_reader_seq(13);
+        assert(current >= last && current <= 100000);
+        last = current;
+    }
+    publisher.join();
+    assert(registry.min_reader_seq(13) == 100000);
+    registry.unregister_reader(live);
     return 0;
 }

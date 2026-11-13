@@ -51,6 +51,20 @@ int main() {
         return 3;
     }
 
+    // Mixed/opaque stacks still reject a same-size type mismatch without
+    // consuming the value. Scalar-contract execution opts into the known-type
+    // path separately.
+    uint32_t wrong_type_value = 0;
+    const size_t before_wrong_pop = dst->byte_count;
+    if (raw_stack_pop_typed(*dst, &wrong_type_value,
+                            ValueTypeRegistry::global().builtin(VT_UINT32)) ||
+        dst->byte_count != before_wrong_pop) {
+        std::cerr << "wrong typed pop consumed a value\n";
+        raw_stack_destroy_frame(src);
+        raw_stack_destroy_frame(dst);
+        return 4;
+    }
+
     // Pop back and validate values (LIFO)
     int32_t out1 = 0;
     int32_t out2 = 0;

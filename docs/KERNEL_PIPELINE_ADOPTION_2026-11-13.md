@@ -1,5 +1,26 @@
 # Camera and transport kernel pipeline adoption (2026-11-13 UTC)
 
+## Review-branch qualification against current Nodus default
+
+Branch `codex/nodus-ray-kernel-library` was formed from current
+`origin/nogodsnomasters` at `7f56f50`, then the kernel-library and authored
+shader path was applied without the unrelated OpenGL/service worktree edits.
+The default branch's newer fixed-buffer declaration remains in
+`mem_backend.h`. `nodus_runtime` links the shared tensor core so the runtime,
+canvas and shader tools do not own separate backend registries. An initial
+isolated run before this link fix crashed during buffer cleanup; the repaired
+build and six-job run exited zero.
+
+The isolated build passed `test_spectral_t5_vulkan`,
+`test_spectral_exact_lens_vulkan`, `test_spectral_t3_vulkan`,
+`test_tensor_state_library`, `test_vulkan_state_bank`,
+`test_vulkan_device_local_state`, and `edge_runtime_abi_test`. The six-job
+T3→T5 run, the 26-stage fixture regression, the direct T3 record trial,
+and the four-stage sensor→T1→conic T2→T3 lens trial exited zero. Logs are
+under `C:/Users/alber/nodus-build/review-ray-*.log`. These are native
+hardware trials; they do not establish a complete Studio exposure or the
+second Studio tracer sequence.
+
 ## Authored T3 producer joined to T5 on Nodus
 
 A second mode of `tests/spectral_t5_vulkan_test.cpp` now takes the authored
@@ -377,5 +398,3 @@ PhotoJobs worker.
 4. Connect native T5 buffers and MIS results, then benchmark equivalent
    OpenGL/Vulkan/native end-to-end exposures. T5 artifact compilation alone
    is not a usable BDPT pipeline.
-
-\n

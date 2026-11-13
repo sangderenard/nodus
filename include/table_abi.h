@@ -494,6 +494,9 @@ int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
 int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written, int32_t timeout_ms);
 // Query unread sample count for a subscriber on an edge.
 int32_t gp_table_edge_unread(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, int32_t* out_count);
+// Atomic FIFO frontier query for independently running table workers. Returns
+// 1 when the channel can accept `sample_count` writes without dropping data.
+int32_t gp_table_edge_can_publish(GP_TableContext* ctx, int32_t edge_idx, int32_t sample_count);
 // Quiescent transaction checkpoint for managed scientific rollback. These
 // functions include writer binding and every active reader key/sequence in
 // addition to FIFO storage and publication tags. The caller must ensure no
@@ -569,6 +572,7 @@ int32_t gp_table_enqueue_unbind_stage_port(GP_TableContext* ctx, unsigned long l
 
 // Apply any pending queued ops on the current thread (manager should call this).
 int32_t gp_table_apply_pending_ops(GP_TableContext* ctx);
+int32_t gp_table_has_pending_ops(GP_TableContext* ctx);
 
 // Network-only immutable snapshot (NO UI data). Two-call pattern:
 // 1) gp_table_snapshot_network_size -> returns node and edge counts + stamp

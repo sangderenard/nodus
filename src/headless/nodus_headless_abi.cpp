@@ -3,6 +3,7 @@
 #include "contract_negotiator_registry.h"
 #include "turing_compile_host_tool.h"
 #include "cron_tool.h"
+#include "tcp_byte_stream_tool.h"
 #include "nodus_headless_abi.h"
 
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
@@ -61,6 +62,7 @@ struct NodusHeadlessGraph {
     std::unordered_map<std::string, PortBinding> input_ports;
     std::unordered_map<std::string, PortBinding> output_ports;
     std::vector<EdgeBinding> edges;
+    std::vector<std::string> registered_tcp_stream_rows;
     gp_mem_backend_handle_t vulkan_backend = nullptr;
 
     std::mutex events_mu;
@@ -392,8 +394,42 @@ extern "C" void nodus_headless_destroy(NodusHeadlessGraph* g) {
     // process-owned and are deliberately NOT released here.
     g->contract_ports.clear();
     if (g->ctx) gp_canvas_destroy(g->ctx);
+    for (const auto& id : g->registered_tcp_stream_rows)
+        tool_registry_global().unregister_tool(id);
     if (g->vulkan_backend) gp_mem_backend_release(g->vulkan_backend);
     delete g;
+}
+
+extern "C" int32_t nodus_headless_register_tcp_byte_stream(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t pending_frames) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !port ||
+        maximum_frame_bytes == 0 || maximum_frame_bytes > 64ull*1024*1024 ||
+        pending_frames == 0 || pending_frames > 1024) return 0;
+    nodus::net::TcpByteStreamConfig config;
+    config.id=tool_id;config.port=port;
+    config.maximum_frame_bytes=static_cast<std::size_t>(maximum_frame_bytes);
+    config.pending_frames=pending_frames;
+    if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
+        return 0;
+    g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_register_tcp_broadcast(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t max_readers) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !port ||
+        maximum_frame_bytes == 0 || maximum_frame_bytes > 64ull*1024*1024 ||
+        max_readers == 0 || max_readers > 64) return 0;
+    nodus::net::TcpByteStreamConfig config;
+    config.id=tool_id;config.port=port;
+    config.maximum_frame_bytes=static_cast<std::size_t>(maximum_frame_bytes);
+    config.pending_frames=1;config.broadcast_readers=max_readers;
+    if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
+        return 0;
+    g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
 }
 
 namespace {
@@ -465,6 +501,8 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
 
     std::vector<TrailerEdge> trailer_edges;
     std::vector<TrailerPort> trailer_ports;
+    struct ModulePolicy { int32_t module; int32_t exec; int32_t stack; };
+    std::vector<ModulePolicy> trailer_policies;
     std::vector<nodus::contracts::CanvasContractPorts::Record> trailer_contract_ports;
     {
         std::ifstream ifs(path);
@@ -494,7 +532,23 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
                 std::getline(ss, tp.name);
                 if (!tp.name.empty() && tp.name[0] == ' ') tp.name.erase(0, 1);
                 trailer_ports.push_back(std::move(tp));
+            } else if (tag == "MODULE_POLICY") {
+                ModulePolicy policy{};
+                if (!(ss >> policy.module >> policy.exec >> policy.stack) ||
+                    policy.exec < -1 || policy.exec > 3 || policy.stack < 0 || policy.stack > 2) {
+                    std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                    return 0;
+                }
+                trailer_policies.push_back(policy);
             }
+        }
+    }
+
+    for (const auto& policy : trailer_policies) {
+        if (!nodus_headless_set_module_exec_mode(g, policy.module, policy.exec) ||
+            !nodus_headless_set_module_stack_contract(g, policy.module, policy.stack)) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot restore MODULE_POLICY %d\n", policy.module);
+            return 0;
         }
     }
 
@@ -574,6 +628,14 @@ extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* p
         return l.pb->declaration_order < r.pb->declaration_order;
     });
     std::ostringstream trailer;
+    const int32_t module_count = nodus_headless_get_module_count(g);
+    for (int32_t module = 0; module < module_count; ++module) {
+        int32_t exec = -1;
+        int32_t stack = 2;
+        if (!nodus_headless_get_module_exec_mode(g, module, &exec) ||
+            !nodus_headless_get_module_stack_contract(g, module, &stack)) return 0;
+        trailer << "MODULE_POLICY " << module << " " << exec << " " << stack << "\n";
+    }
     for (const auto& e : g->edges) {
         if (!e.configured) continue;
         NodusHeadlessFifoConfig c{};
@@ -693,11 +755,86 @@ extern "C" int32_t nodus_headless_get_module_stack_contract(
     return gp_canvas_get_module_stack_contract(g->ctx, module_idx, out_contract);
 }
 
+extern "C" int32_t nodus_headless_set_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t mode) {
+    return g && g->ctx ? gp_canvas_set_module_exec_mode(g->ctx, module_idx, mode) : 0;
+}
+
+extern "C" int32_t nodus_headless_get_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_mode) {
+    return g && g->ctx ? gp_canvas_get_module_exec_mode(g->ctx, module_idx, out_mode) : 0;
+}
+
 extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id) {
     if (!g || !g->ctx || !desc) return -1;
     int32_t canvas_edge_idx = gp_canvas_add_edge_with_type(g->ctx, desc, type_id);
     if (canvas_edge_idx < 0) return -1;
     return attach_edge_binding(g, *desc, canvas_edge_idx);
+}
+
+static int32_t sync_ui_edges(NodusHeadlessGraph* g) {
+    if (!g || !g->ctx || !g->table) return 0;
+    gp_table_apply_pending_ops(g->table);
+    const auto previous = g->edges;
+    const int32_t count = gp_canvas_get_edge_count(g->ctx);
+    if (count < 0) return 0;
+    std::vector<EdgeBinding> current(static_cast<size_t>(count));
+    for (int32_t i = 0; i < count; ++i) {
+        GP_CanvasEdgeDesc desc{};
+        int32_t type_id = 0;
+        if (!gp_canvas_get_edge(g->ctx, i, &desc, &type_id)) return 0;
+        const uint64_t a = (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_module)) << 32) |
+                           (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_contact_idx)) << 16);
+        const uint64_t b = (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_module)) << 32) |
+                           (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_contact_idx)) << 16);
+        int32_t table_index = -1;
+        if (!gp_table_edge_index_for_pair(g->table, a, b, &table_index) || table_index < 0) return 0;
+        const auto prior = std::find_if(previous.begin(), previous.end(), [&](const EdgeBinding& edge) {
+            return edge.desc.a_module == desc.a_module && edge.desc.a_contact_idx == desc.a_contact_idx &&
+                   edge.desc.b_module == desc.b_module && edge.desc.b_contact_idx == desc.b_contact_idx;
+        });
+        current[static_cast<size_t>(i)] = EdgeBinding{desc, table_index,
+            prior == previous.end() ? 0 : prior->configured};
+    }
+    g->edges = std::move(current);
+    for (int32_t i = 0; i < count; ++i) {
+        if (g->edges[static_cast<size_t>(i)].configured) continue;
+        NodusHeadlessFifoConfig config{};
+        if (read_table_edge_config(g->table, g->edges[static_cast<size_t>(i)].table_edge_idx, &config)) {
+            const auto& edge = g->edges[static_cast<size_t>(i)];
+            if (!gp_table_edge_subscribe_ex(g->table, edge.table_edge_idx,
+                scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx), 1)) return 0;
+            g->edges[static_cast<size_t>(i)].configured = 1;
+        } else return 0;
+    }
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height) {
+    return g && g->ctx && width >= 64 && height >= 64 && width <= 4096 && height <= 4096
+        ? gp_canvas_set_size(g->ctx, width, height) : 0;
+}
+
+extern "C" int32_t nodus_headless_ui_mouse(NodusHeadlessGraph* g, int32_t kind,
+    float x, float y, float dx, float dy, int32_t button, float scroll) {
+    if (!g || !g->ctx) return -1;
+    int32_t handled = 0;
+    switch (kind) {
+        case 0: handled = gp_canvas_on_click(g->ctx, static_cast<int>(x), static_cast<int>(y)); break;
+        case 1: handled = gp_canvas_on_mouse_down(g->ctx, x, y, dx, dy, button); break;
+        case 2: handled = gp_canvas_on_mouse_up(g->ctx, x, y, dx, dy, button); break;
+        case 3: handled = gp_canvas_on_mouse_move(g->ctx, x, y, dx, dy); break;
+        case 4: handled = gp_canvas_on_mouse_scroll(g->ctx, x, y, dx, dy, scroll); break;
+        default: return -1;
+    }
+    return sync_ui_edges(g) ? handled : -1;
+}
+
+extern "C" int32_t nodus_headless_ui_key(NodusHeadlessGraph* g,
+    int32_t key, int32_t scancode, int32_t action, int32_t mods) {
+    if (!g || !g->ctx) return -1;
+    const int32_t handled = gp_canvas_on_key(g->ctx, key, scancode, action, mods);
+    return sync_ui_edges(g) ? handled : -1;
 }
 
 extern "C" int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g) {
@@ -891,6 +1028,20 @@ extern "C" int32_t nodus_headless_push_token_ex(
     if (dropped) {
         push_event(g, NODUS_EVT_OVERFLOW, it->second.module_idx, it->second.edge_idx);
     }
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_publish_output_token(
+    NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* out_result) {
+    if (out_result) *out_result = NodusHeadlessPublishResult{};
+    if (!g || !g->table || !port_name || !bytes) return 0;
+    auto it = g->output_ports.find(port_name);
+    if (it == g->output_ports.end() || len != static_cast<size_t>(it->second.config.token_bytes)) return 0;
+    int32_t dropped = 0;
+    const int32_t ok = gp_table_edge_publish(g->table, it->second.edge_idx, it->second.key,
+        bytes, static_cast<int32_t>(len), &dropped);
+    if (out_result) { out_result->accepted = ok != 0; out_result->dropped = dropped != 0; }
     return 1;
 }
 

@@ -317,8 +317,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                     if (chosen_mode == 0) mod.exec_mode = ThreadManager::ExecMode::Sequential;
                     else if (chosen_mode == 1) mod.exec_mode = ThreadManager::ExecMode::Pooled;
                     else if (chosen_mode == 2) mod.exec_mode = ThreadManager::ExecMode::Slip;
-                    // value 3 (Free) is a canvas-only toggle handled elsewhere (manager mode),
-                    // so leave ModuleContract::exec_mode as the default for that value.
+                    else if (chosen_mode == 3) mod.exec_mode = ThreadManager::ExecMode::Free;
                 req.modules.push_back(mod);
             }
             // Update global sim frame-skip count so table stepping decisions

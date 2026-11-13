@@ -3,7 +3,8 @@
 //
 // Wraps a GP_CanvasContext purely as an in-process graph container and tool
 // dispatch mechanism: nothing here ever calls gp_canvas_raster_rgba or any
-// other rendering entry point, and no window/SDL/GL handle is ever created.
+// other rendering entry point, and no window or GL rendering context is created by this graph API. Optional
+// audio tool rows may own SDL audio-device handles.
 // This is the "Prong 1" headless entry point: build or load a tool graph,
 // run ThreadManager's real scheduler to quiescence, and exchange data at a
 // small set of named external ports, all from a plain console process (or
@@ -114,6 +115,19 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_desc(
     NodusHeadlessGraph* g, int32_t module_idx, const GP_CanvasModuleDesc* desc);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_builtin_tool(NodusHeadlessGraph* g, int32_t module_idx, int32_t tool_kind);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_plugin_tool(NodusHeadlessGraph* g, int32_t module_idx, const char* plugin_id);
+// Admit one native TCP byte-stream row into this graph's registry. The host
+// then binds its id with nodus_headless_bind_plugin_tool and connects its
+// Argument/Return contacts to ordinary typed FIFOs. The port is explicit so
+// a saved graph and its host contract can name the same loopback endpoint.
+// The row is unregistered after graph destruction.
+NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_byte_stream(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t pending_frames);
+// One-input, best-effort fan-out. Slow readers lose stale queued frames;
+// the independent table never waits for a reader or replays an old frame.
+NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_broadcast(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t max_readers);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
     NodusHeadlessGraph* g, int32_t module_idx,
     const GP_CanvasModuleRowDesc* rows, int32_t row_count);
@@ -127,7 +141,44 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t contract);
 NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract);
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t mode);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_exec_mode(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_mode);
+
+// Register the native Radio source and UDP broadcast rows. Configure before
+// binding either row. Both rows belong to one Opaque Free table, in that
+// order. The source reuses the native WASAPI/fftfree scope named here.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_configure(
+    const wchar_t* scope_dll, const wchar_t* fftfree_dll,
+    const char* destination_host, uint16_t destination_port,
+    uint32_t fft_size, uint32_t overlap, uint32_t band_count,
+    float min_hz, float max_hz);
+typedef struct NodusRadioStatus {
+    uint64_t captured_frames;
+    uint64_t emitted_packets;
+    uint64_t dropped_packets;
+    uint32_t sample_rate;
+    int32_t capture_running;
+} NodusRadioStatus;
+// Select WAV playback before constructing/launching the Radio table. No loopback capture.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int32_t loop);
+// Opt-in private PCM RTP sender; configure before binding rows, then bind its
+// canonical canvas output FIFO before launching. Requires file source, hop 256.
+// Hold source advancement until a trusted receiver has pinned the announced stream.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_hold(int32_t held);
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_configure(uint16_t loopback_port);
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, uint64_t* dropped);
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module_idx);
+NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
+// Drive the same canvas UI handlers used by the GUI, on the graph's owning
+// thread. Mouse kinds: 0 click, 1 down, 2 up, 3 move, 4 scroll.
+NODUS_HEADLESS_API int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height);
+NODUS_HEADLESS_API int32_t nodus_headless_ui_mouse(NodusHeadlessGraph* g, int32_t kind,
+    float x, float y, float dx, float dy, int32_t button, float scroll);
+NODUS_HEADLESS_API int32_t nodus_headless_ui_key(NodusHeadlessGraph* g,
+    int32_t key, int32_t scancode, int32_t action, int32_t mods);
 // Configured edge FIFOs and named ports are persisted by
 // nodus_headless_save_file as EDGE_FIFO / PORT trailer records appended after
 // the CANVAS V4 body, and restored by nodus_headless_load_file (load returns 0
@@ -233,6 +284,18 @@ NODUS_HEADLESS_API int32_t nodus_headless_declare_output_port_ex(
     int32_t start_at_head);
 NODUS_HEADLESS_API int32_t nodus_headless_push_token(NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len);
 NODUS_HEADLESS_API int32_t nodus_headless_push_token_ex(
+    NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
+    NodusHeadlessPublishResult* out_result);
+// Native source rows may publish onto a declared output using the same edge
+// Explicit process-owned PA consumer. Blocking raw stereo s16le/48000 stdin
+// until EOF; starts a device only when invoked. Run in its own process because
+// the current headless scheduler has process-global canvas ownership.
+// device_id=0 selects SDL's default playback device. No network listener.
+NODUS_HEADLESS_API int32_t nodus_headless_pcm_playback_stdin(uint32_t device_id);
+
+// Native source rows may publish onto a declared output using the same edge
+// transport. Declare/configure all ports before launching persistent workers.
+NODUS_HEADLESS_API int32_t nodus_headless_publish_output_token(
     NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
     NodusHeadlessPublishResult* out_result);
 NODUS_HEADLESS_API int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written);

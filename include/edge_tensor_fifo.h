@@ -246,6 +246,9 @@ struct EdgeTensorFifo {
                     gp_mem_backend_unmap(impl->storage_handle);
                 }
             }
+            // The edge spec fixes the ring layout until quiescence. Pinning
+            // a host allocation makes its ordinary copy hooks lockless.
+            (void)gp_mem_backend_pin_fixed_cpu_buffer(impl->storage_handle);
         }
         for (size_t i = 0; i < impl->slots; ++i) impl->slot_seq[i].store(0, std::memory_order_relaxed);
         impl->write_seq.store(0, std::memory_order_relaxed);
@@ -314,6 +317,7 @@ struct EdgeTensorFifo {
         impl->release_storage();
         impl->storage_handle = replacement;
         impl->backend = h;
+        (void)gp_mem_backend_pin_fixed_cpu_buffer(impl->storage_handle);
         return true;
     }
     gp_mem_backend_handle_t get_backend() const {
@@ -1410,6 +1414,7 @@ public:
         if (old_vt && old_vt->free) old_vt->free(old_h); else gp_mem_backend_release(old_h);
         impl->storage_handle = new_h;
         impl->stride = new_stride;
+        (void)gp_mem_backend_pin_fixed_cpu_buffer(impl->storage_handle);
 
         // update our cached scratch/last_sample sizes to match new stride
         last_sample.assign(impl->stride, 0.0f);

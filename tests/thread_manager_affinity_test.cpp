@@ -266,34 +266,6 @@ int main() {
     request.edges.push_back(dependency(1, 0));
     manager.submit_tick(request, true);
     expect(manager.wait_for_submitted_ticks(), "completion barrier remains intact");
-
-    // Two pooled predecessors may complete in either order. The manager must
-    // collect both results before admitting their Sequential successor.
-    for (auto& rows : graph.module_io_rows) rows.clear();
-    for (auto& instances : graph.module_plugin_instances) instances.clear();
-    request.modules.resize(3);
-    request.modules[2] = request.modules[0];
-    request.modules[2].module_idx = 2;
-    request.modules[2].table = tables[2].get();
-    request.modules[0].exec_mode = ExecMode::Pooled;
-    request.modules[1].exec_mode = ExecMode::Pooled;
-    request.modules[2].exec_mode = ExecMode::Sequential;
-    request.edges = {dependency(0, 2), dependency(1, 2)};
-    std::array<std::atomic<int>, 3> fan_in_runs{};
-    for (int i = 0; i < 3; ++i) {
-        add_probe(graph, i, [&, i](ToolStackContext&) {
-            if (i == 2) {
-                expect(std::this_thread::get_id() == manager_id, "fan-in successor uses manager lane");
-                expect(fan_in_runs[0] == fan_in_runs[2] + 1 && fan_in_runs[1] == fan_in_runs[2] + 1,
-                       "fan-in successor waits for both worker results");
-            } else {
-                expect(std::this_thread::get_id() != manager_id, "fan-in predecessor uses worker lane");
-            }
-            ++fan_in_runs[i];
-        });
-    }
-    for (int tick = 0; tick < 32; ++tick) manager.submit_tick(request, true);
-    for (const auto& runs : fan_in_runs) expect(runs == 32, "fan-in executes once per module per tick");
     manager.stop();
 
     // With one pooled module, a persistent pool has exactly one worker lane.

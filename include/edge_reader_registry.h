@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -19,29 +21,52 @@ class EdgeReaderRegistry {
 public:
     using Slot = int;
     static constexpr Slot kInvalidSlot = 0;
+    static constexpr size_t kSlotsPerSegment = 1024;
+    static constexpr size_t kSegmentCount = 1024;
+
+    EdgeReaderRegistry() = default;
+    ~EdgeReaderRegistry() {
+        for (auto& segment : segments_) delete segment.load(std::memory_order_relaxed);
+    }
+    EdgeReaderRegistry(const EdgeReaderRegistry&) = delete;
+    EdgeReaderRegistry& operator=(const EdgeReaderRegistry&) = delete;
 
     Slot register_reader(uint64_t edge_id) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (next_slot_ == std::numeric_limits<Slot>::max()) {
+        if (next_slot_ >= static_cast<Slot>(kSlotsPerSegment * kSegmentCount)) {
             return kInvalidSlot;
         }
         const Slot slot = ++next_slot_;
-        slots_.emplace(slot, ReaderState{edge_id, 0});
+        const size_t segment_idx = static_cast<size_t>(slot - 1) / kSlotsPerSegment;
+        Segment* segment = segments_[segment_idx].load(std::memory_order_relaxed);
+        if (!segment) {
+            segment = new Segment();
+            segments_[segment_idx].store(segment, std::memory_order_release);
+        }
+        ReaderState* state = &segment->readers[static_cast<size_t>(slot - 1) % kSlotsPerSegment];
+        state->edge_id = edge_id;
+        state->seq.store(0, std::memory_order_relaxed);
+        state->active.store(true, std::memory_order_release);
+        slots_.emplace(slot, state);
         return slot;
     }
 
     void unregister_reader(Slot slot) {
         std::lock_guard<std::mutex> lock(mu_);
-        slots_.erase(slot);
+        const auto found = slots_.find(slot);
+        if (found == slots_.end()) return;
+        found->second->active.store(false, std::memory_order_release);
+        slots_.erase(found);
     }
 
     bool update_reader(Slot slot, uint64_t seq) {
-        std::lock_guard<std::mutex> lock(mu_);
-        const auto found = slots_.find(slot);
-        if (found == slots_.end()) {
-            return false;
-        }
-        found->second.seq = seq;
+        if (slot <= 0 || slot > static_cast<Slot>(kSlotsPerSegment * kSegmentCount)) return false;
+        const size_t segment_idx = static_cast<size_t>(slot - 1) / kSlotsPerSegment;
+        Segment* segment = segments_[segment_idx].load(std::memory_order_acquire);
+        if (!segment) return false;
+        ReaderState& state = segment->readers[static_cast<size_t>(slot - 1) % kSlotsPerSegment];
+        if (!state.active.load(std::memory_order_acquire)) return false;
+        state.seq.store(seq, std::memory_order_release);
         return true;
     }
 
@@ -49,8 +74,8 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         uint64_t minimum = std::numeric_limits<uint64_t>::max();
         for (const auto& entry : slots_) {
-            if (entry.second.edge_id == edge_id) {
-                minimum = std::min(minimum, entry.second.seq);
+            if (entry.second->edge_id == edge_id) {
+                minimum = std::min(minimum, entry.second->seq.load(std::memory_order_acquire));
             }
         }
         return minimum;
@@ -60,7 +85,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         size_t count = 0;
         for (const auto& entry : slots_) {
-            if (entry.second.edge_id == edge_id) {
+            if (entry.second->edge_id == edge_id) {
                 ++count;
             }
         }
@@ -70,10 +95,14 @@ public:
 private:
     struct ReaderState {
         uint64_t edge_id;
-        uint64_t seq;
+        std::atomic<uint64_t> seq{0};
+        std::atomic<bool> active{false};
     };
+
+    struct Segment { std::array<ReaderState, kSlotsPerSegment> readers{}; };
 
     mutable std::mutex mu_;
     Slot next_slot_ = kInvalidSlot;
-    std::unordered_map<Slot, ReaderState> slots_;
+    std::array<std::atomic<Segment*>, kSegmentCount> segments_{};
+    std::unordered_map<Slot, ReaderState*> slots_;
 };

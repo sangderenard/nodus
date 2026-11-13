@@ -5849,6 +5849,24 @@ extern "C" int gp_canvas_get_module_stack_contract(GP_CanvasContext* ctx_, int m
     return 1;
 }
 
+extern "C" int gp_canvas_set_module_exec_mode(GP_CanvasContext* ctx_, int module_idx, int mode) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size()) ||
+        mode < -1 || mode > 3) return 0;
+    if (module_idx >= static_cast<int>(ctx->module_exec_mode.size()))
+        ctx->module_exec_mode.resize(static_cast<size_t>(module_idx) + 1, -1);
+    ctx->module_exec_mode[static_cast<size_t>(module_idx)] = mode;
+    return 1;
+}
+
+extern "C" int gp_canvas_get_module_exec_mode(GP_CanvasContext* ctx_, int module_idx, int* out_mode) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || !out_mode || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return 0;
+    *out_mode = module_idx < static_cast<int>(ctx->module_exec_mode.size())
+        ? ctx->module_exec_mode[static_cast<size_t>(module_idx)] : -1;
+    return 1;
+}
+
 static int canvas_handle_module_counter_hit(GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& found) {
     if (!ctx) return 0;
     if (found.part != GP_TABLE_HIT_COUNTER_DEC && found.part != GP_TABLE_HIT_COUNTER_INC) return 0;

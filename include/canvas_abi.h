@@ -99,6 +99,9 @@ int gp_canvas_get_module_stack_snapshot_meta(
 int gp_canvas_get_module_stack_tail(
     GP_CanvasContext* ctx, int module_idx,
     float* out_values, int capacity, int* out_count);
+// Apply scheduler inspection values to a read-only mirror of this canvas.
+int gp_canvas_set_module_stack_tail(
+    GP_CanvasContext* ctx, int module_idx, const float* values, int count);
 
 // rasterize into RGBA buffer sized width*height*4; returns 1 on success
 int gp_canvas_raster_rgba(GP_CanvasContext* ctx, uint8_t* out_rgba, int32_t out_len_bytes);
@@ -491,6 +494,11 @@ int gp_canvas_get_module_row(GP_CanvasContext* ctx, int module_idx, int row_idx,
 // `contract` is ModuleStackContract (thread_manager.h).
 int gp_canvas_set_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int contract);
 int gp_canvas_get_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int* out_contract);
+// Per-module execution mode: -1 inherits the canvas choice, 0 sequential,
+// 1 pooled, 2 slip, 3 independent Free table worker. Set before stepping or
+// at a quiescent graph-edit boundary.
+int gp_canvas_set_module_exec_mode(GP_CanvasContext* ctx, int module_idx, int mode);
+int gp_canvas_get_module_exec_mode(GP_CanvasContext* ctx, int module_idx, int* out_mode);
 int gp_canvas_autobind_keyboard_ports(GP_CanvasContext* ctx, int module_idx, int max_ports);
 
 // Thread manager / scheduler mode (0 = free-spinning, 1 = scheduled).

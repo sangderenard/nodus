@@ -196,6 +196,9 @@ gp_mem_backend_handle_t gp_mem_backend_create_cpu(size_t initial_bytes);
 // New alias for host-backed memory creation (preferred name). Deprecated
 // wrapper around `gp_mem_backend_create_cpu` for clarity.
 gp_mem_backend_handle_t gp_mem_backend_create_host(size_t initial_bytes);
+// Pin a CPU buffer whose allocation is owned by a quiescently reconfigured
+// FIFO. Resizing is refused thereafter; payload copies use its fixed address.
+int gp_mem_backend_pin_fixed_cpu_buffer(gp_mem_backend_handle_t h);
 // Create a persistent Vulkan device/context backend. Allocations made through
 // its vtable are storage-buffer-capable and remain valid across dispatches.
 gp_mem_backend_handle_t gp_mem_backend_create_vulkan(const gp_mem_backend_vulkan_params_t* params);

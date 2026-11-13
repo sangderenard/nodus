@@ -9,7 +9,13 @@ CLI usage::
 
     python tools/turing_row_tool_compiler.py --request row.json
 
-The request is JSON.  It must contain ``row_entry``, ``columns``, ``backend``
+An opt-in Site-only source request uses ``unstable_source_only: true`` and
+``source_names`` instead of a row entry or column ABI. It requires an explicit
+Turing root, extraction contract and trusted ``site_artifact_context``. Site
+must enforce owner permissions before dispatch. The existing source divider
+partitions and emits C/LLVM/Fortran source without native build or adoption.
+
+The default tensor row request is JSON.  It must contain ``row_entry``, ``columns``, ``backend``
 (``c``, ``llvm`` or ``fortran``), ``output_dir``, ``extraction_contract``, and
 exactly one of ``source_path`` or ``source_text``.  The extraction contract is
 the caller-selected Turing contract; this adapter never synthesizes one.
@@ -31,7 +37,7 @@ The adapter always sets ``ssa_composition`` true.  It never links SSA itself.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import dataclasses
 import hashlib
 import json
@@ -40,10 +46,14 @@ import pickle
 import re
 import subprocess
 import sys
+import tempfile
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 
+SOURCE_PRODUCT_SCHEMA = "nodus-turing-source-only-product-v1"
 PRODUCT_SCHEMA = "nodus-turing-row-tool-product-v1"
 BUFFER_ABI_SCHEMA = "nodus-turing-buffer-abi-v2"
 REQUEST_SCHEMA = "nodus-turing-row-tool-request-v1"
@@ -149,9 +159,18 @@ class RowToolRequest:
         default_factory=dict
     )
     allow_uncompiled: bool = True
+    site_artifact_context: Mapping[str, Any] | None = None
+    unstable_source_only: bool = False
+    source_names: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RowToolRequest":
+        if "unstable_source_only" in value and type(value["unstable_source_only"]) is not bool:
+            raise ValueError("unstable_source_only must be a boolean")
+        if value.get("unstable_source_only") is True:
+            return _source_only_request(value)
+        if "source_names" in value:
+            raise ValueError("source_names requires unstable_source_only")
         source_path = value.get("source_path")
         source_text = value.get("source_text")
         if (source_path is None) == (source_text is None):
@@ -224,7 +243,130 @@ class RowToolRequest:
             ssa_composition_directory=composition_directory,
             ssa_composition_options=composition_options,
             allow_uncompiled=bool(value.get("allow_uncompiled", True)),
+            site_artifact_context=value.get("site_artifact_context"),
         )
+
+
+def _valid_authored_name(name: Any) -> bool:
+    """Validate catalogue spelling, not source structure or a replacement partition.
+
+    Turing's source divider uses C.m and f.<locals>.g, including repeated
+    lexical nesting. Preserve those names verbatim for the existing divider.
+    """
+    if not isinstance(name, str):
+        return False
+    parts = name.split(".")
+    return all(
+        part.isidentifier() or (
+            part == "<locals>" and 0 < index < len(parts) - 1
+            and parts[index - 1].isidentifier() and parts[index + 1].isidentifier()
+        )
+        for index, part in enumerate(parts)
+    )
+
+
+def _source_only_request(value: Mapping[str, Any]) -> RowToolRequest:
+    allowed = {"unstable_source_only", "source_names", "source_text", "source_path",
+               "backend", "output_dir", "extraction_contract", "turing_root",
+               "site_artifact_context"}
+    if set(value) - allowed:
+        raise ValueError("source-only request has unsupported or mixed-mode fields: "
+                         + ", ".join(sorted(set(value) - allowed)))
+    names = value.get("source_names")
+    if (not isinstance(names, (list, tuple)) or not names
+            or any(not _valid_authored_name(name) for name in names)
+            or len(set(names)) != len(names)):
+        raise ValueError("source_names must be non-empty unique authored names")
+    # The existing divider maps qualified names to directory stems.
+    stems = [re.sub(r"\W+", "_", name).strip("_") or "entry" for name in names]
+    if len(set(stems)) != len(stems):
+        raise ValueError("source_names collide in divider output paths")
+    if (value.get("source_path") is None) == (value.get("source_text") is None):
+        raise ValueError("request requires exactly one of source_path or source_text")
+    if value.get("source_text") is not None and not isinstance(value["source_text"], str):
+        raise ValueError("source_text must be a string")
+    for key in ("output_dir", "extraction_contract", "turing_root"):
+        if not isinstance(value.get(key), (str, Path)) or not str(value[key]):
+            raise ValueError(f"source-only request requires {key}")
+    if value.get("backend") not in _BACKENDS:
+        raise ValueError("unsupported source-only backend")
+    if not isinstance(value.get("site_artifact_context"), Mapping):
+        raise ValueError("source-only request requires site_artifact_context")
+    request = RowToolRequest(
+        row_entry="", columns=(), backend=value["backend"], output_dir=Path(value["output_dir"]),
+        source_text=value.get("source_text"),
+        source_path=Path(value["source_path"]) if value.get("source_path") is not None else None,
+        extraction_contract=Path(value["extraction_contract"]), turing_root=Path(value["turing_root"]),
+        site_artifact_context=value["site_artifact_context"], unstable_source_only=True,
+        source_names=tuple(names))
+    _site_context(request)
+    return request
+
+
+class SourceDividerBoundary:
+    """Use the existing divider child entry inside the already isolated host."""
+
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+
+    def attempt(self, spec: Path) -> int:
+        sys.path.insert(0, str(self.root))
+        try:
+            from examples.meowdoku.source_divider import _attempt_main
+            return _attempt_main(str(spec))
+        finally:
+            sys.path.pop(0)
+
+
+def _compile_source_only(request: RowToolRequest, *, compiler=None) -> dict[str, Any]:
+    output = request.output_dir.resolve()
+    authored, origin = _read_authored_source(request)
+    contract = request.extraction_contract.resolve()
+    _write_text(output / "authored-source.py", authored)
+    _write_bytes(output / "extraction-contract.yaml", contract.read_bytes())
+    work = output / "compiler-work"
+    backend = work / "source-divider"
+    backend.mkdir(parents=True, exist_ok=True)
+    spec_path = work / "source-divider-request.json"
+    _write_json(spec_path, {"names": list(request.source_names), "backend": request.backend,
+                           "source_file": str(output / "authored-source.py"),
+                           "out_dir": str(backend),
+                           "extraction_contract": str(output / "extraction-contract.yaml")})
+    boundary = compiler if compiler is not None else SourceDividerBoundary(request.turing_root)
+    with _compiler_working_directory(work):
+        rc = boundary.attempt(spec_path)
+    if rc != 0:
+        raise ProductError(f"source divider child returned {rc}")
+    attempt = json.loads((backend / "attempt.json").read_text(encoding="utf-8"))
+    entries = attempt["entries"]
+    if [entry.get("name") for entry in entries] != list(request.source_names):
+        raise ProductError("source divider result names do not match request")
+    for entry in entries:
+        if entry.get("state") == "complete":
+            if entry.get("note") != "emitted-not-built":
+                raise ProductError("source divider returned a non-source product")
+            product = backend / entry["product"]
+            _product_relative(output, product)
+            if not product.is_file() or _sha256(product) != entry.get("sha256"):
+                raise ProductError("source divider product missing or hash mismatch")
+    state = "emitted-not-built" if all(e["state"] == "complete" for e in entries) else "refused"
+    sys.stdout.flush()
+    sys.stderr.flush()
+    records = [_artifact_record(output, path, "compiler-side-product" if path.is_relative_to(work)
+                                else "authored-source" if path.name == "authored-source.py"
+                                else "extraction-contract")
+               for path in sorted(output.rglob("*")) if path.is_file()
+               and path.name not in {"site-artifact-lifecycle.json", "nodus-row-tool-product.json"}]
+    manifest = {"schema": SOURCE_PRODUCT_SCHEMA, "request_schema": REQUEST_SCHEMA,
+                "unstable_source_only": True, "state": state, "note": state,
+                "backend": request.backend, "source_names": list(request.source_names),
+                "site_artifact_context": _site_context(request),
+                "source": {"origin": origin, "authored_sha256": _sha256(output / "authored-source.py"),
+                           "extraction_contract": "extraction-contract.yaml"},
+                "attempt": attempt, "loadable": False, "binary": None,
+                "adoption_receipt": None, "buffer_abi": None, "artifacts": records}
+    _write_json(output / "nodus-row-tool-product.json", manifest)
+    return manifest
 
 
 class CompilerBoundary(Protocol):
@@ -295,7 +437,8 @@ def _safe_name(value: str) -> str:
 def _read_authored_source(request: RowToolRequest) -> tuple[str, str | None]:
     if request.source_path is not None:
         path = request.source_path.resolve()
-        return path.read_text(encoding="utf-8"), path.as_posix()
+        with path.open(encoding="utf-8", newline="") as stream:
+            return stream.read(), path.as_posix()
     assert request.source_text is not None
     return request.source_text, None
 
@@ -756,7 +899,218 @@ class TuringBoundary:
         )
 
 
+# Existing compiler configuration knobs, scoped to the isolated site job process.
+_SITE_DIRECTORIES = {
+    "TURING_COMPILER_ARTIFACT_ROOT": "compiler-artifacts",
+    "TURING_IDENTITY_SPILL_DIR": "identity-spill",
+    "TURING_SYMPY_DUAL_IR_CACHE_DIR": "sympy-dual-ir",
+    "TURING_HOST_SSA_CACHE": "host-ssa",
+    "TURING_LAW_NATIVE_CACHE": "native-laws",
+    "TURING_LAW_MODULE_CACHE_DIR": "law-modules",
+    "TURING_ACCELERATOR_CACHE_DIR": "accelerators",
+    "TURING_GLSL_CACHE_DIR": "glsl",
+    "TURING_COMPILER_USAGE_TRACE_ROOT": "usage-traces",
+    "TMP": "tmp", "TEMP": "tmp", "TMPDIR": "tmp",
+}
+
+
+def _site_context(request: RowToolRequest) -> dict[str, Any] | None:
+    context = request.site_artifact_context
+    if context is None:
+        return None
+    if not isinstance(context, Mapping):
+        raise ValueError("site_artifact_context must be an object")
+    owner = context.get("owner_id")
+    if type(owner) is not int or owner <= 0:
+        raise ValueError("site artifact owner_id must be a positive integer")
+    workspace = context.get("workspace_id")
+    if not isinstance(workspace, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", workspace):
+        raise ValueError("site artifact workspace_id must be an existing lease ID")
+    job = context.get("job_id")
+    if not isinstance(job, str) or not job.strip():
+        raise ValueError("site artifact job_id is required")
+    raw_directory = context.get("job_directory")
+    if not isinstance(raw_directory, str) or not Path(raw_directory).is_absolute():
+        raise ValueError("site artifact job_directory must be absolute")
+    output = request.output_dir.resolve()
+    if output != Path(raw_directory).resolve():
+        raise ProductError("site output_dir must equal its ledger job_directory")
+    forbidden = [Path(__file__).resolve().parents[1]]
+    if request.turing_root is not None:
+        forbidden.append(request.turing_root.resolve())
+    if any(output.is_relative_to(root) for root in forbidden) or any(
+        (parent / ".git").exists() for parent in (output, *output.parents)
+    ):
+        raise ProductError("site artifacts must be outside repository worktrees")
+    if request.ssa_composition_directory is not None:
+        _product_relative(output, request.ssa_composition_directory)
+    # Existing links/junctions must not redirect writes out of this job.
+    if output.exists():
+        for path in output.rglob("*"):
+            _product_relative(output, path)
+            if path.name == ".git":
+                raise ProductError("site artifact directory contains a repository")
+    return {"owner_id": owner, "workspace_id": workspace, "job_id": job,
+            "job_directory": str(output)}
+
+
+@contextmanager
+def _site_compiler_diagnostics(output: Path):
+    """Capture Python, CRT and inherited child output in this isolated process."""
+    work = output / "compiler-work"
+    work.mkdir(parents=True, exist_ok=True)
+    paths = [work / "stdout.log", work / "stderr.log"]
+    for path in paths:
+        _product_relative(output, path)
+    # Python streams can be wrappers (including pytest capture); preserve those
+    # separately from the process descriptors that native tools inherit.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    windows = None
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        windows = ctypes.WinDLL("kernel32", use_last_error=True)
+        windows.GetStdHandle.argtypes = [wintypes.DWORD]
+        windows.GetStdHandle.restype = wintypes.HANDLE
+        windows.SetStdHandle.argtypes = [wintypes.DWORD, wintypes.HANDLE]
+        windows.SetStdHandle.restype = wintypes.BOOL
+
+        def set_handle(number, handle):
+            if not windows.SetStdHandle(number, handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+    saved = []
+    with ExitStack() as stack:
+        streams = [stack.enter_context(path.open("a", encoding="utf-8", buffering=1))
+                   for path in paths]
+        try:
+            for descriptor, stream, handle_number in zip((1, 2), streams, (-11, -12)):
+                duplicate = os.dup(descriptor)
+                inheritable = os.get_inheritable(descriptor)
+                handle = windows.GetStdHandle(handle_number) if windows is not None else None
+                handle_matches_fd = (windows is not None and
+                                     handle == msvcrt.get_osfhandle(descriptor))
+                saved.append((descriptor, duplicate, inheritable, handle_number,
+                              handle, handle_matches_fd))
+                os.dup2(stream.fileno(), descriptor, inheritable=True)
+                if windows is not None:
+                    set_handle(handle_number, msvcrt.get_osfhandle(descriptor))
+            with redirect_stdout(streams[0]), redirect_stderr(streams[1]):
+                try:
+                    yield
+                except BaseException:
+                    traceback.print_exc(file=streams[1])
+                    raise
+                finally:
+                    streams[0].flush()
+                    streams[1].flush()
+        finally:
+            # Restore before closing the log streams or returning to CLI output.
+            restore_error = None
+            for descriptor, duplicate, inheritable, handle_number, handle, matches_fd in reversed(saved):
+                try:
+                    os.dup2(duplicate, descriptor, inheritable=inheritable)
+                    if windows is not None:
+                        set_handle(handle_number, msvcrt.get_osfhandle(descriptor)
+                                   if matches_fd else handle)
+                except OSError as error:
+                    restore_error = restore_error or error
+                finally:
+                    os.close(duplicate)
+            if restore_error is not None:
+                raise restore_error
+
+
+@contextmanager
+def _site_compiler_environment(output: Path):
+    previous = {key: os.environ.get(key)
+                for key in (*_SITE_DIRECTORIES, "PYTHONDONTWRITEBYTECODE")}
+    old_tempdir = tempfile.tempdir
+    old_bytecode = sys.dont_write_bytecode
+    try:
+        for key, relative in _SITE_DIRECTORIES.items():
+            directory = output / "compiler-work" / relative
+            _product_relative(output, directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            os.environ[key] = str(directory)
+        tempfile.tempdir = os.environ["TMPDIR"]
+        # Imports must not create __pycache__ beside compiler sources.
+        sys.dont_write_bytecode = True
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        yield
+    finally:
+        tempfile.tempdir = old_tempdir
+        sys.dont_write_bytecode = old_bytecode
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def compile_row_tool(
+    request: RowToolRequest | Mapping[str, Any],
+    *,
+    compiler: CompilerBoundary | None = None,
+) -> dict[str, Any]:
+    """Compile a product; site callers supply trusted ledger ownership metadata.
+
+    The adapter runs in a dedicated subprocess: cwd, environment and tempfile
+    state are process-global. This metadata is not authentication; only the
+    site bridge may resolve the owner and workspace lease.
+    """
+    if not isinstance(request, RowToolRequest):
+        request = RowToolRequest.from_mapping(request)
+    if type(request.unstable_source_only) is not bool:
+        raise ValueError("unstable_source_only must be a boolean")
+    if request.source_names and not request.unstable_source_only:
+        raise ValueError("source_names requires unstable_source_only")
+    if request.unstable_source_only:
+        if (request.row_entry or request.columns or request.global_scope or request.ssa_composition_directory
+                or request.ssa_composition_options or request.product_name):
+            raise ValueError("source-only request cannot carry a tensor row ABI or composition")
+        # Revalidate dataclass callers before creating any artifacts.
+        request = _source_only_request({
+            "unstable_source_only": True, "source_names": request.source_names,
+            "source_text": request.source_text, "source_path": request.source_path,
+            "backend": request.backend, "output_dir": request.output_dir,
+            "extraction_contract": request.extraction_contract, "turing_root": request.turing_root,
+            "site_artifact_context": request.site_artifact_context})
+        if not request.extraction_contract.is_file():
+            raise FileNotFoundError("source-only extraction contract does not exist")
+        _read_authored_source(request)
+        # Never delete or reuse an earlier runnable product or stale attempt.
+        if request.output_dir.exists() and any(request.output_dir.iterdir()):
+            raise ProductError("source-only output directory must be empty")
+    context = _site_context(request)
+    if context is None:
+        return _compile_row_tool(request, compiler=compiler)
+    output = request.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    receipt = output / "site-artifact-lifecycle.json"
+    lifecycle = {"schema": "nodus-site-artifact-lifecycle-v1", **context,
+                 "started_at": datetime.now(timezone.utc).isoformat(),
+                 "state": "running", "automatic_deletion": False}
+    _write_json(receipt, lifecycle)
+    try:
+        with _site_compiler_environment(output), _site_compiler_diagnostics(output):
+            manifest = (_compile_source_only(request, compiler=compiler) if request.unstable_source_only
+                        else _compile_row_tool(request, compiler=compiler))
+        lifecycle["state"] = (manifest["state"] if request.unstable_source_only
+                              else "completed" if manifest["loadable"] else "uncompiled")
+        return manifest
+    except BaseException as error:
+        lifecycle["state"] = "failed"
+        lifecycle["error"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        lifecycle["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _write_json(receipt, lifecycle)
+
+
+def _compile_row_tool(
     request: RowToolRequest | Mapping[str, Any],
     *,
     compiler: CompilerBoundary | None = None,
@@ -851,6 +1205,8 @@ def compile_row_tool(
             artifact = compiler.emit_c(module, root, entry_name=product_name)
             if not bool(getattr(artifact, "complete", False)):
                 raise ProductError(f"C emission incomplete: {getattr(artifact, 'shortfalls', ())!r}")
+            if not _IDENTIFIER.fullmatch(str(artifact.name)):
+                raise ProductError("invalid backend artifact name")
             backend_source_path = backend_dir / f"{artifact.name}.c"
             _write_text(backend_source_path, str(artifact.source))
             abi_path = backend_dir / f"{artifact.name}.nodus_buffer_abi.txt"
@@ -871,6 +1227,8 @@ def compile_row_tool(
                 raise ProductError(
                     f"LLVM emission incomplete: {getattr(artifact, 'shortfalls', ())!r}"
                 )
+            if not _IDENTIFIER.fullmatch(str(artifact.name)):
+                raise ProductError("invalid backend artifact name")
             backend_source_path = backend_dir / f"{artifact.name}.ll"
             _write_text(backend_source_path, str(artifact.llvm_ir))
             abi_path = backend_dir / f"{artifact.name}.nodus_buffer_abi.txt"
@@ -893,6 +1251,8 @@ def compile_row_tool(
                 raise ProductError(
                     f"Fortran emission incomplete: {getattr(artifact, 'shortfalls', ())!r}"
                 )
+            if not _IDENTIFIER.fullmatch(str(artifact.name)):
+                raise ProductError("invalid backend artifact name")
             backend_source_path = Path(artifact.write(backend_dir))
             candidate_api = backend_source_path.with_suffix(".api.yaml")
             if candidate_api.is_file():
@@ -923,6 +1283,14 @@ def compile_row_tool(
         if not request.allow_uncompiled:
             raise ProductError(build_error["message"])
 
+    if request.site_artifact_context is not None:
+        for path in (backend_source_path, abi_path, binary_path):
+            if path is not None:
+                _product_relative(output, path)
+
+    # Diagnostic records must include buffered output emitted during compilation.
+    sys.stdout.flush()
+    sys.stderr.flush()
     artifact_records = [
         _artifact_record(output, authored_path, "authored-source"),
         _artifact_record(output, submitted_path, "submitted-source"),
@@ -950,6 +1318,7 @@ def compile_row_tool(
     manifest = {
         "schema": PRODUCT_SCHEMA,
         "request_schema": REQUEST_SCHEMA,
+        "site_artifact_context": _site_context(request),
         "product_name": product_name,
         "backend": request.backend,
         "row_entry": request.row_entry,
@@ -1017,6 +1386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"turing-row-tool: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
     print((Path(request_data["output_dir"]).resolve() / "nodus-row-tool-product.json"))
+    if manifest.get("unstable_source_only"):
+        return 0 if manifest["state"] == "emitted-not-built" else 1
     return 0 if manifest["loadable"] or request_data.get("allow_uncompiled", True) else 1
 
 

@@ -117,5 +117,3 @@ size_t count(const char* value) {size_t n=0;for(const auto& x:calls)if(x==value)
 
 // Link-time mock of the actual Nodus context registry, deliberately no device.
 extern "C" uintptr_t gp_mem_backend_get_registered_gl_context(uintptr_t id) {return id==5?77:0;}
-
-\n

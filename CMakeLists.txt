@@ -557,6 +557,8 @@ add_test(NAME edge_runtime_abi_test COMMAND edge_runtime_abi_test)
 # ThreadManager, but exports only its own narrow nodus_headless_* surface.
 add_library(nodus_headless SHARED
   src/headless/nodus_headless_abi.cpp
+  src/headless/radio_rows.cpp
+  src/headless/pcm_playback.cpp
 )
 target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
 target_include_directories(nodus_headless PUBLIC
@@ -567,7 +569,7 @@ target_include_directories(nodus_headless PUBLIC
 target_link_libraries(nodus_headless PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
   # contract ports: loopback listener and socket adapters (include/contract_listener.h)
-  target_link_libraries(nodus_headless PRIVATE ws2_32)
+  target_link_libraries(nodus_headless PRIVATE ws2_32 SDL3::SDL3)
   # The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
   # refers to that object, so from the static library the linker would leave it out; this keeps it in.
   target_link_options(nodus_headless PRIVATE "/INCLUDE:nodus_exec_row_source")
@@ -645,6 +647,17 @@ target_include_directories(frame_compression_pipeline_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(frame_compression_pipeline_test PRIVATE canvas_tables_static nodus_tensor_core)
 target_compile_features(frame_compression_pipeline_test PUBLIC cxx_std_20)
+# Native Radio: one headless table containing its ordered capture/fftfree and
+# UDP rows, executed by the independent Free table worker.
+add_executable(nodus_radio tools/nodus_radio.cpp)
+target_include_directories(nodus_radio PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(nodus_radio PRIVATE nodus_headless)
+target_compile_features(nodus_radio PRIVATE cxx_std_20)
+
+add_executable(nodus_pcm_playback tools/nodus_pcm_playback.cpp)
+target_include_directories(nodus_pcm_playback PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(nodus_pcm_playback PRIVATE nodus_headless)
+target_compile_features(nodus_pcm_playback PRIVATE cxx_std_20)
 
 # Loads a real bridge-generated canvas (turing's nodus_canvas_kpn.py output)
 # headlessly, validates its computed output against an independent Python
@@ -947,6 +960,16 @@ add_executable(test_thread_manager_affinity tests/thread_manager_affinity_test.c
 target_link_libraries(test_thread_manager_affinity PRIVATE canvas_tables_static)
 target_compile_features(test_thread_manager_affinity PRIVATE cxx_std_20)
 add_test(NAME thread_manager_affinity_test COMMAND test_thread_manager_affinity)
+add_executable(test_thread_manager_free tests/thread_manager_free_test.cpp)
+target_link_libraries(test_thread_manager_free PRIVATE canvas_tables_static)
+target_compile_features(test_thread_manager_free PRIVATE cxx_std_20)
+add_test(NAME thread_manager_free_test COMMAND test_thread_manager_free)
+add_executable(edge_fifo_concurrent_backpressure_test tests/edge_fifo_concurrent_backpressure_test.cpp)
+target_link_libraries(edge_fifo_concurrent_backpressure_test PRIVATE canvas_tables_static)
+target_compile_features(edge_fifo_concurrent_backpressure_test PRIVATE cxx_std_20)
+add_test(NAME edge_fifo_concurrent_backpressure_test COMMAND edge_fifo_concurrent_backpressure_test)
+set_tests_properties(edge_fifo_concurrent_backpressure_test PROPERTIES TIMEOUT 15)
+set_tests_properties(thread_manager_free_test PROPERTIES TIMEOUT 30 LABELS "cpu;scheduler")
 set_tests_properties(thread_manager_affinity_test PROPERTIES TIMEOUT 30 LABELS "cpu;scheduler")
 if(WIN32)
   set_tests_properties(thread_manager_test thread_manager_affinity_test PROPERTIES
@@ -1362,19 +1385,27 @@ target_link_libraries(test_vulkan_dispatch PRIVATE nodus_tensor_core)
 target_compile_features(test_vulkan_dispatch PRIVATE cxx_std_20)
 add_test(NAME vulkan_dispatch_test COMMAND test_vulkan_dispatch)
 
-# Explicit hardware integration entry for the authored Spectral ray stages.
-# Artifact paths are supplied by the caller; this is not an automatic CTest.
+# Explicit hardware trials of the authored Spectral transport stages. Artifact
+# paths are provided by the caller; these are not automatic CTest jobs.
 add_executable(test_spectral_exact_lens_vulkan
   tests/spectral_exact_lens_vulkan_test.cpp)
 target_link_libraries(test_spectral_exact_lens_vulkan PRIVATE canvas_tables_static)
 target_compile_features(test_spectral_exact_lens_vulkan PRIVATE cxx_std_20)
+add_executable(test_spectral_wave_vulkan
+  tests/spectral_wave_vulkan_test.cpp)
+target_link_libraries(test_spectral_wave_vulkan PRIVATE canvas_tables_static)
+target_compile_features(test_spectral_wave_vulkan PRIVATE cxx_std_20)
+add_executable(test_tcp_byte_stream_tool tests/tcp_byte_stream_tool_test.cpp)
+target_link_libraries(test_tcp_byte_stream_tool PRIVATE canvas_tables_static)
+target_compile_features(test_tcp_byte_stream_tool PRIVATE cxx_std_20)
+add_test(NAME tcp_byte_stream_tool_test COMMAND test_tcp_byte_stream_tool)
+set_tests_properties(tcp_byte_stream_tool_test PROPERTIES TIMEOUT 10)
 add_executable(test_spectral_t3_vulkan tests/spectral_t3_vulkan_test.cpp)
 target_link_libraries(test_spectral_t3_vulkan PRIVATE nodus_tensor_core)
 target_compile_features(test_spectral_t3_vulkan PRIVATE cxx_std_20)
 add_executable(test_spectral_t5_vulkan tests/spectral_t5_vulkan_test.cpp)
 target_link_libraries(test_spectral_t5_vulkan PRIVATE canvas_tables_static)
 target_compile_features(test_spectral_t5_vulkan PRIVATE cxx_std_20)
-
 # Inventory/selection failures are tested with fake Vulkan entry points. These
 # tests never submit or compile shaders and do not depend on a physical GPU.
 if(Vulkan_FOUND)
@@ -1494,6 +1525,16 @@ if(WIN32)
   add_test(NAME contract_registry_transaction_test COMMAND test_contract_registry_transaction)
   set_tests_properties(contract_registry_transaction_test PROPERTIES TIMEOUT 30 LABELS "cpu;registry;allocation-faults")
 endif()
+add_executable(test_tensor_state_library tests/tensor_state_library_test.cpp)
+target_link_libraries(test_tensor_state_library PRIVATE nodus_tensor_core)
+target_compile_features(test_tensor_state_library PRIVATE cxx_std_20)
+add_executable(test_vulkan_state_bank tests/vulkan_state_bank_test.cpp)
+target_link_libraries(test_vulkan_state_bank PRIVATE nodus_tensor_core)
+target_compile_features(test_vulkan_state_bank PRIVATE cxx_std_20)
+add_executable(test_vulkan_device_local_state
+  tests/vulkan_device_local_state_test.cpp)
+target_link_libraries(test_vulkan_device_local_state PRIVATE nodus_tensor_core)
+target_compile_features(test_vulkan_device_local_state PRIVATE cxx_std_20)
 
 # Persistent Vulkan shader rows communicating through the ordinary FIFO ABI.
 add_executable(test_vulkan_ssbo_fifo
