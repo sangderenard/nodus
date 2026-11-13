@@ -244,3 +244,9 @@ only under its own explicit device control.
 This source change has not yet completed a native rebuild: the configured build
 stalled during its project/glob phase. Do not deploy it as a verified binary.
 The integration proof lives in Turing tools/test_nodus_radio_jukebox_native.py.
+
+Follow-up verification: Release build succeeded with MSBuild /m:1 /nr:false.
+Silent full-frame gated source proof passed:48007frames/188packets, exact final
+seven-frame block, verified RTCP EOF, zero loss/late/rejected/resync. Two successive
+streams then fed one existing native PA sink through Turing's bounded readback tap:
+96014frames accepted. SDL dummy explicitly selected; real speakers untested.
