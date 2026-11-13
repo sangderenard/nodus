@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nodus_graph import Graph, compile_row_product_graph
 from tools.compile_tensor_network_row import request
-from tools.live_market_frames import current_row, matured_rows, timestamp
+from tools.live_market_frames import current_row, matured_rows
 from tools.replay_tensor_network_stock import STOCK, _series, causal_rows, infer
 from tools.run_canvas import ConsoleServer
 from tools.train_aapl_qualified_row import PolicyNetwork, scaled, target_for, window_results
@@ -87,12 +87,10 @@ def _observations(path: Path, current: dict | None = None) -> list[dict]:
         raise ValueError("live observations are invalid")
     if current is None:
         return frames
-    hour = timestamp(current["decision_bar"]).replace(minute=0, second=0, microsecond=0)
-    if any(timestamp(frame["t"]).replace(minute=0, second=0, microsecond=0) == hour
-           for frame in frames):
+    if any(frame["t"] == current["decision_bar"] for frame in frames):
         return frames
     frames = (frames + [{"t": current["decision_bar"],
-                         "features": current["features"].tolist()}])[-256:]
+                         "features": current["features"].tolist()}])[-4096:]
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump({"frames": frames}, handle)
