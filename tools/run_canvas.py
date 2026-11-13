@@ -6,14 +6,19 @@ SIGINT/SIGTERM or --ticks, then prints {"ticks": n}.  Errors go to stderr, exit 
 The native library prints diagnostics on fd 1, so fd 1 is redirected to stderr and the
 JSON lines are written to a saved duplicate of the real stdout.
 
-Optional read-only admin console (--console-port / --console-token-file), protocol
-nodus-console/1, newline-delimited UTF-8 over 127.0.0.1:
+Optional managed console (--console-port / --console-token-file), newline-delimited
+UTF-8 over 127.0.0.1. Version 1 remains read-only:
   HELLO nodus-console/1 <token>  -> OK console <canvas-basename> read-only | REFUSED <reason> (closes)
   SNAPSHOT -> CANVAS <revision> <n>\\n<n bytes>\\nSTATE <json>\\n
   DIGEST | GRAPH | TOOLS | ACTIVITY -> JSON <VERB> <n>
 <n bytes of compact sorted-key UTF-8 JSON>
   anything else -> REFUSED read-only
 (docs/NODUS_CONSOLE_READ_PROTOCOL_2026-11-10.md)
+
+Version 2 uses HELLO nodus-console/2 <token> and adds
+ACTION <n>\n<n bytes of JSON>. Each action supplies expected_revision and one
+canvas UI operation. The stepping thread applies it, saves changed canvas state,
+then replies JSON ACTION <n>\n<n bytes of JSON>.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import argparse
 import ctypes
 import hmac
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -52,15 +58,16 @@ def _on_signal(signum, frame) -> None:
 
 
 class ConsoleServer:
-    """Read-only admin console.
+    """Managed canvas console.
 
     Client threads never touch the Graph: they request a snapshot and the stepping
     thread builds it in service().  Snapshots are shared and coalesced to 100 ms.
     """
 
-    def __init__(self, token: str, canvas_name: str, ticks_fn) -> None:
+    def __init__(self, token: str, canvas_name: str, ticks_fn, canvas_path: str) -> None:
         self._token = token.encode("utf-8")
         self._canvas_name = canvas_name
+        self._canvas_path = canvas_path
         self._ticks_fn = ticks_fn
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
@@ -69,6 +76,7 @@ class ConsoleServer:
         self._closing = False
         self._snap = None  # (monotonic_time, canvas_bytes, state_json_bytes, revision, views)
         self._want_views = set()  # views clients asked for; built on the stepping thread
+        self._actions = []  # (validated request, result box, completion event); stepping thread owns Graph
         self._rate = 0.0
         self._started = time.time()
         self._hosts = []  # [(prefix, host_id)], read on the stepping thread only
@@ -105,14 +113,22 @@ class ConsoleServer:
             return
         with self._lock:
             wanted = set(self._want_views)
-            fresh = (self._snap is not None
-                     and time.monotonic() - self._snap[0] < CONSOLE_COALESCE_SECONDS
-                     and wanted <= set(self._snap[4]))
+            self._want_views -= wanted
+            actions = self._actions
+            self._actions = []
+            self._wanted.clear()
+        for request, box, done in actions:
+            try:
+                box.append(self._apply_action(graph, request))
+            except (ValueError, RuntimeError) as exc:
+                box.append({"error": str(exc)[:200]})
+            finally:
+                done.set()
+        fresh = (not actions and self._snap is not None
+                 and time.monotonic() - self._snap[0] < CONSOLE_COALESCE_SECONDS
+                 and wanted <= set(self._snap[4]))
         if fresh:
             return
-        self._wanted.clear()
-        with self._lock:
-            self._want_views -= wanted
         try:
             snap = self._build(graph, wanted)
         except Exception as exc:  # noqa: BLE001
@@ -123,6 +139,46 @@ class ConsoleServer:
                 self._snap = snap
             self._generation += 1
             self._cond.notify_all()
+
+    def _apply_action(self, graph, request: dict) -> dict:
+        if not isinstance(request, dict) or type(request.get("expected_revision")) is not int:
+            raise ValueError("expected_revision is required")
+        if request["expected_revision"] != self._revision:
+            return {"error": "canvas revision changed", "revision": self._revision}
+        op = request.get("op")
+        if op == "viewport" and set(request) == {"op", "expected_revision", "width", "height"}:
+            width, height = request["width"], request["height"]
+            if type(width) is not int or type(height) is not int:
+                raise ValueError("viewport width and height must be integers")
+            graph.ui_viewport(width, height)
+            handled = True
+        elif op == "mouse" and set(request) <= {"op", "expected_revision", "kind", "x", "y", "dx", "dy", "button", "scroll"}:
+            kind, x, y = request.get("kind"), request.get("x"), request.get("y")
+            dx, dy, button, scroll = (request.get("dx", 0), request.get("dy", 0),
+                                       request.get("button", 0), request.get("scroll", 0))
+            if kind not in ("click", "down", "up", "move", "scroll") or type(button) is not int or not 0 <= button <= 5:
+                raise ValueError("invalid canvas mouse action")
+            if any(not isinstance(v, (int, float)) or not math.isfinite(v) or abs(v) > 4096
+                   for v in (x, y, dx, dy, scroll)):
+                raise ValueError("canvas mouse coordinates must be finite and bounded")
+            handled = graph.ui_mouse(kind, x, y, dx=dx, dy=dy, button=button, scroll=scroll)
+        elif op == "key" and set(request) <= {"op", "expected_revision", "key", "scancode", "action", "mods"}:
+            values = [request.get("key"), request.get("scancode", 0), request.get("action", 1), request.get("mods", 0)]
+            if any(type(v) is not int or abs(v) > 65535 for v in values):
+                raise ValueError("invalid canvas key action")
+            handled = graph.ui_key(*values)
+        else:
+            raise ValueError("unknown canvas UI action")
+        previous_revision = self._revision
+        snap = self._build(graph, {"graph"})
+        if self._revision != previous_revision:
+            graph.save(self._canvas_path)
+        with self._cond:
+            self._snap = snap
+            self._generation += 1
+            self._cond.notify_all()
+        return {"handled": bool(handled), "revision": self._revision,
+                "canvas": self._canvas_name}
 
     def _build(self, graph, wanted=frozenset()):
         path = os.path.join(self._tmp, "snapshot.nodus.txt")
@@ -224,6 +280,7 @@ class ConsoleServer:
             conn.settimeout(CONSOLE_IDLE_SECONDS)
             reader = conn.makefile("rb")
             authed = False
+            actions = False
             while not self._closing:
                 try:
                     raw = reader.readline(4096)
@@ -234,15 +291,16 @@ class ConsoleServer:
                 line = raw.rstrip(b"\r\n")
                 if not authed:
                     parts = line.split(b" ", 2)
-                    if len(parts) != 3 or parts[0] != b"HELLO" or parts[1] != b"nodus-console/1":
+                    if len(parts) != 3 or parts[0] != b"HELLO" or parts[1] not in (b"nodus-console/1", b"nodus-console/2"):
                         self._send(conn, b"REFUSED bad hello\n")
                         return
                     if not hmac.compare_digest(parts[2], self._token):
                         self._send(conn, b"REFUSED bad token\n")
                         return
                     authed = True
+                    actions = parts[1] == b"nodus-console/2"
                     if not self._send(conn, b"OK console " + self._canvas_name.encode("utf-8")
-                                      + b" read-only\n"):
+                                      + (b" actions\n" if actions else b" read-only\n")):
                         return
                     continue
                 if line == b"SNAPSHOT":
@@ -264,6 +322,25 @@ class ConsoleServer:
                             return
                         continue
                     if not self._send(conn, b"JSON %s %d\n" % (line, len(body)) + body):
+                        return
+                elif actions and line.startswith(b"ACTION "):
+                    try:
+                        size = int(line[7:])
+                        if not 1 <= size <= 4096:
+                            raise ValueError("invalid action size")
+                        request = json.loads(reader.read(size))
+                    except (ValueError, UnicodeError):
+                        self._send(conn, b"REFUSED invalid action\n")
+                        return
+                    box, done = [], threading.Event()
+                    with self._lock:
+                        self._actions.append((request, box, done))
+                        self._wanted.set()
+                    if not done.wait(CONSOLE_STEP_WAIT_SECONDS):
+                        self._send(conn, b"REFUSED action outcome uncertain\n")
+                        return
+                    body = json.dumps(box[0], separators=(",", ":")).encode()
+                    if not self._send(conn, b"JSON ACTION %d\n" % len(body) + body):
                         return
                 elif not self._send(conn, b"REFUSED read-only\n"):
                     return
@@ -402,7 +479,7 @@ def main(argv=None) -> int:
         ticks = 0
         console_port = None
         if token is not None:
-            console = ConsoleServer(token, os.path.basename(args.canvas), lambda: ticks)
+            console = ConsoleServer(token, os.path.basename(args.canvas), lambda: ticks, args.canvas)
             console_port = console.start(args.console_port)
             console.set_context(args.rate, [])
         with Graph() as graph:

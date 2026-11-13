@@ -49,3 +49,12 @@
 #include "inl/canvas_abi_actions_edges.inl"
 #include "inl/canvas_abi_save_load.inl"
 #include "inl/canvas_abi_overlay_raster.inl"
+
+extern "C" int gp_canvas_set_module_stack_tail(
+    GP_CanvasContext* ctx, int module_idx, const float* values, int count) {
+    if (!ctx || count < 0 || count > 4096 || (count && !values)) return 0;
+    auto* canvas = reinterpret_cast<GP_CanvasContextImpl*>(ctx);
+    if (module_idx < 0 || module_idx >= static_cast<int>(canvas->modules.size())) return 0;
+    module_stack_tail_write(canvas, module_idx, values, count);
+    return 1;
+}

@@ -756,6 +756,71 @@ extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_Canva
     return attach_edge_binding(g, *desc, canvas_edge_idx);
 }
 
+static int32_t sync_ui_edges(NodusHeadlessGraph* g) {
+    if (!g || !g->ctx || !g->table) return 0;
+    gp_table_apply_pending_ops(g->table);
+    const auto previous = g->edges;
+    const int32_t count = gp_canvas_get_edge_count(g->ctx);
+    if (count < 0) return 0;
+    std::vector<EdgeBinding> current(static_cast<size_t>(count));
+    for (int32_t i = 0; i < count; ++i) {
+        GP_CanvasEdgeDesc desc{};
+        int32_t type_id = 0;
+        if (!gp_canvas_get_edge(g->ctx, i, &desc, &type_id)) return 0;
+        const uint64_t a = (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_module)) << 32) |
+                           (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_contact_idx)) << 16);
+        const uint64_t b = (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_module)) << 32) |
+                           (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_contact_idx)) << 16);
+        int32_t table_index = -1;
+        if (!gp_table_edge_index_for_pair(g->table, a, b, &table_index) || table_index < 0) return 0;
+        const auto prior = std::find_if(previous.begin(), previous.end(), [&](const EdgeBinding& edge) {
+            return edge.desc.a_module == desc.a_module && edge.desc.a_contact_idx == desc.a_contact_idx &&
+                   edge.desc.b_module == desc.b_module && edge.desc.b_contact_idx == desc.b_contact_idx;
+        });
+        current[static_cast<size_t>(i)] = EdgeBinding{desc, table_index,
+            prior == previous.end() ? 0 : prior->configured};
+    }
+    g->edges = std::move(current);
+    for (int32_t i = 0; i < count; ++i) {
+        if (g->edges[static_cast<size_t>(i)].configured) continue;
+        NodusHeadlessFifoConfig config{};
+        if (read_table_edge_config(g->table, g->edges[static_cast<size_t>(i)].table_edge_idx, &config)) {
+            const auto& edge = g->edges[static_cast<size_t>(i)];
+            if (!gp_table_edge_subscribe_ex(g->table, edge.table_edge_idx,
+                scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx), 1)) return 0;
+            g->edges[static_cast<size_t>(i)].configured = 1;
+        } else return 0;
+    }
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height) {
+    return g && g->ctx && width >= 64 && height >= 64 && width <= 4096 && height <= 4096
+        ? gp_canvas_set_size(g->ctx, width, height) : 0;
+}
+
+extern "C" int32_t nodus_headless_ui_mouse(NodusHeadlessGraph* g, int32_t kind,
+    float x, float y, float dx, float dy, int32_t button, float scroll) {
+    if (!g || !g->ctx) return -1;
+    int32_t handled = 0;
+    switch (kind) {
+        case 0: handled = gp_canvas_on_click(g->ctx, static_cast<int>(x), static_cast<int>(y)); break;
+        case 1: handled = gp_canvas_on_mouse_down(g->ctx, x, y, dx, dy, button); break;
+        case 2: handled = gp_canvas_on_mouse_up(g->ctx, x, y, dx, dy, button); break;
+        case 3: handled = gp_canvas_on_mouse_move(g->ctx, x, y, dx, dy); break;
+        case 4: handled = gp_canvas_on_mouse_scroll(g->ctx, x, y, dx, dy, scroll); break;
+        default: return -1;
+    }
+    return sync_ui_edges(g) ? handled : -1;
+}
+
+extern "C" int32_t nodus_headless_ui_key(NodusHeadlessGraph* g,
+    int32_t key, int32_t scancode, int32_t action, int32_t mods) {
+    if (!g || !g->ctx) return -1;
+    const int32_t handled = gp_canvas_on_key(g->ctx, key, scancode, action, mods);
+    return sync_ui_edges(g) ? handled : -1;
+}
+
 extern "C" int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g) {
     if (!g || !g->ctx) return -1;
     return gp_canvas_get_edge_count(g->ctx);

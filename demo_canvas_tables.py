@@ -10,6 +10,12 @@ for the canvas system when you do not have tighter integration points yet.
 Run the server:
     python demo_canvas_tables.py --mode server --port 8000
 
+Read-only mirror of a managed Nodus canvas:
+    python demo_canvas_tables.py --mode server --host 127.0.0.1 --port 8000 \
+        --attach-console 127.0.0.1:47612 --console-token-file PATH
+    GET /frame gives the full UI; GET /frame?x=0&y=0&width=320&height=240
+    gives a region. The mirror refuses all POST controls.
+
 Keep the legacy pygame demo:
     python demo_canvas_tables.py --mode pygame
 
@@ -33,6 +39,8 @@ import urllib.parse
 import zlib
 import subprocess
 import gc
+import hashlib
+import tempfile
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -141,6 +149,10 @@ def load_canvas_lib():
     lib.gp_canvas_set_edge_hues.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_float)
     lib.gp_canvas_raster_rgba.restype = ctypes.c_int
     lib.gp_canvas_raster_rgba.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int)
+    if hasattr(lib, "gp_canvas_set_module_stack_tail"):
+        lib.gp_canvas_set_module_stack_tail.restype = ctypes.c_int
+        lib.gp_canvas_set_module_stack_tail.argtypes = (ctypes.c_void_p, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int)
     lib.gp_canvas_on_click.restype = ctypes.c_int
     lib.gp_canvas_on_click.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
     # new mouse/drag and table helpers
@@ -218,7 +230,7 @@ class CanvasBackend:
 
     def __init__(self, width: int, height: int, step_dt: float = 1.0 / 60.0,
                  canvas_path: Optional[pathlib.Path] = None,
-                 plugin_paths: tuple[pathlib.Path, ...] = ()):
+                 plugin_paths: tuple[pathlib.Path, ...] = (), *, animate: bool = True):
         self.width = width
         self.height = height
         self.step_dt = step_dt
@@ -261,8 +273,9 @@ class CanvasBackend:
         # Kick the raster once so internal state (rope sim) is ready.
         self.lib.gp_canvas_raster_rgba(self.ctx, self.buf, self.buf_len)
 
-        self._step_thread = threading.Thread(target=self._step_loop, daemon=True)
-        self._step_thread.start()
+        self._step_thread = threading.Thread(target=self._step_loop, daemon=True) if animate else None
+        if self._step_thread is not None:
+            self._step_thread.start()
 
     def _step_loop(self) -> None:
         while self._running.is_set():
@@ -272,7 +285,8 @@ class CanvasBackend:
 
     def shutdown(self) -> None:
         self._running.clear()
-        self._step_thread.join(timeout=1.0)
+        if self._step_thread is not None:
+            self._step_thread.join(timeout=1.0)
         with self.lock:
             self.lib.gp_canvas_destroy(self.ctx)
             for plugin_id in reversed(self.loaded_plugins):
@@ -305,13 +319,85 @@ class CanvasBackend:
                 return bool(self.lib.gp_canvas_on_click(self.ctx, x, y))
         return False
 
-    def raster_png(self) -> bytes:
+    def raster_png(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         with self.lock:
             ok = self.lib.gp_canvas_raster_rgba(self.ctx, self.buf, self.buf_len)
             if not ok:
                 raise RuntimeError("gp_canvas_raster_rgba failed")
             rgba = bytes(bytearray(self.buf))
-        return encode_rgba_to_png(self.width, self.height, rgba)
+        if region is None:
+            return encode_rgba_to_png(self.width, self.height, rgba)
+        x, y, width, height = region
+        stride = self.width * 4
+        cropped = b"".join(rgba[row * stride + x * 4:row * stride + (x + width) * 4]
+                           for row in range(y, y + height))
+        return encode_rgba_to_png(width, height, cropped)
+
+    def apply_tails(self, state: dict) -> None:
+        if not hasattr(self.lib, "gp_canvas_set_module_stack_tail"):
+            raise RuntimeError("this Nodus UI build cannot show managed stack updates")
+        with self.lock:
+            for module in state.get("modules", []):
+                values = module.get("stack_tail") or []
+                samples = (ctypes.c_float * len(values))(*(float(v) for v in values))
+                if not self.lib.gp_canvas_set_module_stack_tail(
+                        self.ctx, int(module["index"]), samples, len(values)):
+                    raise RuntimeError("managed canvas stack update did not match the UI graph")
+
+
+class ConsoleMirror:
+    """Read-only UI surface of the managed host's existing console snapshots."""
+
+    def __init__(self, host: str, port: int, token_file: pathlib.Path, width: int,
+                 height: int, step_dt: float, plugins: tuple[pathlib.Path, ...]):
+        self.host, self.port, self.token_file = host, port, token_file
+        self.width, self.height, self.step_dt, self.plugins = width, height, step_dt, plugins
+        self.directory = tempfile.TemporaryDirectory(prefix="nodus_ui_mirror_")
+        self.revision = None
+        self.digest = None
+        self.path = None
+        self.next_poll = 0.0
+
+    def snapshot(self) -> dict:
+        from nodus_graph.console_client import ConsoleClient
+        token = self.token_file.read_text(encoding="utf-8").splitlines()[0]
+        with ConsoleClient(self.host, self.port, token, timeout=5.0) as client:
+            return client.snapshot()
+
+    def backend_for(self, snapshot: dict) -> CanvasBackend:
+        revision = snapshot["revision"]
+        digest = hashlib.sha256(snapshot["canvas"]).digest()
+        path = pathlib.Path(self.directory.name) / f"snapshot-{revision}-{digest.hex()[:12]}.nodus.txt"
+        path.write_bytes(snapshot["canvas"])
+        backend = CanvasBackend(self.width, self.height, self.step_dt, path,
+                                self.plugins, animate=False)
+        try:
+            backend.apply_tails(snapshot["state"])
+        except Exception:
+            backend.shutdown()
+            raise
+        self.revision, self.digest, self.path = revision, digest, path
+        return backend
+
+    def refresh(self, server) -> None:
+        if time.monotonic() < self.next_poll:
+            return
+        snapshot = self.snapshot()
+        self.next_poll = time.monotonic() + 0.5
+        if (snapshot["revision"] == self.revision
+                and hashlib.sha256(snapshot["canvas"]).digest() == self.digest):
+            server.backend.apply_tails(snapshot["state"])
+            return
+        old_path = self.path
+        replacement = self.backend_for(snapshot)
+        old = server.backend
+        server.backend = replacement
+        old.shutdown()
+        if old_path is not None:
+            old_path.unlink(missing_ok=True)
+
+    def close(self) -> None:
+        self.directory.cleanup()
 
 
 def _free_cdll(cdll: ctypes.CDLL) -> None:
@@ -408,7 +494,7 @@ HTML_TEMPLATE = """<!doctype html>
     <div id="hit-layer"></div>
   </div>
   <div id="info">Dragging and clicking sends events to the backend. Frames auto-refresh.</div>
-    <div style="margin-top:8px">
+    <div id="library-controls" style="margin-top:8px">
           <button id="reload-btn">Reload native library</button>
           <button id="unload-btn" style="margin-left:8px">Unload native library</button>
           <button id="load-btn" style="margin-left:8px">Load native library</button>
@@ -527,12 +613,32 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         if parsed.path == "/frame":
             with self.server.backend_lock:
+                if self.server.mirror is not None:
+                    try:
+                        self.server.mirror.refresh(self.server)
+                    except Exception as exc:
+                        self._send_response(503, json.dumps({"error": f"UI feed unavailable: {type(exc).__name__}"}).encode(), "application/json")
+                        return
                 if getattr(self.server, "backend", None) is None:
                     body = json.dumps({"error": "native library unloaded"}).encode("utf-8")
                     self._send_response(503, body, "application/json")
                     return
                 try:
-                    frame = self.server.backend.raster_png()  # type: ignore[attr-defined]
+                    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+                    if query:
+                        if set(query) != {"x", "y", "width", "height"} or any(len(v) != 1 for v in query.values()):
+                            raise ValueError("region requires x, y, width and height")
+                        region = tuple(int(query[key][0]) for key in ("x", "y", "width", "height"))
+                        x, y, width, height = region
+                        if (x < 0 or y < 0 or width < 1 or height < 1
+                                or x + width > self.server.backend.width or y + height > self.server.backend.height):
+                            raise ValueError("region is outside the canvas")
+                    else:
+                        region = None
+                    frame = self.server.backend.raster_png(region)  # type: ignore[attr-defined]
+                except ValueError as exc:
+                    self._send_response(400, json.dumps({"error": str(exc)}).encode(), "application/json")
+                    return
                 except Exception as exc:  # pragma: no cover - informational
                     body = json.dumps({"error": str(exc)}).encode("utf-8")
                     self._send_response(500, body, "application/json")
@@ -541,6 +647,12 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         if parsed.path == "/meta":
             with self.server.backend_lock:
+                if self.server.mirror is not None:
+                    try:
+                        self.server.mirror.refresh(self.server)
+                    except Exception as exc:
+                        self._send_response(503, json.dumps({"error": f"UI feed unavailable: {type(exc).__name__}"}).encode(), "application/json")
+                        return
                 if getattr(self.server, "backend", None) is None:
                     body = json.dumps({"error": "native library unloaded"}).encode("utf-8")
                     self._send_response(503, body, "application/json")
@@ -550,12 +662,18 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
                     "height": self.server.backend.height,  # type: ignore[attr-defined]
                     "step_dt": self.server.backend.step_dt,  # type: ignore[attr-defined]
                 }
+                if self.server.mirror is not None:
+                    data["revision"] = self.server.mirror.revision
+                    data["read_only"] = True
             self._send_response(200, json.dumps(data).encode("utf-8"), "application/json")
             return
         self.send_error(404, "Not Found")
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
+        if self.server.mirror is not None:
+            self._send_response(403, b'{"error":"attached UI feed is read-only"}', "application/json")
+            return
         if parsed.path == "/unload":
             try:
                 with self.server.backend_lock:
@@ -661,11 +779,18 @@ class CanvasRequestHandler(http.server.BaseHTTPRequestHandler):
 class CanvasHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address, RequestHandlerClass, backend: CanvasBackend):
+    def __init__(self, server_address, RequestHandlerClass, backend: CanvasBackend, mirror: ConsoleMirror | None = None):
         super().__init__(server_address, RequestHandlerClass)
         self.backend = backend
+        self.mirror = mirror
         self.backend_lock = threading.Lock()
         self.rendered_html = HTML_TEMPLATE.format(w=backend.width, h=backend.height)
+        if mirror is not None:
+            self.rendered_html = (self.rendered_html
+                .replace('<div id="hit-layer"></div>', '<div id="hit-layer" style="pointer-events:none"></div>')
+                .replace('Dragging and clicking sends events to the backend. Frames auto-refresh.',
+                         'Read-only view of the managed Nodus canvas. Frames auto-refresh.')
+                .replace('<div id="library-controls"', '<div id="library-controls" hidden'))
         # remember last known backend size so unload/load can preserve dimensions
         try:
             self.last_backend_size = (backend.width, backend.height, backend.step_dt)
@@ -675,20 +800,28 @@ class CanvasHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def run_server(host: str, port: int, width: int, height: int, step_dt: float,
                canvas_path: Optional[pathlib.Path] = None,
-               plugin_paths: tuple[pathlib.Path, ...] = ()) -> int:
-    backend = CanvasBackend(
-        width, height, step_dt=step_dt, canvas_path=canvas_path,
-        plugin_paths=plugin_paths,
-    )
-    server = CanvasHTTPServer((host, port), CanvasRequestHandler, backend)
-    print(f"Serving canvas frames on http://{host}:{port}")
+               plugin_paths: tuple[pathlib.Path, ...] = (),
+               attach: tuple[str, int, pathlib.Path] | None = None) -> int:
+    mirror = None
+    if attach is not None:
+        if host not in ("127.0.0.1", "localhost"):
+            raise ValueError("an attached UI feed must bind to loopback")
+        mirror = ConsoleMirror(*attach, width, height, step_dt, plugin_paths)
+        backend = mirror.backend_for(mirror.snapshot())
+    else:
+        backend = CanvasBackend(width, height, step_dt=step_dt, canvas_path=canvas_path,
+                                plugin_paths=plugin_paths)
+    server = CanvasHTTPServer((host, port), CanvasRequestHandler, backend, mirror)
+    print(f"Serving canvas frames on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping server...")
     finally:
         server.server_close()
-        backend.shutdown()
+        server.backend.shutdown()
+        if mirror is not None:
+            mirror.close()
     return 0
 
 
@@ -823,6 +956,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1000, help="Canvas width in pixels")
     parser.add_argument("--height", type=int, default=720, help="Canvas height in pixels")
     parser.add_argument("--step-dt", type=float, default=1.0 / 60.0, help="Simulation step size in seconds")
+    parser.add_argument("--attach-console", help="Read-only managed canvas console at 127.0.0.1:PORT")
+    parser.add_argument("--console-token-file", type=pathlib.Path, help="Managed console token file for --attach-console")
     parser.add_argument(
         "--canvas", type=pathlib.Path,
         help="Load an existing native CANVAS graph before serving frames",
@@ -837,9 +972,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     if args.mode == "server":
+        attach = None
+        if args.attach_console is not None:
+            if args.canvas is not None or args.console_token_file is None:
+                raise ValueError("--attach-console requires --console-token-file and excludes --canvas")
+            host, sep, port = args.attach_console.rpartition(":")
+            if sep != ":" or host not in ("127.0.0.1", "localhost") or not port.isdecimal() or not 1 <= int(port) <= 65535:
+                raise ValueError("--attach-console expects 127.0.0.1:PORT")
+            attach = (host, int(port), args.console_token_file)
         return run_server(
             args.host, args.port, args.width, args.height, args.step_dt,
-            args.canvas, tuple(path.resolve() for path in args.plugin),
+            args.canvas, tuple(path.resolve() for path in args.plugin), attach,
         )
     return run_pygame_demo(args.width, args.height)
 

@@ -152,6 +152,15 @@ def _contract_from_native(value: int) -> ExecutionContract:
 
 def _load(lib_path: Optional[str] = None):
     lib = load_headless_lib(lib_path)
+    if hasattr(lib, "nodus_headless_ui_mouse"):
+        lib.nodus_headless_ui_viewport.restype = ctypes.c_int32
+        lib.nodus_headless_ui_viewport.argtypes = (ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32)
+        lib.nodus_headless_ui_mouse.restype = ctypes.c_int32
+        lib.nodus_headless_ui_mouse.argtypes = (ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int32, ctypes.c_float)
+        lib.nodus_headless_ui_key.restype = ctypes.c_int32
+        lib.nodus_headless_ui_key.argtypes = (ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_int32, ctypes.c_int32)
     lib.nodus_headless_get_module_count.restype = ctypes.c_int32
     lib.nodus_headless_get_module_count.argtypes = (ctypes.c_void_p,)
     lib.nodus_headless_get_module_desc.restype = ctypes.c_int32
@@ -1191,6 +1200,36 @@ class Graph:
         self._ensure_scalar_execution()
         if not self.lib.nodus_headless_step(self._handle, dt):
             raise RuntimeError("native graph step failed")
+
+    def ui_viewport(self, width: int, height: int) -> None:
+        if not hasattr(self.lib, "nodus_headless_ui_viewport"):
+            raise UnsupportedNativeContract("this Nodus build lacks canvas UI actions")
+        if not self.lib.nodus_headless_ui_viewport(self._handle, width, height):
+            raise ValueError("canvas viewport must be 64..4096 pixels on each axis")
+
+    def ui_mouse(self, kind: str, x: float, y: float, *, dx: float = 0.0, dy: float = 0.0,
+                 button: int = 0, scroll: float = 0.0) -> bool:
+        if not hasattr(self.lib, "nodus_headless_ui_mouse"):
+            raise UnsupportedNativeContract("this Nodus build lacks canvas UI actions")
+        kinds = {"click": 0, "down": 1, "up": 2, "move": 3, "scroll": 4}
+        if kind not in kinds:
+            raise ValueError("unknown canvas mouse action")
+        handled = self.lib.nodus_headless_ui_mouse(self._handle, kinds[kind], x, y, dx, dy, button, scroll)
+        if handled < 0:
+            raise RuntimeError("native canvas UI action could not synchronize edges")
+        self.edges.clear()  # native UI owns current edge bindings; definition queries them directly
+        self._loaded_unattached_edges.clear()
+        return bool(handled)
+
+    def ui_key(self, key: int, scancode: int = 0, action: int = 1, mods: int = 0) -> bool:
+        if not hasattr(self.lib, "nodus_headless_ui_key"):
+            raise UnsupportedNativeContract("this Nodus build lacks canvas UI actions")
+        handled = self.lib.nodus_headless_ui_key(self._handle, key, scancode, action, mods)
+        if handled < 0:
+            raise RuntimeError("native canvas UI key could not synchronize edges")
+        self.edges.clear()
+        self._loaded_unattached_edges.clear()
+        return bool(handled)
 
     def save(self, path: Union[str, pathlib.Path]) -> None:
         if not self.lib.nodus_headless_save_file(self._handle, str(path).encode()):
