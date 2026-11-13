@@ -591,7 +591,14 @@ bool generate_plugin_source(const Descriptor& descriptor, std::string* source, s
     out << "        if (i == 1) return ToolPortSpec{ToolPortKind::Return, " << static_cast<int32_t>(descriptor.outputs.size()) << "};\n";
     out << "        return ToolPortSpec{};\n    }\n";
     out << "    void execute_stack(ToolStackContext& c) override {\n";
-    out << "        if (!c.stack.raw) return; std::string e; if (!interpreter_.execute_tensor_stack(*c.stack.raw, &e)) std::fprintf(stderr, \"python row "
+    // Interpreter refusal restores the input tensors. Propagate that result to
+    // ThreadManager so its subsequent Output row cannot publish those inputs
+    // as successful returns. A missing stack is also a refused invocation.
+    out << "        c.succeeded = false;\n";
+    out << "        if (!c.stack.raw) return;\n";
+    out << "        std::string e;\n";
+    out << "        c.succeeded = interpreter_.execute_tensor_stack(*c.stack.raw, &e);\n";
+    out << "        if (!c.succeeded) std::fprintf(stderr, \"python row "
         << cpp_escape(descriptor.tool_id) << ": %s\\n\", e.c_str());\n    }\n";
     out << "private:\n    nodus::python_row::Interpreter interpreter_;\n};\n} // namespace\n\n";
     out << "extern \"C\" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new " << class_name << "(); }\n";
