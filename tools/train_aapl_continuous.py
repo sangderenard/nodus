@@ -2,6 +2,8 @@
 
 The historical holdout is deliberately untouched here. Repeated validation is
 feedback for training, never a qualification verdict or an order permission.
+The native canvas and weight checkpoint both participate in resume; startup
+never replaces either half of an incomplete pair.
 """
 from __future__ import annotations
 
@@ -161,6 +163,10 @@ def main() -> int:
     targets = np.stack([target_for(row, index, stock) for row in train_rows])
     network = PolicyNetwork(AT, seed=0)
     checkpoint = args.output / "latest.npz"
+    canvas_exists = args.canvas.is_file()
+    checkpoint_exists = checkpoint.is_file()
+    if canvas_exists != checkpoint_exists:
+        raise RuntimeError("training canvas and weight checkpoint must both exist to resume; refusing to replace saved state")
     epoch = _load_weights(network, checkpoint, dataset_sha256)
     observation_path = args.output / "live-observations.json"
     observations = _observations(observation_path)
@@ -187,9 +193,18 @@ def main() -> int:
                 graph, request_path, stable_id=0x4E45544E,
                 python_executable=sys.executable, turing_root=args.turing_root,
                 product_dir=row_request["output_dir"], nodus_root=args.native_nodus_root,
-                module_library_root=args.output / "module-library")
+                module_library_root=args.output / "module-library",
+                install_definition=not canvas_exists)
             loaded_id = str(adoption["loaded_tool_id"])
-            graph.save(args.canvas)
+            if canvas_exists:
+                graph.load(args.canvas)
+                graph.definition()  # Refuse an unrestorable tool or invalid edited topology.
+                for name in ("features", "input_weight", "hidden_bias", "output_weight", "output_bias"):
+                    graph.port_fifo_state(name)
+                graph.port_fifo_state("prediction", output=True)
+            else:
+                graph.save(args.canvas)
+                _save_weights(network, checkpoint, dataset_sha256, epoch)
             token = args.console_token_file.read_text(encoding="utf-8").splitlines()[0]
             if not token:
                 raise ValueError("console token file is empty")

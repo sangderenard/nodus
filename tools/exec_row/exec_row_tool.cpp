@@ -63,10 +63,10 @@ public:
     void tick(double, HostAPI&) override {}
     void render(RenderContext&) override {}
 
-    int32_t port_count() const override { return 2; }
+    int32_t port_count() const override { return settings_.stream ? 1 : 2; }
     ToolPortSpec port_spec(int32_t idx) const override {
         if (idx == 0) return {ToolPortKind::Argument, 1};
-        if (idx == 1) return {ToolPortKind::Return, 1};
+        if (idx == 1 && !settings_.stream) return {ToolPortKind::Return, 1};
         return {};
     }
 
@@ -89,6 +89,7 @@ public:
 
     void execute_stack(ToolStackContext& ctx) override {
         if (!ctx.stack.raw) return;
+        if (settings_.stream) { execute_stream(ctx); return; }
         RawStackFrame& frame = *ctx.stack.raw;
         if (!collect()) ctx.succeeded = false;
 
@@ -131,7 +132,7 @@ private:
         nodus::exec::Program program;
         if (!nodus::exec::row_program(settings_, program, refused_)) return false;
         auto child = std::make_unique<nodus::exec::Child>();
-        if (!child->start(program, refused_)) return false;
+        if (!child->start(program, refused_, settings_.stream)) return false;
         waiting_ = std::move(child);
         return true;
     }
@@ -143,6 +144,30 @@ private:
         span.assign(static_cast<size_t>(desc.total_bytes), '\0');
         return span.empty() ||
                nodus_tensor_read(handle.id, 0, span.data(), span.size()) == static_cast<int64_t>(span.size());
+    }
+
+    void execute_stream(ToolStackContext& ctx) {
+        RawStackFrame& frame = *ctx.stack.raw;
+        if (waiting_ && !waiting_->running()) {
+            const int code = waiting_->exit_code();
+            waiting_.reset();
+            ctx.succeeded = false;
+            report("stream program ended with exit code " + std::to_string(code));
+        }
+        std::vector<nodus::tensors::AbstractTensorHandle> arrived;
+        nodus::tensors::AbstractTensorHandle handle{};
+        while (raw_stack_pop_abstract_tensor(frame, handle)) arrived.push_back(handle);
+        if (arrived.empty()) return;
+        std::vector<std::string> spans(arrived.size());
+        bool accepted = keep_one_waiting();
+        for (size_t i = arrived.size(); accepted && i-- > 0;)
+            accepted = read_span(arrived[i], spans[arrived.size() - 1 - i]);
+        if (accepted) accepted = waiting_->try_send_many(spans, settings_.queue_bytes);
+        if (!accepted) {
+            for (size_t back = arrived.size(); back-- > 0;) raw_stack_push_abstract_tensor(frame, arrived[back]);
+            ctx.succeeded = false;
+            report(waiting_ ? "stream input queue is full or a tensor is unreadable" : refused_);
+        }
     }
 
     // Queued spans go to children, oldest first, while fewer than most_at_once are working.

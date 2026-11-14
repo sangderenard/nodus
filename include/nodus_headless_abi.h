@@ -170,6 +170,10 @@ NODUS_HEADLESS_API int32_t nodus_headless_radio_hold(int32_t held);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_configure(uint16_t loopback_port);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, uint64_t* dropped);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module_idx);
+// Same canonical PCM output FIFO, attached to the RTP row's actual index when
+// a stack conversion row is inserted before the spectrum/RTP exits.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind_at(
+    NodusHeadlessGraph* graph, int32_t module_idx, int32_t row_idx);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
 // Drive the same canvas UI handlers used by the GUI, on the graph's owning

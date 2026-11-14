@@ -86,6 +86,12 @@ static void report(const char* name,const ProtectedLinkOutcome& out) {
 int wmain(int argc,wchar_t** argv) {
     if(argc>1)return protected_detail::protected_child_main(argc,argv,cpu_child);
     try {
+        MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
+        if(!GlobalMemoryStatusEx(&memory) ||
+           memory.ullAvailPhys<options().minimum_available_memory_bytes) {
+            std::puts("SKIP: protected child requires the configured available RAM floor");
+            return 77;
+        }
         Work work;auto request=work.request();std::string error;
         ProtectedOpenGLProcess unauthorized(options());
         require(!unauthorized.ready(error),"unarmed provider admitted");

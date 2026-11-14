@@ -1513,14 +1513,14 @@ if(WIN32)
   target_compile_definitions(test_opengl_protected_process PRIVATE NODUS_PROTECTED_PROCESS_TEST_HOOKS=1)
   target_link_libraries(test_opengl_protected_process PRIVATE bcrypt)
   add_test(NAME opengl_protected_process_test COMMAND test_opengl_protected_process)
-  set_tests_properties(opengl_protected_process_test PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-process-containment")
+  set_tests_properties(opengl_protected_process_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "cpu;gpu-process-containment")
   add_executable(test_opengl_protected_row_threadmanager
     tests/opengl_protected_row_threadmanager_test.cpp src/kernels/kernel_opengl.cpp)
   target_link_libraries(test_opengl_protected_row_threadmanager PRIVATE
     nodus_protected_opengl canvas_tables_static)
   target_include_directories(test_opengl_protected_row_threadmanager PRIVATE include src)
   add_test(NAME opengl_protected_row_threadmanager_test COMMAND test_opengl_protected_row_threadmanager)
-  set_tests_properties(opengl_protected_row_threadmanager_test PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-row;gpu-process-containment")
+  set_tests_properties(opengl_protected_row_threadmanager_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "cpu;gpu-row;gpu-process-containment")
   # Supplied inventory only: factory/config and contract registration, no query
   # or GPU work. Uses the same canvas/static registry image as the caller.
   add_library(nodus_gpu_inventory_rows STATIC src/gpu_inventory_rows.cpp)
