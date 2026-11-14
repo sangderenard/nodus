@@ -153,10 +153,17 @@ void WaveT4StateTool::execute_stack(ToolStackContext& context){
                         if(plan_){
                             const auto lease_started=std::chrono::steady_clock::now();
                             auto waves=library_.borrow_cpu(w[0],w[1],false);
+                            bool admitted=bool(waves);
+                            if(admitted){
+                                const auto* wavelengths=static_cast<const double*>(waves.data());
+                                for(std::size_t i=0;i<arenas*bands;++i)
+                                    admitted=admitted&&std::isfinite(wavelengths[i])&&
+                                             wavelengths[i]>0&&dx<=0.5*wavelengths[i];
+                                if(!admitted)status=3;
+                            }
                             std::vector<TensorStateLibraryTool::CpuLoan> fields;
                             std::vector<float*> real,imag;
                             fields.reserve(2*arenas);real.reserve(arenas);imag.reserve(arenas);
-                            bool admitted=bool(waves);
                             for(std::size_t i=0;i<arenas&&admitted;++i){
                                 auto re=library_.borrow_cpu(w[0],w[4+2*i],true);
                                 auto im=library_.borrow_cpu(w[0],w[5+2*i],true);
@@ -170,24 +177,17 @@ void WaveT4StateTool::execute_stack(ToolStackContext& context){
                             }
                             lease_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<
                                 std::chrono::nanoseconds>(std::chrono::steady_clock::now()-lease_started).count());
-                            status=5;
                             if(admitted){
                                 const auto* wavelengths=static_cast<const double*>(waves.data());
-                                bool finite=true;
-                                for(std::size_t i=0;i<arenas*bands;++i)
-                                    finite=finite&&std::isfinite(wavelengths[i])&&
-                                           wavelengths[i]>0&&dx<=0.5*wavelengths[i];
-                                if(finite){
-                                    const auto dispatch_started=std::chrono::steady_clock::now();
-                                    const auto result=step_(plan_,static_cast<int>(arenas),
-                                        static_cast<int>(bands),dx,dz,
-                                        static_cast<int>(direction),wavelengths,
-                                        real.data(),imag.data());
-                                    dispatch_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<
-                                        std::chrono::nanoseconds>(std::chrono::steady_clock::now()-dispatch_started).count());
-                                    status=result?6:0;
-                                }else status=3;
-                            }
+                                const auto dispatch_started=std::chrono::steady_clock::now();
+                                const auto result=step_(plan_,static_cast<int>(arenas),
+                                    static_cast<int>(bands),dx,dz,
+                                    static_cast<int>(direction),wavelengths,
+                                    real.data(),imag.data());
+                                dispatch_ns=static_cast<std::uint64_t>(std::chrono::duration_cast<
+                                    std::chrono::nanoseconds>(std::chrono::steady_clock::now()-dispatch_started).count());
+                                status=result?6:0;
+                            }else if(status!=3)status=5;
                         }
                     }
                 }
