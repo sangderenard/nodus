@@ -66,9 +66,11 @@ int main(int argc,char** argv){
     const std::size_t feeds=kind=="angular_propagating"?7:
         kind=="angular_evanescent"?4:
         kind=="aperture_material"?8:
-        kind=="jones_interface"?12:0;
+        kind=="jones_interface"?12:
+        kind=="volume3d"?15:0;
     if(!feeds)return 2;
-    const std::size_t outputs=kind=="jones_interface"?4:2;
+    const std::size_t outputs=kind=="jones_interface"?4:
+        kind=="volume3d"?1:2;
     std::ifstream input(argv[2],std::ios::binary);
     std::vector<char> bytes{std::istreambuf_iterator<char>(input),{}};
     if(bytes.empty()||bytes.size()%4)return 2;
@@ -97,7 +99,7 @@ int main(int argc,char** argv){
 
     // Binding order is each Turing product's published argument order,
     // followed by its outputs and element-count control.
-    // One 512x512 field plane, not a four-sample shader smoke test.
+    // One 512x512 field plane or a 64x64x64 volume, not a tiny shader probe.
     constexpr std::size_t lanes=512*512;
     std::vector<std::vector<std::uint32_t>> state(joined?15:feeds+outputs+1);
     const auto fb=[](float value){return std::bit_cast<std::uint32_t>(value);};
@@ -126,6 +128,26 @@ int main(int argc,char** argv){
             // imaginary_index,real_index,wavelength
             const float values[]={ai,ar,1.f,lane&1?-1.f:1.f,1e-6f,
                                   .01f,1.5f,550e-9f};
+            for(std::size_t i=0;i<feeds;i++)state[i][lane]=fb(values[i]);
+        }else if(kind=="volume3d"){
+            // Binding order: current,damping,dt,dx,dy,dz,previous,
+            // source,speed,x-,x+,y-,y+,z-,z+. A stationary central
+            // impulse must propagate equally to all six axial neighbors.
+            constexpr std::size_t center=(32*64+32)*64+32;
+            const bool central=lane==center;
+            const auto value=[&](std::size_t neighbor){
+                return neighbor==center?1.f:0.f;
+            };
+            const std::size_t x=lane/(64*64),y=(lane/64)%64,z=lane%64;
+            const float values[]={
+                central?1.f:0.f,0.f,.5f,1.f,1.f,1.f,
+                central?1.f:0.f,0.f,.5f,
+                x>0?value(lane-64*64):0.f,
+                x<63?value(lane+64*64):0.f,
+                y>0?value(lane-64):0.f,
+                y<63?value(lane+64):0.f,
+                z>0?value(lane-1):0.f,
+                z<63?value(lane+1):0.f};
             for(std::size_t i=0;i<feeds;i++)state[i][lane]=fb(values[i]);
         }else{
             // a_im,a_re,b_im,b_re,c_im,c_re,d_im,d_re,pi,pr,si,sr
@@ -231,6 +253,13 @@ int main(int argc,char** argv){
                 const float ti=attenuation*std::sin(phase);
                 expected[0]=get(1)*tr-get(0)*ti;
                 expected[1]=get(1)*ti+get(0)*tr;
+            }else if(kind=="volume3d"){
+                constexpr std::size_t center=(32*64+32)*64+32;
+                const std::size_t x=lane/(64*64),y=(lane/64)%64,z=lane%64;
+                const int distance=std::abs(static_cast<int>(x)-32)
+                    +std::abs(static_cast<int>(y)-32)
+                    +std::abs(static_cast<int>(z)-32);
+                expected[0]=lane==center?.625f:distance==1?.0625f:0.f;
             }else{
                 expected[0]=get(9);expected[1]=get(8);
                 expected[2]=get(11);expected[3]=get(10);
