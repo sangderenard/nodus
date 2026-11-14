@@ -255,3 +255,31 @@ Silent full-frame gated source proof passed:48007frames/188packets, exact final
 seven-frame block, verified RTCP EOF, zero loss/late/rejected/resync. Two successive
 streams then fed one existing native PA sink through Turing's bounded readback tap:
 96014frames accepted. SDL dummy explicitly selected; real speakers untested.
+
+## Bounded decoder-output prerequisite (2026-11-14)
+
+`nodus::exec::Child::start` now accepts an optional fourth `output_limit`
+argument. Zero retains the existing span behavior; a positive byte count
+backpressures the child's stdout instead of accumulating the complete output.
+`take(out, maximum)` consumes bounded pieces without blocking the caller.
+`output_drained()` distinguishes stdout EOF plus consumed buffered bytes from
+process completion. Consumers must keep taking output while the child runs;
+waiting for exit before consuming bounded output can deadlock by design.
+Cancellation wakes the backpressured reader and terminates the owned child job.
+The OS pipe and one 64KiB reader buffer are additional fixed storage, not part
+of the application queue limit.
+
+`tools/exec_row/exec_pipe_output_test.cpp` verifies byte continuity with partial
+reads, a tiny limit, cancellation, restart and unchanged legacy span behavior.
+Built with MSVC C++20 and passed on Windows. An optional invocation with
+`<ffmpeg.exe> <180-second stereo 48kHz WAV>` also decoded 69,120,000 float32
+bytes through a 65,536-byte queue, crossing the old radio allocation limit
+without holding the whole decoded song. Test input was generated silence;
+there was no audio device, network sender or service restart.
+
+This is the existing execution primitive needed for a streaming decoder.
+**The radio file source still uses SDL_LoadWAV and its old 64MiB limits.**
+Connecting the decoder to its paced SDL/scope/canonical PCM FIFO, declaring
+the trusted executable through service configuration, and verifying real
+radio EOF/loop/error handling remain separate integration work. This receipt
+does not claim that long songs now play on the live station.

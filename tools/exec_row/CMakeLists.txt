@@ -32,3 +32,7 @@ add_executable(exec_row_registry_test exec_row_registry_test.cpp
 target_include_directories(exec_row_registry_test PRIVATE "${NODUS_ROOT}" "${NODUS_ROOT}/include")
 target_link_libraries(exec_row_registry_test PRIVATE "${NODUS_TENSOR_CORE_DIR}/nodus_tensor_core.lib")
 target_compile_definitions(exec_row_registry_test PRIVATE NOMINMAX)
+
+# Generic bounded child-output regression; no tensor runtime dependency.
+add_executable(exec_pipe_output_test exec_pipe_output_test.cpp)
+target_include_directories(exec_pipe_output_test PRIVATE "${NODUS_ROOT}/include")
