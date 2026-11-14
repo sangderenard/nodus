@@ -20,9 +20,9 @@ std::wstring path_from_utf8(const char* source) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 5 || argc > 12) {
+    if (argc < 5 || argc > 13) {
         std::fprintf(stderr,
-            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port] [wait-for-start=0]\n");
+            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port] [wait-for-start=0] [hls=0]\n");
         return 2;
     }
     const int port = std::atoi(argv[4]);
@@ -45,6 +45,9 @@ int main(int argc, char** argv) {
     const int pcm_port = argc > 10 ? std::atoi(argv[10]) : 0;
     if (argc > 10 && (pcm_port < 1 || pcm_port > 65535 || !nodus_headless_radio_pcm_configure(static_cast<uint16_t>(pcm_port)))) return 2;
     const bool wait_for_start = argc > 11 && std::atoi(argv[11]) == 1;
+    const bool hls = argc > 12 && std::strcmp(argv[12], "1") == 0;
+    if (argc > 12 && (std::strcmp(argv[12], "0") && !hls)) return 2;
+    if (hls && (!pcm_port || argc <= 8)) return 2;
     if (wait_for_start && (!pcm_port || !nodus_headless_radio_hold(1))) return 2;
     NodusHeadlessGraph* graph = nodus_headless_create();
     if (!graph) return 1;
@@ -57,10 +60,17 @@ int main(int argc, char** argv) {
         {1, 0, 1, 1, "radio.udp_broadcast"},
         {1, 0, 1, 1, "radio.pcm_rtp"},
     };
-    if (table < 0 || !nodus_headless_set_module_rows(graph, table, rows, pcm_port ? 3 : 2) ||
+    const GP_CanvasModuleRowDesc hls_rows[] = {
+        {1, 0, 1, 1, "radio.file_output"},
+        {1, 0, 1, 1, "radio.pcm_s16le"},
+        {1, 0, 1, 1, "radio.udp_broadcast"},
+        {1, 0, 1, 1, "radio.pcm_rtp"},
+        {1, 0, 1, 1, "exec.radio.hls"},
+    };
+    if (table < 0 || !nodus_headless_set_module_rows(graph, table, hls ? hls_rows : rows, hls ? 5 : (pcm_port ? 3 : 2)) ||
         !nodus_headless_set_module_stack_contract(graph, table, 2) ||
         !nodus_headless_set_module_exec_mode(graph, table, 3) ||
-        (pcm_port && !nodus_headless_radio_pcm_bind(graph, table)) ||
+        (pcm_port && !nodus_headless_radio_pcm_bind_at(graph, table, hls ? 3 : 2)) ||
         !nodus_headless_step(graph, 1.0 / 60.0)) {
         std::fprintf(stderr, "Radio table construction or Free launch failed\n");
         nodus_headless_destroy(graph);
