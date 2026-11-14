@@ -10,6 +10,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <SDL3/SDL.h>
+#include "exec_row.h"
 
 #include <array>
 #include <algorithm>
@@ -117,6 +118,19 @@ public:
             feed_ = reinterpret_cast<scope_feed_fn>(GetProcAddress(module_, "openrgb_audio_scope_feed_stereo"));
             if (!feed_ || !SDL_InitSubSystem(SDL_INIT_AUDIO)) return;
             audio_ready_ = true;
+            SDL_AudioSpec target{SDL_AUDIO_F32, 2, 48000};
+            const auto decoders = nodus::exec::environment_paths("NODUS_RADIO_DECODER");
+            if (!decoders.empty()) {
+                // Operator-only executable declaration, never supplied by a song or HTTP caller.
+                if (decoders.size() != 1 || !std::filesystem::path(decoders[0]).is_absolute() ||
+                    !std::filesystem::is_regular_file(decoders[0]) || !std::filesystem::is_regular_file(c.wav)) return;
+                decoder_program_ = {decoders[0], {"-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe",
+                    "-i", std::filesystem::path(c.wav).string(), "-vn", "-f", "f32le", "-ar", "48000", "-ac", "2", "pipe:1"},
+                    std::filesystem::current_path().string(), nodus::exec::declared_core_roots(), nodus::exec::declared_work_roots()};
+                if (!start_decoder()) return;
+                decoding_ = true;
+                rate_ = 48000;
+            } else {
             std::error_code size_error;
             const auto bytes = std::filesystem::file_size(c.wav, size_error);
             if (size_error || bytes > 64u * 1024u * 1024u) return;
@@ -130,7 +144,7 @@ public:
                 (static_cast<uint64_t>(length) / source_frame_bytes) * 8 * (c.pcm_port ? 48000 : spec.freq) / spec.freq > 64u * 1024u * 1024u) {
                 SDL_free(original); return;
             }
-            SDL_AudioSpec target{SDL_AUDIO_F32, 2, c.pcm_port ? 48000 : spec.freq};
+            target.freq = c.pcm_port ? 48000 : spec.freq;
             Uint8* converted = nullptr;
             int converted_length = 0;
             const bool ok = length <= INT_MAX && SDL_ConvertAudioSamples(&spec, original, static_cast<int>(length),
@@ -143,12 +157,14 @@ public:
             SDL_free(converted);
             for (float value : samples_) if (!std::isfinite(value)) { samples_.clear(); return; }
             rate_ = static_cast<uint32_t>(target.freq);
+            }
             stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &target, nullptr, nullptr);
             if (!stream_ || !SDL_ResumeAudioStreamDevice(stream_)) return;
             shared_->running.store(1);
         }
     }
     void shutdown() override {
+        decoder_.stop();
         if (stream_) { SDL_DestroyAudioStream(stream_); stream_ = nullptr; }
         if (audio_ready_) { SDL_QuitSubSystem(SDL_INIT_AUDIO); audio_ready_ = false; }
         if (scope_ && free_) { free_(scope_); scope_ = nullptr; }
@@ -176,8 +192,31 @@ public:
             if (queued >= static_cast<int>(shared_->config.fft_size * 2 * 2 * sizeof(float))) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1)); ctx.succeeded = false; return;
             }
+            if (decoding_ && position_ == samples_.size()) {
+                const size_t bytes = hop * 2 * sizeof(float);
+                decoder_.take(decoded_bytes_, bytes - decoded_bytes_.size());
+                const bool ended = decoder_.output_drained() && !decoder_.running();
+                if (ended && (decoder_.exit_code() != 0 || decoded_bytes_.size() % (2 * sizeof(float)))) {
+                    std::fprintf(stderr, "Radio decoder failed or returned a partial stereo frame\n");
+                    shared_->running.store(0); ctx.succeeded = false; return;
+                }
+                if (decoded_bytes_.size() < bytes && !ended) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1)); ctx.succeeded = false; return;
+                }
+                samples_.resize(decoded_bytes_.size() / sizeof(float));
+                if (!samples_.empty()) std::memcpy(samples_.data(), decoded_bytes_.data(), decoded_bytes_.size());
+                decoded_bytes_.clear(); position_ = 0;
+                for (float value : samples_) if (!std::isfinite(value)) {
+                    shared_->running.store(0); ctx.succeeded = false; return;
+                }
+                if (samples_.empty() && ended && shared_->config.loop) {
+                    if (!decoder_had_samples_ || !start_decoder()) shared_->running.store(0);
+                    ctx.succeeded = false; return;
+                }
+                if (!samples_.empty()) decoder_had_samples_ = true;
+            }
             if (position_ == samples_.size()) {
-                if (shared_->config.loop) position_ = 0;
+                if (shared_->config.loop && !decoding_) position_ = 0;
                 else {
                     // A zero-frame terminal token shares the canonical PCM FIFO:
                     // its first_frame is the exclusive end of the finite source.
@@ -249,6 +288,19 @@ public:
         shared_->sample_rate.store(sample_rate, std::memory_order_relaxed);
     }
 private:
+    bool start_decoder() {
+        std::string why;
+        if (!decoder_.start(decoder_program_, why, false, 65536)) {
+            std::fprintf(stderr, "Radio decoder: %s\n", why.c_str()); return false;
+        }
+        decoder_.finish_input();
+        decoder_had_samples_ = false;
+        return true;
+    }
+    nodus::exec::Child decoder_;
+    nodus::exec::Program decoder_program_;
+    bool decoding_ = false, decoder_had_samples_ = false;
+    std::string decoded_bytes_;
     std::shared_ptr<Shared> shared_;
     HMODULE module_ = nullptr;
     void* scope_ = nullptr;

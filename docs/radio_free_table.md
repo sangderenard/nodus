@@ -283,3 +283,38 @@ Connecting the decoder to its paced SDL/scope/canonical PCM FIFO, declaring
 the trusted executable through service configuration, and verifying real
 radio EOF/loop/error handling remain separate integration work. This receipt
 does not claim that long songs now play on the live station.
+
+### Native file-source decoder integration
+
+Setting the operator-only `NODUS_RADIO_DECODER` to one absolute trusted FFmpeg
+executable opts `radio.file_output` into bounded decoding. Leave it unset to
+retain SDL's existing bounded whole-WAV loader. The input must be a local
+regular file. FFmpeg is invoked with fixed local file/pipe protocols and fixed
+48kHz stereo float32 output; songs cannot supply executable arguments.
+The child uses the existing exec Program core/work-root policy and inherits
+the source's working directory, so the operator should launch in an approved
+user scratch directory rather than a repository directory.
+
+Decoded output is capped at65,536 bytes, then consumed in one existing FFT hop
+at a time. The same samples go to SDL device pacing, fftfree analysis, the
+canonical `radio.pcm` FIFO, and the existing HLS stack conversion. There is no
+new transport, queue scheduler, FFT or parallel media engine. The terminal
+partial hop is retained; only a successful, frame-aligned decoder EOF emits the
+normal end token. Looping restarts the decoder without resetting the sample
+clock; empty streams do not spin forever. Shutdown cancels the owned decoder.
+
+The prior prerequisite receipt above described the source before this
+integration. `tools/test_radio_decoder.py` now exercises the actual native
+source silently with generated local WAV/MP3 files, isolated UDP sockets,
+monotonic RTP and stereo samples, partial EOF/BYE, looping and bounded-duration
+cancellation of a180-second file. This does not configure a live station or
+claim a provider-account integration.
+
+Verification on final native build: WAV and MP3 each delivered exactly14,400
+stereo frames, including a64-frame final packet and compound RTCP BYE. The
+0.3-second WAV loop ran continuously for3seconds with monotonic sequence and
+sample timestamps; a180-second WAV streamed for3seconds before clean bounded
+shutdown. Native counters reported zero PCM drops; observed shutdown times
+were72-101ms. Invalid audio failed without hanging. The original SDL WAV/NRAD
+regression also remains applicable with the decoder option unset. This is not
+a full180-second real-time radio soak or a browser HLS playback test.
