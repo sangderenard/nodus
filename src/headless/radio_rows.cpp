@@ -1,6 +1,7 @@
 #include "nodus_headless_abi.h"
 #include "tool_api.h"
 #include "tool_registry.h"
+#include "fftfree_tool.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 #include "common/tensors/abstraction/abstract_tensor_handle.h"
 
@@ -42,22 +43,33 @@ struct Config {
     uint32_t bands = 0;
     float min_hz = 0;
     float max_hz = 0;
+    bool linear_bands = false;
     std::wstring wav;
     bool loop = false;
     uint16_t pcm_port = 0;
 };
 
+struct RadioFrame;
 struct Shared {
     Config config;
+    std::unique_ptr<nodus::gpu::TensorStateLibraryTool> fft_states;
+    RadioFrame* current_frame = nullptr;
+    static constexpr uint64_t fft_card = 0x524144494fULL;
+    static constexpr uint64_t fft_input = 0x100;
+    static constexpr uint64_t fft_real = 0x101;
+    static constexpr uint64_t fft_imag = 0x102;
+    static constexpr uint64_t fft_magnitude = 0x103;
     std::atomic<bool> held{false};
     NodusHeadlessGraph* pcm_graph = nullptr;
     std::atomic<uint64_t> pcm_dropped{0};
     std::atomic<uint64_t> pcm_emitted{0};
     std::atomic<uint64_t> captured{0};
+    std::atomic<uint64_t> capture_overruns{0};
     std::atomic<uint64_t> emitted{0};
     std::atomic<uint64_t> dropped{0};
     std::atomic<uint32_t> sample_rate{0};
     std::atomic<int32_t> running{0};
+    ~Shared() { if (fft_states) fft_states->shutdown(); }
 };
 
 std::mutex config_mutex;
@@ -83,33 +95,89 @@ struct RadioFrame {
     bool terminal = false; // Internal row control, never part of NRAD.
 };
 
-using scope_create_fn = void* (__cdecl *)(const wchar_t*, size_t, size_t, size_t, float, float);
+using scope_create_capture_fn = void* (__cdecl *)();
 using scope_start_fn = int (__cdecl *)(void*);
-using scope_snapshot_fn = size_t (__cdecl *)(void*, float, float*, float*, float*, size_t, float*, uint32_t*);
+using scope_read_fn = size_t (__cdecl *)(void*, uint64_t*, float*, size_t, uint32_t*, uint64_t*);
 using scope_running_fn = int (__cdecl *)(void*);
 using scope_frame_count_fn = uint64_t (__cdecl *)(void*);
 using scope_feed_fn = int (__cdecl *)(void*, const float*, size_t, uint32_t);
 using scope_free_fn = void (__cdecl *)(void*);
+
+bool radio_state_request(nodus::gpu::TensorStateLibraryTool& library,
+                         const std::array<uint64_t, 12>& words, uint64_t payload) {
+    const uint64_t shape[1] = {words.size()};
+    const auto request = nodus_tensor_create(NODUS_DTYPE_U64, 1, shape);
+    if (!request) return false;
+    bool ok = nodus_tensor_write(request, 0, words.data(), sizeof(words)) == sizeof(words);
+    RawStackFrame stack{};
+    if (ok) ok = raw_stack_init_frame(stack, 4096);
+    if (ok) ok = raw_stack_push_abstract_tensor(stack, {request}) &&
+                 raw_stack_push_abstract_tensor(stack, {payload});
+    ToolStackContext context{};
+    context.stack.raw = &stack;
+    if (ok) library.execute_stack(context);
+    nodus::tensors::AbstractTensorHandle reply{};
+    if (ok) ok = context.succeeded && raw_stack_pop_abstract_tensor(stack, reply);
+    uint64_t status = UINT64_MAX;
+    if (ok) ok = nodus_tensor_read(reply.id, 0, &status, sizeof(status)) == sizeof(status) && status == 0;
+    if (reply.id) nodus_tensor_destroy(reply.id);
+    if (stack.backend) { raw_stack_free_mask(stack); gp_mem_backend_release(stack.backend); }
+    nodus_tensor_destroy(request);
+    return ok;
+}
+
+bool radio_register_fft_states(Shared& shared) {
+    auto& library = *shared.fft_states;
+    const uint64_t dummy_shape[1] = {1};
+    const auto dummy = nodus_tensor_create(NODUS_DTYPE_U64, 1, dummy_shape);
+    if (!dummy) return false;
+    std::array<uint64_t, 12> request{};
+    request[0] = 1; request[1] = Shared::fft_card; request[2] = 1;
+    request[4] = 16ull << 20;
+    bool ok = radio_state_request(library, request, dummy);
+    nodus_tensor_destroy(dummy);
+    const uint64_t n = shared.config.fft_size;
+    const uint64_t bins = n / 2 + 1;
+    for (uint64_t address = Shared::fft_input; ok && address <= Shared::fft_magnitude; ++address) {
+        const uint64_t state_shape[1] = {address == Shared::fft_input ? 2 * n : 2 * bins};
+        const auto state = nodus_tensor_create(NODUS_DTYPE_F32, 1, state_shape);
+        if (!state) return false;
+        request = {};
+        request[0] = 2; request[1] = Shared::fft_card; request[3] = address;
+        ok = radio_state_request(library, request, state);
+        nodus_tensor_destroy(state);
+    }
+    return ok;
+}
+
+template<size_t N>
+uint64_t radio_words_tensor(const std::array<uint64_t, N>& words) {
+    const uint64_t shape[1] = {N};
+    const auto tensor = nodus_tensor_create(NODUS_DTYPE_U64, 1, shape);
+    if (!tensor) return 0;
+    if (nodus_tensor_write(tensor, 0, words.data(), sizeof(words)) == sizeof(words)) return tensor;
+    nodus_tensor_destroy(tensor);
+    return 0;
+}
 
 class RadioSource final : public ITool {
 public:
     explicit RadioSource(std::shared_ptr<Shared> shared) : shared_(std::move(shared)) {}
     ~RadioSource() noexcept override { shutdown(); }
     const char* id_cstr() const noexcept override { return shared_->config.wav.empty() ? "radio.system_output" : "radio.file_output"; }
-    const char* name_cstr() const noexcept override { return "Radio system output + fftfree"; }
+    const char* name_cstr() const noexcept override { return "Radio PCM source"; }
     void initialize(const ToolInitContext&) override {
         module_ = LoadLibraryW(shared_->config.scope_dll.c_str());
         if (!module_) return;
-        create_ = reinterpret_cast<scope_create_fn>(GetProcAddress(module_, "openrgb_audio_scope_create"));
+        create_capture_ = reinterpret_cast<scope_create_capture_fn>(GetProcAddress(module_, "openrgb_audio_scope_create_capture"));
         start_ = reinterpret_cast<scope_start_fn>(GetProcAddress(module_, "openrgb_audio_scope_start"));
-        snapshot_ = reinterpret_cast<scope_snapshot_fn>(GetProcAddress(module_, "openrgb_audio_scope_snapshot"));
+        read_ = reinterpret_cast<scope_read_fn>(GetProcAddress(module_, "openrgb_audio_scope_read_stereo"));
         running_ = reinterpret_cast<scope_running_fn>(GetProcAddress(module_, "openrgb_audio_scope_running"));
         frame_count_ = reinterpret_cast<scope_frame_count_fn>(GetProcAddress(module_, "openrgb_audio_scope_frame_count"));
         free_ = reinterpret_cast<scope_free_fn>(GetProcAddress(module_, "openrgb_audio_scope_free"));
-        if (!create_ || !start_ || !snapshot_ || !running_ || !frame_count_ || !free_) return;
+        if (!create_capture_ || !start_ || !read_ || !running_ || !frame_count_ || !free_) return;
         const Config& c = shared_->config;
-        scope_ = create_(c.fftfree_dll.c_str(), c.fft_size, c.overlap,
-                         c.bands, c.min_hz, c.max_hz);
+        scope_ = create_capture_();
         if (!scope_) return;
         if (c.wav.empty()) {
             if (!start_(scope_)) { free_(scope_); scope_ = nullptr; }
@@ -147,8 +215,28 @@ public:
             if (!stream_ || !SDL_ResumeAudioStreamDevice(stream_)) return;
             shared_->running.store(1);
         }
+        std::array<uint64_t, nodus::gpu::FftFreeTool::kConfigWords> config{};
+        const uint64_t n = c.fft_size;
+        config[0] = 1; config[1] = n; config[2] = 1; config[3] = 2;
+        config[5] = 1; config[6] = 2; config[16] = 2;
+        config[17] = n; config[18] = n; config[19] = 1;
+        config[20] = 1; config[23] = 1;
+        // fftfree's optional vectored crash hook is process-global and cannot
+        // outlive a dynamically loaded row DLL in this long-running host.
+        config[28] = 1; // silent crash reports: documented handler opt-out
+        std::array<uint64_t, nodus::gpu::FftFreeTool::kWorkWords> work{};
+        work[0] = 1; work[1] = Shared::fft_card; work[2] = Shared::fft_input;
+        work[4] = Shared::fft_real; work[5] = Shared::fft_imag;
+        work[6] = Shared::fft_magnitude; work[7] = 2 * n; work[8] = 2;
+        left_.assign(n, 0.0f); right_.assign(n, 0.0f);
+        config_token_ = radio_words_tensor(config);
+        work_token_ = radio_words_tensor(work);
+        if (config_token_ && work_token_) shared_->current_frame = &frame_;
     }
     void shutdown() override {
+        if (shared_->current_frame == &frame_) shared_->current_frame = nullptr;
+        if (config_token_) { nodus_tensor_destroy(config_token_); config_token_ = 0; }
+        if (work_token_) { nodus_tensor_destroy(work_token_); work_token_ = 0; }
         if (stream_) { SDL_DestroyAudioStream(stream_); stream_ = nullptr; }
         if (audio_ready_) { SDL_QuitSubSystem(SDL_INIT_AUDIO); audio_ready_ = false; }
         if (scope_ && free_) { free_(scope_); scope_ = nullptr; }
@@ -162,7 +250,7 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             ctx.succeeded = false; return;
         }
-        if (!scope_ || !ctx.stack.raw) {
+        if (!scope_ || !config_token_ || !work_token_ || !ctx.stack.raw) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             ctx.succeeded = false;
             return;
@@ -189,64 +277,94 @@ public:
                         if (result.dropped) shared_->pcm_dropped.fetch_add(result.dropped);
                     }
                     shared_->running.store(queued > 0);
-                    // Refusal stops following rows in ThreadManager. Supply a
-                    // terminal control value so the PCM row can drain its FIFO
-                    // and send BYE without emitting fictitious spectrum frames.
-                    frame_.terminal = true;
-                    void* terminal = &frame_;
-                    const auto type = ValueTypeRegistry::global().builtin(VT_VOID_PTR);
-                    ctx.succeeded = raw_stack_push_typed(*ctx.stack.raw, &terminal, type);
+                    ctx.succeeded = false;
                     std::this_thread::sleep_for(std::chrono::milliseconds(1)); return;
                 }
             }
-            const size_t count = std::min(hop, (samples_.size() - position_) / 2);
+            const size_t count = std::min({hop, size_t{256}, (samples_.size() - position_) / 2});
             if (!SDL_PutAudioStreamData(stream_, samples_.data() + position_, static_cast<int>(count * 2 * sizeof(float))) ||
                 !feed_(scope_, samples_.data() + position_, count, rate_)) {
                 shared_->running.store(0); ctx.succeeded = false; return;
-            }
-            if (shared_->config.pcm_port && shared_->pcm_graph) {
-                PcmBlock block{};
-                block.frames = static_cast<uint32_t>(count);
-                block.first_frame = frame_count_(scope_) - count;
-                std::copy_n(samples_.data() + position_, count * 2, block.stereo.data());
-                frame_.pcm = block;
-                NodusHeadlessPublishResult result{};
-                if (!nodus_headless_publish_output_token(shared_->pcm_graph, kPcmPort, &block, sizeof(block), &result) ||
-                    !result.accepted || result.dropped) shared_->pcm_dropped.fetch_add(1);
             }
             position_ += count * 2;
         }
         const uint64_t captured = frame_count_(scope_);
         shared_->running.store(running_(scope_), std::memory_order_release);
-        const uint64_t hop = shared_->config.fft_size / shared_->config.overlap;
-        if (captured < last_emitted_ || captured - last_emitted_ < hop) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            ctx.succeeded = false;
-            return;
-        }
-        std::array<float, kMaxBands * 2> xy{};
-        std::array<float, kMaxBands> frequencies{};
+        std::array<float, 512> pcm{};
         uint32_t sample_rate = 0;
-        float rms = 0;
-        const size_t count = snapshot_(scope_, 1.0f, xy.data(), frame_.power.data(),
-                                       frequencies.data(), kMaxBands, &rms, &sample_rate);
-        if (count != shared_->config.bands || !sample_rate) {
-            ctx.succeeded = false;
-            return;
+        uint64_t lost = 0;
+        const uint64_t first_frame = read_cursor_;
+        const size_t count = read_(scope_, &read_cursor_, pcm.data(), 256,
+                                   &sample_rate, &lost);
+        if (lost) {
+            shared_->capture_overruns.fetch_add(lost, std::memory_order_relaxed);
+            captured_since_fft_ = 0;
+            std::fill(left_.begin(), left_.end(), 0.0f);
+            std::fill(right_.begin(), right_.end(), 0.0f);
         }
-        frame_.band_count = static_cast<uint32_t>(count);
-        frame_.sample_rate = sample_rate;
-        frame_.captured_frames = captured;
-        frame_.rms = rms;
-        void* frame_ptr = &frame_;
-        const ValueTypeId pointer_type = ValueTypeRegistry::global().builtin(VT_VOID_PTR);
-        if (!raw_stack_push_typed(*ctx.stack.raw, &frame_ptr, pointer_type)) {
-            ctx.succeeded = false;
-            return;
+        if (!count || !sample_rate) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ctx.succeeded = false; return;
         }
-        last_emitted_ = captured;
+        if (frame_.sample_rate && frame_.sample_rate != sample_rate) {
+            captured_since_fft_ = 0;
+            std::fill(left_.begin(), left_.end(), 0.0f);
+            std::fill(right_.begin(), right_.end(), 0.0f);
+        }
+        frame_.pcm = {};
+        frame_.pcm.first_frame = first_frame + lost;
+        frame_.pcm.sample_rate = sample_rate;
+        frame_.pcm.frames = static_cast<uint32_t>(count);
+        std::copy_n(pcm.data(), 2 * count, frame_.pcm.stereo.data());
+        if (shared_->config.pcm_port && shared_->pcm_graph) {
+            NodusHeadlessPublishResult result{};
+            if (!nodus_headless_publish_output_token(shared_->pcm_graph, kPcmPort,
+                    &frame_.pcm, sizeof(frame_.pcm), &result) || !result.accepted || result.dropped)
+                shared_->pcm_dropped.fetch_add(1);
+        }
+        const size_t n = shared_->config.fft_size;
+        for (size_t i = 0; i < count; ++i) {
+            if (!std::isfinite(pcm[2*i]) || !std::isfinite(pcm[2*i+1])) {
+                captured_since_fft_ = 0;
+                std::fill(left_.begin(), left_.end(), 0.0f);
+                std::fill(right_.begin(), right_.end(), 0.0f);
+                ctx.succeeded = false; return;
+            }
+            left_[ring_write_] = pcm[2*i]; right_[ring_write_] = pcm[2*i+1];
+            ring_write_ = (ring_write_ + 1) % n;
+        }
+        captured_since_fft_ += count;
         shared_->captured.store(captured, std::memory_order_relaxed);
         shared_->sample_rate.store(sample_rate, std::memory_order_relaxed);
+        const uint64_t hop = n / shared_->config.overlap;
+        if (captured_since_fft_ < hop) {
+            ctx.succeeded = false; return;
+        }
+        captured_since_fft_ %= hop;
+        auto input = shared_->fft_states->borrow_cpu(Shared::fft_card, Shared::fft_input, true);
+        if (!input || input.bytes() < 2 * n * sizeof(float)) {
+            ctx.succeeded = false; return;
+        }
+        auto* values = static_cast<float*>(input.data());
+        double power = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const size_t at = (ring_write_ + i) % n;
+            values[i] = left_[at]; values[n+i] = right_[at];
+            power += 0.5 * (double(values[i])*values[i] + double(values[n+i])*values[n+i]);
+            const float window = 0.5f - 0.5f * std::cos(
+                6.2831853071795864769f * static_cast<float>(i) / static_cast<float>(n - 1));
+            values[i] *= window; values[n+i] *= window;
+        }
+        input = {};
+        frame_.sample_rate = sample_rate;
+        frame_.captured_frames = read_cursor_;
+        frame_.rms = static_cast<float>(std::sqrt(power / n));
+        if (nodus_tensor_write(work_token_, 9 * sizeof(uint64_t),
+                &frame_.captured_frames, sizeof(uint64_t)) != sizeof(uint64_t) ||
+            !raw_stack_push_abstract_tensor(*ctx.stack.raw, {work_token_}) ||
+            !raw_stack_push_abstract_tensor(*ctx.stack.raw, {config_token_})) {
+            ctx.succeeded = false; return;
+        }
     }
 private:
     std::shared_ptr<Shared> shared_;
@@ -259,13 +377,17 @@ private:
     std::vector<float> samples_;
     size_t position_ = 0;
     uint32_t rate_ = 0;
-    scope_create_fn create_ = nullptr;
+    scope_create_capture_fn create_capture_ = nullptr;
     scope_start_fn start_ = nullptr;
-    scope_snapshot_fn snapshot_ = nullptr;
+    scope_read_fn read_ = nullptr;
     scope_running_fn running_ = nullptr;
     scope_frame_count_fn frame_count_ = nullptr;
     scope_free_fn free_ = nullptr;
-    uint64_t last_emitted_ = 0;
+    uint64_t read_cursor_ = 0;
+    uint64_t captured_since_fft_ = 0;
+    size_t ring_write_ = 0;
+    std::vector<float> left_, right_;
+    uint64_t config_token_ = 0, work_token_ = 0;
     RadioFrame frame_{};
 };
 
@@ -313,6 +435,71 @@ public:
     }
 private:
     uint64_t owned_ = 0;
+};
+
+class RadioFftBands final : public ITool {
+public:
+    explicit RadioFftBands(std::shared_ptr<Shared> shared) : shared_(std::move(shared)) {}
+    const char* id_cstr() const noexcept override { return "radio.fft_bands"; }
+    const char* name_cstr() const noexcept override { return "Radio fftfree band projection"; }
+    void initialize(const ToolInitContext&) override {}
+    void shutdown() override {}
+    void tick(double, HostAPI&) override {}
+    void render(RenderContext&) override {}
+    void execute_stack(ToolStackContext& ctx) override {
+        ctx.succeeded = false;
+        if (!ctx.stack.raw || !shared_->current_frame || !shared_->fft_states) return;
+        nodus::tensors::AbstractTensorHandle token{};
+        if (!raw_stack_pop_abstract_tensor(*ctx.stack.raw, token)) return;
+        std::array<uint64_t, nodus::gpu::FftFreeTool::kReceiptWords> receipt{};
+        const bool valid = nodus_tensor_read(token.id, 0, receipt.data(), sizeof(receipt)) == sizeof(receipt);
+        nodus_tensor_destroy(token.id);
+        auto& frame = *shared_->current_frame;
+        const size_t n = shared_->config.fft_size;
+        const size_t bins = n / 2 + 1;
+        if (!valid || receipt[0] != 0 || receipt[1] != frame.captured_frames ||
+            receipt[2] != 2 || receipt[3] != n || receipt[4] != bins ||
+            !frame.sample_rate || frame.sample_rate <= 2 * shared_->config.min_hz) return;
+        auto magnitude = shared_->fft_states->borrow_cpu(Shared::fft_card,
+                                                         Shared::fft_magnitude, false);
+        if (!magnitude || magnitude.bytes() < 2 * bins * sizeof(float)) return;
+        const auto* left = static_cast<const float*>(magnitude.data());
+        const auto* right = left + bins;
+        const float low = std::max(1.0f, shared_->config.min_hz);
+        const float high = std::min(std::max(low * 1.001f, shared_->config.max_hz),
+                                    0.5f * frame.sample_rate);
+        const double log_low = std::log(low), span = std::log(high) - log_low;
+        const double scale = 4.0 / (n - 1); // Two over the exact Hann sum.
+        for (size_t band = 0; band < shared_->config.bands; ++band) {
+            const auto edge = [&](size_t index) {
+                const double fraction = double(index) / shared_->config.bands;
+                return shared_->config.linear_bands
+                    ? low + (high - low) * fraction
+                    : std::exp(log_low + span * fraction);
+            };
+            const double edge0 = edge(band), edge1 = edge(band + 1);
+            size_t first = std::max<size_t>(1, static_cast<size_t>(std::ceil(edge0 * n / frame.sample_rate)));
+            size_t last = std::min(n / 2, static_cast<size_t>(std::floor(edge1 * n / frame.sample_rate)));
+            if (last < first) {
+                first = std::max<size_t>(1, static_cast<size_t>(std::llround(
+                    (shared_->config.linear_bands ? 0.5 * (edge0 + edge1) : std::sqrt(edge0 * edge1))
+                    * n / frame.sample_rate)));
+                last = std::min(n / 2, first);
+            }
+            double power = 0.0;
+            for (size_t bin = first; bin <= last; ++bin)
+                power += 0.5 * (double(left[bin])*left[bin] + double(right[bin])*right[bin]);
+            const double db = 20.0 * std::log10(std::max(1.0e-9, scale * std::sqrt(power)));
+            frame.power[band] = static_cast<float>(std::clamp((db + 80.0) / 80.0, 0.0, 1.0));
+        }
+        frame.band_count = shared_->config.bands;
+        magnitude = {};
+        void* pointer = &frame;
+        const auto type = ValueTypeRegistry::global().builtin(VT_VOID_PTR);
+        ctx.succeeded = raw_stack_push_typed(*ctx.stack.raw, &pointer, type);
+    }
+private:
+    std::shared_ptr<Shared> shared_;
 };
 
 class RadioUdp final : public ITool {
@@ -530,12 +717,27 @@ extern "C" int32_t nodus_headless_radio_configure(
     auto shared = std::make_shared<Shared>();
     shared->config = {scope_dll, fftfree_dll, destination_host, destination_port,
                       fft_size, overlap, band_count, min_hz, max_hz};
+    shared->fft_states = std::make_unique<nodus::gpu::TensorStateLibraryTool>(
+        16ull << 20, std::vector<uint64_t>{}, false); // Radio FFT is CPU-only.
+    shared->fft_states->initialize({});
+    if (!radio_register_fft_states(*shared)) return 0;
     auto& registry = tool_registry_global();
-    if (!registry.register_tool(entry("radio.system_output", "Radio system output + fftfree",
-        [shared] { return ToolRegistry::Factory::result_type(new RadioSource(shared), [](ITool* p) { delete p; }); }))) return 0;
+    if (!nodus::gpu::register_fftfree_tool(registry, *shared->fft_states,
+                                           std::filesystem::path(fftfree_dll).string())) return 0;
+    if (!registry.register_tool(entry("radio.system_output", "Radio PCM source",
+        [shared] { return ToolRegistry::Factory::result_type(new RadioSource(shared), [](ITool* p) { delete p; }); }))) {
+        registry.unregister_tool("nodus.fftfree"); return 0;
+    }
+    if (!registry.register_tool(entry("radio.fft_bands", "Radio fftfree band projection",
+        [shared] { return ToolRegistry::Factory::result_type(new RadioFftBands(shared), [](ITool* p) { delete p; }); }))) {
+        registry.unregister_tool("radio.system_output");
+        registry.unregister_tool("nodus.fftfree"); return 0;
+    }
     if (!registry.register_tool(entry("radio.udp_broadcast", "Radio UDP broadcast",
         [shared] { return ToolRegistry::Factory::result_type(new RadioUdp(shared), [](ITool* p) { delete p; }); }))) {
         registry.unregister_tool("radio.system_output");
+        registry.unregister_tool("radio.fft_bands");
+        registry.unregister_tool("nodus.fftfree");
         return 0;
     }
     configured = std::move(shared);
@@ -551,6 +753,14 @@ extern "C" int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int
     auto shared = configured;
     return tool_registry_global().register_tool(entry("radio.file_output", "Radio WAV playback + fftfree",
         [shared] { return ToolRegistry::Factory::result_type(new RadioSource(shared), [](ITool* p) { delete p; }); })) ? 1 : 0;
+}
+
+extern "C" int32_t nodus_headless_radio_band_scale(int32_t linear) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!configured || configured->running.load() || configured->captured.load() ||
+        (linear != 0 && linear != 1)) return 0;
+    configured->config.linear_bands = linear != 0;
+    return 1;
 }
 
 extern "C" int32_t nodus_headless_radio_hold(int32_t held) {
@@ -607,14 +817,23 @@ extern "C" int32_t nodus_headless_radio_status(NodusRadioStatus* out_status) {
     out_status->capture_running = configured->running.load(std::memory_order_relaxed);
     return 1;
 }
+extern "C" int32_t nodus_headless_radio_capture_overruns(uint64_t* lost_frames) {
+    if (!lost_frames) return 0;
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!configured) return 0;
+    *lost_frames = configured->capture_overruns.load(std::memory_order_relaxed);
+    return 1;
+}
 #else
 extern "C" int32_t nodus_headless_radio_hold(int32_t) { return 0; }
 extern "C" int32_t nodus_headless_radio_configure(
     const wchar_t*, const wchar_t*, const char*, uint16_t,
     uint32_t, uint32_t, uint32_t, float, float) { return 0; }
 extern "C" int32_t nodus_headless_radio_file_source(const wchar_t*, int32_t) { return 0; }
+extern "C" int32_t nodus_headless_radio_band_scale(int32_t) { return 0; }
 extern "C" int32_t nodus_headless_radio_pcm_configure(uint16_t) { return 0; }
 extern "C" int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph*, int32_t) { return 0; }
 extern "C" int32_t nodus_headless_radio_pcm_status(uint64_t*, uint64_t*) { return 0; }
 extern "C" int32_t nodus_headless_radio_status(NodusRadioStatus*) { return 0; }
+extern "C" int32_t nodus_headless_radio_capture_overruns(uint64_t*) { return 0; }
 #endif

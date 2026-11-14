@@ -154,6 +154,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_radio_configure(
     const char* destination_host, uint16_t destination_port,
     uint32_t fft_size, uint32_t overlap, uint32_t band_count,
     float min_hz, float max_hz);
+  // Configure band edges before capture starts: 0 logarithmic (default), 1 linear Hz.
+  NODUS_HEADLESS_API int32_t nodus_headless_radio_band_scale(int32_t linear);
 typedef struct NodusRadioStatus {
     uint64_t captured_frames;
     uint64_t emitted_packets;
@@ -175,6 +177,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* gra
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind_at(
     NodusHeadlessGraph* graph, int32_t module_idx, int32_t row_idx);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
+// Absolute PCM frames lost when the live capture ring outruns Radio's cursor.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_capture_overruns(uint64_t* lost_frames);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
 // Drive the same canvas UI handlers used by the GUI, on the graph's owning
 // thread. Mouse kinds: 0 click, 1 down, 2 up, 3 move, 4 scroll.
