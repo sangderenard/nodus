@@ -193,7 +193,7 @@ int main() try {
     require(!gp_mem_backend_create_vulkan(&params) && device_calls == 0,
             "noncompute device silently fell back");
     require(std::strstr(gp_mem_backend_vulkan_last_error(), "no compute queue"), "queue diagnostic lost");
-    params = {2, 1};
+    params = {2, 2};
     const auto before_flags = instances;
     require(!gp_mem_backend_create_vulkan(&params) && instances == before_flags,
             "reserved flags created a context");
