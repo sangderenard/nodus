@@ -654,6 +654,12 @@ target_include_directories(nodus_radio PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(nodus_radio PRIVATE nodus_headless)
 target_compile_features(nodus_radio PRIVATE cxx_std_20)
 
+add_executable(nodus_audio_codec tools/nodus_audio_codec.cpp)
+target_include_directories(nodus_audio_codec PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(nodus_audio_codec PRIVATE canvas_tables_static nodus_tensor_core)
+target_compile_features(nodus_audio_codec PRIVATE cxx_std_20)
+
 add_executable(nodus_pcm_playback tools/nodus_pcm_playback.cpp)
 target_include_directories(nodus_pcm_playback PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(nodus_pcm_playback PRIVATE nodus_headless)

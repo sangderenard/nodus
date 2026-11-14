@@ -162,6 +162,9 @@ uint64_t radio_words_tensor(const std::array<uint64_t, N>& words) {
 
 class RadioSource final : public ITool {
 public:
+    // A 270 s stereo track at 48 kHz occupies about 104 MiB as F32 PCM.
+    // Keep the existing bounded file-source path while admitting complete songs.
+    static constexpr std::uint64_t kMaxFilePcmBytes = 256ull * 1024ull * 1024ull;
     explicit RadioSource(std::shared_ptr<Shared> shared) : shared_(std::move(shared)) {}
     ~RadioSource() noexcept override { shutdown(); }
     const char* id_cstr() const noexcept override { return shared_->config.wav.empty() ? "radio.system_output" : "radio.file_output"; }
@@ -187,7 +190,7 @@ public:
             audio_ready_ = true;
             std::error_code size_error;
             const auto bytes = std::filesystem::file_size(c.wav, size_error);
-            if (size_error || bytes > 64u * 1024u * 1024u) return;
+            if (size_error || bytes > kMaxFilePcmBytes) return;
             SDL_AudioSpec spec{};
             Uint8* original = nullptr;
             Uint32 length = 0;
@@ -195,7 +198,7 @@ public:
             if (!SDL_LoadWAV(reinterpret_cast<const char*>(utf8.c_str()), &spec, &original, &length)) return;
             const int source_frame_bytes = SDL_AUDIO_FRAMESIZE(spec);
             if (source_frame_bytes <= 0 || spec.freq <= 0 ||
-                (static_cast<uint64_t>(length) / source_frame_bytes) * 8 * (c.pcm_port ? 48000 : spec.freq) / spec.freq > 64u * 1024u * 1024u) {
+                (static_cast<uint64_t>(length) / source_frame_bytes) * 8 * (c.pcm_port ? 48000 : spec.freq) / spec.freq > kMaxFilePcmBytes) {
                 SDL_free(original); return;
             }
             SDL_AudioSpec target{SDL_AUDIO_F32, 2, c.pcm_port ? 48000 : spec.freq};
@@ -205,7 +208,7 @@ public:
                 &target, &converted, &converted_length);
             SDL_free(original);
             if (!ok) return;
-            if (converted_length <= 0 || converted_length > 64 * 1024 * 1024 || converted_length % (2 * sizeof(float))) { SDL_free(converted); return; }
+            if (converted_length <= 0 || converted_length > static_cast<int>(kMaxFilePcmBytes) || converted_length % (2 * sizeof(float))) { SDL_free(converted); return; }
             samples_.resize(static_cast<size_t>(converted_length) / sizeof(float));
             std::memcpy(samples_.data(), converted, converted_length);
             SDL_free(converted);
