@@ -89,10 +89,26 @@ int main(int argc,char** argv){
     if(!row||row->port_count()!=3)return 8;
     row->initialize({});
     std::vector<std::uint64_t> control{
-        1,16,16,2,1,bits(0.5e-6),bits(0.25e-6),1};
+        1,16,16,2,1,bits(0.2e-6),bits(0.25e-6),1};
     std::vector<std::uint64_t> work{
         card,100,777,42,101,102,103,104};
     auto control_token=u64_tensor(control),work_token=u64_tensor(work);
+    auto coarse=control;
+    coarse[5]=bits(0.5e-6);
+    auto coarse_token=u64_tensor(coarse);
+    if(!invoke(*row,work_token,coarse_token,reply))return 17;
+    std::array<std::uint64_t,9> refused{};
+    nodus_tensor_read(reply,0,refused.data(),sizeof(refused));
+    if(refused[0]!=3||refused[1]!=777||refused[2]!=42)return 18;
+    nodus_tensor_destroy(reply);
+    for(std::uint64_t address:{101ull,103ull}){
+        auto field=library.borrow_cpu(card,address,false);
+        if(!field||field.bytes()<256*sizeof(float))return 19;
+        const auto* values=static_cast<const float*>(field.data());
+        for(int i=0;i<256;++i)
+            if(values[i]!=(i==8*16+8?1.f:0.f))return 20;
+    }
+    nodus_tensor_destroy(coarse_token);
     if(!invoke(*row,work_token,control_token,reply))return 9;
     std::array<std::uint64_t,9> receipt{};
     nodus_tensor_read(reply,0,receipt.data(),sizeof(receipt));

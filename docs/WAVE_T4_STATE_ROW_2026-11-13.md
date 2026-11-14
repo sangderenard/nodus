@@ -12,6 +12,10 @@ card, wavelength-state address, frame identity, continuation generation,
 then real and imaginary F32 state addresses for each arena. The wavelength
 state is F64[arena count * bands]. Each field state holds at least
 width * height * bands samples. All addresses belong to the same card.
+The row refuses a work item before changing field state if any medium
+wavelength is nonpositive, nonfinite, or shorter than twice the cell pitch.
+This is the existing two samples per wavelength arena admission rule; callers
+must provide wavelengths in the arena medium.
 The row leases fields once, runs the authored batch entry, and releases the
 loans before emitting a U64[9] receipt: status, frame identity, generation,
 arena count, bands, width, height, elapsed nanoseconds, card. Successful

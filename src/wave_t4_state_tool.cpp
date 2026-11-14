@@ -176,7 +176,7 @@ void WaveT4StateTool::execute_stack(ToolStackContext& context){
                                 bool finite=true;
                                 for(std::size_t i=0;i<arenas*bands;++i)
                                     finite=finite&&std::isfinite(wavelengths[i])&&
-                                           wavelengths[i]>0;
+                                           wavelengths[i]>0&&dx<=0.5*wavelengths[i];
                                 if(finite){
                                     const auto dispatch_started=std::chrono::steady_clock::now();
                                     const auto result=step_(plan_,static_cast<int>(arenas),
