@@ -20,9 +20,9 @@ std::wstring path_from_utf8(const char* source) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 5 || argc > 13) {
+    if (argc < 5 || argc > 14) {
         std::fprintf(stderr,
-            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port] [wait-for-start=0] [hls=0]\n");
+            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port] [wait-for-start=0] [hls=0] [band-scale=log|linear]\n");
         return 2;
     }
     const int port = std::atoi(argv[4]);
@@ -39,11 +39,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Radio configuration or row registration failed\n");
         return 1;
     }
+    const bool linear_bands = argc > 13 && std::strcmp(argv[13], "linear") == 0;
+    if (argc > 13 && !linear_bands && std::strcmp(argv[13], "log")) return 2;
+    if (!nodus_headless_radio_band_scale(linear_bands ? 1 : 0)) return 1;
     if (argc > 8 && !nodus_headless_radio_file_source(path_from_utf8(argv[8]).c_str(), argc > 9 ? std::atoi(argv[9]) : 0)) {
         std::fprintf(stderr, "Radio file-source configuration failed\n"); return 1;
     }
     const int pcm_port = argc > 10 ? std::atoi(argv[10]) : 0;
-    if (argc > 10 && (pcm_port < 1 || pcm_port > 65535 || !nodus_headless_radio_pcm_configure(static_cast<uint16_t>(pcm_port)))) return 2;
+    if (argc > 10 && (pcm_port < 0 || pcm_port > 65535 ||
+        (pcm_port && !nodus_headless_radio_pcm_configure(static_cast<uint16_t>(pcm_port))))) return 2;
     const bool wait_for_start = argc > 11 && std::atoi(argv[11]) == 1;
     const bool hls = argc > 12 && std::strcmp(argv[12], "1") == 0;
     if (argc > 12 && (std::strcmp(argv[12], "0") && !hls)) return 2;
@@ -57,20 +61,31 @@ int main(int argc, char** argv) {
     const int table = nodus_headless_add_module(graph, &module);
     const GP_CanvasModuleRowDesc rows[] = {
         {1, 0, 1, 1, argc > 8 ? "radio.file_output" : "radio.system_output"},
+        {1, 0, 1, 1, "nodus.fftfree"},
+        {1, 0, 1, 1, "radio.fft_bands"},
         {1, 0, 1, 1, "radio.udp_broadcast"},
+    };
+    const GP_CanvasModuleRowDesc pcm_rows[] = {
         {1, 0, 1, 1, "radio.pcm_rtp"},
+        {1, 0, 1, 1, argc > 8 ? "radio.file_output" : "radio.system_output"},
+        {1, 0, 1, 1, "nodus.fftfree"},
+        {1, 0, 1, 1, "radio.fft_bands"},
+        {1, 0, 1, 1, "radio.udp_broadcast"},
     };
     const GP_CanvasModuleRowDesc hls_rows[] = {
+        {1, 0, 1, 1, "radio.pcm_rtp"},
         {1, 0, 1, 1, "radio.file_output"},
+        {1, 0, 1, 1, "nodus.fftfree"},
+        {1, 0, 1, 1, "radio.fft_bands"},
         {1, 0, 1, 1, "radio.pcm_s16le"},
         {1, 0, 1, 1, "radio.udp_broadcast"},
-        {1, 0, 1, 1, "radio.pcm_rtp"},
         {1, 0, 1, 1, "exec.radio.hls"},
     };
-    if (table < 0 || !nodus_headless_set_module_rows(graph, table, hls ? hls_rows : rows, hls ? 5 : (pcm_port ? 3 : 2)) ||
+    if (table < 0 || !nodus_headless_set_module_rows(graph, table,
+            hls ? hls_rows : (pcm_port ? pcm_rows : rows), hls ? 7 : (pcm_port ? 5 : 4)) ||
         !nodus_headless_set_module_stack_contract(graph, table, 2) ||
         !nodus_headless_set_module_exec_mode(graph, table, 3) ||
-        (pcm_port && !nodus_headless_radio_pcm_bind_at(graph, table, hls ? 3 : 2)) ||
+        (pcm_port && !nodus_headless_radio_pcm_bind_at(graph, table, 0)) ||
         !nodus_headless_step(graph, 1.0 / 60.0)) {
         std::fprintf(stderr, "Radio table construction or Free launch failed\n");
         nodus_headless_destroy(graph);
@@ -85,19 +100,23 @@ int main(int argc, char** argv) {
         nodus_headless_radio_hold(0);
     }
     std::signal(SIGINT, on_signal);
-    std::printf("Radio: one Free table, source=%s, udp://%s:%d, bands=%d\n",
-                argc > 8 ? "wav+fftfree" : "system_output+fftfree", argv[3], port, bands);
+    std::printf("Radio: one Free table, source=%s, udp://%s:%d, bands=%d, scale=%s\n",
+                argc > 8 ? "wav+fftfree" : "system_output+fftfree", argv[3], port, bands,
+                linear_bands ? "linear" : "log");
     std::fflush(stdout);
     const auto started = std::chrono::steady_clock::now();
     while (!stopping.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         NodusRadioStatus status{};
         if (nodus_headless_radio_status(&status)) {
-            std::printf("capture=%d rate=%u frames=%llu packets=%llu dropped=%llu\n",
+            uint64_t pcm_lost = 0;
+            nodus_headless_radio_capture_overruns(&pcm_lost);
+            std::printf("capture=%d rate=%u frames=%llu packets=%llu dropped=%llu pcm_overrun_frames=%llu\n",
                 status.capture_running, status.sample_rate,
                 static_cast<unsigned long long>(status.captured_frames),
                 static_cast<unsigned long long>(status.emitted_packets),
-                static_cast<unsigned long long>(status.dropped_packets));
+                static_cast<unsigned long long>(status.dropped_packets),
+                static_cast<unsigned long long>(pcm_lost));
             if (pcm_port) {
                 uint64_t sent = 0, lost = 0;
                 nodus_headless_radio_pcm_status(&sent, &lost);

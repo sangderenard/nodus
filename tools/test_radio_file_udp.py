@@ -1,5 +1,5 @@
 """Bounded local NRAD acceptance test for the real native WAV source.
-Usage: python tools/test_radio_file_udp.py <radio.exe> <scope.dll> <fft.dll> <wav>
+Usage: python tools/test_radio_file_udp.py <radio.exe> <scope.dll> <fft.dll> <wav> [log|linear]
 SDL3 runtime must be on PATH. Plays three seconds of the approved WAV.
 """
 import math
@@ -12,11 +12,16 @@ import tempfile
 
 
 def main():
-    executable, scope, fft, wav = sys.argv[1:]
+    executable, scope, fft, wav = sys.argv[1:5]
+    scale = sys.argv[5] if len(sys.argv) > 5 else "log"
+    assert scale in ("log", "linear")
     with tempfile.TemporaryDirectory(prefix="nodus-radio-test-") as workspace, tempfile.TemporaryFile(mode="w+t") as log, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
         receiver.bind(("127.0.0.1", 0))
         receiver.settimeout(.2)
-        process = subprocess.Popen([executable, scope, fft, "127.0.0.1", str(receiver.getsockname()[1]), "3", "5", "1024", wav, "1"], stdout=log, stderr=log, text=True, cwd=workspace)
+        command = [executable, scope, fft, "127.0.0.1", str(receiver.getsockname()[1]), "3", "5", "1024", wav, "1"]
+        if scale == "linear":
+            command.extend(("0", "0", "0", "linear"))
+        process = subprocess.Popen(command, stdout=log, stderr=log, text=True, cwd=workspace)
         packets = []
         deadline = time.monotonic() + 15
         try:
@@ -32,7 +37,7 @@ def main():
                 assert (magic, version, bands, rate) == (0x4441524e, 1, 5, 48000)
                 assert math.isfinite(rms) and all(math.isfinite(x) and 0 <= x <= 1 for x in power)
                 assert not packets or index > packets[-1][0]
-                packets.append((index, rms, peer[1]))
+                packets.append((index, rms, peer[1], power))
             process.wait(timeout=5)
             log.seek(0)
             stdout = log.read()
@@ -40,9 +45,12 @@ def main():
             assert process.returncode == 0, process.returncode
             assert len(packets) > 20, len(packets)
             assert max(x[1] for x in packets) > .001
+            assert all(x[0] % 256 == 0 for x in packets), "overlap-4 FFT cadence changed"
+            assert max(max(x[3]) for x in packets) > .05, "fftfree band projection stayed dark"
             assert len({x[2] for x in packets}) == 1
             assert f"radio_udp_source_port={packets[0][2]}" in stdout
-            print(f"PASS {len(packets)} real WAV NRAD frames, monotonic indices, finite nonzero RMS, matching source port")
+            assert f"scale={scale}" in stdout
+            print(f"PASS {len(packets)} real WAV NRAD frames, {scale} bands, monotonic indices, finite nonzero RMS, matching source port")
         finally:
             if process.poll() is None:
                 process.terminate()

@@ -58,7 +58,7 @@ void TensorStateLibraryTool::initialize(const ToolInitContext&) {
     std::vector<TensorStateLibrary::Device> devices;
     std::vector<kernels::VulkanDeviceInfo> inventory;
     std::string error;
-    if(kernels::enumerate_vulkan_devices(&inventory,&error))
+    if(include_gpu_&&kernels::enumerate_vulkan_devices(&inventory,&error))
         for(const auto& item:inventory){
             if(!item.compute)continue;
             gp_mem_backend_vulkan_params_t params{item.index,GP_VULKAN_ALLOC_DEVICE_LOCAL};

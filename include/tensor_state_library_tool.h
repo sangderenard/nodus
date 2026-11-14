@@ -24,9 +24,11 @@ class TensorStateLibraryTool final : public ITool {
 public:
     explicit TensorStateLibraryTool(
         std::uint64_t ram_budget_bytes=1024ull*1024*1024,
-        std::vector<std::uint64_t> device_budget_bytes={})
+        std::vector<std::uint64_t> device_budget_bytes={},
+        bool include_gpu=true)
         :ram_budget_(ram_budget_bytes),
-         device_budget_bytes_(std::move(device_budget_bytes)){}
+         device_budget_bytes_(std::move(device_budget_bytes)),
+         include_gpu_(include_gpu){}
     enum class Operation : std::uint64_t {
         Card=1, Put=2, Remove=3, Status=4, ChooseResident=5
     };
@@ -163,6 +165,7 @@ private:
     std::unordered_map<std::uint64_t,std::uint64_t> address_card_,address_bytes_;
     std::uint64_t ram_budget_;
     std::vector<std::uint64_t> device_budget_bytes_;
+    bool include_gpu_ = true;
     std::uint64_t inflight_gpu_loans_=0;
     struct CompletionWindow {
         std::array<std::uint64_t,8> lease{},dispatch{},total{};
