@@ -266,3 +266,66 @@ Silent full-frame gated source proof passed:48007frames/188packets, exact final
 seven-frame block, verified RTCP EOF, zero loss/late/rejected/resync. Two successive
 streams then fed one existing native PA sink through Turing's bounded readback tap:
 96014frames accepted. SDL dummy explicitly selected; real speakers untested.
+
+## Bounded decoder-output prerequisite (2026-11-14)
+
+`nodus::exec::Child::start` now accepts an optional fourth `output_limit`
+argument. Zero retains the existing span behavior; a positive byte count
+backpressures the child's stdout instead of accumulating the complete output.
+`take(out, maximum)` consumes bounded pieces without blocking the caller.
+`output_drained()` distinguishes stdout EOF plus consumed buffered bytes from
+process completion. Consumers must keep taking output while the child runs;
+waiting for exit before consuming bounded output can deadlock by design.
+Cancellation wakes the backpressured reader and terminates the owned child job.
+The OS pipe and one 64KiB reader buffer are additional fixed storage, not part
+of the application queue limit.
+
+`tools/exec_row/exec_pipe_output_test.cpp` verifies byte continuity with partial
+reads, a tiny limit, cancellation, restart and unchanged legacy span behavior.
+Built with MSVC C++20 and passed on Windows. An optional invocation with
+`<ffmpeg.exe> <180-second stereo 48kHz WAV>` also decoded 69,120,000 float32
+bytes through a 65,536-byte queue, crossing the old radio allocation limit
+without holding the whole decoded song. Test input was generated silence;
+there was no audio device, network sender or service restart.
+
+This is the existing execution primitive needed for a streaming decoder.
+**The radio file source still uses SDL_LoadWAV and its old 64MiB limits.**
+Connecting the decoder to its paced SDL/scope/canonical PCM FIFO, declaring
+the trusted executable through service configuration, and verifying real
+radio EOF/loop/error handling remain separate integration work. This receipt
+does not claim that long songs now play on the live station.
+
+### Native file-source decoder integration
+
+Setting the operator-only `NODUS_RADIO_DECODER` to one absolute trusted FFmpeg
+executable opts `radio.file_output` into bounded decoding. Leave it unset to
+retain SDL's existing bounded whole-WAV loader. The input must be a local
+regular file. FFmpeg is invoked with fixed local file/pipe protocols and fixed
+48kHz stereo float32 output; songs cannot supply executable arguments.
+The child uses the existing exec Program core/work-root policy and inherits
+the source's working directory, so the operator should launch in an approved
+user scratch directory rather than a repository directory.
+
+Decoded output is capped at65,536 bytes, then consumed in one existing FFT hop
+at a time. The same samples go to SDL device pacing, fftfree analysis, the
+canonical `radio.pcm` FIFO, and the existing HLS stack conversion. There is no
+new transport, queue scheduler, FFT or parallel media engine. The terminal
+partial hop is retained; only a successful, frame-aligned decoder EOF emits the
+normal end token. Looping restarts the decoder without resetting the sample
+clock; empty streams do not spin forever. Shutdown cancels the owned decoder.
+
+The prior prerequisite receipt above described the source before this
+integration. `tools/test_radio_decoder.py` now exercises the actual native
+source silently with generated local WAV/MP3 files, isolated UDP sockets,
+monotonic RTP and stereo samples, partial EOF/BYE, looping and bounded-duration
+cancellation of a180-second file. This does not configure a live station or
+claim a provider-account integration.
+
+Verification on final native build: WAV and MP3 each delivered exactly14,400
+stereo frames, including a64-frame final packet and compound RTCP BYE. The
+0.3-second WAV loop ran continuously for3seconds with monotonic sequence and
+sample timestamps; a180-second WAV streamed for3seconds before clean bounded
+shutdown. Native counters reported zero PCM drops; observed shutdown times
+were72-101ms. Invalid audio failed without hanging. The original SDL WAV/NRAD
+regression also remains applicable with the decoder option unset. This is not
+a full180-second real-time radio soak or a browser HLS playback test.

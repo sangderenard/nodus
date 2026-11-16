@@ -110,7 +110,9 @@ public:
     Child& operator=(const Child&) = delete;
     ~Child() { stop(); }
 
-    bool start(const Program& program, std::string& why, bool discard_output = false) {
+    // output_limit=0 preserves span mode. A positive limit backpressures stdout;
+    // consumers must call take while the child runs, not wait for process exit.
+    bool start(const Program& program, std::string& why, bool discard_output = false, size_t output_limit = 0) {
         stop();
         why = refusal(program);
         if (!why.empty()) return false;
@@ -163,6 +165,8 @@ public:
         process_ = made.hProcess;
         input_done_ = false;
         discard_output_ = discard_output;
+        output_limit_ = output_limit;
+        stopping_ = false;
         reader_ = std::thread([this] { read_loop(); });
         writer_ = std::thread([this] { write_loop(); });
         return true;
@@ -200,12 +204,27 @@ public:
     }
 
     // Move whatever the child has written so far into `out` (appended). Returns the number of bytes moved.
-    size_t take(std::string& out) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const size_t moved = from_child_.size();
-        out.append(from_child_);
-        from_child_.clear();
+    size_t take(std::string& out, size_t maximum = SIZE_MAX) {
+        size_t moved;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            moved = std::min(maximum, from_child_.size());
+            out.append(from_child_, 0, moved);
+            from_child_.erase(0, moved);
+        }
+        output_space_.notify_all();
         return moved;
+    }
+
+    size_t buffered_output() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return from_child_.size();
+    }
+
+    // Distinguish process completion from delivery of the final buffered bytes.
+    bool output_drained() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return output_closed_.load() && from_child_.empty();
     }
 
     bool running() const { return process_ && WaitForSingleObject(process_, 0) == WAIT_TIMEOUT; }
@@ -218,7 +237,11 @@ public:
         return process_ && GetExitCodeProcess(process_, &code) ? static_cast<int>(code) : -1;
     }
 
-    void kill() { if (job_) TerminateJobObject(job_, 1); }
+    void kill() {
+        { std::lock_guard<std::mutex> lock(mutex_); stopping_ = true; }
+        output_space_.notify_all();
+        if (job_) TerminateJobObject(job_, 1);
+    }
 
     void stop() {
         kill();
@@ -270,8 +293,18 @@ private:
     void read_loop() {
         char buffer[1 << 16];
         for (;;) {
+            DWORD want = sizeof(buffer);
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                output_space_.wait(lock, [this] {
+                    return stopping_ || discard_output_ || !output_limit_ || from_child_.size() < output_limit_;
+                });
+                if (stopping_) break;
+                if (!discard_output_ && output_limit_)
+                    want = static_cast<DWORD>(std::min<size_t>(want, output_limit_ - from_child_.size()));
+            }
             DWORD got = 0;
-            if (!ReadFile(output_, buffer, sizeof(buffer), &got, nullptr) || got == 0) break;
+            if (!ReadFile(output_, buffer, want, &got, nullptr) || got == 0) break;
             std::lock_guard<std::mutex> lock(mutex_);
             if (!discard_output_) from_child_.append(buffer, got);
         }
@@ -282,12 +315,14 @@ private:
     std::thread reader_, writer_;
     mutable std::mutex mutex_;
     std::mutex handles_;
-    std::condition_variable wake_;
+    std::condition_variable wake_, output_space_;
     std::deque<std::string> to_child_;
     std::string from_child_;
     size_t pending_bytes_ = 0;
     bool input_done_ = false;
     bool discard_output_ = false;
+    bool stopping_ = false;
+    size_t output_limit_ = 0;
     std::atomic<bool> output_closed_{false};
 };
 
