@@ -65,6 +65,8 @@ int main() {
     if (!write_text(
             python_source,
             "def calculate(left, right):\n"
+            "    if left < 0:\n"
+            "        raise RuntimeError('deliberate interpreted row refusal')\n"
             "    return left * 2.0 + right, int(left - right)\n")) {
         std::cerr << "could not retain authored Python source\n";
         return 1;
@@ -122,6 +124,12 @@ int main() {
     }
 
     tool->initialize(ToolInitContext{});
+    ToolStackContext missing{};
+    tool->execute_stack(missing);
+    if (missing.succeeded) {
+        std::cerr << "missing interpreted row stack reported success\n";
+        return 1;
+    }
     RawStackFrame raw{};
     if (!raw_stack_init_frame(raw, 256)) {
         std::cerr << "could not initialize row stack\n";
@@ -141,13 +149,14 @@ int main() {
     }
     ToolStackContext stack{};
     stack.stack.raw = &raw;
+    stack.succeeded = false; // A successful invocation must publish its own result.
     tool->execute_stack(stack);
 
     nodus::tensors::AbstractTensorHandle difference_handle{};
     nodus::tensors::AbstractTensorHandle combined_handle{};
     int64_t difference = 0;
     double combined = 0.0;
-    const bool executed =
+    const bool executed = stack.succeeded &&
                           raw_stack_pop_abstract_tensor(raw, difference_handle) &&
                           raw_stack_pop_abstract_tensor(raw, combined_handle) &&
                           nodus_tensor_read(difference_handle.id, 0, &difference,
@@ -159,6 +168,24 @@ int main() {
                           raw.byte_count == 0 &&
                           difference == 5 &&
                           std::abs(combined - 23.0) < 1.0e-12;
+    // The same loaded wrapper must propagate refusal while the interpreter
+    // restores the exact input handles for inspection, not output publishing.
+    const double negative = -9.5;
+    if (nodus_tensor_write(left_tensor, 0, &negative, sizeof(negative)) !=
+            static_cast<int64_t>(sizeof(negative)) ||
+        !raw_stack_push_abstract_tensor(raw, left_handle) ||
+        !raw_stack_push_abstract_tensor(raw, right_handle)) {
+        std::cerr << "could not prepare refusal inputs\n";
+        return 1;
+    }
+    stack.succeeded = true;
+    tool->execute_stack(stack);
+    nodus::tensors::AbstractTensorHandle restored_right{}, restored_left{};
+    const bool refused = !stack.succeeded &&
+        raw_stack_pop_abstract_tensor(raw, restored_right) &&
+        raw_stack_pop_abstract_tensor(raw, restored_left) &&
+        restored_right.id == right_tensor && restored_left.id == left_tensor &&
+        raw.byte_count == 0;
     if (difference_handle.id) nodus_tensor_destroy(difference_handle.id);
     if (combined_handle.id) nodus_tensor_destroy(combined_handle.id);
     if (left_tensor) nodus_tensor_destroy(left_tensor);
@@ -171,8 +198,8 @@ int main() {
     tool->shutdown();
     tool.reset();
 
-    if (!executed) {
-        std::cerr << "registered interpreted row returned the wrong values\n";
+    if (!executed || !refused) {
+        std::cerr << "registered interpreted row returned wrong values or refusal status\n";
         return 1;
     }
     if (!gp_plugin_unload(loaded_id)) {
