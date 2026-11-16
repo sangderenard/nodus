@@ -201,6 +201,17 @@ public:
         it->second.gpu_writable = writable;
         return GpuLease(this, address, device, std::move(lease));
     }
+    bool set_gpu_pin(std::uint64_t address, std::size_t device, bool pinned) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(address);
+        if (it == entries_.end() || it->second.leased || device >= banks_.size())
+            return false;
+        if (pinned && it->second.latest_gpu >= 0 &&
+            it->second.latest_gpu != static_cast<std::int64_t>(device) &&
+            !flush_latest(address, it->second)) return false;
+        std::lock_guard<std::mutex> bank_lock(*bank_mutexes_[device]);
+        return banks_[device]->set_pin(address, pinned);
+    }
     bool remove(std::uint64_t address) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(address);

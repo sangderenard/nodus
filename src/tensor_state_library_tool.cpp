@@ -20,7 +20,7 @@ TensorStateLibraryTool::choose_resident_locked(
     for(std::size_t row=0;row<candidates.size();++row){
         const auto base=candidates[row].base,count=candidates[row].fields;
         if(!base||!count||count>256||base>UINT64_MAX-count+1)continue;
-        std::uint64_t total=0,resident=0;
+        std::uint64_t total=0,resident=0,extra=0;
         bool owned=true;
         for(std::uint64_t field=0;field<count;++field){
             const auto address=base+field;
@@ -32,8 +32,10 @@ TensorStateLibraryTool::choose_resident_locked(
             }
             total+=size->second;
             resident+=library_->resident_bytes(address,device);
+            if(!pins_.contains({address,device}))extra+=size->second;
         }
-        if(!owned||total>client->second.gpu_quota[device]-
+        if(!owned||extra>client->second.gpu_quota[device]-
+                          client->second.gpu_pinned[device]-
                           client->second.gpu_leased[device])continue;
         const bool full=resident==total;
         const bool best_full=best&&best->resident_bytes==best->total_bytes;
@@ -97,7 +99,7 @@ void TensorStateLibraryTool::shutdown() {
             std::fputs("Nodus tensor state library could not release an address\n",stderr);
             return;
         }
-    address_card_.clear();address_bytes_.clear();cards_.clear();
+    address_card_.clear();address_bytes_.clear();cards_.clear();pins_.clear();
     completion_windows_.clear();work_windows_.clear();
     library_.reset();contexts_.clear();
 }
@@ -194,6 +196,7 @@ TensorStateLibraryTool::Result TensorStateLibraryTool::handle(
         Card card;card.process=request[2];card.ram_quota=request[4];
         card.gpu_quota.resize(stats.vram.size());
         card.gpu_leased.resize(stats.vram.size());
+        card.gpu_pinned.resize(stats.vram.size());
         for(std::size_t i=0;i<3;i++){
             const auto requested=request[5+i];
             if(i>=stats.vram.size()){
@@ -235,6 +238,9 @@ TensorStateLibraryTool::Result TensorStateLibraryTool::handle(
         receipt[25]=device;
         return Result::Ok;
     }
+    if(op==Operation::Pin||op==Operation::Unpin)
+        return set_gpu_pin_locked(card_id,address,
+            static_cast<std::size_t>(request[5]),op==Operation::Pin);
     if(!address)return Result::Invalid;
     if(op==Operation::Put){
         if(address_card_.count(address))return Result::StateConflict;
@@ -260,11 +266,50 @@ TensorStateLibraryTool::Result TensorStateLibraryTool::handle(
         if(!address_card_.count(address)||address_card_[address]!=card_id)
             return Result::CardUnknown;
         if(!library_->remove(address))return Result::StateConflict;
+        for(auto it=pins_.begin();it!=pins_.end();){
+            if(it->first.first==address){
+                found->second.gpu_pinned[it->first.second]-=address_bytes_[address];
+                it=pins_.erase(it);
+            }else ++it;
+        }
         found->second.ram_used-=address_bytes_[address];
         address_bytes_.erase(address);address_card_.erase(address);
         return Result::Ok;
     }
     return Result::Invalid;
+}
+
+TensorStateLibraryTool::Result TensorStateLibraryTool::set_gpu_pin_locked(
+    std::uint64_t card,std::uint64_t address,std::size_t device,bool pinned){
+    const auto owner=address_card_.find(address);
+    auto client=cards_.find(card);
+    if(!library_||client==cards_.end()||owner==address_card_.end()||
+       owner->second!=card)return Result::CardUnknown;
+    if(device>=client->second.gpu_quota.size())return Result::DeviceUnavailable;
+    const auto key=std::make_pair(address,device);
+    const auto existing=pins_.find(key);
+    if(pinned){
+        if(existing!=pins_.end())return Result::Ok;
+        const auto bytes=address_bytes_.at(address);
+        if(bytes>client->second.gpu_quota[device]-
+                 client->second.gpu_pinned[device]-
+                 client->second.gpu_leased[device])return Result::Quota;
+        if(!library_->set_gpu_pin(address,device,true))return Result::StateConflict;
+        client->second.gpu_pinned[device]+=bytes;
+        pins_.emplace(key,card);
+        return Result::Ok;
+    }
+    if(existing==pins_.end())return Result::Invalid;
+    if(!library_->set_gpu_pin(address,device,false))return Result::StateConflict;
+    client->second.gpu_pinned[device]-=address_bytes_.at(address);
+    pins_.erase(existing);
+    return Result::Ok;
+}
+
+bool TensorStateLibraryTool::pin_gpu(std::uint64_t card,std::uint64_t address,
+                                     std::size_t device,bool pinned){
+    std::lock_guard<std::mutex> lock(mutex_);
+    return set_gpu_pin_locked(card,address,device,pinned)==Result::Ok;
 }
 
 void TensorStateLibraryTool::execute_stack(ToolStackContext& context) {
@@ -303,6 +348,7 @@ void TensorStateLibraryTool::execute_stack(ToolStackContext& context) {
                 receipt[9+i*5]=stats.vram[i].reused;
                 receipt[10+i*5]=stats.vram[i].saved;
                 receipt[26+i]=stats.vram[i].restored;
+                receipt[29+i]=stats.vram[i].pinned_bytes;
             }
         }
     }
@@ -320,7 +366,7 @@ void TensorStateLibraryTool::execute_stack(ToolStackContext& context) {
 
 TensorStateLibraryTool::GpuLoan TensorStateLibraryTool::borrow_gpu(
     std::uint64_t card,std::uint64_t address,std::size_t device,bool writable){
-    std::uint64_t bytes=0;
+    std::uint64_t bytes=0,charge=0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto client=cards_.find(card);
@@ -328,19 +374,21 @@ TensorStateLibraryTool::GpuLoan TensorStateLibraryTool::borrow_gpu(
         if(!library_||client==cards_.end()||owner==address_card_.end()||
            owner->second!=card||device>=client->second.gpu_quota.size())return {};
         bytes=address_bytes_[address];
-        if(bytes>client->second.gpu_quota[device]-client->second.gpu_leased[device])
+        charge=pins_.contains({address,device})?0:bytes;
+        if(charge>client->second.gpu_quota[device]-
+                  client->second.gpu_pinned[device]-client->second.gpu_leased[device])
             return {};
-        client->second.gpu_leased[device]+=bytes;
+        client->second.gpu_leased[device]+=charge;
         ++inflight_gpu_loans_;
     }
     auto lease=library_->lease_gpu(address,device,writable);
     if(!lease){
         std::lock_guard<std::mutex> lock(mutex_);
-        cards_.at(card).gpu_leased[device]-=bytes;
+        cards_.at(card).gpu_leased[device]-=charge;
         --inflight_gpu_loans_;
         return {};
     }
-    return GpuLoan(this,card,device,bytes,std::move(lease));
+    return GpuLoan(this,card,device,charge,std::move(lease));
 }
 TensorStateLibraryTool::CpuLoan TensorStateLibraryTool::borrow_cpu(
     std::uint64_t card,std::uint64_t address,bool writable){

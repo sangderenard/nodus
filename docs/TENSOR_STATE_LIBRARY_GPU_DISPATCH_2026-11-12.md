@@ -3,6 +3,25 @@
 This is an implementation and measurement receipt, not a claim that a live
 canvas table or production service is complete.
 
+## Hard GPU pin extension (2026-11-16)
+
+The library control row now accepts `Pin=6` and `Unpin=7`. A request names the
+owning card in slot 1, the existing tensor address in slot 3, and the physical
+device index in slot 5. Pin warms that tensor on the selected GPU, charges its
+bytes to the card's GPU quota, and prevents LRU eviction until Unpin or Remove.
+An ordinary borrow of the same pinned address does not charge those bytes a
+second time. Status reports pinned resident bytes for each GPU in receipt
+slots 29 onward. A pin fails if the tensor is leased, exceeds card quota, or
+cannot fit within the GPU bank's physical budget. Other addresses can still be
+cycled through unreserved capacity.
+
+The pin is for addressed Nodus tensor state in the current process. GPU writes
+on another device can invalidate a stale pinned copy; the pin intent remains
+and the next lease restores current data. It is not a reservation for
+`llama.cpp` model weights or KV cache, which are allocated outside this state
+library. A separate allocator integration would be required before Llama
+instances can use this pin contract.
+
 ## Native path
 
 - `nodus.tensor.state.library` is a registered `ITool` row. It accepts FIFO

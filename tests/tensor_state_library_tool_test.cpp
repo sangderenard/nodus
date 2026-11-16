@@ -91,6 +91,16 @@ int main(int argc,char** argv){
     request={};request[0]=2;request[1]=card;request[3]=address;
     receipt=send(*tool,command_edge,payload_edge,reply_edge,request,data);
     if(receipt[0]!=0||receipt[3]!=sizeof(values))return 5;
+    request={};request[0]=6;request[1]=card;request[3]=address;request[5]=0;
+    receipt=send(*tool,command_edge,payload_edge,reply_edge,request,dummy);
+    if(receipt[0]!=0||receipt[29]<sizeof(values))return 59;
+    {
+        auto pinned=library->borrow_gpu(card,address,0,false);
+        if(!pinned||library->pin_gpu(card,address,0,false))return 60;
+    }
+    request[0]=7;
+    receipt=send(*tool,command_edge,payload_edge,reply_edge,request,dummy);
+    if(receipt[0]!=0||receipt[29]!=0)return 61;
     {
         auto loan=library->borrow_gpu(card,address,0,true);
         if(!loan)return 6;

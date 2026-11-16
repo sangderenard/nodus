@@ -30,7 +30,8 @@ public:
          device_budget_bytes_(std::move(device_budget_bytes)),
          include_gpu_(include_gpu){}
     enum class Operation : std::uint64_t {
-        Card=1, Put=2, Remove=3, Status=4, ChooseResident=5
+        Card=1, Put=2, Remove=3, Status=4, ChooseResident=5,
+        Pin=6, Unpin=7
     };
     enum class Result : std::uint64_t {
         Ok=0, Invalid=1, CardUnknown=2, Quota=3, StateConflict=4,
@@ -42,7 +43,8 @@ public:
     // Argument port as an ordinary typed tensor. ChooseResident takes U64[N,2]
     // candidate rows {base_address, field_count}, device in request[5], and
     // selects the warmest admissible candidate; equal scores keep FIFO order.
-    // Other operations ignore the payload.
+    // Pin and Unpin use address in request[3], device in request[5], and
+    // reserve/release that card's GPU quota. Other operations ignore payload.
     const char* id_cstr() const noexcept override {return "nodus.tensor.state.library";}
     const char* name_cstr() const noexcept override {return "Tensor state library";}
     ToolCaps caps() const override {return ToolCaps::None;}
@@ -104,6 +106,8 @@ public:
     // The library card limits simultaneously leased bytes for that client on each GPU.
     GpuLoan borrow_gpu(std::uint64_t card,std::uint64_t address,
                        std::size_t device,bool writable);
+    bool pin_gpu(std::uint64_t card,std::uint64_t address,
+                 std::size_t device,bool pinned);
     CpuLoan borrow_cpu(std::uint64_t card,std::uint64_t address,bool writable);
     std::optional<TensorStateLibrary::Spec> describe_state(
         std::uint64_t card,std::uint64_t address) const;
@@ -147,7 +151,7 @@ public:
 private:
     struct Card {
         std::uint64_t process=0,ram_quota=0,ram_used=0;
-        std::vector<std::uint64_t> gpu_quota,gpu_leased;
+        std::vector<std::uint64_t> gpu_quota,gpu_leased,gpu_pinned;
     };
     void release_gpu_loan(std::uint64_t card,std::size_t device,
                           std::uint64_t bytes,
@@ -155,6 +159,8 @@ private:
     Result handle(const std::array<std::uint64_t,kRequestWords>&,
                   std::uint64_t payload,
                   std::array<std::uint64_t,kReceiptWords>& receipt);
+    Result set_gpu_pin_locked(std::uint64_t card,std::uint64_t address,
+                              std::size_t device,bool pinned);
     std::optional<ResidencyChoice> choose_resident_locked(
         std::uint64_t card,std::size_t device,
         std::span<const Candidate> candidates) const;
@@ -162,6 +168,7 @@ private:
     std::vector<std::unique_ptr<void,decltype(&gp_mem_backend_release)>> contexts_;
     std::unique_ptr<TensorStateLibrary> library_;
     std::unordered_map<std::uint64_t,Card> cards_;
+    std::map<std::pair<std::uint64_t,std::size_t>,std::uint64_t> pins_;
     std::unordered_map<std::uint64_t,std::uint64_t> address_card_,address_bytes_;
     std::uint64_t ram_budget_;
     std::vector<std::uint64_t> device_budget_bytes_;
