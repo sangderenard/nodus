@@ -770,7 +770,7 @@ target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables PUBLIC nodus_runtime)
 if(WIN32)
-  target_link_libraries(canvas_tables PUBLIC ws2_32 bcrypt)  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG) in the src glob
+  target_link_libraries(canvas_tables PUBLIC ws2_32 bcrypt winhttp crypt32)  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
 endif()
 target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
@@ -803,7 +803,7 @@ target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables_static PUBLIC nodus_runtime)
 if(WIN32)
-  target_link_libraries(canvas_tables_static PUBLIC ws2_32 bcrypt)  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG) in the src glob
+  target_link_libraries(canvas_tables_static PUBLIC ws2_32 bcrypt winhttp crypt32)  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
 endif()
 target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
@@ -1009,7 +1009,7 @@ add_executable(nodus_headless_runtime_test
 target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
 if(WIN32)
-  target_link_libraries(nodus_headless_runtime_test PRIVATE ws2_32 bcrypt)  # bcrypt: the link test signs tickets (nodus_link.h)
+  target_link_libraries(nodus_headless_runtime_test PRIVATE ws2_32 bcrypt winhttp crypt32)  # the link tests sign tickets (nodus_link.h, nodus_link_wss.h)
 endif()
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)

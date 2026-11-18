@@ -474,6 +474,31 @@ extern "C" int32_t nodus_headless_register_link_dialer(
     return 1;
 }
 
+extern "C" int32_t nodus_headless_register_link_wss_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* path_base,
+    const char* prefix, int32_t secure, const uint8_t* pin32, const uint8_t* control_ticket128,
+    const uint8_t* bulk_ticket128, int32_t timeout_ms, uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !host || !*host || !prefix || !*prefix || !port ||
+        !control_ticket128 || !bulk_ticket128) return 0;
+    nodus::link::LinkDialConfig config;
+    config.id = tool_id; config.wss = true;
+    config.wss_target.host = host; config.wss_target.port = port; config.wss_target.prefix = prefix;
+    if (path_base && *path_base) config.wss_target.path_base = path_base;
+    config.wss_target.secure = secure != 0;
+    if (pin32) { config.wss_target.pinned = true; std::memcpy(config.wss_target.pin.data(), pin32, 32); }
+    if (timeout_ms > 0) config.wss_target.timeout_ms = timeout_ms;
+    std::memcpy(config.control_ticket.data(), control_ticket128, config.control_ticket.size());
+    std::memcpy(config.bulk_ticket.data(), bulk_ticket128, config.bulk_ticket.size());
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    std::string error;
+    if (!nodus::link::register_link_dialer(tool_registry_global(), std::move(config), &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_wss_dialer: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return 1;
+}
+
 extern "C" int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16) {
     nodus::link::EndpointReport r;
     if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;

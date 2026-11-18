@@ -2,6 +2,8 @@
 // on loopback in one process: the four FIFOs both ways, bulk integrity and throughput, control not held back by bulk,
 // and every ticket refusal. No Apache, no TLS, no canvas: those are later stages.
 #include "nodus_link.h"
+#include "nodus_link_wss.h"
+#include "exec_pipe.h"
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -147,6 +149,85 @@ static void refused(LinkListener& l, const char* label, const TicketBytes& c, co
     std::printf("refused %s\n", label);
 }
 
+// ---- stage 4: WinHTTP dial-out, ws:// direct and wss:// through a TLS front (tls_relay.py stands where Apache stands) ----
+static std::unique_ptr<Link> dial_wss(LinkListener& l, const WssTarget& t, const Tickets& k, std::string& why) {
+    WssDialer d(t, k.control, k.bulk);
+    double worst = 0;
+    auto end = Clock::now() + std::chrono::seconds(20);
+    while (!d.ready() && !d.failed() && Clock::now() < end) {
+        auto a = Clock::now(); d.poll(); worst = std::max(worst, std::chrono::duration<double>(Clock::now() - a).count());
+        l.poll(now_s());
+    }
+    why = d.failed() ? (d.reason() ? d.reason() : "failed") : (d.ready() ? "" : "no answer in 20 s");
+    CHECK(worst < 0.05, "a WssDialer poll took %.4f s", worst);
+    return d.take();
+}
+static void run_wss(LinkListener& listener, const Key& key, const std::string& python, const std::string& relay, const std::string& scratch) {
+    std::string why;
+    {   // ws:// through WinHTTP straight to the listener
+        WssTarget t; t.host = "127.0.0.1"; t.port = listener.port(); t.prefix = kPrefix; t.secure = false;
+        auto d = dial_wss(listener, t, tickets_for(key, new_link_id(), 7), why);
+        CHECK(d != nullptr, "winhttp ws:// dial: %s", why.c_str());
+        auto h = d ? wait_take(listener, d.get()) : nullptr;
+        CHECK(h && h->account() == 7, "winhttp ws:// link not handed out");
+        if (d && h) {
+            control_both_ways(*d, *h, listener, 1000, "winhttp ws dialer->host");
+            control_both_ways(*h, *d, listener, 1000, "winhttp ws host->dialer");
+            bulk_one_way(*d, *h, listener, size_t(16) << 20, 21, "winhttp ws dialer->host");
+            bulk_one_way(*h, *d, listener, size_t(16) << 20, 22, "winhttp ws host->dialer");
+            d->close(); pump(listener, d.get(), h.get(), 200);
+        }
+    }
+    nodus::exec::Program p; p.path = python; p.arguments = {relay, std::to_string(listener.port()), scratch}; p.working_dir = scratch;
+    nodus::exec::Child child; std::string out;
+    if (!child.start(p, why)) { CHECK(false, "relay did not start: %s", why.c_str()); return; }
+    auto end = Clock::now() + std::chrono::seconds(30);
+    while (out.find('\n') == std::string::npos && Clock::now() < end && !child.finished()) child.take(out);
+    unsigned relay_port = 0; char pin_hex[65] = {};
+    if (out.rfind("RELAY ", 0) == 0) {
+        relay_port = unsigned(std::strtoul(out.c_str() + 6, nullptr, 10));
+        size_t space = out.find(' ', 6);
+        if (space != std::string::npos && out.size() >= space + 65) std::memcpy(pin_hex, out.data() + space + 1, 64);
+    }
+    if (!relay_port || !pin_hex[63]) { CHECK(false, "relay said: %s", out.c_str()); child.kill(); return; }
+    std::array<uint8_t, 32> pin{};
+    for (size_t i = 0; i < 32; ++i) { char two[3] = {pin_hex[2 * i], pin_hex[2 * i + 1], 0}; pin[i] = uint8_t(std::strtoul(two, nullptr, 16)); }
+    std::printf("tls front (test relay) on 127.0.0.1:%u, certificate sha256 %.16s...\n", relay_port, pin_hex);
+    WssTarget t; t.host = "127.0.0.1"; t.port = uint16_t(relay_port); t.prefix = kPrefix; t.secure = true; t.pinned = true; t.pin = pin;
+    {   // wss:// with the right pin
+        auto d = dial_wss(listener, t, tickets_for(key, new_link_id(), 8), why);
+        CHECK(d != nullptr, "wss pinned dial: %s", why.c_str());
+        auto h = d ? wait_take(listener, d.get()) : nullptr;
+        CHECK(h && h->account() == 8, "wss link not handed out");
+        if (d && h) {
+            control_both_ways(*d, *h, listener, 1000, "wss dialer->host");
+            control_both_ways(*h, *d, listener, 1000, "wss host->dialer");
+            bulk_one_way(*d, *h, listener, size_t(64) << 20, 23, "wss dialer->host");
+            bulk_one_way(*h, *d, listener, size_t(16) << 20, 24, "wss host->dialer");
+            d->close(); pump(listener, d.get(), h.get(), 200);
+        }
+    }
+    const uint64_t links_before = listener.counters().links;
+    {   // a different pin: refused at the TLS handshake, before any ticket leaves
+        WssTarget wrong = t; wrong.pin[0] ^= 1;
+        auto d = dial_wss(listener, wrong, tickets_for(key, new_link_id(), 9), why);
+        CHECK(!d && why.find("pin") != std::string::npos, "wrong pin: %s", why.c_str());
+        std::printf("refused wss wrong pin: %s\n", why.c_str());
+    }
+    {   // no pin: Windows validates the chain, and a self-signed certificate is not trusted
+        WssTarget plain = t; plain.pinned = false;
+        auto d = dial_wss(listener, plain, tickets_for(key, new_link_id(), 10), why);
+        CHECK(!d, "an untrusted certificate was accepted without a pin");
+        std::printf("refused wss without pin: %s\n", why.c_str());
+    }
+    pump(listener, nullptr, nullptr, 100);
+    CHECK(listener.counters().links == links_before, "a refused dial produced a link");
+    child.finish_input();
+    auto stop = Clock::now() + std::chrono::seconds(5);
+    while (!child.finished() && Clock::now() < stop) { std::string s; child.take(s); }
+    if (!child.finished()) child.kill();
+}
+
 // `link_test vector`: one ticket from fixed fields, as hex, the known answer other issuers (turing link_tickets.py)
 // must reproduce byte for byte. key = 00..1f, link id = 10..1f, prefix "lab", account 42, issued 1795000000,
 // expires 1795000120, nonce = a0..af, channel control, role dialer.
@@ -163,6 +244,7 @@ static int print_vector() {
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "vector") == 0) return print_vector();
+    const bool wss = argc == 5 && std::strcmp(argv[1], "wss") == 0;   // link_test wss <python> <tls_relay.py> <scratch-dir>
     Key key{}; random_bytes(key.data(), key.size());
     ListenerConfig cfg; cfg.prefix = kPrefix; cfg.key = key;
     LinkListener listener(cfg);
@@ -219,6 +301,8 @@ int main(int argc, char** argv) {
         CHECK(d.failed() && worst < 0.01, "closed port: failed=%d worst poll %.4f s", int(d.failed()), worst);
         std::printf("refused closed port: %s after %.3f s, longest poll %.6f s\n", d.reason(), total, worst);
     }
+
+    if (wss) run_wss(listener, key, argv[2], argv[3], argv[4]);
 
     // The first link is untouched by the refusals.
     control_both_ways(*dialer, *host, listener, 100, "after refusals");

@@ -140,6 +140,13 @@ NODUS_HEADLESS_API int32_t nodus_headless_register_link_dialer(
     NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* prefix,
     const uint8_t* control_ticket128, const uint8_t* bulk_ticket128, int32_t timeout_ms,
     uint64_t maximum_bulk_bytes);
+// Dialer through WinHTTP (stage 4): `host` is a name or an address, `path_base` the public path before the prefix
+// (null = "/ws/link/"), secure 1 = wss:// (0 = ws://). pin32: SHA-256 of the server certificate's DER, or null for
+// Windows certificate validation. Nothing blocks; the rows advance the dial. 1 on success.
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_wss_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* path_base,
+    const char* prefix, int32_t secure, const uint8_t* pin32, const uint8_t* control_ticket128,
+    const uint8_t* bulk_ticket128, int32_t timeout_ms, uint64_t maximum_bulk_bytes);
 // State (0 waiting, 1 linked, 2 closed, 3 failed) and 16 counters, in this order: listen_port, account,
 // control_sent, control_received, bulk_bytes_sent, bulk_bytes_received, bulk_tensors_sent, bulk_tensors_received,
 // control_refused, bulk_refused, bulk_dropped, peers_refused, control_read_stalls, bulk_read_stalls,

@@ -184,10 +184,25 @@ inline void encode_bulk_header(uint8_t* b, BulkKind kind, uint64_t stream, uint6
     put_le(b + 16, offset, 8); put_le(b + 24, total, 8); put_le(b + 32, length, 4); put_le(b + 36, 0, 4);
 }
 
+// ---- one message stream: what a Link needs from each of its two sockets ---------------------------------------------
+// WsStream (a raw nonblocking socket, the listener side and the loopback dialer) and nodus_link_wss.h's WinHTTP stream
+// (wss:// through TLS) implement it. Every call returns at once.
+class Stream {
+public:
+    virtual ~Stream() = default;
+    virtual bool closed() const = 0;
+    // One binary message gathered from two parts; false when the bounded out queue cannot take it.
+    virtual bool queue(const uint8_t* a, size_t an, const uint8_t* b = nullptr, size_t bn = 0) = 0;
+    virtual void flush(size_t budget) = 0;
+    // True when one complete binary message is in `out`.
+    virtual bool next(std::vector<uint8_t>& out, size_t budget) = 0;
+    virtual void close(uint16_t code) = 0;
+};
+
 // ---- one WebSocket over one nonblocking socket ----------------------------------------------------------------------
 // Binary messages only (text is a protocol violation); ping answered, close echoed; fragments reassembled up to
 // max_message. The client side masks what it sends and requires unmasked input; the server side the reverse.
-class WsStream {
+class WsStream final : public Stream {
 public:
     WsStream(SOCKET s, bool client, size_t max_message, size_t out_limit, std::vector<uint8_t> leftover = {})
         : socket_(s), client_(client), max_message_(max_message), out_limit_(out_limit), rx_(std::move(leftover)) {
@@ -195,26 +210,26 @@ public:
         if (!WireSocket::set_nonblocking(s)) { WireSocket::close_socket(s); throw std::runtime_error("nonblocking socket refused"); }
         random_bytes(&mask_state_, sizeof(mask_state_)); mask_state_ |= 1;
     }
-    ~WsStream() { WireSocket::close_socket(socket_); }
+    ~WsStream() override { WireSocket::close_socket(socket_); }
     WsStream(const WsStream&) = delete;
     WsStream& operator=(const WsStream&) = delete;
 
-    bool closed() const { return closed_; }
+    bool closed() const override { return closed_; }
     size_t queued_bytes() const { return out_bytes_; }
     size_t frame_bytes(size_t n) const { return n + 2 + (n >= 65536 ? 8 : n >= 126 ? 2 : 0) + (client_ ? 4 : 0); }
     bool can_queue(size_t n) const { return !closed_ && !closing_ && n <= max_message_ && out_bytes_ + frame_bytes(n) <= out_limit_; }
     // One binary message gathered from two parts (header + body), so a bulk chunk is copied once.
-    bool queue(const uint8_t* a, size_t an, const uint8_t* b = nullptr, size_t bn = 0) {
+    bool queue(const uint8_t* a, size_t an, const uint8_t* b = nullptr, size_t bn = 0) override {
         if (!can_queue(an + bn)) return false;
         push_frame(2, a, an, b, bn); return true;
     }
     // Best effort close frame (code 1000 normal, 1008 policy, 1002 protocol), then the stream reads as closed.
-    void close(uint16_t code) {
+    void close(uint16_t code) override {
         if (closed_ || closing_) return;
         uint8_t c[2] = {uint8_t(code >> 8), uint8_t(code)};
         push_frame(8, c, 2, nullptr, 0); closing_ = true; flush(size_t(1) << 16); closed_ = true;
     }
-    void flush(size_t budget) {
+    void flush(size_t budget) override {
         while (!closed_ && !out_.empty() && budget) {
             auto& f = out_.front();
             size_t want = std::min(budget, f.size() - sent_);
@@ -226,7 +241,7 @@ public:
         }
     }
     // True when one complete binary message is in `out`. Reads at most `budget` bytes from the socket.
-    bool next(std::vector<uint8_t>& out, size_t budget) {
+    bool next(std::vector<uint8_t>& out, size_t budget) override {
         if (closed_) return false;
         if (parse(out)) return true;
         std::array<char, 65536> buf;
@@ -325,7 +340,7 @@ struct LinkStats {
 };
 class Link {
 public:
-    Link(std::unique_ptr<WsStream> control, std::unique_ptr<WsStream> bulk, Role role, uint64_t account, const LinkId& id)
+    Link(std::unique_ptr<Stream> control, std::unique_ptr<Stream> bulk, Role role, uint64_t account, const LinkId& id)
         : control_(std::move(control)), bulk_(std::move(bulk)), role_(role), account_(account), id_(id) {}
     Role role() const { return role_; }
     uint64_t account() const { return account_; }
@@ -433,7 +448,7 @@ private:
     }
     void violation() { ++stats_.protocol_violations; close(1002); }
 
-    std::unique_ptr<WsStream> control_, bulk_;
+    std::unique_ptr<Stream> control_, bulk_;
     Role role_; uint64_t account_; LinkId id_;
     LinkStats stats_;
     std::deque<ControlPacket> control_in_;

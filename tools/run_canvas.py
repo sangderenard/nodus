@@ -393,6 +393,14 @@ def _parse_compile_host(text: str):
     return parts[0], int(parts[1]), parts[2]
 
 
+def _parse_link_host(text: str):
+    # KEYFILE may hold a drive colon (C:/state/secrets/nodus_link.key); only the first three colons split.
+    parts = text.split(":", 3)
+    if len(parts) != 4 or not parts[0] or not parts[1] or not parts[2].isdigit() or not 0 < int(parts[2]) < 65536 or not parts[3]:
+        raise ValueError(f"--link-host expects ID:PREFIX:PORT:KEYFILE (PORT 1-65535), got {text!r}")
+    return parts[0], parts[1], int(parts[2]), parts[3]
+
+
 def _parse_cron(text: str):
     # JOBS_DIR may hold a drive colon (C:/jobs); only the first two colons split.
     parts = text.split(":", 2)
@@ -424,6 +432,10 @@ def main(argv=None) -> int:
     parser.add_argument("--cron", action="append", default=[], metavar="PREFIX:ENGINE_ID:JOBS_DIR",
                         help="attach the cron tool as an engine of an acquired prefix; JOBS_DIR/cron.table is its "
                              "schedule and it keeps cron.ledger, cron.log and one request file per run there")
+    parser.add_argument("--link-host", action="append", default=[], metavar="ID:PREFIX:PORT:KEYFILE",
+                        help="register a Nodus link host before the canvas loads (research case 98d49cb8): rows "
+                             "<ID>.control and <ID>.bulk over a 127.0.0.1:PORT listener for /ws/link/<PREFIX>/, tickets "
+                             "checked with the 32-byte KEYFILE (meowdoku link_tickets KEY_FILE); the canvas binds the rows")
     parser.add_argument("--compile-python", default=None,
                         help="python for the Turing compiler driver (default: this interpreter)")
     parser.add_argument("--turing-root", default=None,
@@ -460,6 +472,9 @@ def main(argv=None) -> int:
                 raise ValueError(f"--compile-host prefix {prefix!r} must also be given to --acquire")
         if len({(p, h) for p, h, _ in compile_hosts}) != len(compile_hosts):
             raise ValueError("--compile-host PREFIX:HOST_ID given twice")
+        link_hosts = [_parse_link_host(a) for a in args.link_host]
+        if len({i for i, _, _, _ in link_hosts}) != len(link_hosts):
+            raise ValueError("--link-host ID given twice")
         crons = [_parse_cron(a) for a in args.cron]
         for prefix, _engine_id, _jobs in crons:
             if prefix not in acquired:
@@ -485,6 +500,12 @@ def main(argv=None) -> int:
         with Graph() as graph:
             for prefix, capacity, loan in acquires:
                 graph.acquire_contract_pair(prefix, capacity, loan)
+            links = []
+            for link_id, link_prefix, link_port, key_file in link_hosts:   # before the load: the canvas binds the rows
+                with open(key_file, "rb") as handle:
+                    key = handle.read()
+                bound = graph.register_link_host(link_id, link_prefix, key, link_port)
+                links.append({"id": link_id, "prefix": link_prefix, "listen_port": bound})
             graph.load(args.canvas)
             attached = []
             try:
@@ -517,7 +538,7 @@ def main(argv=None) -> int:
                 ports.append({"prefix": prefix,
                               "listen_port": bound[0] if bound else declared,
                               "capacity": capacity, "edge": edge})
-            print(json.dumps({"canvas": args.canvas, "contract_ports": ports,
+            print(json.dumps({"canvas": args.canvas, "contract_ports": ports, "links": links,
                               "pid": os.getpid(), "console_port": console_port, "cron": cron_report}),
                   file=out, flush=True)
             next_t = time.perf_counter()

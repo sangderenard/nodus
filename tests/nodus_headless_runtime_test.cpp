@@ -582,6 +582,35 @@ static void test_link_rows_headless() {
     std::printf("test_link_rows_headless: OK (port %d)\n",port);
 }
 
+// Nodus link stage 4: the WinHTTP dialer endpoint (nodus_headless_register_link_wss_dialer, ws:// on this machine) and a
+// host endpoint in one graph; the dial is advanced only by nodus_headless_step.
+static void test_link_wss_dialer_headless() {
+    nodus::link::Key key{}; nodus::link::random_bytes(key.data(), key.size());
+    auto* graph=nodus_headless_create();REQUIRE(graph);
+    const int32_t port=nodus_headless_register_link_host(graph,"proof.wss.h","lab",0,key.data(),0);
+    REQUIRE(port>0);
+    const auto id=nodus::link::new_link_id();const uint64_t now=uint64_t(std::time(nullptr));
+    using nodus::link::Channel;using nodus::link::Role;
+    const auto c=nodus::link::sign_ticket(nodus::link::make_ticket(Channel::Control,Role::Dialer,id,"lab",43,now,60),key);
+    const auto b=nodus::link::sign_ticket(nodus::link::make_ticket(Channel::Bulk,Role::Dialer,id,"lab",43,now,60),key);
+    REQUIRE(nodus_headless_register_link_wss_dialer(graph,"proof.wss.d","localhost",uint16_t(port),nullptr,"lab",0,nullptr,
+                                                     c.data(),b.data(),5000,0));
+    for(const char* row:{"proof.wss.h.control","proof.wss.h.bulk","proof.wss.d.control","proof.wss.d.bulk"}){
+        GP_CanvasModuleDesc desc{};desc.w=desc.h=64;
+        const auto module=nodus_headless_add_module(graph,&desc);REQUIRE(module>=0);
+        REQUIRE(nodus_headless_bind_plugin_tool(graph,module,row)>=0);
+    }
+    int32_t hs=-1,ds=-1;uint64_t hv[16]={},dv[16]={};
+    const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+    while(!(hs==1&&ds==1)&&ds!=3&&std::chrono::steady_clock::now()<end){
+        REQUIRE(nodus_headless_step(graph,1.0/60.0));
+        REQUIRE(nodus_headless_link_report("proof.wss.h",&hs,hv));REQUIRE(nodus_headless_link_report("proof.wss.d",&ds,dv));
+    }
+    REQUIRE(hs==1&&ds==1);REQUIRE(hv[1]==43&&dv[1]==43);
+    nodus_headless_destroy(graph);
+    std::printf("test_link_wss_dialer_headless: OK (WinHTTP ws://localhost:%d)\n",port);
+}
+
 static void test_tcp_stream_row_registration() {
     SOCKET probe=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
     REQUIRE(probe!=INVALID_SOCKET);
@@ -632,5 +661,6 @@ int main() {
     test_contract_port_engine_reconnect_and_loan_ticks();
     test_tcp_stream_row_registration();
     test_link_rows_headless();
+    test_link_wss_dialer_headless();
     return 0;
 }

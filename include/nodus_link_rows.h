@@ -8,6 +8,7 @@
 // belong to whoever pops them. A refused input is restored to the stack with succeeded=false, as TcpByteStreamTool does.
 // Research case 98d49cb8520e44d092c5d134c37c3c32, stage 2. Include before <windows.h> (winsock).
 #include "nodus_link.h"
+#include "nodus_link_wss.h"
 #include "tool_registry.h"
 
 #include <cstdint>
@@ -25,7 +26,9 @@ struct LinkHostConfig {
 };
 struct LinkDialConfig {
     std::string id;
-    DialTarget target;
+    DialTarget target;              // the loopback passage (LinkDialer), used when `wss` is false
+    bool wss = false;               // dial with WinHTTP instead (WssDialer): wss:// or ws://, a name or an address
+    WssTarget wss_target;
     TicketBytes control_ticket{}, bulk_ticket{};
     uint64_t maximum_bulk_bytes = uint64_t(256) << 20;
 };
@@ -41,6 +44,7 @@ struct EndpointReport {
     uint64_t control_refused = 0;           // inputs restored: not linked, not one packet, FIFO full
     uint64_t bulk_dropped = 0;              // arrivals that could not become a tensor (descriptor, create, size)
     uint64_t peers_refused = 0;             // a second peer while one is linked
+    std::string reason;                     // why a wss dial failed (WinHTTP, TLS, pin), when it did
 };
 
 // Registers <id>.control and <id>.bulk; the listener is open on return (port in report). False on refusal.

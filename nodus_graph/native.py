@@ -1320,6 +1320,13 @@ class Graph:
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p,
                 ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_uint64)
             lib.nodus_headless_link_report.restype = ctypes.c_int32
+        lib._link_wss_abi = lib._link_abi and hasattr(lib, "nodus_headless_register_link_wss_dialer")
+        if lib._link_wss_abi:
+            lib.nodus_headless_register_link_wss_dialer.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_wss_dialer.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p, ctypes.c_char_p,
+                ctypes.c_int32, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_uint64)
+        if lib._link_abi:
             lib.nodus_headless_link_report.argtypes = (
                 ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_uint64))
         lib._contract_port_abi = True
@@ -1357,6 +1364,23 @@ class Graph:
                 self._handle, tool_id.encode("utf-8"), host.encode("utf-8"), int(port), prefix.encode("utf-8"),
                 bytes(control_ticket), bytes(bulk_ticket), int(timeout_ms), int(maximum_bulk_bytes)):
             raise RuntimeError(f"native link dialer registration refused: {tool_id}")
+
+    def register_link_wss_dialer(self, tool_id: str, host: str, port: int, prefix: str, control_ticket: bytes,
+                                 bulk_ticket: bytes, *, secure: bool = True, pin_sha256: Optional[bytes] = None,
+                                 path_base: str = "/ws/link/", timeout_ms: int = 10000, maximum_bulk_bytes: int = 0) -> None:
+        """Admit <tool_id>.control and <tool_id>.bulk over one WinHTTP dial: wss://host:port<path_base><prefix>/....
+
+        `pin_sha256` (32 bytes, SHA-256 of the server certificate DER) replaces CA validation with that one certificate."""
+        lib = self._link_lib()
+        if not lib._link_wss_abi:
+            raise RuntimeError("this nodus_headless library has no wss link dialer (nodus_headless_register_link_wss_dialer)")
+        if len(control_ticket) != 128 or len(bulk_ticket) != 128 or (pin_sha256 is not None and len(pin_sha256) != 32):
+            raise ValueError("tickets are 128 bytes and a pin is 32")
+        if not lib.nodus_headless_register_link_wss_dialer(
+                self._handle, tool_id.encode("utf-8"), host.encode("utf-8"), int(port), path_base.encode("utf-8"),
+                prefix.encode("utf-8"), 1 if secure else 0, None if pin_sha256 is None else bytes(pin_sha256),
+                bytes(control_ticket), bytes(bulk_ticket), int(timeout_ms), int(maximum_bulk_bytes)):
+            raise RuntimeError(f"native wss link dialer registration refused: {tool_id}")
 
     def link_report(self, tool_id: str) -> Optional[dict]:
         """{"state": waiting|linked|closed|failed, counters...} of a registered link endpoint, or None."""
