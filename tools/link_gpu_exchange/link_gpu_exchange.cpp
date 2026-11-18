@@ -118,6 +118,10 @@ struct Host {
     std::vector<std::vector<uint8_t>> results; std::vector<uint64_t> result_addresses; std::array<uint64_t, 6> remote_event{};
     double seed = 0; uint64_t remote_base = 0, local_base = 0;
     double sent_at = 0; Clock::time_point t0 = Clock::now();
+    // Roles: a requester offers its shader, sends a job and re-checks the result with its own dispatch; a worker
+    // accepts an offer and serves jobs. The two-process test runs both in each process; a volunteer is a worker only.
+    bool requester = true, worker = true;
+    std::string link_id;
 
     std::array<uint64_t, 32> library_call(std::array<uint64_t, 12> request, uint64_t payload) {
         const uint64_t command = make_tensor(NODUS_DTYPE_U64, 12, request.data(), sizeof(request));
@@ -152,28 +156,44 @@ struct Host {
         return {p, p + kLanes * sizeof(double)};
     }
 
-    bool setup(const fs::path& shader_dir, const std::string& link_id) {
-        if (!raw_stack_init_frame(frame, 1 << 16) || !session) { say("library refused"); return false; }
-        glsl = read_file(shader_dir / "spring_network_step.comp");
-        vulkan = read_file(shader_dir / "spring_network_step.direct-glsl.spv");
-        if (glsl.empty() || vulkan.empty() || vulkan.size() % 4) { say("shader files missing in %s", shader_dir.string()); return false; }
-        std::vector<uint32_t> words(vulkan.size() / 4); std::memcpy(words.data(), vulkan.data(), vulkan.size());
+    // The dispatch rows hold one shader per session: registered from this process's own files, or (a volunteer with
+    // no shader of its own) from the first offer it accepts.
+    bool register_shader(const std::vector<uint8_t>& spirv) {
+        if (spirv.empty() || spirv.size() % 4) return false;
+        std::vector<uint32_t> words(spirv.size() / 4); std::memcpy(words.data(), spirv.data(), spirv.size());
         if (!session.register_fabric_dispatch(words, 256)) { say("fabric dispatch registration refused"); return false; }
         dispatch = tool_registry_global().create("nodus.fabric.dispatch.vulkan." + std::to_string(kDevice));
+        if (!dispatch) { say("dispatch row missing"); return false; }
+        vulkan = spirv;
+        return true;
+    }
+    bool setup(const fs::path& shader_dir, const std::string& id) {
+        link_id = id;
+        if (!raw_stack_init_frame(frame, 1 << 16) || !session) { say("library refused"); return false; }
+        if (!shader_dir.empty()) {
+            glsl = read_file(shader_dir / "spring_network_step.comp");
+            auto spirv = read_file(shader_dir / "spring_network_step.direct-glsl.spv");
+            if (glsl.empty() || spirv.empty()) { say("shader files missing in %s", shader_dir.string()); return false; }
+            if (!register_shader(spirv)) return false;
+        }
         control = tool_registry_global().create(link_id + ".control"); bulk = tool_registry_global().create(link_id + ".bulk");
-        if (!dispatch || !control || !bulk) { say("rows missing"); return false; }
+        if (!control || !bulk) { say("rows missing"); return false; }
         std::array<uint64_t, 12> card{}; card[0] = 1; card[1] = kCard; card[2] = 901; card[4] = 512ull << 20;
         card[5] = card[6] = card[7] = 128ull << 20;
         auto r = library_call(card, 0);
         if (r[0] != 0) { say("card refused"); return false; }
-        char msg[200]; std::snprintf(msg, sizeof(msg), "host up: %zu GPU bank(s), shader GLSL %zu B, Vulkan %zu B",
-            session.library().device_count(), glsl.size(), vulkan.size()); say("%s", msg);
+        char msg[200]; std::snprintf(msg, sizeof(msg), "host up: %zu GPU bank(s), %s", session.library().device_count(),
+            vulkan.empty() ? "no shader of its own (takes the server's offer)" : ("shader GLSL " + std::to_string(glsl.size()) +
+            " B, Vulkan " + std::to_string(vulkan.size()) + " B").c_str()); say("%s", msg);
         return true;
     }
 
     void send_offer() {
         auto hg = sha256(glsl.data(), glsl.size()), hv = sha256(vulkan.data(), vulkan.size());
-        control_out.push_back(packet(Offer, {glsl.size(), vulkan.size(), get_le(hg.data(), 8), get_le(hv.data(), 8)}));
+        // the full SHA-256 of both products: a worker with no glslang accepts the Vulkan bytes on this digest alone
+        control_out.push_back(packet(Offer, {glsl.size(), vulkan.size(), get_le(hg.data(), 8), get_le(hg.data() + 8, 8),
+            get_le(hg.data() + 16, 8), get_le(hg.data() + 24, 8), get_le(hv.data(), 8), get_le(hv.data() + 8, 8),
+            get_le(hv.data() + 16, 8), get_le(hv.data() + 24, 8)}));
         bulk_out.push_back(make_tensor(NODUS_DTYPE_U8, glsl.size(), glsl.data(), glsl.size()));
         bulk_out.push_back(make_tensor(NODUS_DTYPE_U8, vulkan.size(), vulkan.data(), vulkan.size()));
     }
@@ -226,6 +246,27 @@ struct Host {
             auto& w = instructions.front();
             if (w[0] == Offer) {
                 if (offer_parts < 2) return;
+                auto digest_is = [&](const std::vector<uint8_t>& bytes, size_t at) {
+                    if (w.size() < at + 4) return false;
+                    auto d = sha256(bytes.data(), bytes.size());
+                    for (size_t i = 0; i < 4; ++i) if (get_le(d.data() + 8 * i, 8) != w[at + i]) return false;
+                    return true;
+                };
+                const bool digests = w.size() >= 11 && w[1] == offered_glsl.size() && w[2] == offered_vulkan.size() &&
+                                     digest_is(offered_glsl, 3) && digest_is(offered_vulkan, 7);
+                if (!digests) {
+                    control_out.push_back(packet(Accept, {1u, 0u, 0u}));
+                    say("offer REFUSED: the products do not match the offered SHA-256"); failed = true;
+                    instructions.pop_front(); continue;
+                }
+                if (glslang.empty()) {          // a volunteer: no compiler here, the digest is the check
+                    const bool usable = vulkan.empty() ? register_shader(offered_vulkan) : offered_vulkan == vulkan;
+                    control_out.push_back(packet(Accept, {usable ? 0u : 1u, 0u, usable ? 1u : 0u}));
+                    say(usable ? "offer accepted on its SHA-256 (no glslang here); dispatch rows hold the offered Vulkan"
+                               : "offer REFUSED: this session already holds a different shader");
+                    accepted_peer = usable; if (!usable) failed = true;
+                    instructions.pop_front(); continue;
+                }
                 if (!compiling) {
                     std::ofstream(work / "offered.comp", std::ios::binary).write(reinterpret_cast<const char*>(offered_glsl.data()), std::streamsize(offered_glsl.size()));
                     std::error_code ec; fs::remove(work / "offered.spv", ec);
@@ -291,11 +332,13 @@ struct Host {
         if (taken) { nodus_tensor_destroy(bulk_out.front()); bulk_out.pop_front(); }
         if (got) on_bulk(got);
         work_instructions();
-        if (peer_accepted_us && !requested) send_job();
+        if (requester && peer_accepted_us && !requested) send_job();
         check_results();
-        if (passed && served && !sent_done) { control_out.push_back(packet(Done, {1})); sent_done = true; }
+        if ((!requester || passed) && (!worker || served) && !sent_done) { control_out.push_back(packet(Done, {1})); sent_done = true; }
     }
-    bool finished() const { return failed || (passed && served && sent_done && peer_done && control_out.empty()); }
+    bool finished() const {
+        return failed || ((!requester || passed) && (!worker || served) && sent_done && peer_done && control_out.empty());
+    }
     ~Host() {
         for (auto t : early_bulk) nodus_tensor_destroy(t);
         for (auto t : control_out) nodus_tensor_destroy(t); for (auto t : bulk_out) nodus_tensor_destroy(t);
@@ -309,7 +352,10 @@ int serve(Host& h, const std::function<bool(const std::string&)>& linked, nodus:
     bool offered = false; std::string relay;
     while (Clock::now() < end && !h.finished()) {
         h.turn();
-        if (!offered && linked(h.control->id_cstr())) { h.send_offer(); offered = true; say("linked; offer sent (GLSL + Vulkan)"); }
+        if (!offered && linked(h.link_id)) {
+            offered = true;
+            if (h.requester) { h.send_offer(); say("linked; offer sent (GLSL + Vulkan)"); } else say("linked");
+        }
         if (peer) { peer->take(relay); size_t nl; while ((nl = relay.find('\n')) != std::string::npos) { std::printf("%s\n", relay.substr(0, nl).c_str()); relay.erase(0, nl + 1); } std::fflush(stdout); }
     }
     // let the last packets leave before the rows go
@@ -323,16 +369,19 @@ int serve(Host& h, const std::function<bool(const std::string&)>& linked, nodus:
         if (!peer->finished() || peer->exit_code() != 0) { say("peer process did not pass"); return 1; }
     }
     if (!h.finished() || h.failed) { say("FAILED (passed=%s)", h.passed ? "1" : "0"); return 1; }
-    say("PASSED: served the peer's GPU work and received ours back identical");
+    say(h.requester && h.worker ? "PASSED: served the peer's GPU work and received ours back identical"
+        : h.requester ? "PASSED: the volunteer's GPU result matched our own dispatch byte for byte" : "PASSED: served the server's GPU work");
     return 0;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
-    auto linked_report = [](const std::string& row) {
-        EndpointReport r; std::string id = row.substr(0, row.rfind('.'));
-        return link_endpoint_report(id, &r) && r.state == EndpointState::Linked;
+    auto linked_report = [](const std::string& id) {
+        EndpointReport r;
+        if (!link_endpoint_report(id, &r)) return false;
+        if (r.state == EndpointState::Failed && !r.reason.empty()) { say("dial failed: %s", r.reason); std::exit(1); }
+        return r.state == EndpointState::Linked;
     };
     if (mode == "run" && argc == 5) {
         g_who = "A";
@@ -370,6 +419,80 @@ int main(int argc, char** argv) {
         if (!h.setup(argv[5], "exchange.b")) return 1;
         return serve(h, linked_report, nullptr);
     }
+    if (mode == "volunteer") {
+        // The volunteer: no shader, no compiler, no listening port. It dials out (wss://, or ws:// with --ws), takes the
+        // server's offer on its digest, and serves the server's jobs on its GPU.
+        g_who = "volunteer";
+        std::string host = "127.0.0.1", prefix = "lab", pin_hex, control_hex, bulk_hex; int port = 443; bool ws = false;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i]; auto value = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
+            if (a == "--host") host = value(); else if (a == "--port") port = std::stoi(value()); else if (a == "--prefix") prefix = value();
+            else if (a == "--pin") pin_hex = value(); else if (a == "--ws") ws = true;
+            else if (a == "--control-ticket") control_hex = value(); else if (a == "--bulk-ticket") bulk_hex = value();
+            else { say("unknown argument %s", a); return 2; }
+        }
+        auto c = unhex(control_hex), b = unhex(bulk_hex), pin = unhex(pin_hex);
+        if (c.size() != kTicketBytes || b.size() != kTicketBytes || (!pin_hex.empty() && pin.size() != 32)) {
+            say("usage: volunteer --host H --port P --prefix X [--pin SHA256HEX] [--ws] --control-ticket HEX --bulk-ticket HEX"); return 2;
+        }
+        LinkDialConfig dc; dc.id = "volunteer"; dc.wss = true;
+        dc.wss_target.host = host; dc.wss_target.port = uint16_t(port); dc.wss_target.prefix = prefix; dc.wss_target.secure = !ws;
+        if (!pin.empty()) { dc.wss_target.pinned = true; std::memcpy(dc.wss_target.pin.data(), pin.data(), 32); }
+        std::memcpy(dc.control_ticket.data(), c.data(), kTicketBytes); std::memcpy(dc.bulk_ticket.data(), b.data(), kTicketBytes);
+        std::string err;
+        if (!register_link_dialer(tool_registry_global(), dc, &err)) { say("dialer refused: %s", err); return 1; }
+        int rc = 1;
+        {
+            Host h; h.requester = false; h.worker = true;
+            if (!h.setup({}, "volunteer")) return 1;
+            say("dialing %s", std::string(ws ? "ws://" : "wss://") + host + ":" + std::to_string(port) + "/ws/link/" + prefix + "/");
+            rc = serve(h, linked_report, nullptr);
+        }
+        unregister_link(tool_registry_global(), "volunteer");
+        return rc;
+    }
+    if (mode == "volunteer-test" && argc == 6) {
+        // The server side only requests and re-checks; a volunteer child process dials it through a TLS front (the test
+        // relay, where Apache stands in production) with a pinned certificate and no shader of its own.
+        g_who = "server";
+        const fs::path shader_dir = argv[2], work = argv[3]; fs::create_directories(work / "relay"); fs::create_directories(work / "volunteer");
+        Key key{}; random_bytes(key.data(), key.size());
+        LinkHostConfig hc; hc.id = "exchange.server"; hc.prefix = "lab"; hc.key = key;
+        uint16_t port = 0; std::string err;
+        if (!register_link_host(tool_registry_global(), hc, &port, &err)) { say("listener refused: %s", err); return 1; }
+        nodus::exec::Program rp; rp.path = argv[4]; rp.arguments = {argv[5], std::to_string(port), (work / "relay").string()};
+        rp.working_dir = (work / "relay").string();
+        nodus::exec::Child relay; std::string why, line;
+        if (!relay.start(rp, why)) { say("relay refused: %s", why); return 1; }
+        auto until = Clock::now() + std::chrono::seconds(30);
+        while (line.find('\n') == std::string::npos && Clock::now() < until && !relay.finished()) relay.take(line);
+        if (line.rfind("RELAY ", 0) != 0) { say("relay said: %s", line); relay.kill(); return 1; }
+        const std::string relay_port = line.substr(6, line.find(' ', 6) - 6);
+        const std::string pin = line.substr(line.find(' ', 6) + 1, 64);
+        int rc = 1;
+        {
+            Host h; h.requester = true; h.worker = false; h.seed = 0.5; h.remote_base = 3000; h.local_base = 7000;
+            if (!h.setup(shader_dir, "exchange.server")) return 1;
+            const auto id = new_link_id(); const uint64_t now = uint64_t(std::time(nullptr));
+            auto c = sign_ticket(make_ticket(Channel::Control, Role::Dialer, id, "lab", 42, now, 120), key);
+            auto b = sign_ticket(make_ticket(Channel::Bulk, Role::Dialer, id, "lab", 42, now, 120), key);
+            nodus::exec::Program vp; vp.path = fs::absolute(argv[0]).string(); vp.working_dir = (work / "volunteer").string();
+            vp.arguments = {"volunteer", "--host", "127.0.0.1", "--port", relay_port, "--prefix", "lab", "--pin", pin,
+                            "--control-ticket", hex(c.data(), c.size()), "--bulk-ticket", hex(b.data(), b.size())};
+            nodus::exec::Child volunteer;
+            if (!volunteer.start(vp, why)) { say("volunteer refused: %s", why); return 1; }
+            say("listening on 127.0.0.1:%s; the TLS front and a volunteer process started", std::to_string(port) + " (front 127.0.0.1:" + relay_port + ")");
+            rc = serve(h, linked_report, &volunteer);
+        }
+        relay.finish_input();
+        auto stop = Clock::now() + std::chrono::seconds(5);
+        while (!relay.finished() && Clock::now() < stop) { std::string sink; relay.take(sink); }
+        if (!relay.finished()) relay.kill();
+        unregister_link(tool_registry_global(), "exchange.server");
+        return rc;
+    }
     std::printf("usage: link_gpu_exchange run <shader-dir> <work-dir> <glslangValidator>\n");
+    std::printf("       link_gpu_exchange volunteer --host H --port P --prefix X [--pin SHA256HEX] [--ws] --control-ticket HEX --bulk-ticket HEX\n");
+    std::printf("       link_gpu_exchange volunteer-test <shader-dir> <work-dir> <python with cryptography> <tls_relay.py>\n");
     return 2;
 }
