@@ -1415,6 +1415,14 @@ add_executable(test_spectral_wave_vulkan
   tests/spectral_wave_vulkan_test.cpp)
 target_link_libraries(test_spectral_wave_vulkan PRIVATE canvas_tables_static)
 target_compile_features(test_spectral_wave_vulkan PRIVATE cxx_std_20)
+# Nodus link stage 5 (research case 98d49cb8520e44d092c5d134c37c3c32): two Nodus host processes share GPU work over
+# the link; the shader travels as GLSL + its Vulkan SDK (glslang) SPIR-V.
+#   link_gpu_exchange run <turing spring shader dir> <work dir> <glslangValidator>
+if(WIN32)
+  add_executable(link_gpu_exchange tools/link_gpu_exchange/link_gpu_exchange.cpp)
+  target_link_libraries(link_gpu_exchange PRIVATE canvas_tables_static ws2_32 bcrypt)
+  target_compile_features(link_gpu_exchange PRIVATE cxx_std_20)
+endif()
 add_executable(test_tcp_byte_stream_tool tests/tcp_byte_stream_tool_test.cpp)
 target_link_libraries(test_tcp_byte_stream_tool PRIVATE canvas_tables_static)
 target_compile_features(test_tcp_byte_stream_tool PRIVATE cxx_std_20)

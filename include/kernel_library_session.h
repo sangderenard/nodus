@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu_shader_job_tool.h"
+#include "gpu_fabric_dispatch_tool.h"
 #include "fftfree_tool.h"
 #include "wave_t4_state_tool.h"
 #include "kernel_pipeline_tool.h"
@@ -50,6 +51,25 @@ public:
         if(!register_gpu_shader_job(registry_,*library_,contract)){
             // The registrar may have inserted earlier device rows before a
             // later registration failed. All ids were absent at preflight.
+            for(const auto& id:ids)registry_.unregister_tool(id);
+            return false;
+        }
+        registered_.insert(registered_.end(),ids.begin(),ids.end());
+        return true;
+    }
+
+    // The fabric dispatch rows nodus.fabric.dispatch.vulkan.<device>, one per GPU bank, over this owner's library
+    // (gpu_fabric_dispatch_tool.h); unregistered with the session like the other rows.
+    bool register_fabric_dispatch(const std::vector<std::uint32_t>& shader,std::uint32_t local_size,
+                                  GpuShaderWorkContract contract={}){
+        if(!library_||library_->device_count()==0)return false;
+        std::vector<std::string> ids;
+        for(std::size_t device=0;device<library_->device_count();device++){
+            auto id="nodus.fabric.dispatch.vulkan."+std::to_string(device);
+            if(registry_.find(id))return false;
+            ids.push_back(std::move(id));
+        }
+        if(!register_gpu_fabric_dispatchers(registry_,*library_,shader,local_size,contract)){
             for(const auto& id:ids)registry_.unregister_tool(id);
             return false;
         }
