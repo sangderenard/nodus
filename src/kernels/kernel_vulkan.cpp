@@ -243,11 +243,19 @@ VulkanDeviceInfo device_info(VkPhysicalDevice physical, std::uint32_t index) {
     info.max_storage_buffers = std::min(properties.limits.maxPerStageDescriptorStorageBuffers,
                                         properties.limits.maxDescriptorSetStorageBuffers);
     info.max_storage_buffer_bytes = properties.limits.maxStorageBufferRange;
+    info.max_compute_invocations = properties.limits.maxComputeWorkGroupInvocations;
+    for (int axis = 0; axis < 3; ++axis) info.max_compute_size[axis] = properties.limits.maxComputeWorkGroupSize[axis];
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(physical, &features);
+    info.shader_float64 = features.shaderFloat64 == VK_TRUE;
     if (properties.apiVersion >= VK_API_VERSION_1_1) {
         VkPhysicalDeviceIDProperties ids{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        ids.pNext = &subgroup;
         VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         props.pNext = &ids;
         vkGetPhysicalDeviceProperties2(physical, &props);
+        info.subgroup_size = subgroup.subgroupSize;
         std::copy_n(ids.deviceUUID, info.uuid.size(), info.uuid.begin());
         std::copy_n(ids.deviceLUID, info.luid.size(), info.luid.begin());
         info.uuid_valid = true;
