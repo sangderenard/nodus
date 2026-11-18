@@ -2,6 +2,7 @@
 
 #include "gpu_shader_job_tool.h"
 #include "gpu_fabric_dispatch_tool.h"
+#include "fabric_spring_state_tool.h"
 #include "fftfree_tool.h"
 #include "wave_t4_state_tool.h"
 #include "kernel_pipeline_tool.h"
@@ -75,6 +76,14 @@ public:
         }
         registered_.insert(registered_.end(),ids.begin(),ids.end());
         return true;
+    }
+
+    // The fabric row on this library (fabric_spring_state_tool.h): its stage rows, law rows, pipeline and program row
+    // `row_id` with backend "cpu" or "vulkan.<device>", its state at `base` on `card`.
+    bool register_fabric_spring(const FabricSpringProducts& products,const std::string& row_id,
+                                const std::string& backend,std::uint64_t card,std::uint64_t base){
+        if(!library_||registry_.find(row_id))return false;
+        return nodus::gpu::register_fabric_spring(registry_,*library_,products,row_id,backend,card,base,&registered_);
     }
 
     bool register_pipeline(std::string id,
