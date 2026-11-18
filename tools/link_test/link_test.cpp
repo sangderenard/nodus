@@ -5,8 +5,6 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
-#include <future>
-#include <thread>
 
 using namespace nodus::link;
 using Clock = std::chrono::steady_clock;
@@ -29,12 +27,13 @@ static Tickets tickets_for(const Key& key, const LinkId& id, uint64_t account, c
             sign_ticket(make_ticket(Channel::Bulk, Role::Dialer, id, prefix, account, t, life), key)};
 }
 
-// The dial blocks on the upgrade answer, so it runs on its own thread while this one polls the listener.
+// One thread: the dialer and the listener are both polled until the dialer is ready or refused.
 static std::unique_ptr<Link> dial(LinkListener& l, const TicketBytes& c, const TicketBytes& b, const std::string& prefix = kPrefix) {
     DialTarget t; t.port = l.port(); t.prefix = prefix; t.timeout_ms = 3000;
-    auto f = std::async(std::launch::async, [&] { return dial_link(t, c, b); });
-    while (f.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) l.poll(now_s());
-    return f.get();
+    LinkDialer d(t, c, b);
+    while (!d.ready() && !d.failed()) { d.poll(); l.poll(now_s()); }
+    if (d.failed()) std::printf("  dialer: %s\n", d.reason());
+    return d.take();
 }
 static std::unique_ptr<Link> wait_take(LinkListener& l, Link* dialer, int ms = 2000) {
     auto end = Clock::now() + std::chrono::milliseconds(ms);
@@ -192,6 +191,19 @@ int main() {
         refused(listener, "halves of two accounts", c, b, &ListenerCounters::refused_pair);
     }
     { auto t = tickets_for(key, new_link_id(), 42); refused(listener, "unknown path", t.control, t.bulk, &ListenerCounters::refused_handshake, "nope"); }
+
+    {   // Nobody listening: the dialer reports the refusal from poll(), each poll returning at once.
+        DialTarget t; t.port = 1; t.prefix = kPrefix; t.timeout_ms = 3000;
+        auto tk = tickets_for(key, new_link_id(), 42);
+        LinkDialer d(t, tk.control, tk.bulk);
+        double worst = 0; auto t0 = Clock::now();
+        while (!d.ready() && !d.failed()) {
+            auto a = Clock::now(); d.poll(); worst = std::max(worst, std::chrono::duration<double>(Clock::now() - a).count());
+        }
+        double total = std::chrono::duration<double>(Clock::now() - t0).count();
+        CHECK(d.failed() && worst < 0.01, "closed port: failed=%d worst poll %.4f s", int(d.failed()), worst);
+        std::printf("refused closed port: %s after %.3f s, longest poll %.6f s\n", d.reason(), total, worst);
+    }
 
     // The first link is untouched by the refusals.
     control_both_ways(*dialer, *host, listener, 100, "after refusals");

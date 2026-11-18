@@ -13,8 +13,8 @@
 // and only then is a Link handed out. A ticket is accepted once per channel.
 //
 // Nonblocking, bounded work per poll(); every queue is bounded and refuses when full; when an incoming queue is full
-// the socket is simply not read (TCP backpressure), counted in LinkStats. The one blocking call is dial_link(), at
-// setup. Windows: crypto from CNG (bcrypt.lib), sockets from ws2_32.
+// the socket is simply not read (TCP backpressure), counted in LinkStats. Nothing blocks: listener, dialer and
+// link are all advanced by poll(). Windows: crypto from CNG (bcrypt.lib), sockets from ws2_32.
 #include "contract_listener.h"   // ensure_sockets, WireSocket socket helpers
 #ifdef _WIN32
 #include <ws2tcpip.h>
@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -612,55 +613,110 @@ private:
     std::deque<std::unique_ptr<Link>> ready_;
 };
 
-// ---- dialer (blocking, at setup) ------------------------------------------------------------------------------------
+// ---- dialer (polled, never blocks) ----------------------------------------------------------------------------------
 // Plain ws:// to a LinkListener on this machine, or to whatever terminates TLS for it. The public wss:// dial-out is
-// stage 4 (WinHTTP, OS TLS); this is the loopback passage both stages share.
+// stage 4; this is the loopback passage both share. Construct, then poll() each tick until ready() or failed(); take()
+// hands out the Link. Nonblocking connect, upgrade and ticket; numeric IPv4 only (no resolver, which would block).
 struct DialTarget { std::string host = "127.0.0.1"; uint16_t port = 0; std::string prefix; int timeout_ms = 5000; };
-namespace detail {
-inline std::unique_ptr<WsStream> dial_one(const DialTarget& t, Channel channel, const TicketBytes& ticket) {
-    contracts::ensure_sockets();
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return nullptr;
-    DWORD to = DWORD(t.timeout_ms);
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(t.port);
-    if (inet_pton(AF_INET, t.host.c_str(), &a.sin_addr) != 1 || connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
-        WireSocket::close_socket(s); return nullptr;
+class LinkDialer {
+public:
+    LinkDialer(DialTarget target, const TicketBytes& control_ticket, const TicketBytes& bulk_ticket)
+        : target_(std::move(target)), deadline_(std::chrono::steady_clock::now() + std::chrono::milliseconds(target_.timeout_ms)) {
+        contracts::ensure_sockets();
+        halves_[0].channel = Channel::Control; halves_[0].ticket = control_ticket;
+        halves_[1].channel = Channel::Bulk; halves_[1].ticket = bulk_ticket;
+        std::memcpy(id_.data(), control_ticket.data() + 8, 16);      // unverified: the dialer holds no key
+        account_ = get_le(control_ticket.data() + 56, 8);
+        for (auto& h : halves_) if (!start(h)) { fail(); return; }
     }
-    uint8_t raw[16]; random_bytes(raw, sizeof(raw)); std::string key = base64(raw, sizeof(raw));
-    std::string req = "GET /ws/link/" + t.prefix + "/" + channel_name(channel) + " HTTP/1.1\r\nHost: " + t.host + ":" + std::to_string(t.port)
-        + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
-    for (size_t sent = 0; sent < req.size();) {
-        int n = ::send(s, req.data() + sent, int(req.size() - sent), 0);
-        if (n <= 0) { WireSocket::close_socket(s); return nullptr; }
-        sent += size_t(n);
+    ~LinkDialer() { for (auto& h : halves_) if (h.s != INVALID_SOCKET) WireSocket::close_socket(h.s); }
+    LinkDialer(const LinkDialer&) = delete;
+    LinkDialer& operator=(const LinkDialer&) = delete;
+    bool failed() const { return failed_; }
+    bool ready() const { return !failed_ && halves_[0].ws && halves_[1].ws && !link_taken_; }
+    const char* reason() const { return reason_; }
+    void poll() {
+        if (failed_ || ready() || link_taken_) return;
+        if (std::chrono::steady_clock::now() > deadline_) { fail("timed out"); return; }
+        for (auto& h : halves_) if (!h.ws && !advance(h)) { fail(reason_ ? reason_ : "refused"); return; }
     }
-    std::string head; char buf[2048]; size_t end = std::string::npos;
-    while (end == std::string::npos) {
-        int n = ::recv(s, buf, sizeof(buf), 0);
-        if (n <= 0 || head.size() > 8192) { WireSocket::close_socket(s); return nullptr; }
-        head.append(buf, size_t(n)); end = head.find("\r\n\r\n");
+    std::unique_ptr<Link> take() {
+        if (!ready()) return nullptr;
+        link_taken_ = true;
+        return std::make_unique<Link>(std::move(halves_[0].ws), std::move(halves_[1].ws), Role::Dialer, account_, id_);
     }
-    std::vector<uint8_t> leftover(head.begin() + ptrdiff_t(end + 4), head.end());
-    head.resize(end + 2);
-    std::string first; std::map<std::string, std::string> h;
-    if (!parse_http(head, first, h) || first.rfind("HTTP/1.1 101", 0) != 0 || h["sec-websocket-accept"] != websocket_accept(key)) {
-        WireSocket::close_socket(s); return nullptr;
+
+private:
+    enum class Stage { Connect, Send, Read };
+    struct Half {
+        Channel channel = Channel::Control; TicketBytes ticket{};
+        SOCKET s = INVALID_SOCKET; Stage stage = Stage::Connect;
+        std::string request, head, key; size_t sent = 0;
+        std::unique_ptr<WsStream> ws;
+    };
+    void fail(const char* why = "refused") {
+        failed_ = true; if (!reason_) reason_ = why;
+        for (auto& h : halves_) { if (h.s != INVALID_SOCKET) { WireSocket::close_socket(h.s); h.s = INVALID_SOCKET; } h.ws.reset(); }
     }
-    size_t max_message = channel == Channel::Control ? kControlPacketBytes : kBulkHeaderBytes + kBulkChunkBytes;
-    size_t out_limit = channel == Channel::Control ? kControlQueuePackets * (kControlPacketBytes + 8) : kBulkWindowBytes + kBulkHeaderBytes + 16;
-    auto ws = std::make_unique<WsStream>(s, true, max_message, out_limit, std::move(leftover));
-    if (!ws->queue(ticket.data(), ticket.size())) return nullptr;
-    ws->flush(kTicketBytes + 16);
-    return ws;
-}
-}  // namespace detail
-// Both tickets name the same link; their account and link id are read back (unverified: the dialer holds no key).
-inline std::unique_ptr<Link> dial_link(const DialTarget& t, const TicketBytes& control_ticket, const TicketBytes& bulk_ticket) {
-    auto c = detail::dial_one(t, Channel::Control, control_ticket); if (!c) return nullptr;
-    auto b = detail::dial_one(t, Channel::Bulk, bulk_ticket); if (!b) return nullptr;
-    LinkId id{}; std::memcpy(id.data(), control_ticket.data() + 8, 16);
-    return std::make_unique<Link>(std::move(c), std::move(b), Role::Dialer, get_le(control_ticket.data() + 56, 8), id);
-}
+    bool start(Half& h) {
+        h.s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (h.s == INVALID_SOCKET || !WireSocket::set_nonblocking(h.s)) { reason_ = "socket refused"; return false; }
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(target_.port);
+        if (inet_pton(AF_INET, target_.host.c_str(), &a.sin_addr) != 1) { reason_ = "host is not a numeric IPv4 address"; return false; }
+        if (connect(h.s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 && WSAGetLastError() != WSAEWOULDBLOCK) { reason_ = "connect refused"; return false; }
+        uint8_t raw[16]; random_bytes(raw, sizeof(raw)); h.key = base64(raw, sizeof(raw));
+        h.request = "GET /ws/link/" + target_.prefix + "/" + channel_name(h.channel) + " HTTP/1.1\r\nHost: " + target_.host + ":"
+            + std::to_string(target_.port) + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + h.key
+            + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        return true;
+    }
+    // False on refusal (reason_ set); true while in progress or done.
+    bool advance(Half& h) {
+        if (h.stage == Stage::Connect) {
+            fd_set w, e; FD_ZERO(&w); FD_ZERO(&e); FD_SET(h.s, &w); FD_SET(h.s, &e);
+            timeval zero{0, 0};
+            int n = select(0, nullptr, &w, &e, &zero);           // zero timeout: a readiness query, not a wait
+            if (n < 0) { reason_ = "select refused"; return false; }
+            if (n == 0) return true;
+            int err = 0; int len = sizeof(err);
+            getsockopt(h.s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+            if (FD_ISSET(h.s, &e) || err) { reason_ = "connect refused"; return false; }
+            h.stage = Stage::Send;
+        }
+        if (h.stage == Stage::Send) {
+            int n = ::send(h.s, h.request.data() + h.sent, int(h.request.size() - h.sent), 0);
+            if (n < 0 && !WireSocket::would_block()) { reason_ = "send refused"; return false; }
+            if (n > 0) h.sent += size_t(n);
+            if (h.sent < h.request.size()) return true;
+            h.stage = Stage::Read;
+        }
+        char buf[2048];
+        int n = ::recv(h.s, buf, sizeof(buf), 0);
+        if (n == 0 || (n < 0 && !WireSocket::would_block())) { reason_ = "upgrade refused"; return false; }
+        if (n < 0) return true;
+        h.head.append(buf, size_t(n));
+        size_t end = h.head.find("\r\n\r\n");
+        if (end == std::string::npos) { if (h.head.size() > 8192) { reason_ = "upgrade answer too long"; return false; } return true; }
+        std::vector<uint8_t> leftover(h.head.begin() + ptrdiff_t(end + 4), h.head.end());
+        h.head.resize(end + 2);
+        std::string first; std::map<std::string, std::string> hd;
+        if (!detail::parse_http(h.head, first, hd) || first.rfind("HTTP/1.1 101", 0) != 0 || hd["sec-websocket-accept"] != websocket_accept(h.key)) {
+            reason_ = "upgrade refused"; return false;
+        }
+        size_t max_message = h.channel == Channel::Control ? kControlPacketBytes : kBulkHeaderBytes + kBulkChunkBytes;
+        size_t out_limit = h.channel == Channel::Control ? kControlQueuePackets * (kControlPacketBytes + 8) : kBulkWindowBytes + kBulkHeaderBytes + 16;
+        SOCKET s = h.s; h.s = INVALID_SOCKET;
+        h.ws = std::make_unique<WsStream>(s, true, max_message, out_limit, std::move(leftover));
+        if (!h.ws->queue(h.ticket.data(), h.ticket.size())) { reason_ = "ticket refused by own queue"; return false; }
+        h.ws->flush(kTicketBytes + 16);                           // what does not go now goes on the Link's first poll
+        return true;
+    }
+
+    DialTarget target_;
+    std::chrono::steady_clock::time_point deadline_;
+    Half halves_[2];
+    LinkId id_{}; uint64_t account_ = 0;
+    bool failed_ = false, link_taken_ = false;
+    const char* reason_ = nullptr;
+};
 }  // namespace nodus::link
