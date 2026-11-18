@@ -128,6 +128,23 @@ NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_byte_stream(
 NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_broadcast(
     NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
     uint64_t maximum_frame_bytes, uint32_t max_readers);
+// Nodus link (include/nodus_link_rows.h; research case 98d49cb8520e44d092c5d134c37c3c32): admits two rows,
+// <tool_id>.control and <tool_id>.bulk, sharing one endpoint; bind them with nodus_headless_bind_plugin_tool.
+// Host: a 127.0.0.1 listener on `port` (0 = ephemeral) for /ws/link/<prefix>/{control,bulk}; tickets are checked
+// with the 32-byte key. Returns the bound port, 0 on refusal. maximum_bulk_bytes 0 = 256 MiB.
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_host(
+    NodusHeadlessGraph* g, const char* tool_id, const char* prefix, uint16_t port,
+    const uint8_t* key32, uint64_t maximum_bulk_bytes);
+// Dialer: numeric IPv4 `host`:`port`, the two 128-byte tickets the issuing service gave. 1 on success.
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* prefix,
+    const uint8_t* control_ticket128, const uint8_t* bulk_ticket128, int32_t timeout_ms,
+    uint64_t maximum_bulk_bytes);
+// State (0 waiting, 1 linked, 2 closed, 3 failed) and 16 counters, in this order: listen_port, account,
+// control_sent, control_received, bulk_bytes_sent, bulk_bytes_received, bulk_tensors_sent, bulk_tensors_received,
+// control_refused, bulk_refused, bulk_dropped, peers_refused, control_read_stalls, bulk_read_stalls,
+// protocol_violations, refused_full (control + bulk). 1 when the endpoint is registered.
+NODUS_HEADLESS_API int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
     NodusHeadlessGraph* g, int32_t module_idx,
     const GP_CanvasModuleRowDesc* rows, int32_t row_count);

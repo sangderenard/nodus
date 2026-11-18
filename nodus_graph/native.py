@@ -1308,8 +1308,65 @@ class Graph:
             lib.nodus_headless_detach_cron.argtypes = (ctypes.c_char_p, ctypes.c_uint64)
             lib.nodus_headless_cron_stats.restype = ctypes.c_int32
             lib.nodus_headless_cron_stats.argtypes = (ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64))
+        # The Nodus link rows (research case 98d49cb8520e44d092c5d134c37c3c32) arrived after the cron tool; an older library
+        # still serves everything else and refuses only register_link_host/register_link_dialer/link_report, by name.
+        lib._link_abi = hasattr(lib, "nodus_headless_register_link_host")
+        if lib._link_abi:
+            lib.nodus_headless_register_link_host.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_host.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p, ctypes.c_uint64)
+            lib.nodus_headless_register_link_dialer.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_dialer.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p,
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_uint64)
+            lib.nodus_headless_link_report.restype = ctypes.c_int32
+            lib.nodus_headless_link_report.argtypes = (
+                ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_uint64))
         lib._contract_port_abi = True
         return lib
+
+    _LINK_STATES = ("waiting", "linked", "closed", "failed")
+    _LINK_COUNTERS = ("listen_port", "account", "control_sent", "control_received", "bulk_bytes_sent", "bulk_bytes_received",
+                      "bulk_tensors_sent", "bulk_tensors_received", "control_refused", "bulk_refused", "bulk_dropped",
+                      "peers_refused", "control_read_stalls", "bulk_read_stalls", "protocol_violations", "refused_full")
+
+    def _link_lib(self):
+        lib = self._contract_abi()
+        if not lib._link_abi:
+            raise RuntimeError("this nodus_headless library has no link rows (nodus_headless_register_link_host)")
+        return lib
+
+    def register_link_host(self, tool_id: str, prefix: str, key: bytes, port: int = 0, maximum_bulk_bytes: int = 0) -> int:
+        """Admit <tool_id>.control and <tool_id>.bulk over a 127.0.0.1 link listener; returns the bound port.
+
+        `key` is the 32-byte ticket key (meowdoku link_tickets.KEY_FILE); place the two rows as PluginTool rows."""
+        if len(key) != 32:
+            raise ValueError("the link key is 32 bytes")
+        bound = int(self._link_lib().nodus_headless_register_link_host(
+            self._handle, tool_id.encode("utf-8"), prefix.encode("utf-8"), int(port), bytes(key), int(maximum_bulk_bytes)))
+        if bound <= 0:
+            raise RuntimeError(f"native link host registration refused: {tool_id}")
+        return bound
+
+    def register_link_dialer(self, tool_id: str, host: str, port: int, prefix: str, control_ticket: bytes, bulk_ticket: bytes,
+                             timeout_ms: int = 5000, maximum_bulk_bytes: int = 0) -> None:
+        """Admit <tool_id>.control and <tool_id>.bulk over one dial to host:port with the issued tickets (128 bytes each)."""
+        if len(control_ticket) != 128 or len(bulk_ticket) != 128:
+            raise ValueError("each link ticket is 128 bytes")
+        if not self._link_lib().nodus_headless_register_link_dialer(
+                self._handle, tool_id.encode("utf-8"), host.encode("utf-8"), int(port), prefix.encode("utf-8"),
+                bytes(control_ticket), bytes(bulk_ticket), int(timeout_ms), int(maximum_bulk_bytes)):
+            raise RuntimeError(f"native link dialer registration refused: {tool_id}")
+
+    def link_report(self, tool_id: str) -> Optional[dict]:
+        """{"state": waiting|linked|closed|failed, counters...} of a registered link endpoint, or None."""
+        lib = self._link_lib()
+        state, out = ctypes.c_int32(), (ctypes.c_uint64 * 16)()
+        if not lib.nodus_headless_link_report(tool_id.encode("utf-8"), ctypes.byref(state), out):
+            return None
+        report = {name: int(value) for name, value in zip(self._LINK_COUNTERS, out)}
+        report["state"] = self._LINK_STATES[state.value] if 0 <= state.value < 4 else str(state.value)
+        return report
 
     def acquire_contract_pair(self, prefix: str, capacity: int, loan_ticks: Optional[int] = None) -> None:
         """Create the process-owned `<prefix>.market` / `<prefix>.worker` plugin rows.

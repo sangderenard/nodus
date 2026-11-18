@@ -1009,7 +1009,7 @@ add_executable(nodus_headless_runtime_test
 target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
 if(WIN32)
-  target_link_libraries(nodus_headless_runtime_test PRIVATE ws2_32)
+  target_link_libraries(nodus_headless_runtime_test PRIVATE ws2_32 bcrypt)  # bcrypt: the link test signs tickets (nodus_link.h)
 endif()
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)

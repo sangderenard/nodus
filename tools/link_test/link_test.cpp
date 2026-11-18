@@ -147,7 +147,22 @@ static void refused(LinkListener& l, const char* label, const TicketBytes& c, co
     std::printf("refused %s\n", label);
 }
 
-int main() {
+// `link_test vector`: one ticket from fixed fields, as hex, the known answer other issuers (turing link_tickets.py)
+// must reproduce byte for byte. key = 00..1f, link id = 10..1f, prefix "lab", account 42, issued 1795000000,
+// expires 1795000120, nonce = a0..af, channel control, role dialer.
+static int print_vector() {
+    Key key{}; for (size_t i = 0; i < key.size(); ++i) key[i] = uint8_t(i);
+    Ticket t; t.channel = Channel::Control; t.role = Role::Dialer;
+    for (size_t i = 0; i < 16; ++i) { t.link_id[i] = uint8_t(0x10 + i); t.nonce[i] = uint8_t(0xA0 + i); }
+    t.prefix_hash = prefix_hash("lab"); t.account = 42; t.issued_at = 1795000000; t.expires_at = 1795000120;
+    auto b = sign_ticket(t, key);
+    for (auto x : b) std::printf("%02x", x);
+    std::printf("\n");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "vector") == 0) return print_vector();
     Key key{}; random_bytes(key.data(), key.size());
     ListenerConfig cfg; cfg.prefix = kPrefix; cfg.key = key;
     LinkListener listener(cfg);

@@ -4,6 +4,7 @@
 #include "turing_compile_host_tool.h"
 #include "cron_tool.h"
 #include "tcp_byte_stream_tool.h"
+#include "nodus_link_rows.h"
 #include "nodus_headless_abi.h"
 
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
@@ -63,6 +64,7 @@ struct NodusHeadlessGraph {
     std::unordered_map<std::string, PortBinding> output_ports;
     std::vector<EdgeBinding> edges;
     std::vector<std::string> registered_tcp_stream_rows;
+    std::vector<std::string> registered_links;  // nodus::link endpoints (two rows each)
     gp_mem_backend_handle_t vulkan_backend = nullptr;
 
     std::mutex events_mu;
@@ -396,6 +398,8 @@ extern "C" void nodus_headless_destroy(NodusHeadlessGraph* g) {
     if (g->ctx) gp_canvas_destroy(g->ctx);
     for (const auto& id : g->registered_tcp_stream_rows)
         tool_registry_global().unregister_tool(id);
+    for (const auto& id : g->registered_links)
+        nodus::link::unregister_link(tool_registry_global(), id);
     if (g->vulkan_backend) gp_mem_backend_release(g->vulkan_backend);
     delete g;
 }
@@ -429,6 +433,58 @@ extern "C" int32_t nodus_headless_register_tcp_broadcast(
     if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
         return 0;
     g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_register_link_host(
+    NodusHeadlessGraph* g, const char* tool_id, const char* prefix, uint16_t port,
+    const uint8_t* key32, uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !prefix || !*prefix || !key32) return 0;
+    nodus::link::LinkHostConfig config;
+    config.id = tool_id; config.prefix = prefix; config.port = port;
+    std::memcpy(config.key.data(), key32, config.key.size());
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    uint16_t bound = 0; std::string error;
+    if (!nodus::link::register_link_host(tool_registry_global(), std::move(config), &bound, &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_host: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return bound;
+}
+
+extern "C" int32_t nodus_headless_register_link_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* prefix,
+    const uint8_t* control_ticket128, const uint8_t* bulk_ticket128, int32_t timeout_ms,
+    uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !host || !prefix || !*prefix || !port ||
+        !control_ticket128 || !bulk_ticket128) return 0;
+    nodus::link::LinkDialConfig config;
+    config.id = tool_id; config.target.host = host; config.target.port = port; config.target.prefix = prefix;
+    if (timeout_ms > 0) config.target.timeout_ms = timeout_ms;
+    std::memcpy(config.control_ticket.data(), control_ticket128, config.control_ticket.size());
+    std::memcpy(config.bulk_ticket.data(), bulk_ticket128, config.bulk_ticket.size());
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    std::string error;
+    if (!nodus::link::register_link_dialer(tool_registry_global(), std::move(config), &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_dialer: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16) {
+    nodus::link::EndpointReport r;
+    if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;
+    if (state) *state = static_cast<int32_t>(r.state);
+    if (out16) {
+        const uint64_t v[16] = {r.listen_port, r.account, r.link.control_sent, r.link.control_received,
+            r.link.bulk_bytes_sent, r.link.bulk_bytes_received, r.bulk_tensors_sent, r.bulk_tensors_received,
+            r.control_refused, r.bulk_refused, r.bulk_dropped, r.peers_refused, r.link.control_read_stalls,
+            r.link.bulk_read_stalls, r.link.protocol_violations, r.link.control_refused_full + r.link.bulk_refused_full};
+        std::memcpy(out16, v, sizeof(v));
+    }
     return 1;
 }
 
