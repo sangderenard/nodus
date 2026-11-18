@@ -54,7 +54,9 @@ constexpr uint16_t kTicketVersion = 1;
 
 enum class Channel : uint8_t { Control = 1, Bulk = 2 };
 enum class Role : uint8_t { Host = 1, Dialer = 2 };
-enum class ControlKind : uint16_t { Instruction = 1, Api = 2, Metric = 3, Receipt = 4 };
+// Contract = one 72-byte contract-negotiator frame (contract_socket.h WireSocket encoding) in the payload: the work
+// market carried over the link (volunteer case a11b5c9b1be74c9b9fb684790f7fd5a3, stage 1).
+enum class ControlKind : uint16_t { Instruction = 1, Api = 2, Metric = 3, Receipt = 4, Contract = 5 };
 enum class BulkKind : uint16_t { Begin = 1, Chunk = 2, End = 3, Abort = 4 };
 
 using Key = std::array<uint8_t, 32>;
