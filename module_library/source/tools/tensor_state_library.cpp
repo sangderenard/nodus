@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <utility>
@@ -360,9 +361,176 @@ bool TensorStateLibraryTool::pin_gpu(std::uint64_t card,std::uint64_t address,
     return set_gpu_pin_locked(card,address,device,pinned)==Result::Ok;
 }
 
+// ---- The volunteer cycle (case a11b5c9b1be74c9b9fb684790f7fd5a3) -------------------------------------------------
+// Slot kinds and layout: include/gpu_work_row_tool.h (VolunteerSlots). A target is device + 1; 0 = choose.
+namespace {
+constexpr std::size_t kSlotWords=10;
+constexpr std::uint64_t kSlotNull=0,kSlotWork=6,kSlotReceipt=9;
+}
+
+TensorStateLibraryTool::CycleCounts TensorStateLibraryTool::cycle_counts() const {
+    std::lock_guard<std::mutex> lock(cycle_mutex_);
+    return {work_queue_.size(),outstanding_.size(),completed_,retried_,batches_.size(),completed_by_device_};
+}
+
+// Rule 1, by the library's metrics: the device whose measured completions are fastest, weighted by the work already
+// sent to it; an unmeasured device counts as fast, so it is measured. Returns device + 1, or 0 with no device.
+std::uint64_t TensorStateLibraryTool::choose_target_locked() {
+    const std::size_t devices=device_count();
+    if(!devices)return 0;
+    if(inflight_by_device_.size()<devices)inflight_by_device_.resize(devices,0);
+    std::size_t best=0;
+    std::uint64_t best_score=UINT64_MAX;
+    for(std::size_t d=0;d<devices;++d){
+        const auto perf=device_performance(d);
+        const std::uint64_t average=perf&&perf->samples?perf->average_total_ns:0;
+        const std::uint64_t score=(inflight_by_device_[d]+1)*(average+1);
+        if(score<best_score){best_score=score;best=d;}
+    }
+    return best+1;
+}
+
+// One batch: receipts finish (rule 2: success completes it; failure re-queues it, first), then null slots take work.
+void TensorStateLibraryTool::fill_and_settle_locked(std::vector<std::uint64_t>& words) {
+    const std::size_t slots=words.size()/kSlotWords;
+    for(std::size_t s=0;s<slots;++s){
+        std::uint64_t* slot=&words[s*kSlotWords];
+        if(slot[0]!=kSlotReceipt)continue;
+        const std::uint64_t* receipt=slot+1;  // the job row's U64[9]: status, device, ..., work id at 4, ok at 8
+        const auto found=outstanding_.find(receipt[4]);
+        if(found!=outstanding_.end()){
+            const auto device=static_cast<std::size_t>(receipt[1]);
+            if(device<inflight_by_device_.size()&&inflight_by_device_[device])--inflight_by_device_[device];
+            if(receipt[0]==0&&receipt[8]==1){
+                ++completed_;
+                if(device<completed_by_device_.size())++completed_by_device_[device];
+            }
+            else{++retried_;work_queue_.push_front(found->second);}
+            outstanding_.erase(found);
+        }
+        std::fill(slot,slot+kSlotWords,0);
+    }
+    for(std::size_t s=0;s<slots&&!work_queue_.empty();++s){
+        std::uint64_t* slot=&words[s*kSlotWords];
+        if(slot[0]!=kSlotNull)continue;
+        const WorkPacket packet=work_queue_.front();
+        const std::uint64_t target=packet[5]?packet[5]:choose_target_locked();
+        if(!target)break;  // no device: the work waits in the queue
+        slot[0]=kSlotWork;
+        std::copy(packet.begin(),packet.begin()+5,slot+1);
+        slot[6]=target;
+        outstanding_[packet[3]]=packet;
+        if(inflight_by_device_.size()<target)inflight_by_device_.resize(target,0);
+        ++inflight_by_device_[target-1];
+        work_queue_.pop_front();
+    }
+}
+
+bool TensorStateLibraryTool::cycle_step(ToolStackContext& context) {
+    auto& stack=*context.stack.raw;
+    const ValueTypeId tensor_type=ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+    // 0 nothing on the stack, 1 work packet, 2 batch, 3 anything else (an ordinary library request), 4 the 0 an
+    // Input row pushes for an empty edge (its pad: nothing arrived there; the mint reads a 0 the same way).
+    auto top=[&](std::uint64_t& id)->int{
+        ValueTypeId tid=kInvalidValueTypeId;
+        if(!raw_stack_peek_type(stack,tid))return 0;
+        if(tid!=tensor_type){
+            const ValueType* vt=ValueTypeRegistry::global().get(tid);
+            if(vt&&vt->size==sizeof(double)){
+                double v=1.0;
+                if(raw_stack_peek_known_type(stack,&v,tid,sizeof(v))&&v==0.0)return 4;
+            }else if(vt&&vt->size==sizeof(float)){
+                float v=1.0f;
+                if(raw_stack_peek_known_type(stack,&v,tid,sizeof(v))&&v==0.0f)return 4;
+            }
+            return 3;
+        }
+        nodus::tensors::AbstractTensorHandle h{};
+        NodusTensorDesc d{};
+        if(!raw_stack_peek_abstract_tensor(stack,h))return 3;
+        if(!h.id)return 4;  // in a tensor table the Input row's pad for an empty edge is the null handle
+        if(nodus_tensor_describe(h.id,&d)!=NODUS_OK||d.dtype!=NODUS_DTYPE_U64)return 3;
+        id=h.id;
+        if(d.rank==1&&d.shape[0]==6)return 1;
+        if(d.rank==2&&d.shape[1]==kSlotWords&&d.shape[0])return 2;
+        return 3;
+    };
+    std::uint64_t id=0;
+    int kind=top(id);
+    std::lock_guard<std::mutex> lock(cycle_mutex_);
+    if(kind==3)return false;
+    if(kind==0&&work_queue_.empty()&&batches_.empty()&&outstanding_.empty())return false;
+    while(kind==1||kind==2||kind==4){
+        if(kind==4){
+            ValueTypeId tid=kInvalidValueTypeId;
+            const ValueType* vt=raw_stack_peek_type(stack,tid)?ValueTypeRegistry::global().get(tid):nullptr;
+            std::uint64_t scratch=0;
+            if(!vt||!raw_stack_pop_known_type(stack,&scratch,tid,vt->size,true))break;
+            kind=top(id);
+            continue;
+        }
+        nodus::tensors::AbstractTensorHandle h{};
+        if(!raw_stack_pop_abstract_tensor(stack,h))break;
+        if(kind==1){
+            WorkPacket packet{};
+            if(nodus_tensor_read(h.id,0,packet.data(),sizeof(packet))==static_cast<std::int64_t>(sizeof(packet))&&
+               packet[0]&&packet[2]&&packet[3])work_queue_.push_back(packet);
+            nodus_tensor_destroy(h.id);  // the packet is read into the queue; the library keeps nothing else of it
+        }else batches_.push_back(h.id);
+        kind=top(id);
+    }
+    // Work waits and no batch is in hand: borrow an empty one from the mint.
+    if(batches_.empty()&&!work_queue_.empty()&&context.row_ports&&context.row_ports->consume){
+        std::uint64_t blank=0;
+        std::size_t written=0;
+        if(context.row_ports->consume(context.row_ports->host,0,&blank,sizeof(blank),&written)&&
+           written==sizeof(blank)&&blank){
+            NodusTensorDesc d{};
+            if(nodus_tensor_describe(blank,&d)==NODUS_OK&&d.dtype==NODUS_DTYPE_U64&&d.rank==2&&
+               d.shape[1]==kSlotWords&&d.shape[0])batches_.push_back(blank);
+            else nodus_tensor_destroy(blank);
+        }
+    }
+    std::vector<std::uint64_t> carrying;  // per batch in hand: whether any slot is filled
+    for(const auto batch:batches_){
+        NodusTensorDesc d{};
+        bool filled=false;
+        if(nodus_tensor_describe(batch,&d)==NODUS_OK){
+            std::vector<std::uint64_t> words(static_cast<std::size_t>(d.shape[0])*kSlotWords);
+            const auto bytes=static_cast<std::int64_t>(words.size()*sizeof(std::uint64_t));
+            if(nodus_tensor_read(batch,0,words.data(),bytes)==bytes){
+                fill_and_settle_locked(words);
+                nodus_tensor_write(batch,0,words.data(),bytes);
+                for(std::size_t s=0;s<words.size();s+=kSlotWords)filled=filled||words[s]!=kSlotNull;
+            }
+        }
+        carrying.push_back(filled?1:0);
+    }
+    // One batch leaves on the Output row: the first that carries work, else (while work is out) an empty one to
+    // bring the receipts back. Empty batches beyond that go back to the mint.
+    std::size_t leave=batches_.size();
+    for(std::size_t i=0;i<batches_.size()&&leave==batches_.size();++i)if(carrying[i])leave=i;
+    if(leave==batches_.size()&&!batches_.empty()&&(!outstanding_.empty()||!work_queue_.empty()))leave=0;
+    std::deque<std::uint64_t> kept;
+    for(std::size_t i=0;i<batches_.size();++i){
+        const auto batch=batches_[i];
+        if(i==leave){
+            if(!raw_stack_push_abstract_tensor(stack,{batch}))kept.push_back(batch);
+            continue;
+        }
+        if(!carrying[i]&&context.row_ports&&context.row_ports->publish&&
+           context.row_ports->publish(context.row_ports->host,1,&batch,sizeof(batch)))continue;
+        kept.push_back(batch);
+    }
+    batches_=std::move(kept);
+    context.succeeded=true;
+    return true;
+}
+
 void TensorStateLibraryTool::execute_stack(ToolStackContext& context) {
     context.succeeded=false;
     if(!context.stack.raw)return;
+    if(cycle_step(context))return;
     auto& stack=*context.stack.raw;
     nodus::tensors::AbstractTensorHandle payload{},control{};
     if(!raw_stack_pop_abstract_tensor(stack,payload))return;

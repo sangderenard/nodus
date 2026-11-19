@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -66,6 +67,26 @@ public:
     void tick(double,HostAPI&) override {}
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext&) override;
+
+    // The volunteer cycle (case a11b5c9b1be74c9b9fb684790f7fd5a3): "the state library on a table that outputs work
+    // and inputs state returns from the work". Besides its U64[12] requests the row takes, on its table's Input row:
+    //   U64[6] work packet {card, base, invocations, work id, Y invocations, target}: queued (rule 3);
+    //   U64[N,10] batch (gpu_work_row_tool.h VolunteerSlots): each receipt slot finishes its work, or re-queues it
+    //   when it failed (rule 2: retry, no re-checking); each null slot is filled with queued work, its target kept
+    //   when set ahead of time and otherwise chosen by the library's metrics (rule 1).
+    // Empty batches come from the tensor mint on the row's own port "blank"; a batch with nothing left to carry goes
+    // back on "spent". At most one batch leaves per step, on the table's Output row, to the work table.
+    int32_t row_port_count() const override {return 2;}
+    ToolRowPort row_port(int32_t index) const override {
+        if(index==0)return ToolRowPort{ToolPortKind::Argument,0.0f,0.5f,"blank",8};
+        if(index==1)return ToolRowPort{ToolPortKind::Return,1.0f,0.5f,"spent",8};
+        return ToolRowPort{};
+    }
+    struct CycleCounts {
+        std::uint64_t queued=0,outstanding=0,completed=0,retried=0,batches_in_hand=0;
+        std::array<std::uint64_t,4> completed_by_device{};  // by the receipt's device word (first four devices)
+    };
+    CycleCounts cycle_counts() const;
 
     class GpuLoan {
     public:
@@ -189,6 +210,19 @@ private:
     std::vector<CompletionWindow> completion_windows_;
     using WorkKey=std::tuple<ExecutionApi,std::size_t,std::uint64_t,std::uint64_t>;
     std::map<WorkKey,CompletionWindow> work_windows_;
+
+    // The volunteer cycle's state, under its own lock (device_performance takes mutex_).
+    using WorkPacket=std::array<std::uint64_t,6>;
+    bool cycle_step(ToolStackContext& context);
+    std::uint64_t choose_target_locked();
+    void fill_and_settle_locked(std::vector<std::uint64_t>& words);
+    mutable std::mutex cycle_mutex_;
+    std::deque<WorkPacket> work_queue_;
+    std::unordered_map<std::uint64_t,WorkPacket> outstanding_;  // work id -> the packet as queued
+    std::vector<std::uint64_t> inflight_by_device_;
+    std::deque<std::uint64_t> batches_;                          // batches in hand, oldest first
+    std::uint64_t completed_=0,retried_=0;
+    std::array<std::uint64_t,4> completed_by_device_{};
 };
 
 } // namespace nodus::gpu

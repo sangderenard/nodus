@@ -13,7 +13,7 @@ endif()
 set(NODUS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 add_executable(link_volunteer link_volunteer.cpp
   "${NODUS_ROOT}/src/tool_registry.cpp" "${NODUS_ROOT}/src/tensor_state_library_tool.cpp"
-  "${NODUS_ROOT}/src/gpu_shader_job_tool.cpp" "${NODUS_ROOT}/src/kernel_pipeline_tool.cpp"
+  "${NODUS_ROOT}/src/gpu_shader_job_tool.cpp" "${NODUS_ROOT}/src/gpu_work_row_tool.cpp" "${NODUS_ROOT}/src/kernel_pipeline_tool.cpp"
   "${NODUS_ROOT}/src/cpu_fabric_dispatch_tool.cpp" "${NODUS_ROOT}/src/gpu_fabric_dispatch_tool.cpp"
   "${NODUS_ROOT}/src/fftfree_tool.cpp" "${NODUS_ROOT}/src/wave_t4_state_tool.cpp"
   "${NODUS_ROOT}/src/fabric_spring_state_tool.cpp")

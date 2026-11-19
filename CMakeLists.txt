@@ -881,6 +881,17 @@ target_link_libraries(nodus_contract_service PRIVATE canvas_tables_static nodus_
 if(WIN32)
   target_link_libraries(nodus_contract_service PRIVATE ws2_32)
 endif()
+# The volunteer cycle end to end (case a11b5c9b1be74c9b9fb684790f7fd5a3): its session and its headless graph share
+# one registry image, as the socket graph qualification below does.
+#   test_volunteer_cycle <glslangValidator> <nodus root> <module library root> <work dir>
+add_executable(test_volunteer_cycle tests/volunteer_cycle_test.cpp src/headless/nodus_headless_abi.cpp)
+target_compile_definitions(test_volunteer_cycle PRIVATE NODUS_HEADLESS_BUILD=1 NOMINMAX)
+target_link_libraries(test_volunteer_cycle PRIVATE canvas_tables_static nodus_runtime)
+target_compile_features(test_volunteer_cycle PRIVATE cxx_std_20)
+if(WIN32)
+  target_link_libraries(test_volunteer_cycle PRIVATE ws2_32)
+endif()
+
 # Socket qualification uses the same native registry image as its headless graph.
 add_executable(contract_socket_test tests/contract_socket_graph_test.cpp)
 target_link_libraries(contract_socket_test PRIVATE canvas_tables_static nodus_runtime)

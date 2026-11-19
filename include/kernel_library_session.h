@@ -6,15 +6,40 @@
 #include "fftfree_tool.h"
 #include "wave_t4_state_tool.h"
 #include "kernel_pipeline_tool.h"
+#include "gpu_work_row_tool.h"
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace nodus::gpu {
+
+// A table row that is a session's own state library row: every call goes to that one row, and the session owns its
+// lifetime (initialize and shutdown are the session's, never the table's).
+class LibraryRowView final : public ITool {
+public:
+    explicit LibraryRowView(ITool& row):row_(row){}
+    const char* id_cstr() const noexcept override{return "nodus.volunteer.library";}
+    const char* name_cstr() const noexcept override{return row_.name_cstr();}
+    ToolCaps caps() const override{return row_.caps();}
+    void initialize(const ToolInitContext&) override{}
+    void shutdown() override{}
+    void tick(double dt,HostAPI& host) override{row_.tick(dt,host);}
+    void render(RenderContext& context) override{row_.render(context);}
+    int32_t port_count() const override{return row_.port_count();}
+    ToolPortSpec port_spec(int32_t index) const override{return row_.port_spec(index);}
+    void execute_stack(ToolStackContext& context) override{row_.execute_stack(context);}
+    int32_t row_port_count() const override{return row_.row_port_count();}
+    ToolRowPort row_port(int32_t index) const override{return row_.row_port(index);}
+    ToolTensorRole tensor_role() const override{return row_.tensor_role();}
+private:
+    ITool& row_;
+};
 
 // Process owner for the existing state-library row and its registered shader
 // and pipeline rows. GPU row factories retain a reference to the library, so
@@ -84,6 +109,26 @@ public:
                                 const std::string& backend,std::uint64_t card,std::uint64_t base){
         if(!library_||registry_.find(row_id))return false;
         return nodus::gpu::register_fabric_spring(registry_,*library_,products,row_id,backend,card,base,&registered_);
+    }
+
+    // The volunteer cycle's rows on this library (case a11b5c9b1be74c9b9fb684790f7fd5a3): the library row
+    // nodus.volunteer.library, which IS this session's state library row (a table holding it acts on this library,
+    // not a second one), and one work row per device around the shader job `job_id` registered here
+    // (gpu_work_row_tool.h). `capacity` bounds each work row's runner queue.
+    bool register_volunteer_rows(const std::string& job_id,std::size_t capacity=4){
+        if(!library_||registry_.find("nodus.volunteer.library"))return false;
+        ToolRegistry::Entry item;
+        item.id="nodus.volunteer.library";
+        item.name="Volunteer state library";
+        item.caps=ToolCaps::None;
+        auto* row=row_.get();
+        item.factory=[row]{
+            return std::unique_ptr<ITool,std::function<void(ITool*)>>(new LibraryRowView(*row),
+                [](ITool* value){delete value;});
+        };
+        if(!registry_.register_tool(std::move(item)))return false;
+        registered_.push_back("nodus.volunteer.library");
+        return register_volunteer_work_rows(registry_,job_id,library_->device_count(),capacity,&registered_);
     }
 
     bool register_pipeline(std::string id,
