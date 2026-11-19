@@ -26,6 +26,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -61,6 +62,12 @@ public:
     // Event payloads stashed mid-delivery to a module frame port. Keyed by
     // (module_idx<<32)|led_idx.
     std::unordered_map<uint64_t, void*> managed_event_payloads;
+
+    // Per module, the AbstractTensor handles its Borrower rows used up and its Returns row has not yet handed on to
+    // the mint table (ITool::tensor_role, research case 6393486c). Kept only for modules that have a Returns row; a
+    // module touches only its own entry, the map itself is guarded by the mutex.
+    std::mutex module_returns_mu;
+    std::unordered_map<int, std::vector<uint64_t>> module_pending_returns;
 
     // Per-module IO arity and execution policy -- feeds
     // ThreadManager::ModuleContract directly.

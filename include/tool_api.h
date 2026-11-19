@@ -144,6 +144,17 @@ struct ToolRowPortAccess {
     int32_t (*consume)(void* host, int32_t port, void* out, size_t capacity, size_t* written) = nullptr;
 };
 
+enum class ToolTensorRole : uint8_t { Owner = 0, Borrower = 1, Returns = 2 };
+
+// The table's used-up AbstractTensor handles, oldest first, offered to a Returns row (ITool::tensor_role). Every use
+// of a duplicated handle (tensor_handle_dup) is a stack entry, so a handle appears here only once no entry names it.
+// The row sets `taken` to how many it handed on, from the front; the host keeps the rest for the next tick.
+struct ToolReturnedTensors {
+    const uint64_t* ids = nullptr;
+    size_t count = 0;
+    size_t taken = 0;
+};
+
 struct ToolStackContext {
     ToolStackFrame stack{};
     const ToolInputState* input = nullptr;
@@ -156,6 +167,8 @@ struct ToolStackContext {
     // The row's own ports (row_port_count() > 0), bound by the host for this execution; null otherwise. Trailing, as
     // `succeeded` is, so rows that declare no ports are unaffected.
     const ToolRowPortAccess* row_ports = nullptr;
+    // For a Returns row (ITool::tensor_role): the table's used-up handles; null for every other row. Trailing.
+    ToolReturnedTensors* returns = nullptr;
 };
 
 inline float tool_stack_pop(ToolStackFrame& frame) {
@@ -334,6 +347,14 @@ struct ITool {
     virtual int32_t row_control_count() const { return 0; }
     virtual ToolRowControl row_control(int32_t /*idx*/) const { return ToolRowControl{}; }
     virtual void on_row_control(int32_t /*id*/, const ToolRowControlEvent& /*event*/) {}
+
+    // What a row does with the AbstractTensor handles it pops (research case 6393486c, the mint table). Appended after
+    // the row-surface virtuals so their order is unchanged.
+    //   Owner    : the row may keep what it pops (state libraries, negotiators); the host never returns it. Default.
+    //   Borrower : the row only reads what it pops and never keeps or destroys it (compiled rows, tensor_handle_dup).
+    //              A handle a Borrower row pops that no stack entry still names is used up: the host records it.
+    //   Returns  : the row hands the table's used-up handles on (ToolStackContext::returns) to the mint table.
+    virtual ToolTensorRole tensor_role() const { return ToolTensorRole::Owner; }
 };
 
 #if defined(_WIN32)

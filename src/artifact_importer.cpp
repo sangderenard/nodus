@@ -938,6 +938,19 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "        if (idx == 0) return ToolPortSpec{ToolPortKind::Argument, " << input_indices.size() << "};\n";
     ss << "        if (idx == 1) return ToolPortSpec{ToolPortKind::Return, " << output_indices.size() << "};\n";
     ss << "        return ToolPortSpec{};\n    }\n";
+    // The mint table (research case 6393486c): a compiled row only reads its inputs, so the host may return them to the
+    // mint once no stack entry names them; each output is taken from the row's own port "blank" (blank1, ... for
+    // further outputs) when the mint has lent one of the right size, and created here otherwise.
+    ss << "    ToolTensorRole tensor_role() const override { return ToolTensorRole::Borrower; }\n";
+    ss << "    int32_t row_port_count() const override { return " << output_indices.size() << "; }\n";
+    ss << "    ToolRowPort row_port(int32_t idx) const override {\n";
+    for (size_t k = 0; k < output_indices.size(); ++k) {
+        const std::string name = k == 0 ? "blank" : "blank" + std::to_string(k);
+        const float y = output_indices.size() == 1 ? 0.5f : (static_cast<float>(k) + 0.5f) / static_cast<float>(output_indices.size());
+        ss << "        if (idx == " << k << ") return ToolRowPort{ToolPortKind::Argument, 0.0f, " << y << "f, \"" << name
+           << "\", 8};\n";
+    }
+    ss << "        return ToolRowPort{};\n    }\n";
     ss << "    void execute_stack(ToolStackContext& ctx) override {\n";
     // A compiled row succeeds only after every output is published. Missing
     // entry/input previously inherited success=true and advanced an idle row.
@@ -1018,24 +1031,38 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     for (size_t i = 0; i < doc.values.size(); ++i) {
         const auto& value = doc.values[i];
         if (value.role != BufferValue::Role::Input) {
-            if (value.shape.empty()) {
-                ss << "        handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype << ", 0, nullptr);\n";
-            } else {
-                ss << "        { const std::array<uint64_t, " << value.shape.size() << "> shape = {";
-                for (size_t axis = 0; axis < value.shape.size(); ++axis) {
-                    if (axis) ss << ", ";
-                    if (value.dynamic_shape[axis]) {
-                        const size_t source_index = buffer_value_index(
-                            doc, value.shape_source[axis]);
-                        ss << "descs[" << source_index << "].shape["
-                           << value.shape_source_axis[axis] << "]";
-                    } else {
-                        ss << value.shape[axis] << "ull";
-                    }
+            const auto out_pos = std::find(output_indices.begin(), output_indices.end(), i);
+            const bool lent = out_pos != output_indices.end();
+            const size_t rank = value.shape.size();
+            ss << "        { const std::array<uint64_t, " << std::max<size_t>(rank, 1) << "> shape = {";
+            if (rank == 0) ss << "0ull";
+            for (size_t axis = 0; axis < rank; ++axis) {
+                if (axis) ss << ", ";
+                if (value.dynamic_shape[axis]) {
+                    const size_t source_index = buffer_value_index(
+                        doc, value.shape_source[axis]);
+                    ss << "descs[" << source_index << "].shape["
+                       << value.shape_source_axis[axis] << "]";
+                } else {
+                    ss << value.shape[axis] << "ull";
                 }
-                ss << "}; handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype << ", "
-                   << value.shape.size() << ", shape.data()); }\n";
             }
+            ss << "};\n";
+            if (lent) {
+                // A blank the mint lent on this output's port, if it is exactly this output's dtype and shape.
+                ss << "          if (ctx.row_ports && ctx.row_ports->consume) { uint64_t blank = 0; size_t got = 0;\n"
+                      "            if (ctx.row_ports->consume(ctx.row_ports->host, "
+                   << (out_pos - output_indices.begin()) << ", &blank, sizeof(blank), &got) && got == sizeof(blank) && blank) {\n"
+                      "              NodusTensorDesc bd{}; bool fits = nodus_tensor_describe(blank, &bd) == NODUS_OK && bd.dtype == "
+                   << value.nodus_dtype << " && bd.rank == " << rank << "u;\n"
+                      "              for (uint32_t a = 0; fits && a < " << rank << "u; ++a) fits = bd.shape[a] == shape[a];\n"
+                      "              if (fits) handles[" << i << "].id = blank;\n"
+                      "              else { fprintf(stderr, \"[imported-buffer:" << sym
+                   << "] lent blank does not fit output " << i << "; destroyed\\n\"); nodus_tensor_destroy(blank); }\n"
+                      "            } }\n";
+            }
+            ss << "          if (!handles[" << i << "].id) handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype
+               << ", " << rank << ", " << (rank == 0 ? "nullptr" : "shape.data()") << "); }\n";
             ss << "        if (!handles[" << i << "].id) { fail(); return; }\n";
             ss << "        if (nodus_tensor_describe(handles[" << i << "].id, &descs[" << i
                << "]) != NODUS_OK) { fail(); return; }\n";

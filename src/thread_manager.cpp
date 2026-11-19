@@ -229,6 +229,27 @@ static int32_t row_port_consume(void* host, int32_t port, void* out, size_t capa
 }
 
 
+// Every AbstractTensor handle a stack entry names, bottom to top (research case 6393486c, the mint table). The walk is
+// the StackDisplay walk: each entry's size is its registered type's size.
+static void stack_tensor_ids(const RawStackFrame* frame, std::vector<uint64_t>& out) {
+    out.clear();
+    if (!frame || !frame->types_per_byte || !frame->backend) return;
+    const ValueTypeId tensor_tid = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+    const gp_mem_backend_vtable_t* bvt = gp_mem_backend_get_vtable(frame->backend);
+    if (!bvt || !bvt->copy_from_backend) return;
+    size_t idx = 0;
+    while (idx < frame->byte_count) {
+        const ValueTypeId tid = frame->types_per_byte[idx];
+        const ValueType* vt = ValueTypeRegistry::global().get(tid);
+        if (!vt || vt->size == 0) break;
+        if (tid == tensor_tid && vt->size == sizeof(nodus::tensors::AbstractTensorHandle)) {
+            nodus::tensors::AbstractTensorHandle h{};
+            if (bvt->copy_from_backend(frame->backend, idx, &h, sizeof(h)) && h.id) out.push_back(h.id);
+        }
+        idx += vt->size;
+    }
+}
+
 static float raw_stack_value_as_float(const uint8_t* bytes, size_t size) {
     if (!bytes || size == 0) return 0.0f;
     if (size == sizeof(float)) {
@@ -914,6 +935,20 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         if (_tm_enabled) {
             _tm_start = std::chrono::high_resolution_clock::now();
         }
+        // The mint table's return path (research case 6393486c): only a module with a Returns row records the handles
+        // its Borrower rows use up; they wait in the module's pending list until that row hands them on.
+        std::vector<uint64_t>* pending_returns = nullptr;
+        if (graph_runtime_ && mod_idx >= 0 &&
+            mod_idx < static_cast<int>(graph_runtime_->module_plugin_instances.size())) {
+            for (const auto& row_inst : graph_runtime_->module_plugin_instances[static_cast<size_t>(mod_idx)]) {
+                if (row_inst && row_inst->tensor_role() == ToolTensorRole::Returns) {
+                    std::lock_guard<std::mutex> lk(graph_runtime_->module_returns_mu);
+                    pending_returns = &graph_runtime_->module_pending_returns[mod_idx];
+                    break;
+                }
+            }
+        }
+        std::vector<uint64_t> tensors_before, tensors_after;
         for (int row = 0; row < row_count; ++row) {
             ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None, 0};
             if (meta.kind == ModuleRowKind::Input) {
@@ -1072,10 +1107,33 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         } else {
                             tctx.input = nullptr;
                         }
+                        const ToolTensorRole tensor_role = inst->tensor_role();
+                        const bool track_used = pending_returns && tensor_role == ToolTensorRole::Borrower;
+                        if (track_used) stack_tensor_ids(module_stack, tensors_before);
+                        ToolReturnedTensors returns_view;
+                        if (pending_returns && tensor_role == ToolTensorRole::Returns) {
+                            returns_view.ids = pending_returns->data();
+                            returns_view.count = pending_returns->size();
+                            tctx.returns = &returns_view;
+                        }
                         try {
                             inst->execute_stack(tctx);
                         } catch (...) {
                             tctx.succeeded = false;
+                        }
+                        if (tctx.returns) {
+                            const size_t taken = std::min(returns_view.taken, pending_returns->size());
+                            pending_returns->erase(pending_returns->begin(), pending_returns->begin() + static_cast<std::ptrdiff_t>(taken));
+                        }
+                        if (track_used && tctx.succeeded) {
+                            // A popped handle that no stack entry names any more is used up: every use of a duplicated
+                            // handle is its own entry, so this is the last one.
+                            stack_tensor_ids(module_stack, tensors_after);
+                            for (uint64_t id : tensors_before) {
+                                if (std::find(tensors_after.begin(), tensors_after.end(), id) != tensors_after.end()) continue;
+                                if (std::find(pending_returns->begin(), pending_returns->end(), id) != pending_returns->end()) continue;
+                                pending_returns->push_back(id);
+                            }
                         }
                         if (!tctx.succeeded) {
                             // Refusing tools restore their inputs by contract.

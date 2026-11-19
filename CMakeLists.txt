@@ -1272,6 +1272,13 @@ add_executable(test_abstract_tensor_pool_torture
 target_link_libraries(test_abstract_tensor_pool_torture PRIVATE canvas_tables_static)
 add_test(NAME abstract_tensor_pool_torture_test COMMAND test_abstract_tensor_pool_torture)
 
+# The tensor handle dup row refuses failure-atomically (review 924fc2a7, research case 6393486c).
+add_executable(test_tensor_handle_dup tests/tensor_handle_dup_test.cpp)
+target_include_directories(test_tensor_handle_dup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_tensor_handle_dup PRIVATE canvas_tables_static)
+target_compile_definitions(test_tensor_handle_dup PRIVATE NOMINMAX)
+add_test(NAME tensor_handle_dup_test COMMAND test_tensor_handle_dup)
+
 add_executable(test_scatter_indices
   tests/scatter_indices_test.cpp
 )

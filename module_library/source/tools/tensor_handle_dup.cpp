@@ -6,7 +6,8 @@
 // naming one tensor are two reads of it. Owner decision, 2026-11-19: "Handle dup row".
 //
 // The built-in Clone row repeats a scalar float; this row is its tensor-handle counterpart. A top of stack that is not
-// an AbstractTensor handle is refused and left as it was.
+// an AbstractTensor handle, a full frame, or a backend that refuses the read or the write is refused, and the frame is
+// left exactly as it was.
 #include "tool_api.h"
 #include "value_types.h"
 #include "common/tensors/abstraction/abstract_tensor_handle.h"
@@ -22,6 +23,7 @@ public:
     void shutdown() override {}
     void tick(double, HostAPI&) override {}
     void render(RenderContext&) override {}
+    ToolTensorRole tensor_role() const override { return ToolTensorRole::Borrower; }
     int32_t port_count() const override { return 3; }
     ToolPortSpec port_spec(int32_t idx) const override {
         if (idx == 0) return ToolPortSpec{ToolPortKind::Argument, 1};
@@ -32,13 +34,12 @@ public:
         ctx.succeeded = false;
         if (!ctx.stack.raw) return;
         RawStackFrame& frame = *ctx.stack.raw;
+        // Failure-atomic (review 924fc2a7): the top entry is read in place, never consumed, and a single push adds the
+        // second entry. A failed peek or push changes nothing (raw_stack_push_known_type moves byte_count and the type
+        // mask only after its copy succeeds), so a refusal leaves the frame exactly as it was found.
         nodus::tensors::AbstractTensorHandle handle{};
-        if (!raw_stack_pop_abstract_tensor(frame, handle)) return;
+        if (!raw_stack_peek_abstract_tensor(frame, handle)) return;
         if (!raw_stack_push_abstract_tensor(frame, handle)) return;
-        if (!raw_stack_push_abstract_tensor(frame, handle)) {
-            // Leave the stack as it was found: the one entry is already back on it.
-            return;
-        }
         ctx.succeeded = true;
     }
 };
