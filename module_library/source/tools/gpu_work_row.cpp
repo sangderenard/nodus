@@ -11,8 +11,10 @@
 
 namespace nodus::gpu {
 
-GpuWorkRowTool::GpuWorkRowTool(std::string id, JobRow job, std::size_t device, std::size_t capacity)
-    : id_(std::move(id)), job_(std::move(job)), device_(device), capacity_(capacity ? capacity : 1) {}
+GpuWorkRowTool::GpuWorkRowTool(std::string id, JobRow job, std::size_t device, std::uint64_t program,
+                               std::size_t capacity)
+    : id_(std::move(id)), job_(std::move(job)), device_(device), capacity_(capacity ? capacity : 1),
+      program_(program) {}
 GpuWorkRowTool::GpuWorkRowTool() = default;
 GpuWorkRowTool::~GpuWorkRowTool() { shutdown(); }
 
@@ -120,8 +122,9 @@ void GpuWorkRowTool::execute_stack(ToolStackContext& context) {
         for (std::size_t s = 0; s < slots; ++s) {
             std::uint64_t* slot = &words[s * VolunteerSlots::kWords];
             if (slot[0] != VolunteerSlots::kWork || slot[6] != device_ + 1) continue;
+            if (slot[7] && slot[7] != program_) continue;  // another program's work on this device: its own row's
             if (!job_ || pending_.size() + running_ >= capacity_) break;  // no room: the slot stays for a later pass
-            pending_.push_back({slot[1], slot[2], slot[3], slot[4], slot[5], slot[6]});
+            pending_.push_back({slot[1], slot[2], slot[3], slot[4], slot[5], slot[6], slot[7]});
             std::fill(slot, slot + VolunteerSlots::kWords, 0);
             ++counts_.taken;
             changed = true;

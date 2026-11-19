@@ -70,7 +70,8 @@ public:
 
     // The volunteer cycle (case a11b5c9b1be74c9b9fb684790f7fd5a3): "the state library on a table that outputs work
     // and inputs state returns from the work". Besides its U64[12] requests the row takes, on its table's Input row:
-    //   U64[6] work packet {card, base, invocations, work id, Y invocations, target}: queued (rule 3);
+    //   U64[7] work packet {card, base, invocations, work id, Y invocations, target, program}: queued (rule 3);
+    //   U64[6] (no program word) is program 0, any job on the target device;
     //   U64[N,10] batch (gpu_work_row_tool.h VolunteerSlots): each receipt slot finishes its work, or re-queues it
     //   when it failed (rule 2: retry, no re-checking); each null slot is filled with queued work, its target kept
     //   when set ahead of time and otherwise chosen by the library's metrics (rule 1).
@@ -212,9 +213,9 @@ private:
     std::map<WorkKey,CompletionWindow> work_windows_;
 
     // The volunteer cycle's state, under its own lock (device_performance takes mutex_).
-    using WorkPacket=std::array<std::uint64_t,6>;
+    using WorkPacket=std::array<std::uint64_t,7>;
     bool cycle_step(ToolStackContext& context);
-    std::uint64_t choose_target_locked();
+    std::uint64_t choose_target_locked(std::uint64_t program,std::uint64_t lanes);
     void fill_and_settle_locked(std::vector<std::uint64_t>& words);
     mutable std::mutex cycle_mutex_;
     std::deque<WorkPacket> work_queue_;

@@ -20,24 +20,26 @@ namespace nodus::gpu {
 // The cycle's batch: U64[N,10], one slot per row. Word 0 of a slot is its kind (the payload's size); the other nine
 // words are the payload. The kinds (owner-agreed 2026-11-18):
 //   0  null sentinel (an empty slot)
-//   6  work packet: card, base, invocations, work id, Y invocations (0 = one-dimensional), target
+//   7  work packet: card, base, invocations, work id, Y invocations (0 = one-dimensional), target, program
 //   9  receipt: the job row's receipt U64[9], unchanged
-// A target names a device as device + 1; 0 asks the library to choose (rule 1). The batch is a tensor the tensor
-// mint lends; it travels library -> work -> library on two lossless edges.
+// A target names a device as device + 1; 0 asks the library to choose (rule 1). The program is the job contract's
+// program_id (owner, 2026-11-19: "Yes, add it"), so one device takes mixed jobs; 0 = any program on that device.
+// The batch is a tensor the tensor mint lends; it travels library -> work -> library on two lossless edges.
 struct VolunteerSlots {
     static constexpr std::size_t kWords = 10;
-    static constexpr std::uint64_t kNull = 0, kWork = 6, kReceipt = 9;
+    static constexpr std::uint64_t kNull = 0, kWork = 7, kReceipt = 9;
 };
 
-// One GPU's work row. It wraps that device's job row (a registered shader job row <contract>.vulkan.<device>) and
-// runs it on its own thread, so a dispatch never holds up the table. Per batch it is never blocked:
-//   - it takes each work slot whose target is its own device while its runner has room, and leaves a null slot;
-//     a slot it has no room for stays for a later pass;
+// One GPU's work row for one program. It wraps that device's job row (a registered shader job row
+// <contract>.vulkan.<device>) and runs it on its own thread, so a dispatch never holds up the table. A device runs
+// mixed jobs as one work row per program. Per batch it is never blocked:
+//   - it takes each work slot whose target is its own device and whose program is its own (or 0) while its runner
+//     has room, and leaves a null slot; a slot it has no room for stays for a later pass;
 //   - it writes each finished receipt into a null slot; receipts wait for a batch when none is passing.
 class GpuWorkRowTool final : public ITool {
 public:
     using JobRow = std::unique_ptr<ITool, std::function<void(ITool*)>>;
-    GpuWorkRowTool(std::string id, JobRow job, std::size_t device, std::size_t capacity);
+    GpuWorkRowTool(std::string id, JobRow job, std::size_t device, std::uint64_t program, std::size_t capacity);
     GpuWorkRowTool();  // no job row: the row passes batches through untouched
     ~GpuWorkRowTool() override;
     const char* id_cstr() const noexcept override { return id_.c_str(); }
@@ -59,7 +61,7 @@ public:
     Counts counts() const;
 
 private:
-    using Packet = std::array<std::uint64_t, 6>;
+    using Packet = std::array<std::uint64_t, 7>;
     using Receipt = std::array<std::uint64_t, 9>;
     void run();
     Receipt dispatch(const Packet& packet);
@@ -67,6 +69,7 @@ private:
     std::string id_ = "nodus.volunteer.work";
     JobRow job_;
     std::size_t device_ = 0, capacity_ = 4;
+    std::uint64_t program_ = 0;
     mutable std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<Packet> pending_;
@@ -78,8 +81,9 @@ private:
 };
 
 // The cycle's rows on one KernelLibrarySession: the library row nodus.volunteer.library (the session's own state
-// library) and, for each device, the work row nodus.volunteer.work.<job>.vulkan.<device> around <job>.vulkan.<device>.
-bool register_volunteer_work_rows(ToolRegistry& registry, const std::string& job_id, std::size_t devices,
-                                  std::size_t capacity, std::vector<std::string>* registered);
+// library) and, for each device, the work row nodus.volunteer.work.<job>.vulkan.<device> around <job>.vulkan.<device>,
+// taking the work slots for `program` (the job contract's program_id).
+bool register_volunteer_work_rows(ToolRegistry& registry, const std::string& job_id, std::uint64_t program,
+                                  std::size_t devices, std::size_t capacity, std::vector<std::string>* registered);
 
 }  // namespace nodus::gpu

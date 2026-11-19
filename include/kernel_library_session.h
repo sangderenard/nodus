@@ -113,22 +113,26 @@ public:
 
     // The volunteer cycle's rows on this library (case a11b5c9b1be74c9b9fb684790f7fd5a3): the library row
     // nodus.volunteer.library, which IS this session's state library row (a table holding it acts on this library,
-    // not a second one), and one work row per device around the shader job `job_id` registered here
-    // (gpu_work_row_tool.h). `capacity` bounds each work row's runner queue.
-    bool register_volunteer_rows(const std::string& job_id,std::size_t capacity=4){
-        if(!library_||registry_.find("nodus.volunteer.library"))return false;
-        ToolRegistry::Entry item;
-        item.id="nodus.volunteer.library";
-        item.name="Volunteer state library";
-        item.caps=ToolCaps::None;
-        auto* row=row_.get();
-        item.factory=[row]{
-            return std::unique_ptr<ITool,std::function<void(ITool*)>>(new LibraryRowView(*row),
-                [](ITool* value){delete value;});
-        };
-        if(!registry_.register_tool(std::move(item)))return false;
-        registered_.push_back("nodus.volunteer.library");
-        return register_volunteer_work_rows(registry_,job_id,library_->device_count(),capacity,&registered_);
+    // not a second one), registered once, and one work row per device for the shader job `contract` registered here
+    // (gpu_work_row_tool.h): call once per job, so each device takes mixed programs. `capacity` bounds each work
+    // row's runner queue.
+    bool register_volunteer_rows(const GpuShaderJobContract& contract,std::size_t capacity=4){
+        if(!library_||!registry_.find(contract.id+".vulkan.0"))return false;
+        if(!registry_.find("nodus.volunteer.library")){
+            ToolRegistry::Entry item;
+            item.id="nodus.volunteer.library";
+            item.name="Volunteer state library";
+            item.caps=ToolCaps::None;
+            auto* row=row_.get();
+            item.factory=[row]{
+                return std::unique_ptr<ITool,std::function<void(ITool*)>>(new LibraryRowView(*row),
+                    [](ITool* value){delete value;});
+            };
+            if(!registry_.register_tool(std::move(item)))return false;
+            registered_.push_back("nodus.volunteer.library");
+        }
+        return register_volunteer_work_rows(registry_,contract.id,contract.program_id,library_->device_count(),
+                                            capacity,&registered_);
     }
 
     bool register_pipeline(std::string id,

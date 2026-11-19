@@ -365,7 +365,7 @@ bool TensorStateLibraryTool::pin_gpu(std::uint64_t card,std::uint64_t address,
 // Slot kinds and layout: include/gpu_work_row_tool.h (VolunteerSlots). A target is device + 1; 0 = choose.
 namespace {
 constexpr std::size_t kSlotWords=10;
-constexpr std::uint64_t kSlotNull=0,kSlotWork=6,kSlotReceipt=9;
+constexpr std::uint64_t kSlotNull=0,kSlotWork=7,kSlotReceipt=9;
 }
 
 TensorStateLibraryTool::CycleCounts TensorStateLibraryTool::cycle_counts() const {
@@ -373,17 +373,20 @@ TensorStateLibraryTool::CycleCounts TensorStateLibraryTool::cycle_counts() const
     return {work_queue_.size(),outstanding_.size(),completed_,retried_,batches_.size(),completed_by_device_};
 }
 
-// Rule 1, by the library's metrics: the device whose measured completions are fastest, weighted by the work already
+// Rule 1, by the library's metrics: the device whose measured completions of this program at this lane count are
+// fastest (work_performance, which the job rows record), else its device-level measure, weighted by the work already
 // sent to it; an unmeasured device counts as fast, so it is measured. Returns device + 1, or 0 with no device.
-std::uint64_t TensorStateLibraryTool::choose_target_locked() {
+std::uint64_t TensorStateLibraryTool::choose_target_locked(std::uint64_t program,std::uint64_t lanes) {
     const std::size_t devices=device_count();
     if(!devices)return 0;
     if(inflight_by_device_.size()<devices)inflight_by_device_.resize(devices,0);
     std::size_t best=0;
     std::uint64_t best_score=UINT64_MAX;
     for(std::size_t d=0;d<devices;++d){
-        const auto perf=device_performance(d);
-        const std::uint64_t average=perf&&perf->samples?perf->average_total_ns:0;
+        std::uint64_t average=0;
+        if(const auto work=program?work_performance(ExecutionApi::Vulkan,d,program,lanes):std::nullopt;
+           work&&work->samples)average=work->average_total_ns;
+        else if(const auto perf=device_performance(d);perf&&perf->samples)average=perf->average_total_ns;
         const std::uint64_t score=(inflight_by_device_[d]+1)*(average+1);
         if(score<best_score){best_score=score;best=d;}
     }
@@ -414,11 +417,12 @@ void TensorStateLibraryTool::fill_and_settle_locked(std::vector<std::uint64_t>& 
         std::uint64_t* slot=&words[s*kSlotWords];
         if(slot[0]!=kSlotNull)continue;
         const WorkPacket packet=work_queue_.front();
-        const std::uint64_t target=packet[5]?packet[5]:choose_target_locked();
+        const std::uint64_t target=packet[5]?packet[5]:choose_target_locked(packet[6],packet[2]);
         if(!target)break;  // no device: the work waits in the queue
         slot[0]=kSlotWork;
         std::copy(packet.begin(),packet.begin()+5,slot+1);
         slot[6]=target;
+        slot[7]=packet[6];  // the program
         outstanding_[packet[3]]=packet;
         if(inflight_by_device_.size()<target)inflight_by_device_.resize(target,0);
         ++inflight_by_device_[target-1];
@@ -451,7 +455,7 @@ bool TensorStateLibraryTool::cycle_step(ToolStackContext& context) {
         if(!h.id)return 4;  // in a tensor table the Input row's pad for an empty edge is the null handle
         if(nodus_tensor_describe(h.id,&d)!=NODUS_OK||d.dtype!=NODUS_DTYPE_U64)return 3;
         id=h.id;
-        if(d.rank==1&&d.shape[0]==6)return 1;
+        if(d.rank==1&&(d.shape[0]==6||d.shape[0]==7))return 1;  // U64[6]: no program word (program 0)
         if(d.rank==2&&d.shape[1]==kSlotWords&&d.shape[0])return 2;
         return 3;
     };
@@ -472,8 +476,11 @@ bool TensorStateLibraryTool::cycle_step(ToolStackContext& context) {
         nodus::tensors::AbstractTensorHandle h{};
         if(!raw_stack_pop_abstract_tensor(stack,h))break;
         if(kind==1){
-            WorkPacket packet{};
-            if(nodus_tensor_read(h.id,0,packet.data(),sizeof(packet))==static_cast<std::int64_t>(sizeof(packet))&&
+            WorkPacket packet{};  // a U64[6] packet leaves the program word 0
+            NodusTensorDesc pd{};
+            const auto bytes=nodus_tensor_describe(h.id,&pd)==NODUS_OK?
+                static_cast<std::int64_t>(pd.shape[0]*sizeof(std::uint64_t)):0;
+            if(bytes&&nodus_tensor_read(h.id,0,packet.data(),bytes)==bytes&&
                packet[0]&&packet[2]&&packet[3])work_queue_.push_back(packet);
             nodus_tensor_destroy(h.id);  // the packet is read into the queue; the library keeps nothing else of it
         }else batches_.push_back(h.id);
