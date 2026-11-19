@@ -13,6 +13,12 @@
 #include <chrono>
 #include <ctime>
 #include <cstdlib>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 static PluginLoader g_plugin_loader;
 
@@ -201,7 +207,20 @@ int gp_plugin_build_module_and_load(const char* module_src,
             std::filesystem::path abs_rr = resolve_repo_root(abs_src);
             std::filesystem::path abs_inc = abs_rr / "include";
             cm << "target_include_directories(" << module_name << " PRIVATE \"" << abs_rr.generic_string() << "\" \"" << abs_inc.generic_string() << "\")\n";
+            // The row links the tensor core (and canvas tables) THIS process runs with: the directory of the loaded
+            // nodus_tensor_core module. A row linked against any other copy would hold tensor handles the host
+            // cannot resolve (cmake/auto_sources.cmake). <repo>/build/Release is the fallback when it is unknown.
             std::filesystem::path release_dir = abs_rr / "build" / "Release";
+#if defined(_WIN32)
+            {
+                HMODULE core = GetModuleHandleA("nodus_tensor_core.dll");
+                wchar_t core_path[MAX_PATH] = {};
+                if (core && GetModuleFileNameW(core, core_path, MAX_PATH) > 0) {
+                    const std::filesystem::path loaded_dir = std::filesystem::path(core_path).parent_path();
+                    if (std::filesystem::exists(loaded_dir / "nodus_tensor_core.lib")) release_dir = loaded_dir;
+                }
+            }
+#endif
             // Generated row tools use the shared tensor transport directly.
             // Linking only canvas_tables is insufficient on Windows because
             // that DLL does not re-export nodus_tensor_core's C ABI.

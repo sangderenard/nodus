@@ -586,7 +586,10 @@ def _buffer_abi(
         for index, value_id in enumerate(argument_ids)
     }
     order = tuple(int(item) for item in getattr(artifact, "buffer_order", ()) or ())
-    dtypes = tuple(getattr(artifact, "buffer_dtypes", ()) or ())
+    # The element dtype is the value's identity; the backend's buffer_dtypes are its storage spelling (LLVM's i64
+    # carries no sign, so a uint64 column would read back as i64). Use the element dtypes when the backend has them.
+    element_dtypes = tuple(getattr(artifact, "buffer_element_dtypes", ()) or ())
+    dtypes = element_dtypes or tuple(getattr(artifact, "buffer_dtypes", ()) or ())
     shapes = tuple(getattr(artifact, "buffer_shapes", ()) or ())
     if len(dtypes) not in {0, len(order)} or len(shapes) not in {0, len(order)}:
         raise ProductError("backend buffer metadata does not match buffer_order")
@@ -856,9 +859,19 @@ class TuringBoundary:
                 emit_ssa_function_to_llvm,
             )
             from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
+            # The authored tensor kernels: every other Turing caller (native_package, external_functions,
+            # vehicle_python_compilation) lowers tensor calls against this reference. Without it a tensor op
+            # such as matmul, stack, cat, gather or full_like reached the LLVM emitter un-lowered and was refused
+            # "operation has no repository LLVM emission" (2026-11-18, case 6393486c).
+            from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+                c_backend_repository_ssa_reference,
+            )
+            from src.common.tensors.abstraction import AbstractTensor
         finally:
             sys.path.pop(0)
         self._lower = lower_ast_source_to_ssa
+        self._tensor_reference = c_backend_repository_ssa_reference
+        self._abstract_tensor = AbstractTensor
         self._emit_c = emit_ssa_module_to_c
         self._emit_llvm = emit_ssa_function_to_llvm
         self._compile_llvm = compile_artifact
@@ -868,7 +881,10 @@ class TuringBoundary:
         self.toolchain = compiler_toolchain_fingerprint()
 
     def lower(self, source: str, entrypoint: str, **kwargs: Any) -> tuple[Any, Any, Any]:
-        return self._lower(source, entrypoint, **kwargs)
+        kwargs.setdefault("tensor_ssa_reference", self._tensor_reference())
+        bindings = dict(kwargs.pop("python_bindings", None) or {})
+        bindings.setdefault("AbstractTensor", self._abstract_tensor)
+        return self._lower(source, entrypoint, python_bindings=bindings, **kwargs)
 
     def emit_c(self, module: Any, root: str, *, entry_name: str) -> Any:
         return self._emit_c(module, root, entry_name=entry_name)
