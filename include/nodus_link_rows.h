@@ -33,6 +33,42 @@ struct LinkDialConfig {
     uint64_t maximum_bulk_bytes = uint64_t(256) << 20;
 };
 
+class LinkEndpoint;   // the shared endpoint (module_library/source/tools/nodus_link_endpoint.h)
+
+// The row: <id>.control (bulk=false) or <id>.bulk (bulk=true). Source: module_library/source/tools/nodus_link.cpp.
+// Saved state is the id and which row it is. The endpoint is process state, handed over by the registration; a row
+// made with no endpoint (the no-argument constructor, or a canvas-compiled copy) refuses in execute_stack.
+class LinkRow final : public ITool {
+public:
+    LinkRow(std::string id, bool bulk, std::shared_ptr<LinkEndpoint> ep);
+    LinkRow();
+    void configure(std::string id, bool bulk);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
+    const char* id_cstr() const noexcept override { return id_.c_str(); }
+    const char* name_cstr() const noexcept override { return bulk_ ? "Link bulk" : "Link control"; }
+    ToolCaps caps() const override { return ToolCaps::None; }
+    int32_t port_count() const override { return 2; }
+    ToolPortSpec port_spec(int32_t index) const override {
+        if (index == 0) return {ToolPortKind::Argument, 1};
+        if (index == 1) return {ToolPortKind::Return, 1};
+        return {};
+    }
+    void initialize(const ToolInitContext&) override;
+    void shutdown() override {}
+    void tick(double, HostAPI&) override;
+    void render(RenderContext&) override {}
+    void execute_stack(ToolStackContext& context) override;
+
+private:
+    bool accept_control(uint64_t h);
+    bool accept_bulk(uint64_t h);
+    uint64_t control_tensor();
+    std::string id_;
+    bool bulk_ = false;
+    std::shared_ptr<LinkEndpoint> ep_;
+};
+
 enum class EndpointState : int32_t { Waiting = 0, Linked = 1, Closed = 2, Failed = 3 };
 struct EndpointReport {
     EndpointState state = EndpointState::Waiting;

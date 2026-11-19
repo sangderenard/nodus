@@ -1,6 +1,6 @@
 // exec_row: what an exec tool row is told to run, and how that is saved.
 //
-// The row itself is tools/exec_row/exec_row_tool.cpp, an ordinary ITool plugin source. This header is the part the
+// The row itself is module_library/source/tools/exec_row.cpp, an ordinary ITool plugin source. This header is the part the
 // row and whoever places the row both need: the settings, their saved form (the tool's own serialize/deserialize
 // archive, read from ToolInitContext::serialized_path), and the host's declaration of the core.
 //

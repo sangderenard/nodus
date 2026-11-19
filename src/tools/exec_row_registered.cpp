@@ -4,7 +4,7 @@
 // row the host declared (exec_row.h, the file named by NODUS_EXEC_ROWS) is its own entry, under its declared id, made
 // with its declared program. A host that declared none has no exec rows at all.
 //
-// The row itself is the plugin source tools/exec_row/exec_row_tool.cpp, compiled into this image the way a composed
+// The row itself is the plugin source module_library/source/tools/exec_row.cpp, compiled into this image the way a composed
 // plugin source is: NODUS_PLUGIN_COMPOSITE with its exports renamed.
 //
 // A declaration the rules refuse (Git, a working directory inside the core, no declared core) is not registered, and
@@ -15,7 +15,7 @@
 #define NODUS_PLUGIN_FACTORY_NAME nodus_exec_row_create
 #define NODUS_PLUGIN_DESTROY_NAME nodus_exec_row_destroy
 #define NODUS_PLUGIN_SOURCE_NAME nodus_exec_row_source
-#include "../../tools/exec_row/exec_row_tool.cpp"
+#include "../../module_library/source/tools/exec_row.cpp"
 
 #include "exec_row_registry.h"
 #include "tool_registry.h"

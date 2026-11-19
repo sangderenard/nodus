@@ -1359,6 +1359,10 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     }
     c->post_load_meta_pending.clear();
 
+    // Every table is built from the row program the file defines, not only the focused one: its rows, their ports'
+    // LEDs, and so the ropes between them, are there as soon as the canvas is open.
+    for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) canvas_build_module_table(c, mi);
+
     update_canvas_scroll_state(c, /*pull_from_container=*/false);
     return 1;
 }

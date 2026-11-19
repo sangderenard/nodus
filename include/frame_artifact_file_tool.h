@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/frame_artifact_file.cpp.
 // One admitted job's compressed-frame sink. The host supplies its resolved
 // owner-scoped directory; neither a FIFO token nor shader source may name it.
 #include "tool_api.h"
@@ -14,6 +15,8 @@ class FrameArtifactFileTool final : public ITool {
 public:
     explicit FrameArtifactFileTool(std::filesystem::path admitted_job_directory,
                                    std::uint64_t max_compressed_bytes);
+    // No directory: the admitted directory is the host's, never saved state, so this row refuses every frame.
+    FrameArtifactFileTool();
     ~FrameArtifactFileTool() override;
     FrameArtifactFileTool(const FrameArtifactFileTool&)=delete;
     FrameArtifactFileTool& operator=(const FrameArtifactFileTool&)=delete;

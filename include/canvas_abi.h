@@ -359,6 +359,16 @@ int gp_canvas_get_window_node_id(GP_CanvasContext* ctx, void* window_ptr);
 
 // Typed-edge API: add an edge with an explicit type id (0 == untyped/wildcard).
 int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc* desc, int type_id);
+// Port pairs (research case 075069677cb74e3f9794914c9009cec5): "<table>.<row>:<port> > <table>.<row>:<port>", producer
+// first; <table> is a module label or #<index>, <row> the row's index in its module, <port> a port the row declares
+// (ToolRowPort name or index). resolve fills the edge descriptor (1, or 0 with a reason in error); apply is the move:
+// it resolves and adds the edge, whose rope the canvas lays between the two ports' LEDs (edge index, or -1).
+// A row's own port is the contact GP_CANVAS_ROW_PORT_CONTACT_BASE + row x GP_CANVAS_ROW_PORT_STRIDE + port, where row
+// is the row's index in its module and port the row's declared port index.
+#define GP_CANVAS_ROW_PORT_CONTACT_BASE 20000
+#define GP_CANVAS_ROW_PORT_STRIDE 64
+int gp_canvas_resolve_port_pair(GP_CanvasContext* ctx, const char* pair, GP_CanvasEdgeDesc* out_desc, char* error, int error_capacity);
+int gp_canvas_apply_port_pair(GP_CanvasContext* ctx, const char* pair, char* error, int error_capacity);
 
 // Set the module's supported input/output type lists. Each type id is an int.
 int gp_canvas_set_module_io_types(GP_CanvasContext* ctx, int module_idx, const int* input_types, int input_count, const int* output_types, int output_count);

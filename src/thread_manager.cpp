@@ -187,6 +187,48 @@ static uint64_t canvas_contact_key(int module_idx, int contact_idx) {
     return trid;
 }
 
+// A row's authority over its own ports during its tick (research case 075069677cb74e3f9794914c9009cec5). The row's port
+// p is the contact GP_CANVAS_ROW_PORT_CONTACT_BASE + row x GP_CANVAS_ROW_PORT_STRIDE + p; its edge is found and keyed
+// exactly as an Output row (writer) or Input row (reader) finds and keys the edge at its contact.
+struct RowPortBinding {
+    const ThreadManager::TickRequest* req = nullptr;
+    GP_TableContext* fifo_table = nullptr;
+    int mod_idx = -1;
+    int row = -1;
+};
+static int row_port_contact(int row, int port) {
+    return GP_CANVAS_ROW_PORT_CONTACT_BASE + row * GP_CANVAS_ROW_PORT_STRIDE + port;
+}
+static int32_t row_port_publish(void* host, int32_t port, const void* bytes, size_t len) {
+    auto* b = static_cast<RowPortBinding*>(host);
+    if (!b || !b->req || !b->fifo_table || !bytes || port < 0 || port >= GP_CANVAS_ROW_PORT_STRIDE) return 0;
+    const int contact = row_port_contact(b->row, port);
+    for (const auto& e : b->req->edges) {
+        if (e.a_module != b->mod_idx || e.a_contact_idx != contact) continue;
+        int32_t dropped = 0;
+        return gp_table_edge_publish(b->fifo_table, e.edge_idx, canvas_contact_key(b->mod_idx, contact), bytes,
+                                     static_cast<int32_t>(len), &dropped) ? 1 : 0;
+    }
+    return 0;
+}
+static int32_t row_port_consume(void* host, int32_t port, void* out, size_t capacity, size_t* written) {
+    auto* b = static_cast<RowPortBinding*>(host);
+    if (written) *written = 0;
+    if (!b || !b->req || !b->fifo_table || !out || port < 0 || port >= GP_CANVAS_ROW_PORT_STRIDE) return 0;
+    const int contact = row_port_contact(b->row, port);
+    for (const auto& e : b->req->edges) {
+        if (e.b_module != b->mod_idx || e.b_contact_idx != contact) continue;
+        const uint64_t reader = canvas_contact_key(b->mod_idx, contact);
+        gp_table_edge_subscribe_ex(b->fifo_table, e.edge_idx, reader, /*start_at_head=*/1);
+        int32_t got = 0;
+        if (!gp_table_edge_consume(b->fifo_table, e.edge_idx, reader, out, static_cast<int32_t>(capacity), &got) || got <= 0) return 0;
+        if (written) *written = static_cast<size_t>(got);
+        return 1;
+    }
+    return 0;
+}
+
+
 static float raw_stack_value_as_float(const uint8_t* bytes, size_t size) {
     if (!bytes || size == 0) return 0.0f;
     if (size == sizeof(float)) {
@@ -998,6 +1040,19 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         frame.default_type = stack_default_type;
                         ToolStackContext tctx;
                         tctx.stack = frame;
+                        // The row's own ports, if it declares any: it reads and writes them itself during this tick.
+                        RowPortBinding row_port_binding;
+                        ToolRowPortAccess row_port_access;
+                        if (inst->row_port_count() > 0) {
+                            row_port_binding.req = &req;
+                            row_port_binding.fifo_table = req.root_table ? req.root_table : mod.table;
+                            row_port_binding.mod_idx = mod_idx;
+                            row_port_binding.row = row;
+                            row_port_access.host = &row_port_binding;
+                            row_port_access.publish = &row_port_publish;
+                            row_port_access.consume = &row_port_consume;
+                            tctx.row_ports = &row_port_access;
+                        }
                         ToolInputState tinp;
                         if (load_input_state()) {
                             tinp.mouse_x = input_state.mouse_x;

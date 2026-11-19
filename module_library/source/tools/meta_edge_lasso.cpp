@@ -1,4 +1,3 @@
-#include "tool_registry.h"
 #include "tool_api.h"
 #include "table_abi.h"
 #include "canvas_abi.h"
@@ -34,4 +33,6 @@ public:
     void execute_stack(ToolStackContext& ctx) override { (void)ctx; }
 };
 
-REGISTER_TOOL(MetaEdgeLassoTool, "meta_edge_lasso", "Meta-Edge Lasso", ToolCaps::Table | ToolCaps::Text);
+extern "C" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new MetaEdgeLassoTool(); }
+extern "C" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* tool) { delete tool; }
+extern "C" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME() { return __FILE__; }

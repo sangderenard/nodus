@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/cpu_fabric_dispatch.cpp.
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
 
@@ -12,6 +13,11 @@ public:
                           std::string entry,std::uint64_t batch,
                           std::uint32_t steps_per_loadout=1,
                           std::uint64_t program_id=1);
+    CpuFabricDispatchTool();                  // no library: the row refuses until a host gives it one; settings from configure()/saved state
+    void configure(std::string dll,std::string entry,std::uint64_t batch,
+                   std::uint32_t steps_per_loadout=1,std::uint64_t program_id=1);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     const char* id_cstr() const noexcept override {return "nodus.fabric.dispatch.cpu";}
     const char* name_cstr() const noexcept override {return "CPU fabric dispatch";}
     ToolCaps caps() const override {return ToolCaps::None;}
@@ -27,11 +33,11 @@ public:
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext&) override;
 private:
-    TensorStateLibraryTool& library_;
+    TensorStateLibraryTool* library_=nullptr;
     std::string dll_,entry_name_;
-    std::uint64_t batch_;
-    std::uint32_t steps_per_loadout_;
-    std::uint64_t program_id_;
+    std::uint64_t batch_=0;
+    std::uint32_t steps_per_loadout_=1;
+    std::uint64_t program_id_=1;
     void* module_=nullptr;
     void (*entry_)(void**,int32_t*)=nullptr;
     void (*reset_)()=nullptr;

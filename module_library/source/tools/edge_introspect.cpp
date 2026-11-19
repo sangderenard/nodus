@@ -1,4 +1,3 @@
-#include "tool_registry.h"
 #include "tool_api.h"
 #include "table_abi.h"
 #include "canvas_abi.h"
@@ -125,5 +124,7 @@ public:
     }
 };
 
-REGISTER_TOOL(EdgeIntrospectTool, "edge_introspect", "Edge Introspect", ToolCaps::Table | ToolCaps::Text);
+extern "C" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new EdgeIntrospectTool(); }
+extern "C" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* tool) { delete tool; }
+extern "C" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME() { return __FILE__; }
 

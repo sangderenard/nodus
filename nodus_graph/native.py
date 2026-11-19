@@ -626,6 +626,27 @@ class Graph:
         self.edges.append(edge)
         return edge
 
+    def apply_port_pair(self, pair: str, *, fifo: Optional[FifoConfig] = None) -> int:
+        """Apply a port pair as the move: ``"<table>.<row>:<port> > <table>.<row>:<port>"``, producer first.
+
+        ``<table>`` is a module label or ``#<index>``, ``<row>`` the row's index in its module and ``<port>`` a port the
+        row itself declares (its name or index). The edge is the one the GUI's connect move makes between those two
+        LEDs, and the canvas lays its rope there (research case 075069677cb74e3f9794914c9009cec5). Returns the native
+        edge index; ``fifo`` configures its FIFO.
+        """
+        fn = self.lib.nodus_headless_apply_port_pair
+        fn.restype = ctypes.c_int32
+        fn.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32)
+        error = ctypes.create_string_buffer(512)
+        index = int(fn(self._handle, pair.encode("utf-8"), error, len(error)))
+        if index < 0:
+            raise ValueError(f"port pair {pair!r} refused: {error.value.decode('utf-8', 'replace')}")
+        if fifo is not None:
+            native_fifo = _fifo(fifo)
+            if not self.lib.nodus_headless_configure_edge_fifo(self._handle, index, ctypes.byref(native_fifo)):
+                raise RuntimeError("native edge FIFO configuration failed")
+        return index
+
     def attach_edge(self, source: Contact, target: Contact, *,
                     fifo: Optional[FifoConfig] = FifoConfig.scalar_f32()) -> Edge:
         """Reattach process-local FIFO semantics to a native-restored edge.

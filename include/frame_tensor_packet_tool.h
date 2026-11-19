@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/frame_tensor_packet.cpp.
 // Lossless tensor envelope before a byte-span compressor. The producer owns
 // interpretation fields; the packet keeps the tensor's exact dtype and shape.
 #include "tool_api.h"
@@ -18,6 +19,12 @@ public:
     FrameTensorPacketTool(std::uint32_t color_encoding,std::uint32_t origin,
                           std::uint64_t max_packet_bytes)
         :color_encoding_(color_encoding),origin_(origin),max_bytes_(max_packet_bytes){}
+    FrameTensorPacketTool()=default;   // no settings: configure() or the saved state gives them (a row with none refuses)
+    void configure(std::uint32_t color_encoding,std::uint32_t origin,std::uint64_t max_packet_bytes){
+        color_encoding_=color_encoding;origin_=origin;max_bytes_=max_packet_bytes;
+    }
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     const char* id_cstr() const noexcept override {return "nodus.frame.tensor.packet";}
     const char* name_cstr() const noexcept override {return "Frame tensor packet";}
     ToolCaps caps() const override {return ToolCaps::None;}
@@ -27,13 +34,13 @@ public:
         if(i==1)return {ToolPortKind::Return,1};
         return {};
     }
-    void initialize(const ToolInitContext&) override {}
+    void initialize(const ToolInitContext&) override;
     void shutdown() override {}
     void tick(double,HostAPI&) override {}
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext&) override;
 private:
-    std::uint32_t color_encoding_,origin_;
-    std::uint64_t max_bytes_;
+    std::uint32_t color_encoding_=0,origin_=0;
+    std::uint64_t max_bytes_=0;
 };
 }

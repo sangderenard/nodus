@@ -582,32 +582,36 @@ target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(modlib_actualize PRIVATE canvas_tables)
 target_compile_features(modlib_actualize PUBLIC cxx_std_17)
 
-# kpath raster tools: same-repo standalone plugin DLLs (raw create_tool/
-# destroy_tool exports, no REGISTER_TOOL/tool_registry.cpp link) proving the
-# plugin-DLL loading pattern repo_package.cpp's ingestion uses for real
-# cross-repo packages, with zero cross-repo risk -- exposes kpath's
-# rasterizer as loadable nodus tools. Deliberately not folded into the
-# canvas_tables/canvas_tables_static amalgam (auto_sources.cmake); these are
-# meant to be discovered via PluginLoader, same as a real ingested package.
-add_library(kpath_raster_kernel_tool SHARED
-  plugins/kpath_raster_tool/kpath_raster_kernel_tool.cpp
-)
-target_include_directories(kpath_raster_kernel_tool PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
-)
-target_link_libraries(kpath_raster_kernel_tool PRIVATE canvas_tables)
-
-add_library(kpath_raster_scatter_tool SHARED
-  plugins/kpath_raster_tool/kpath_raster_scatter_tool.cpp
-)
-target_include_directories(kpath_raster_scatter_tool PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
-)
-target_link_libraries(kpath_raster_scatter_tool PRIVATE canvas_tables)
+# Row tools: every row tool's source is module_library/source/tools/<id>.cpp (case 74fd8157), the place the
+# canvas compiler (module_library_actualizer) and the Menu (canvas_refresh_plugin_tools) read. Each source builds
+# as a plugin DLL named by its id into module_library/bin/<config>, where the Menu finds the compiled artifact and
+# PluginLoader records the source. Generated sources (*_ver_*.cpp) are the actualizer's own output, not rows here.
+set(NODUS_ROW_TOOL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/module_library/source/tools")
+set(NODUS_ROW_TOOL_BIN "${CMAKE_CURRENT_SOURCE_DIR}/module_library/bin")
+file(GLOB NODUS_ROW_TOOL_SOURCES CONFIGURE_DEPENDS "${NODUS_ROW_TOOL_DIR}/*.cpp")
+list(FILTER NODUS_ROW_TOOL_SOURCES EXCLUDE REGEX "_ver_[^/]*\.cpp$")
+set(NODUS_ROW_TOOL_TARGETS)
+foreach(row_source IN LISTS NODUS_ROW_TOOL_SOURCES)
+  get_filename_component(row_id "${row_source}" NAME_WE)
+  add_library(${row_id} SHARED "${row_source}")
+  target_include_directories(${row_id} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include" "${NODUS_ROW_TOOL_DIR}")
+  # canvas_tables exports only its C ABI (cmake/canvas_tables.def); a row uses Nodus's C++ classes, so it links the
+  # static canvas. The tensor singletons are in the shared nodus_tensor_core, so tensor handles cross into the host.
+  target_link_libraries(${row_id} PRIVATE canvas_tables_static)
+  # Rows that publish onto declared ports (Radio) call the headless ABI; the PCM playback row opens SDL audio.
+  if(TARGET nodus_headless)
+    target_link_libraries(${row_id} PRIVATE nodus_headless)
+  endif()
+  if(TARGET SDL3::SDL3)
+    target_link_libraries(${row_id} PRIVATE SDL3::SDL3)
+  endif()
+  target_compile_definitions(${row_id} PRIVATE NOMINMAX)
+  set_target_properties(${row_id} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${NODUS_ROW_TOOL_BIN}/$<CONFIG>"
+    LIBRARY_OUTPUT_DIRECTORY "${NODUS_ROW_TOOL_BIN}/$<CONFIG>")
+  list(APPEND NODUS_ROW_TOOL_TARGETS ${row_id})
+endforeach()
 
 # (sdlttf_demo removed)
 
@@ -692,7 +696,8 @@ target_compile_features(kpath_raster_tensor_demo PUBLIC cxx_std_20)
 
 find_package(OpenGL REQUIRED)
 
-if(NODUS_ENABLE_TORCH)
+# frontend_shell is built with or without Torch: only its device probe uses Torch (gated on NODUS_ENABLE_TORCH).
+if(TRUE)
   add_executable(frontend_shell tools/frontend_shell.cpp)
   target_include_directories(frontend_shell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   # One image only: the static canvas library carries the tool registry and the
@@ -700,14 +705,16 @@ if(NODUS_ENABLE_TORCH)
   target_link_libraries(frontend_shell PRIVATE
     canvas_tables_static
     nodus_runtime
-    Torch::Torch
     OpenGL::GL
   )
+  if(NODUS_ENABLE_TORCH)
+    target_link_libraries(frontend_shell PRIVATE Torch::Torch)
+  endif()
   if(WIN32)
     # contract ports hosted by the GUI canvas: loopback listener + socket adapters
     target_link_libraries(frontend_shell PRIVATE ws2_32)
   endif()
-  if(TARGET nodus_torch_includes)
+  if(NODUS_ENABLE_TORCH AND TARGET nodus_torch_includes)
     target_link_libraries(frontend_shell PRIVATE nodus_torch_includes)
   endif()
   if(TARGET SDL3::SDL3)
@@ -729,7 +736,7 @@ if(NODUS_ENABLE_TORCH)
     message(FATAL_ERROR "SDL3 runtime target not available to copy DLL. Ensure SDL3 is found/built.")
   endif()
 
-  if(DEFINED Torch_DIR)
+  if(NODUS_ENABLE_TORCH AND DEFINED Torch_DIR)
     get_filename_component(_TorchInstallPrefix "${Torch_DIR}/../../.." ABSOLUTE)
     set(_TorchDllDir "${_TorchInstallPrefix}/lib")
     if(EXISTS "${_TorchDllDir}")
@@ -746,8 +753,6 @@ if(NODUS_ENABLE_TORCH)
       endforeach()
     endif()
   endif()
-else()
-  message(STATUS "frontend_shell skipped because NODUS_ENABLE_TORCH=OFF")
 endif()
 
 find_package(Eigen3 REQUIRED)
@@ -1634,14 +1639,15 @@ add_executable(test_kpath_raster_tool
   tests/kpath_raster_tool_test.cpp
 )
 target_include_directories(test_kpath_raster_tool PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
+  "${NODUS_ROW_TOOL_DIR}"
 )
 target_link_libraries(test_kpath_raster_tool PRIVATE canvas_tables_static)
 target_compile_definitions(test_kpath_raster_tool PRIVATE
   NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
   NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+  NODUS_ROW_TOOL_BIN="${NODUS_ROW_TOOL_BIN}"
 )
-add_dependencies(test_kpath_raster_tool kpath_raster_kernel_tool kpath_raster_scatter_tool)
+add_dependencies(test_kpath_raster_tool kpath_raster_kernel kpath_raster_scatter)
 add_test(NAME kpath_raster_tool_test COMMAND test_kpath_raster_tool)
 
 # Many unit tests use assert() for both validation and required side effects

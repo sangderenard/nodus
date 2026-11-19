@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/tensor_state_library.cpp.
 #include "tensor_state_library.h"
 #include "tool_api.h"
 #include "common/tensors/abstraction/tensor_abi.h"
@@ -29,6 +30,12 @@ public:
         :ram_budget_(ram_budget_bytes),
          device_budget_bytes_(std::move(device_budget_bytes)),
          include_gpu_(include_gpu){}
+    // No-argument construction is the defaults above (a row made with no saved settings); configure() or the saved
+    // state (serialize/deserialize) gives it its budgets before initialize() opens the library.
+    void configure(std::uint64_t ram_budget_bytes,
+                   std::vector<std::uint64_t> device_budget_bytes,bool include_gpu);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     enum class Operation : std::uint64_t {
         Card=1, Put=2, Remove=3, Status=4, ChooseResident=5,
         Pin=6, Unpin=7

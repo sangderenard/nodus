@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/tcp_byte_stream.cpp.
 
 #include "tool_registry.h"
 
@@ -25,6 +26,10 @@ struct TcpByteStreamConfig {
 class TcpByteStreamTool final : public ITool {
 public:
     explicit TcpByteStreamTool(TcpByteStreamConfig config);
+    TcpByteStreamTool();                                   // no settings: configure() or the saved state gives them
+    void configure(TcpByteStreamConfig config);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     ~TcpByteStreamTool() noexcept override;
     const char* id_cstr() const noexcept override{return config_.id.c_str();}
     const char* name_cstr() const noexcept override{return config_.broadcast_readers?"TCP broadcast exit":"TCP byte stream";}

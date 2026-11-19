@@ -724,6 +724,16 @@ static void canvas_setup_stage_table(GP_TableContext* t, int w_px);
 static void canvas_setup_stage_defaults(GP_StageContext* st, int w_px, int h_px);
 static void stage_bg_callback(void* user, int module_idx, int width, int height, uint8_t* out_rgba, int32_t out_pitch);
 static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_idx);
+// Build one table's layout from its row program now, whether or not it is focused. sync_module_table_io_layout only
+// touches the focused table (so a frame never clobbers a table being edited); a table whose row program was just set
+// or loaded is built by naming it here (research case 075069677cb74e3f9794914c9009cec5: the definition is processed).
+static void canvas_build_module_table(GP_CanvasContextImpl* ctx, int module_idx) {
+    if (!ctx || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
+    const int previous = ctx->focused_module;
+    ctx->focused_module = module_idx;
+    sync_module_table_io_layout(ctx, module_idx);
+    ctx->focused_module = previous;
+}
 
 static void canvas_apply_io_rows(GP_CanvasContextImpl* ctx, int module_idx, const std::vector<ModuleIORow>& rows) {
     if (!ctx) return;
@@ -2278,6 +2288,114 @@ static int resolve_contact_index(const GP_CanvasContextImpl* ctx, int module_idx
         }
     }
     return table_hit_contact_index(hb);
+}
+
+// ---- A row's own surface: its picture, ports and controls (research case 075069677cb74e3f9794914c9009cec5) -------------
+// The one place a plugin row's declared ports and controls become hitboxes. The raster and the click path both call it
+// with the module table's own hits (table-local pixels), so what is drawn is exactly what is clicked.
+struct CanvasRowSurface {
+    int table_row = -1;          // row in the module table
+    int logical_row = -1;        // row in the module's row program (module_io_rows)
+    ITool* tool = nullptr;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;   // the row's rectangle, table-local
+    std::vector<GP_TableHitBox> ports;    // part LED, row code kModuleRowPortRow, aux0 = contact, aux1 = port index
+    std::vector<GP_TableHitBox> controls; // part CELL, row code kModuleRowControlRow, aux0 = logical row, aux1 = control
+};
+
+static int canvas_row_port_contact(int logical_row, int port) {
+    return kModuleRowPortContactBase + logical_row * kModuleRowPortStride + port;
+}
+
+static ITool* canvas_row_tool(const GP_CanvasContextImpl* ctx, int module_idx, int logical_row) {
+    if (!ctx || module_idx < 0 || module_idx >= static_cast<int>(ctx->module_plugin_instances.size())) return nullptr;
+    const auto& insts = ctx->module_plugin_instances[module_idx];
+    if (logical_row < 0 || logical_row >= static_cast<int>(insts.size())) return nullptr;
+    return insts[static_cast<size_t>(logical_row)].get();
+}
+
+static bool canvas_row_has_surface(ITool* tool) {
+    if (!tool) return false;
+    return tool->row_port_count() > 0 || tool->row_control_count() > 0 ||
+           (static_cast<uint32_t>(tool->caps()) & static_cast<uint32_t>(ToolCaps::Table)) != 0u;
+}
+
+static void canvas_row_surfaces(const GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox* hits, int hit_count,
+                                int table_w, std::vector<CanvasRowSurface>& out) {
+    out.clear();
+    if (!ctx || !hits || hit_count <= 0) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(ctx->module_table_rows.size())) return;
+    const auto& rows = ctx->module_table_rows[module_idx];
+    for (int tr = 0; tr < static_cast<int>(rows.size()); ++tr) {
+        const ModuleIORow& meta = rows[static_cast<size_t>(tr)];
+        if (meta.kind != ModuleRowKind::Tool || meta.tool_origin != ModuleToolOrigin::Plugin || meta.contact_idx < 0) continue;
+        ITool* tool = canvas_row_tool(ctx, module_idx, meta.contact_idx);
+        if (!canvas_row_has_surface(tool)) continue;
+        CanvasRowSurface s;
+        s.table_row = tr; s.logical_row = meta.contact_idx; s.tool = tool;
+        bool any = false;
+        for (int hi = 0; hi < hit_count; ++hi) {
+            const GP_TableHitBox& hb = hits[hi];
+            if (hb.row_idx != tr) continue;
+            if (!any) { s.x0 = hb.x0; s.y0 = hb.y0; s.x1 = hb.x1; s.y1 = hb.y1; any = true; }
+            else { s.x0 = std::min(s.x0, hb.x0); s.y0 = std::min(s.y0, hb.y0); s.x1 = std::max(s.x1, hb.x1); s.y1 = std::max(s.y1, hb.y1); }
+        }
+        if (table_w > 0) { s.x0 = std::max(0, s.x0); s.x1 = std::min(s.x1, table_w); }   // the cells may run past the table
+        if (!any || s.x1 <= s.x0 || s.y1 <= s.y0) continue;
+        const float w = static_cast<float>(s.x1 - s.x0), h = static_cast<float>(s.y1 - s.y0);
+        const int ports = std::min(tool->row_port_count(), kModuleRowPortStride);
+        for (int p = 0; p < ports; ++p) {
+            const ToolRowPort port = tool->row_port(p);
+            const int cx = s.x0 + static_cast<int>(std::lround(std::clamp(port.x, 0.0f, 1.0f) * w));
+            const int cy = s.y0 + static_cast<int>(std::lround(std::clamp(port.y, 0.0f, 1.0f) * h));
+            GP_TableHitBox hb{};
+            hb.x0 = cx - 6; hb.y0 = cy - 6; hb.x1 = cx + 6; hb.y1 = cy + 6;
+            hb.row_idx = kModuleRowPortRow;
+            hb.col_idx = (port.kind == ToolPortKind::Argument) ? kModuleColLeftLed : kModuleColRightLed;
+            hb.cell_kind = GP_TABLE_CELL_LEDS;
+            hb.part = GP_TABLE_HIT_LED;
+            hb.aux0 = canvas_row_port_contact(s.logical_row, p);
+            hb.aux1 = p;
+            hb.flags = static_cast<uint32_t>(s.logical_row);
+            s.ports.push_back(hb);
+        }
+        const int controls = tool->row_control_count();
+        for (int ci = 0; ci < controls; ++ci) {
+            const ToolRowControl c = tool->row_control(ci);
+            GP_TableHitBox hb{};
+            hb.x0 = s.x0 + static_cast<int>(std::lround(std::clamp(c.x, 0.0f, 1.0f) * w));
+            hb.y0 = s.y0 + static_cast<int>(std::lround(std::clamp(c.y, 0.0f, 1.0f) * h));
+            hb.x1 = hb.x0 + std::max(1, static_cast<int>(std::lround(std::clamp(c.w, 0.0f, 1.0f) * w)));
+            hb.y1 = hb.y0 + std::max(1, static_cast<int>(std::lround(std::clamp(c.h, 0.0f, 1.0f) * h)));
+            hb.row_idx = kModuleRowControlRow;
+            hb.col_idx = static_cast<int>(c.kind);
+            hb.cell_kind = GP_TABLE_CELL_TEXT;
+            hb.part = GP_TABLE_HIT_CELL;
+            hb.aux0 = s.logical_row;
+            hb.aux1 = ci;
+            s.controls.push_back(hb);
+        }
+        out.push_back(std::move(s));
+    }
+}
+
+// A click on a declared control: the row is told which control and what happened (rectangles are the click routes).
+static bool canvas_row_control_click(GP_CanvasContextImpl* ctx, int module_idx, const GP_TableHitBox& hb, int lx) {
+    if (hb.row_idx != kModuleRowControlRow) return false;
+    ITool* tool = canvas_row_tool(ctx, module_idx, hb.aux0);
+    if (!tool || hb.aux1 < 0 || hb.aux1 >= tool->row_control_count()) return false;
+    const ToolRowControl c = tool->row_control(hb.aux1);
+    ToolRowControlEvent e{};
+    const float fx = (hb.x1 > hb.x0) ? std::clamp(float(lx - hb.x0) / float(hb.x1 - hb.x0), 0.0f, 1.0f) : 0.0f;
+    switch (c.kind) {
+        case ToolRowControlKind::Text: return true;                       // display only; the click is consumed
+        case ToolRowControlKind::Button: e.kind = ToolRowControlEventKind::Press; break;
+        case ToolRowControlKind::Toggle: e.kind = ToolRowControlEventKind::Set; e.value = (c.value != 0.0f) ? 0.0f : 1.0f; break;
+        case ToolRowControlKind::Stepper: e.kind = ToolRowControlEventKind::Step; e.value = (fx < 0.5f) ? -1.0f : 1.0f; break;
+        case ToolRowControlKind::Slider: e.kind = ToolRowControlEventKind::Set; e.value = c.min + fx * (c.max - c.min); break;
+        case ToolRowControlKind::Choice: e.kind = ToolRowControlEventKind::Step; e.value = 1.0f; break;
+    }
+    tool->on_row_control(c.id, e);
+    return true;
 }
 
 static int resolve_side_contact_index(const GP_CanvasContextImpl* ctx, int module_idx, bool is_input, int contact_idx) {
@@ -5441,7 +5559,13 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
                 } else {
                     label_str = tool_label(row.tool);
                 }
-                append_row(label_str.c_str(), ModuleRowKind::Tool, static_cast<int>(row_idx), kModuleLedPerSide, tool_value, row.tool, row.tool_origin, tool_row_h, false, false);
+                // A row that declares its own surface may ask for its own height.
+                int this_row_h = tool_row_h;
+                if (row.tool_origin == ModuleToolOrigin::Plugin) {
+                    ITool* surface_tool = canvas_row_tool(ctx, module_idx, static_cast<int>(row_idx));
+                    if (surface_tool && surface_tool->row_height_px() > 0) this_row_h = std::clamp(surface_tool->row_height_px(), 8, 512);
+                }
+                append_row(label_str.c_str(), ModuleRowKind::Tool, static_cast<int>(row_idx), kModuleLedPerSide, tool_value, row.tool, row.tool_origin, this_row_h, false, false);
             }
             continue;
         }
@@ -5764,7 +5888,7 @@ extern "C" int gp_canvas_set_module_rows(GP_CanvasContext* ctx_, int module_idx,
     // communicated through this API become concrete table rows immediately.
     int previous_focused_module = ctx->focused_module;
     ctx->focused_module = module_idx;
-    sync_module_table_io_layout(ctx, module_idx);
+    canvas_build_module_table(ctx, module_idx);
     ctx->focused_module = previous_focused_module;
     return 1;
 }
@@ -5946,6 +6070,10 @@ static int canvas_handle_module_led_hit(GP_CanvasContextImpl* ctx, int module_id
     bool resolved_role = false;
     if (found.row_idx == kModuleFrameRowSend || found.row_idx == kModuleFrameRowReceive) {
         is_producer = (found.row_idx == kModuleFrameRowSend);
+        resolved_role = true;
+    }
+    if (found.row_idx == kModuleRowPortRow) {   // a row's own port: its declared kind (Return = out of the row)
+        is_producer = (found.col_idx == kModuleColRightLed);
         resolved_role = true;
     }
     const std::vector<ModuleIORow>* rows_ptr = nullptr;

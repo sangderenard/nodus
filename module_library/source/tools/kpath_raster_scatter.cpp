@@ -8,7 +8,7 @@ using namespace nodus::tensors::kpath;
 
 // Wraps rasterize_program_scatter_with_spatial_kernel as a standalone nodus
 // plugin tool -- the scatter/gather sibling of KpathRasterKernelTool
-// (kpath_raster_kernel_tool.cpp; see that file's header comment for the
+// (kpath_raster_kernel.cpp; see that file's header comment for the
 // shared design notes on the plugin-DLL pattern, capability tagging, and why
 // this calls through the gp_kpath_* C-ABI wrappers + links canvas_tables
 // (shared) instead of calling nodus::tensors::kpath:: directly).

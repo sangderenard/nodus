@@ -1,4 +1,6 @@
 #pragma once
+// The row sources: module_library/source/tools/fabric_spring_stage.cpp (the four stage rows) and
+// module_library/source/tools/fabric_spring_state.cpp (the program row).
 // The fabric row (spring.network.batched, turing src/compiler/spring_network_nodus_row.cpp.in) on the tensor state
 // library: its state lives at addressed library columns and each tick runs as library rows in a KernelPipelineTool
 // schedule. Research case 2a1563063ca34358899d5cb971cdf521 (ticket e5b89702a56b48e2be25d2b8b191eff9).
@@ -21,6 +23,7 @@
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,6 +33,15 @@ namespace nodus::gpu {
 constexpr int kFabricNetworks = 8, kFabricNodes = 256, kFabricAxes = 3, kFabricFields = 38;
 constexpr int kFabricNodeSlots = kFabricNetworks * kFabricNodes, kFabricBatch = kFabricNodeSlots * kFabricAxes;
 enum class FabricStage : std::uint32_t { Begin = 1, Prepare = 2, Feedback = 3, Commit = 4 };
+
+// What the stage rows, the program row and the registrar share (library layout above, receipts and program identities).
+inline constexpr std::uint64_t kStageProgram = 0x66616272696331ull;   // "fabric1": the four host stages
+inline constexpr std::uint64_t kLawProgram = 0x737072696e6731ull;     // "spring1": the SymPy law, CPU or GPU product
+inline constexpr std::uint64_t kNeighbors = 27, kContact = 28, kDt = 29, kCommittedP = 30, kCommittedV = 31, kAddresses = 32;
+
+inline std::array<std::uint64_t, 9> stage_receipt(std::uint64_t status, const std::array<std::uint64_t, 4>& w, std::uint64_t ns) {
+    return {status, UINT64_MAX, w[2], ns, w[3], w[1], 0, ns, status == 0 ? 1ull : 0ull};
+}
 
 struct FabricSpringProducts {
     std::string llvm_dll;                    // spring_network_step_batched__tick.dll

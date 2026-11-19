@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/wave_t4_state.cpp.
 
 #include "tensor_state_library_tool.h"
 
@@ -22,6 +23,10 @@ public:
     // frame identity, continuation generation, then each arena's real and
     // imaginary F32 state addresses. Every plane is modified in place.
     WaveT4StateTool(TensorStateLibraryTool& library,std::string dll);
+    WaveT4StateTool();                        // no library: the row refuses until a host gives it one; the DLL path from configure()/saved state
+    void configure(std::string dll);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     ~WaveT4StateTool() override {shutdown();}
     const char* id_cstr() const noexcept override {return "nodus.wave.t4.state";}
     const char* name_cstr() const noexcept override {return "T4 arena state";}
@@ -38,7 +43,7 @@ public:
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext&) override;
 private:
-    TensorStateLibraryTool& library_;
+    TensorStateLibraryTool* library_=nullptr;
     std::string dll_;
     std::mutex mutex_;
     void* module_=nullptr;

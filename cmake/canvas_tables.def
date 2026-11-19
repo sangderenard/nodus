@@ -4,6 +4,8 @@ EXPORTS
     gp_canvas_actualize_to_root
     gp_canvas_add_edge
     gp_canvas_add_edge_with_type
+    gp_canvas_apply_port_pair
+    gp_canvas_resolve_port_pair
     gp_canvas_add_module
     gp_canvas_attach_rope_to_overlay
     gp_canvas_attach_rope_to_overlay_with_module

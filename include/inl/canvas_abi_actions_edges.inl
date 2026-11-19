@@ -941,3 +941,81 @@ extern "C" int gp_canvas_get_module_node_id(GP_CanvasContext* ctx_, int module_i
 // FRAMELED module_idx row_idx led_idx flags reserved0
 // NODE node_id module_idx input_count [inputs...] output_count [outputs...]
 // Lines may appear in any order; loader will reconstruct internal vectors.
+
+// ---- Port pairs: an edge is a move (research case 075069677cb74e3f9794914c9009cec5) ----------------------------------
+// "<table>.<row>:<port> > <table>.<row>:<port>", producer first. <table> is a module label (it may contain dots and
+// spaces) or #<module index>; <row> is the row's index in the module's row program; <port> is a declared row port's
+// name or index. Both ports must be declared by the rows (ToolRowPort); the first must be out of its row (Return), the
+// second into its row (Argument). The result is the edge the GUI's connect move would make between those two LEDs.
+static bool canvas_port_ref(const GP_CanvasContextImpl* c, const std::string& text, bool producer, int& module, int& contact,
+                            std::string& why) {
+    std::string t = text;
+    while (!t.empty() && (t.front() == ' ' || t.front() == '\t')) t.erase(t.begin());
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+    const size_t colon = t.rfind(':');
+    if (colon == std::string::npos) { why = "'" + t + "' has no ':<port>'"; return false; }
+    const size_t dot = t.rfind('.', colon);
+    if (dot == std::string::npos) { why = "'" + t + "' has no '.<row>'"; return false; }
+    const std::string table = t.substr(0, dot), row_text = t.substr(dot + 1, colon - dot - 1), port_text = t.substr(colon + 1);
+    module = -1;
+    if (!table.empty() && table[0] == '#') {
+        try { module = std::stoi(table.substr(1)); } catch (...) { module = -1; }
+    } else {
+        for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi)
+            if (table == c->modules[static_cast<size_t>(mi)].label) { module = mi; break; }
+    }
+    if (module < 0 || module >= static_cast<int>(c->modules.size())) { why = "no table '" + table + "'"; return false; }
+    int row = -1;
+    try { size_t used = 0; row = std::stoi(row_text, &used); if (used != row_text.size()) row = -1; } catch (...) { row = -1; }
+    ITool* tool = canvas_row_tool(c, module, row);
+    if (!tool) { why = "table '" + table + "' has no tool row " + row_text; return false; }
+    int port = -1;
+    const int ports = std::min(tool->row_port_count(), kModuleRowPortStride);
+    for (int p = 0; p < ports && port < 0; ++p) {
+        const ToolRowPort rp = tool->row_port(p);
+        if (rp.name && port_text == rp.name) port = p;
+    }
+    if (port < 0) {
+        try { size_t used = 0; int p = std::stoi(port_text, &used); if (used == port_text.size() && p >= 0 && p < ports) port = p; } catch (...) {}
+    }
+    if (port < 0) { why = "row " + row_text + " of '" + table + "' declares no port '" + port_text + "'"; return false; }
+    const bool is_out = tool->row_port(port).kind == ToolPortKind::Return;
+    if (is_out != producer) {
+        why = std::string("'") + t + "' is " + (is_out ? "out of" : "into") + " its row; the pair is producer > consumer";
+        return false;
+    }
+    contact = canvas_row_port_contact(row, port);
+    return true;
+}
+
+extern "C" int gp_canvas_resolve_port_pair(GP_CanvasContext* ctx_, const char* pair, GP_CanvasEdgeDesc* out_desc,
+                                           char* error, int error_capacity) {
+    auto fail = [&](const std::string& why) {
+        if (error && error_capacity > 0) { std::snprintf(error, static_cast<size_t>(error_capacity), "%s", why.c_str()); }
+        return 0;
+    };
+    if (!ctx_ || !pair || !out_desc) return fail("no canvas, pair or descriptor");
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    const std::string text(pair);
+    const size_t gt = text.find('>');
+    if (gt == std::string::npos || text.find('>', gt + 1) != std::string::npos) return fail("a pair is '<table>.<row>:<port> > <table>.<row>:<port>'");
+    std::string why;
+    GP_CanvasEdgeDesc d{};
+    if (!canvas_port_ref(c, text.substr(0, gt), true, d.a_module, d.a_contact_idx, why)) return fail(why);
+    if (!canvas_port_ref(c, text.substr(gt + 1), false, d.b_module, d.b_contact_idx, why)) return fail(why);
+    for (const auto& e : c->edges)
+        if (e.desc.a_module == d.a_module && e.desc.a_contact_idx == d.a_contact_idx &&
+            e.desc.b_module == d.b_module && e.desc.b_contact_idx == d.b_contact_idx) return fail("that pair is already an edge");
+    *out_desc = d;
+    return 1;
+}
+
+// The move: resolve the pair and add the edge. Its rope is laid by the canvas, between the two ports' LEDs, as for an
+// edge made by clicking them. Returns the edge index, or -1 (error says why).
+extern "C" int gp_canvas_apply_port_pair(GP_CanvasContext* ctx_, const char* pair, char* error, int error_capacity) {
+    GP_CanvasEdgeDesc d{};
+    if (!gp_canvas_resolve_port_pair(ctx_, pair, &d, error, error_capacity)) return -1;
+    const int edge = gp_canvas_add_edge_with_type(ctx_, &d, 0);
+    if (edge < 0 && error && error_capacity > 0) std::snprintf(error, static_cast<size_t>(error_capacity), "the canvas refused the edge");
+    return edge;
+}

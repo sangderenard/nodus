@@ -9,7 +9,13 @@
 /install_manifest.txt
 /compile_commands.json
 /torch
-/module_library
+# The module library is generated output, except its row tool sources: every row tool's source is
+# module_library/source/tools/<id>.cpp, the place the canvas compiler and the Menu read (case 74fd8157).
+/module_library/*
+!/module_library/source/
+/module_library/source/*
+!/module_library/source/tools/
+/module_library/source/tools/*_ver_*.cpp
 
 
 # Visual Studio

@@ -1,6 +1,14 @@
 // Bounded native development entry for ONE explicitly approved link. The
 // existing ThreadManager, GPU ITool, typed FIFOs and ContractNegotiator own the
 // flow. No direct worker invocation, replacement scheduler or dispatch path.
+// The control row (NativeControlTool) is the plugin source module_library/source/tools/opengl_native_control.cpp,
+// compiled into this executable the way a composed plugin source is: NODUS_PLUGIN_COMPOSITE with its exports renamed.
+#define NODUS_PLUGIN_COMPOSITE 1
+#define NODUS_PLUGIN_FACTORY_NAME nodus_opengl_native_control_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_opengl_native_control_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_opengl_native_control_source
+#include "../module_library/source/tools/opengl_native_control.cpp"
+
 #include "opengl_gpu_graph_binding.h"
 #include <array>
 #include <atomic>
@@ -43,14 +51,6 @@ template<size_t N> std::string hex(const std::array<uint8_t,N>& bytes) {
     constexpr char alphabet[]="0123456789abcdef";std::string out;out.reserve(2*N);
     for(auto byte:bytes){out+=alphabet[byte>>4];out+=alphabet[byte&15];}return out;
 }
-class NativeControlTool final:public ITool {
-public:
-    explicit NativeControlTool(std::function<void(ToolStackContext&)> fn):fn_(std::move(fn)){}
-    void initialize(const ToolInitContext&)override{}void shutdown()override{}
-    void tick(double,HostAPI&)override{}void render(RenderContext&)override{}
-    void execute_stack(ToolStackContext& c)override{fn_(c);}
-private:std::function<void(ToolStackContext&)> fn_;
-};
 using Table=std::unique_ptr<GP_TableContext,decltype(&gp_table_destroy)>;
 Table make_table(){Table t(gp_table_create(nullptr),gp_table_destroy);require(bool(t),"Native table allocation failed");gp_table_set_sim_enabled(t.get(),0);return t;}
 uint64_t contact(int module,int port){return uint64_t(module)<<32|uint64_t(port)<<16;}

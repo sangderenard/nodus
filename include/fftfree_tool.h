@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/fftfree.cpp.
 
 #include "tensor_state_library_tool.h"
 #include "tool_api.h"
@@ -27,6 +28,10 @@ public:
     // output magnitude, input samples/frames, max output frames, job id.
     // For complex operation only output real/PCM is used.
     explicit FftFreeTool(TensorStateLibraryTool& library,std::string dll);
+    FftFreeTool();                            // no library: the row refuses until a host gives it one; the DLL path from configure()/saved state
+    void configure(std::string dll);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     ~FftFreeTool() override { shutdown(); }
     const char* id_cstr() const noexcept override {return "nodus.fftfree";}
     const char* name_cstr() const noexcept override {return "fftfree transform";}
@@ -43,7 +48,7 @@ public:
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext&) override;
 private:
-    TensorStateLibraryTool& library_;
+    TensorStateLibraryTool* library_=nullptr;
     std::string dll_;
     std::mutex mutex_;
     void* module_=nullptr;

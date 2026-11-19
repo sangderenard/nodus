@@ -204,6 +204,9 @@ NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_sta
 // Absolute PCM frames lost when the live capture ring outruns Radio's cursor.
 NODUS_HEADLESS_API int32_t nodus_headless_radio_capture_overruns(uint64_t* lost_frames);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
+// A port pair "<table>.<row>:<port> > <table>.<row>:<port>" (gp_canvas_resolve_port_pair), applied as the move: the
+// edge between two ports the rows declare, bound as nodus_headless_add_edge binds it. Edge index, or -1 (error says why).
+NODUS_HEADLESS_API int32_t nodus_headless_apply_port_pair(NodusHeadlessGraph* g, const char* pair, char* error, int32_t error_capacity);
 // Drive the same canvas UI handlers used by the GUI, on the graph's owning
 // thread. Mouse kinds: 0 click, 1 down, 2 up, 3 move, 4 scroll.
 NODUS_HEADLESS_API int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height);

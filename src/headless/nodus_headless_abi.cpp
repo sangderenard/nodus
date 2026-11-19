@@ -853,6 +853,14 @@ extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_Canva
     return attach_edge_binding(g, *desc, canvas_edge_idx);
 }
 
+// A port pair applied as the move (gp_canvas_resolve_port_pair), then added and bound as nodus_headless_add_edge is.
+extern "C" int32_t nodus_headless_apply_port_pair(NodusHeadlessGraph* g, const char* pair, char* error, int32_t error_capacity) {
+    if (!g || !g->ctx || !pair) return -1;
+    GP_CanvasEdgeDesc desc{};
+    if (!gp_canvas_resolve_port_pair(g->ctx, pair, &desc, error, error_capacity)) return -1;
+    return nodus_headless_add_edge(g, &desc, 0);
+}
+
 static int32_t sync_ui_edges(NodusHeadlessGraph* g) {
     if (!g || !g->ctx || !g->table) return 0;
     gp_table_apply_pending_ops(g->table);
