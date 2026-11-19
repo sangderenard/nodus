@@ -168,7 +168,6 @@ public:
         if (!raw_stack_init_frame(frame_, 1 << 16)) frame_ = {};
     }
     ~LibraryRunner() {
-        rows_.clear();
         raw_stack_free_mask(frame_); if (frame_.backend) gp_mem_backend_release(frame_.backend);
     }
     explicit operator bool() const { return bool(session_); }
@@ -208,12 +207,9 @@ public:
             ok = session_.register_shader(c);
             break;
         }
-        case JobKind::Pipeline: {
-            std::vector<nodus::gpu::KernelPipelineComponent> parts;
-            for (const auto& c : d.components) parts.push_back({c.device_bound ? c.tool + ".vulkan." + std::to_string(device_) : c.tool,
-                                                               nodus::gpu::TensorStateLibraryTool::ExecutionApi(c.api), c.program});
-            for (const auto& c : d.components) if (c.device_bound && !tool_registry_global().find(c.tool + ".vulkan." + std::to_string(device_))) return "pending";
-            ok = session_.register_pipeline(d.name, parts);
+        case JobKind::Pipeline: {   // registered per device on first use (ensure_pipeline_on); its components must exist
+            for (const auto& c : d.components) if (c.device_bound && !tool_registry_global().find(c.tool + ".vulkan.0")) return "pending";
+            ok = true;
             break;
         }
         case JobKind::CpuLaw: {
@@ -237,24 +233,41 @@ public:
     }
     bool ready(uint64_t definition) const { return ready_.count(definition) != 0; }
 
-    WorkOutputs run(const WorkItem& w) {
+    // A lane is one market host's execution context: its own stack frame and row instances, on one device.
+    // prepare() runs on the owning (main) thread: card, state writes, row instance (the tool registry has no lock);
+    // execute() may run on the host's own thread: push the inputs, run the row, read the outputs back.
+    struct Lane {
+        uint32_t device = 0;
+        RawStackFrame frame{};
+        std::map<std::string, std::unique_ptr<ITool, std::function<void(ITool*)>>> rows;
+        explicit Lane(uint32_t d = 0) : device(d) { raw_stack_init_frame(frame, 1 << 16); }
+        ~Lane() { rows.clear(); raw_stack_free_mask(frame); if (frame.backend) gp_mem_backend_release(frame.backend); }
+        Lane(const Lane&) = delete; Lane& operator=(const Lane&) = delete;
+    };
+    bool prepare(const WorkItem& w, Lane& lane) {
+        auto def = definitions_.find(w.definition);
+        if (def == definitions_.end() || !ready(w.definition) || !ensure_card(w.card)) return false;
+        for (const auto& [address, t] : w.puts) if (!write_state(w.card, address, t)) return false;
+        return row_for(def->second, lane) != nullptr;
+    }
+    WorkOutputs execute(const WorkItem& w, Lane& lane) {
         WorkOutputs out; out.id = w.id;
         const auto t0 = std::chrono::steady_clock::now();
         auto def = definitions_.find(w.definition);
-        if (def == definitions_.end() || !ready(w.definition) || !ensure_card(w.card)) return out;
-        for (const auto& [address, t] : w.puts) if (!write_state(w.card, address, t)) return out;
-        ITool* row = row_for(def->second);
-        if (!row) return out;
+        if (def == definitions_.end()) return out;
+        auto it = lane.rows.find(row_id(def->second, lane.device));
+        if (it == lane.rows.end()) return out;
+        ITool* row = it->second.get();
         std::vector<uint64_t> handles;
-        for (const auto& t : w.inputs) { handles.push_back(handle_of(t)); raw_stack_push_abstract_tensor(frame_, {handles.back()}); }
-        ToolStackContext c{}; c.stack.raw = &frame_; row->execute_stack(c);
+        for (const auto& t : w.inputs) { handles.push_back(handle_of(t)); raw_stack_push_abstract_tensor(lane.frame, {handles.back()}); }
+        ToolStackContext c{}; c.stack.raw = &lane.frame; row->execute_stack(c);
         nodus::tensors::AbstractTensorHandle r{};
         bool popped = false;
-        if (c.succeeded && raw_stack_pop_abstract_tensor(frame_, r)) { out.row_output = tensor_of(r.id); nodus_tensor_destroy(r.id); popped = true; }
-        while (raw_stack_pop_abstract_tensor(frame_, r)) {}          // a refused row restores its inputs; drop them
+        if (c.succeeded && raw_stack_pop_abstract_tensor(lane.frame, r)) { out.row_output = tensor_of(r.id); nodus_tensor_destroy(r.id); popped = true; }
+        while (raw_stack_pop_abstract_tensor(lane.frame, r)) {}      // a refused row restores its inputs; drop them
         for (auto h : handles) nodus_tensor_destroy(h);
         if (!popped) return out;
-        // a library receipt (U64 rank 1, status first) must say 0; a program row's output is its data
+        // a library receipt (U64, status first) must say 0; a program row's output is its data
         const bool receipt = out.row_output.dtype == NODUS_DTYPE_U64 && out.row_output.bytes.size() >= 8;
         out.status = receipt ? get_le(out.row_output.bytes.data(), 8) : 0;
         for (auto a : w.outputs) {
@@ -265,6 +278,21 @@ public:
         }
         out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         return out;
+    }
+    WorkOutputs run(const WorkItem& w) {                 // both, on the runner's own lane (the server's re-check)
+        if (!prepare(w, main_lane_)) { WorkOutputs out; out.id = w.id; return out; }
+        return execute(w, main_lane_);
+    }
+    std::string row_id(const Definition& d, uint32_t device) const {
+        switch (d.kind) {
+        case JobKind::ShaderJob: return d.name + ".vulkan." + std::to_string(device);
+        case JobKind::Pipeline: return d.name + ".on." + std::to_string(device);
+        case JobKind::FabricProgram: return d.name;
+        case JobKind::CpuLaw: return "nodus.fabric.dispatch.cpu";
+        case JobKind::Fftfree: return "nodus.fftfree";
+        case JobKind::WaveT4: return "nodus.wave.t4.state";
+        }
+        return {};
     }
 
 private:
@@ -315,23 +343,26 @@ private:
         if (ok) state_.insert({card, address});
         return ok;
     }
-    ITool* row_for(const Definition& d) {
-        std::string id;
-        switch (d.kind) {
-        case JobKind::ShaderJob: id = d.name + ".vulkan." + std::to_string(device_); break;
-        case JobKind::Pipeline: case JobKind::FabricProgram: id = d.name; break;
-        case JobKind::CpuLaw: id = "nodus.fabric.dispatch.cpu"; break;
-        case JobKind::Fftfree: id = "nodus.fftfree"; break;
-        case JobKind::WaveT4: id = "nodus.wave.t4.state"; break;
-        }
-        auto it = rows_.find(id);
-        if (it == rows_.end()) {
+    ITool* row_for(const Definition& d, Lane& lane) {
+        const std::string id = row_id(d, lane.device);
+        auto it = lane.rows.find(id);
+        if (it == lane.rows.end()) {
+            if (d.kind == JobKind::Pipeline && !ensure_pipeline_on(d, lane.device)) return nullptr;
             auto row = tool_registry_global().create(id);
             if (!row) return nullptr;
             row->initialize({});
-            it = rows_.emplace(id, std::move(row)).first;
+            it = lane.rows.emplace(id, std::move(row)).first;
         }
         return it->second.get();
+    }
+    // A pipeline of device-bound components is registered once per device it runs on (<name>.on.<device>).
+    bool ensure_pipeline_on(const Definition& d, uint32_t device) {
+        const std::string id = row_id(d, device);
+        if (tool_registry_global().find(id)) return true;
+        std::vector<nodus::gpu::KernelPipelineComponent> parts;
+        for (const auto& c : d.components) parts.push_back({c.device_bound ? c.tool + ".vulkan." + std::to_string(device) : c.tool,
+                                                           nodus::gpu::TensorStateLibraryTool::ExecutionApi(c.api), c.program});
+        return session_.register_pipeline(id, parts);
     }
 
     nodus::gpu::KernelLibrarySession session_{tool_registry_global()};
@@ -346,8 +377,8 @@ private:
     std::map<uint64_t, Definition> definitions_;
     std::set<uint64_t> ready_, cards_;
     std::set<std::pair<uint64_t, uint64_t>> state_;
-    std::map<std::string, std::unique_ptr<ITool, std::function<void(ITool*)>>> rows_;
     uint64_t local_matched_ = 0, local_differed_ = 0;
+    Lane main_lane_{0};
 };
 
 }  // namespace nodus::link

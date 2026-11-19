@@ -67,14 +67,33 @@ inline bool take_frame(ControlMux& mux, WireMessage& m) {
     return WireSocket::decode(f, m);
 }
 
+// Many market hosts share one link (one per device, stage 4): frames are routed by the loan's host id, which the
+// negotiator sets on every offer and every frame here carries back (Accept, Result, Receipt).
+class ContractRouter {
+public:
+    explicit ContractRouter(ControlMux& mux) : mux_(mux) {}
+    Link& link() { return mux_.link(); }
+    bool take(uint64_t host, WireMessage& m) {
+        WireMessage f{};
+        while (take_frame(mux_, f)) queues_[f.result.loan.host].push_back(f);
+        auto it = queues_.find(host);
+        if (it == queues_.end() || it->second.empty()) return false;
+        m = it->second.front(); it->second.pop_front(); return true;
+    }
+
+private:
+    ControlMux& mux_;
+    std::map<uint64_t, std::deque<WireMessage>> queues_;
+};
+
 // ---- server side: the volunteer as a ContractNegotiator::Peer ---------------------------------------------------
 // ContractSocket::exchange with the link as transport: send an offer once per generation, return one response per
 // visit (an Accept or a Result), forward receipts. `host_id` is the account the link's ticket names.
 class LinkHostPeer {
 public:
     // `on_accept` runs when the volunteer accepts a loan: the moment its inputs must go to it (the bulk pair).
-    LinkHostPeer(ControlMux& mux, uint64_t host_id, std::function<void(const Loan&)> on_accept = {})
-        : mux_(mux), id_(host_id), on_accept_(std::move(on_accept)) {}
+    LinkHostPeer(ContractRouter& router, uint64_t host_id, std::function<void(const Loan&)> on_accept = {})
+        : router_(router), id_(host_id), on_accept_(std::move(on_accept)) {}
     Peer peer() {
         Peer p; p.id = id_;
         p.exchange = [this](const Loan* offer) { return exchange(offer); };
@@ -83,11 +102,11 @@ public:
     }
     Exchange exchange(const Loan* offer) {
         if (offer && offer->generation != last_offer_) {
-            if (send_frame(mux_.link(), {WireKind::Offer, {*offer, 0}})) { last_offer_ = offer->generation; offered_ = *offer; }
+            if (send_frame(router_.link(), {WireKind::Offer, {*offer, 0}})) { last_offer_ = offer->generation; offered_ = *offer; }
         }
         Exchange reply{};
         WireMessage m{};
-        if (take_frame(mux_, m)) {
+        if (router_.take(id_, m)) {
             if (m.kind == WireKind::Accept) {
                 reply.accepted_generation = m.result.loan.generation;
                 if (on_accept_ && reply.accepted_generation == offered_.generation) on_accept_(offered_);
@@ -97,13 +116,13 @@ public:
         return reply;
     }
     void receipt(uint64_t generation, bool accepted) {
-        WireMessage m{WireKind::Receipt, {}}; m.result.loan.generation = generation; m.result.payload = accepted ? 1 : 0;
-        send_frame(mux_.link(), m);
+        WireMessage m{WireKind::Receipt, {}}; m.result.loan.generation = generation; m.result.loan.host = id_; m.result.payload = accepted ? 1 : 0;
+        send_frame(router_.link(), m);
     }
-    bool closed() const { return mux_.link().closed(); }
+    bool closed() { return router_.link().closed(); }
 
 private:
-    ControlMux& mux_;
+    ContractRouter& router_;
     uint64_t id_;
     uint64_t last_offer_ = 0;
     Loan offered_{};
@@ -117,16 +136,19 @@ class LinkContractHost {
 public:
     using Start = std::function<bool(const Loan&)>;
     using Poll = std::function<bool(const Loan&, uint64_t& result_payload)>;
-    LinkContractHost(ControlMux& mux, Start start, Poll poll) : mux_(mux), start_(std::move(start)), poll_(std::move(poll)) {}
+    // `host_id` is this host's id in the server's market (one per device); 0 serves every frame (a single host).
+    LinkContractHost(ContractRouter& router, uint64_t host_id, Start start, Poll poll)
+        : router_(router), host_(host_id), start_(std::move(start)), poll_(std::move(poll)) {}
+    uint64_t id() const { return host_; }
     void poll() {
         WireMessage m{};
-        while (take_frame(mux_, m)) {
+        while (router_.take(host_, m)) {
             if (m.kind == WireKind::Offer) {
                 const Loan& offer = m.result.loan;
                 if (working_ || waiting_receipt_) continue;                 // one loan at a time; the offer expires
                 if (offer.generation == declined_) continue;
                 if (!start_(offer)) { declined_ = offer.generation; continue; }
-                if (!send_frame(mux_.link(), {WireKind::Accept, {offer, 0}})) continue;
+                if (!send_frame(router_.link(), {WireKind::Accept, {offer, 0}})) continue;
                 loan_ = offer; working_ = true; ++accepted_;
             } else if (m.kind == WireKind::Receipt) {
                 if (waiting_receipt_ && m.result.loan.generation == loan_.generation) { waiting_receipt_ = false; ++receipts_; }
@@ -134,7 +156,7 @@ public:
         }
         uint64_t payload = 0;
         if (working_ && poll_(loan_, payload)) {
-            if (send_frame(mux_.link(), {WireKind::Result, {loan_, payload}})) { working_ = false; waiting_receipt_ = true; ++results_; }
+            if (send_frame(router_.link(), {WireKind::Result, {loan_, payload}})) { working_ = false; waiting_receipt_ = true; ++results_; }
         }
     }
     bool busy() const { return working_ || waiting_receipt_; }
@@ -143,7 +165,8 @@ public:
     uint64_t receipts() const { return receipts_; }
 
 private:
-    ControlMux& mux_;
+    ContractRouter& router_;
+    uint64_t host_;
     Start start_; Poll poll_;
     Loan loan_{};
     bool working_ = false, waiting_receipt_ = false;

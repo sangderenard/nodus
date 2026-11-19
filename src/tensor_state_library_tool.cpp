@@ -60,9 +60,14 @@ void TensorStateLibraryTool::initialize(const ToolInitContext&) {
     std::vector<TensorStateLibrary::Device> devices;
     std::vector<kernels::VulkanDeviceInfo> inventory;
     std::string error;
+    // One bank per physical device: the Vulkan inventory can list a device twice (two ICDs; e.g. each NVIDIA card on
+    // this machine), and a second bank for the same device would duplicate its state and fall outside the card's
+    // GPU quota words (volunteer case a11b5c9b1be74c9b9fb684790f7fd5a3, stage 4).
+    std::vector<std::array<std::uint8_t,16>> opened;
     if(include_gpu_&&kernels::enumerate_vulkan_devices(&inventory,&error))
         for(const auto& item:inventory){
             if(!item.compute)continue;
+            if(item.uuid_valid&&std::find(opened.begin(),opened.end(),item.uuid)!=opened.end())continue;
             gp_mem_backend_vulkan_params_t params{item.index,GP_VULKAN_ALLOC_DEVICE_LOCAL};
             kernels::VulkanDeviceInfo selected;
             auto* context=kernels::create_vulkan_backend(&params,&selected,&error);
@@ -76,6 +81,7 @@ void TensorStateLibraryTool::initialize(const ToolInitContext&) {
                               device_budget_bytes_[slot]
                 ? std::min(suggested,device_budget_bytes_[slot]) : suggested;
             if(!budget){gp_mem_backend_release(context);continue;}
+            if(item.uuid_valid)opened.push_back(item.uuid);
             contexts_.emplace_back(context,&gp_mem_backend_release);
             devices.push_back({context,budget});
         }

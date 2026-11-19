@@ -46,7 +46,8 @@ int main() {
         return std::numeric_limits<size_t>::max();
     }, 10000);
     ControlMux server_mux(*server_link), volunteer_mux(*volunteer_link);
-    LinkHostPeer volunteer_peer(server_mux, server_link->account());   // host id = the account the ticket names
+    ContractRouter server_router(server_mux), volunteer_router(volunteer_mux);
+    LinkHostPeer volunteer_peer(server_router, server_link->account());   // host id = the account the ticket names
     check(market.add_host(volunteer_peer.peer()), "volunteer host added");
 
     // A local host: accepts at once, returns 3 x payload on its next visit.
@@ -63,7 +64,7 @@ int main() {
 
     // The volunteer's work: 3 x payload, done a few polls after it starts (it is not instant).
     std::map<uint64_t, int> volunteer_progress;
-    LinkContractHost volunteer(volunteer_mux,
+    LinkContractHost volunteer(volunteer_router, server_link->account(),
         [&](const Loan& loan) { volunteer_progress[loan.generation] = 0; return true; },
         [&](const Loan& loan, uint64_t& out) {
             if (++volunteer_progress[loan.generation] < 20) return false;
