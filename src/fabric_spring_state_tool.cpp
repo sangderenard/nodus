@@ -325,7 +325,9 @@ private:
                 for (int edge = 0; edge < 4; edge++) { columns[5 + edge][lane] = row[33 + edge]; columns[18 + edge][lane] = row[21 + edge * 3 + axis]; }
             }
         }
-        if (!carded_) { if (!library_request(1, 0, 0)) return false; carded_ = true; }
+        // The card is the one given at registration: created here if it is new, used as it is if its owner made it
+        // already (the library answers Invalid for an existing card; a card that does not exist fails the Puts below).
+        if (!carded_) { library_request(1, 0, 0); carded_ = true; }
         for (std::uint64_t i = 0; i < 26; i++) if (!put(i, NODUS_DTYPE_F64, columns[i].data(), kFabricBatch, sizeof(double))) return false;
         const std::uint32_t count = std::uint32_t(kFabricBatch); const double zero = 0.0;
         floor_enabled_ = tabletop_enabled_ = false;

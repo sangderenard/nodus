@@ -27,7 +27,8 @@
 namespace nodus::link {
 
 // ---- typed bulk streams ------------------------------------------------------------------------------------------
-enum class BulkStreamKind : uint32_t { Settings = 1, Glsl = 2, Vulkan = 3, Tensor = 4 };
+// Artifact/Definition/WorkItem/Outputs: the job layer (nodus_link_jobs.h, stage 3).
+enum class BulkStreamKind : uint32_t { Settings = 1, Glsl = 2, Vulkan = 3, Tensor = 4, Artifact = 5, Definition = 6, WorkItem = 7, Outputs = 8 };
 constexpr uint32_t kTypedMagic = 0x31595442;   // "BTY1"
 // Descriptor: magic u32 | kind u32 | id u64 | aux [up to 4080 bytes, kind-defined]
 inline std::vector<uint8_t> typed_descriptor(BulkStreamKind kind, uint64_t id, const std::vector<uint8_t>& aux = {}) {

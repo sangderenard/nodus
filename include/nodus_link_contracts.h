@@ -72,7 +72,9 @@ inline bool take_frame(ControlMux& mux, WireMessage& m) {
 // visit (an Accept or a Result), forward receipts. `host_id` is the account the link's ticket names.
 class LinkHostPeer {
 public:
-    LinkHostPeer(ControlMux& mux, uint64_t host_id) : mux_(mux), id_(host_id) {}
+    // `on_accept` runs when the volunteer accepts a loan: the moment its inputs must go to it (the bulk pair).
+    LinkHostPeer(ControlMux& mux, uint64_t host_id, std::function<void(const Loan&)> on_accept = {})
+        : mux_(mux), id_(host_id), on_accept_(std::move(on_accept)) {}
     Peer peer() {
         Peer p; p.id = id_;
         p.exchange = [this](const Loan* offer) { return exchange(offer); };
@@ -81,12 +83,15 @@ public:
     }
     Exchange exchange(const Loan* offer) {
         if (offer && offer->generation != last_offer_) {
-            if (send_frame(mux_.link(), {WireKind::Offer, {*offer, 0}})) last_offer_ = offer->generation;
+            if (send_frame(mux_.link(), {WireKind::Offer, {*offer, 0}})) { last_offer_ = offer->generation; offered_ = *offer; }
         }
         Exchange reply{};
         WireMessage m{};
         if (take_frame(mux_, m)) {
-            if (m.kind == WireKind::Accept) reply.accepted_generation = m.result.loan.generation;
+            if (m.kind == WireKind::Accept) {
+                reply.accepted_generation = m.result.loan.generation;
+                if (on_accept_ && reply.accepted_generation == offered_.generation) on_accept_(offered_);
+            }
             else if (m.kind == WireKind::Result) { reply.has_result = true; reply.result = m.result; }
         }
         return reply;
@@ -101,6 +106,8 @@ private:
     ControlMux& mux_;
     uint64_t id_;
     uint64_t last_offer_ = 0;
+    Loan offered_{};
+    std::function<void(const Loan&)> on_accept_;
 };
 
 // ---- volunteer side: a host that serves the server's market over its link --------------------------------------
