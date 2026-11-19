@@ -80,6 +80,9 @@ public:
     // Explicit row-stack/FIFO transfer policy. FIFO type metadata never
     // selects this policy implicitly.
     std::vector<ModuleStackContract> module_stack_contract;
+    // Stack loopback (owner design, 2026-11-19): a table set in stack loopback keeps its stack from tick to tick; a
+    // refused tensor stays on the stack. 0 = the stack is reset every tick (the default), 1 = stack loopback.
+    std::vector<uint8_t> module_stack_loopback;
 
     // Graph node/contract representation.
     struct NodeContract {

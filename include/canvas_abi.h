@@ -504,6 +504,9 @@ int gp_canvas_get_module_row(GP_CanvasContext* ctx, int module_idx, int row_idx,
 // `contract` is ModuleStackContract (thread_manager.h).
 int gp_canvas_set_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int contract);
 int gp_canvas_get_module_stack_contract(GP_CanvasContext* ctx, int module_idx, int* out_contract);
+// Stack loopback: 1 = the table keeps its stack from tick to tick (a refused tensor stays on it), 0 = reset each tick.
+int gp_canvas_set_module_stack_loopback(GP_CanvasContext* ctx, int module_idx, int on);
+int gp_canvas_get_module_stack_loopback(GP_CanvasContext* ctx, int module_idx, int* out_on);
 // Per-module execution mode: -1 inherits the canvas choice, 0 sequential,
 // 1 pooled, 2 slip, 3 independent Free table worker. Set before stepping or
 // at a quiescent graph-edit boundary.

@@ -132,6 +132,7 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_output_layout.emplace_back();
     c->module_io_rows.emplace_back();
     c->graph->module_stack_contract.push_back(ModuleStackContract::Opaque);
+    c->graph->module_stack_loopback.resize(c->graph->module_stack_contract.size(), 0);
     c->module_table_rows.emplace_back();
     c->module_frame_leds.push_back(make_module_frame_led_group());
     c->module_frame_links.emplace_back();

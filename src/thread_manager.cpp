@@ -211,6 +211,16 @@ static int32_t row_port_publish(void* host, int32_t port, const void* bytes, siz
     }
     return 0;
 }
+static int32_t row_port_can_publish(void* host, int32_t port, int32_t count) {
+    auto* b = static_cast<RowPortBinding*>(host);
+    if (!b || !b->req || !b->fifo_table || port < 0 || port >= GP_CANVAS_ROW_PORT_STRIDE || count < 0) return 0;
+    const int contact = row_port_contact(b->row, port);
+    for (const auto& e : b->req->edges) {
+        if (e.a_module != b->mod_idx || e.a_contact_idx != contact) continue;
+        return gp_table_edge_can_publish(b->fifo_table, e.edge_idx, count) ? 1 : 0;
+    }
+    return 0;
+}
 static int32_t row_port_consume(void* host, int32_t port, void* out, size_t capacity, size_t* written) {
     auto* b = static_cast<RowPortBinding*>(host);
     if (written) *written = 0;
@@ -845,7 +855,8 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         const ValueType* stack_type_info = scalar_stack ? nullptr : ValueTypeRegistry::global().get(stack_default_type);
         size_t stack_elem_size = scalar_stack ? sizeof(double) :
             (stack_type_info && stack_type_info->size > 0 ? stack_type_info->size : sizeof(double));
-        reset_module_tool_stack(*module_stack);
+        // A table set in stack loopback keeps its stack: what a row refused is still on it this tick.
+        if (!mod.stack_loopback) reset_module_tool_stack(*module_stack);
         std::vector<float> stack_snapshot;
         auto push_value = [&](float value) {
             double dv = static_cast<double>(value);
@@ -1086,6 +1097,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                             row_port_access.host = &row_port_binding;
                             row_port_access.publish = &row_port_publish;
                             row_port_access.consume = &row_port_consume;
+                            row_port_access.can_publish = &row_port_can_publish;
                             tctx.row_ports = &row_port_access;
                         }
                         ToolInputState tinp;
@@ -1135,12 +1147,9 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                                 pending_returns->push_back(id);
                             }
                         }
-                        if (!tctx.succeeded) {
-                            // Refusing tools restore their inputs by contract.
-                            // Do not let following output rows reinterpret that
-                            // rolled-back stack tail as successful return values.
-                            break;
-                        }
+                        // A refusing row restores its input to the stack by contract, and the table goes on: the rows
+                        // after it run, so a refused tensor stays on the stack for them (owner, 2026-11-19: a table
+                        // never stops at a refusal; the filter send and governed intake rows loop it back up).
                         continue; // plugin handled this row
                     }
                 }

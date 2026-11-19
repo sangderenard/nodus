@@ -165,6 +165,11 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t contract);
 NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract);
+// Stack loopback (1) or the per-tick stack reset (0, the default); saved with the canvas (MODULE_STACK_LOOPBACK).
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t on);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_on);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_exec_mode(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t mode);
 NODUS_HEADLESS_API int32_t nodus_headless_get_module_exec_mode(

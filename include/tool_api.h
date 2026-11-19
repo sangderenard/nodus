@@ -142,6 +142,9 @@ struct ToolRowPortAccess {
     int32_t (*publish)(void* host, int32_t port, const void* bytes, size_t len) = nullptr;
     // One token from the edge at this (input) port: 1 read into out (*written bytes); 0 nothing waiting or no edge.
     int32_t (*consume)(void* host, int32_t port, void* out, size_t capacity, size_t* written) = nullptr;
+    // 1 when the edge at this (output) port can take `count` more tokens without dropping; 0 otherwise or no edge.
+    // Trailing: hosts that do not fill it leave it null.
+    int32_t (*can_publish)(void* host, int32_t port, int32_t count) = nullptr;
 };
 
 enum class ToolTensorRole : uint8_t { Owner = 0, Borrower = 1, Returns = 2 };

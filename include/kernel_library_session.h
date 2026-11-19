@@ -118,21 +118,28 @@ public:
     // row's runner queue.
     bool register_volunteer_rows(const GpuShaderJobContract& contract,std::size_t capacity=4){
         if(!library_||!registry_.find(contract.id+".vulkan.0"))return false;
-        if(!registry_.find("nodus.volunteer.library")){
-            ToolRegistry::Entry item;
-            item.id="nodus.volunteer.library";
-            item.name="Volunteer state library";
-            item.caps=ToolCaps::None;
-            auto* row=row_.get();
-            item.factory=[row]{
-                return std::unique_ptr<ITool,std::function<void(ITool*)>>(new LibraryRowView(*row),
-                    [](ITool* value){delete value;});
-            };
-            if(!registry_.register_tool(std::move(item)))return false;
-            registered_.push_back("nodus.volunteer.library");
-        }
+        if(!register_volunteer_library())return false;
         return register_volunteer_work_rows(registry_,contract.id,contract.program_id,library_->device_count(),
                                             capacity,&registered_);
+    }
+
+    // The library row alone (nodus.volunteer.library, this session's own row), for a host whose work runs elsewhere:
+    // the server's side of the cycle across the link. Registered once; true when it is registered.
+    bool register_volunteer_library(){
+        if(!library_)return false;
+        if(registry_.find("nodus.volunteer.library"))return true;
+        ToolRegistry::Entry item;
+        item.id="nodus.volunteer.library";
+        item.name="Volunteer state library";
+        item.caps=ToolCaps::None;
+        auto* row=row_.get();
+        item.factory=[row]{
+            return std::unique_ptr<ITool,std::function<void(ITool*)>>(new LibraryRowView(*row),
+                [](ITool* value){delete value;});
+        };
+        if(!registry_.register_tool(std::move(item)))return false;
+        registered_.push_back("nodus.volunteer.library");
+        return true;
     }
 
     bool register_pipeline(std::string id,

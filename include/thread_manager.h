@@ -147,6 +147,7 @@ public:
             int32_t exec_skip_count = 0; // number of frames to skip between executions (0 = every frame)
             ExecMode exec_mode = ExecMode::Pooled;
             ModuleStackContract stack_contract = ModuleStackContract::Opaque;
+            uint8_t stack_loopback = 0;  // 1 = the table keeps its stack from tick to tick (GraphRuntime)
         };
 
     struct EdgeContract {

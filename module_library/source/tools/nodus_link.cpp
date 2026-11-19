@@ -59,16 +59,24 @@ void LinkRow::execute_stack(ToolStackContext& context) {
     bool accepted = false;
     nodus::tensors::AbstractTensorHandle input{};
     if (raw_stack_pop_abstract_tensor(stack, input)) {
-        if (!(bulk_ ? accept_bulk(input.id) : accept_control(input.id))) {
+        if (!input.id) {
+            // The Input row's pad for an empty edge (in a tensor table, the null handle): nothing to send this tick.
+            accepted = true;
+        } else if (!(bulk_ ? accept_bulk(input.id) : accept_control(input.id))) {
             ++(bulk_ ? ep_->report().bulk_refused : ep_->report().control_refused);
-            raw_stack_push_abstract_tensor(stack, input); return;
+            raw_stack_push_abstract_tensor(stack, input);  // refused: it stays on the stack for the rows below
+        } else {
+            accepted = true; ep_->poll();
         }
-        accepted = true; ep_->poll();
     }
-    uint64_t out = bulk_ ? ep_->take_bulk() : control_tensor();
-    if (!out) { context.succeeded = accepted; return; }
-    if (!raw_stack_push_abstract_tensor(stack, {out})) { nodus_tensor_destroy(out); context.succeeded = accepted; return; }
-    context.succeeded = true;
+    // Arrivals go out on the row port "received", one per token, while its edge can take them.
+    const ToolRowPortAccess* ports = context.row_ports;
+    while (ports && ports->publish && ports->can_publish && ports->can_publish(ports->host, 0, 1)) {
+        const uint64_t out = bulk_ ? ep_->take_bulk() : control_tensor();
+        if (!out) break;
+        if (!ports->publish(ports->host, 0, &out, sizeof(out))) { nodus_tensor_destroy(out); break; }
+    }
+    context.succeeded = accepted;
 }
 bool LinkRow::accept_control(uint64_t h) {
     NodusTensorDesc d{}; uint8_t b[kControlPacketBytes]; ControlPacket p;

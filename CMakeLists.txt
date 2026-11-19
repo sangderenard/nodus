@@ -891,6 +891,15 @@ target_compile_features(test_volunteer_cycle PRIVATE cxx_std_20)
 if(WIN32)
   target_link_libraries(test_volunteer_cycle PRIVATE ws2_32)
 endif()
+# The cycle across the Nodus link: the library on this host, the work on a volunteer child process.
+#   test_volunteer_cycle_link run <glslangValidator> <nodus root> <module library root> <work dir>
+add_executable(test_volunteer_cycle_link tests/volunteer_cycle_link_test.cpp src/headless/nodus_headless_abi.cpp)
+target_compile_definitions(test_volunteer_cycle_link PRIVATE NODUS_HEADLESS_BUILD=1 NOMINMAX)
+target_link_libraries(test_volunteer_cycle_link PRIVATE canvas_tables_static nodus_runtime)
+target_compile_features(test_volunteer_cycle_link PRIVATE cxx_std_20)
+if(WIN32)
+  target_link_libraries(test_volunteer_cycle_link PRIVATE ws2_32 bcrypt winhttp crypt32)
+endif()
 
 # Socket qualification uses the same native registry image as its headless graph.
 add_executable(contract_socket_test tests/contract_socket_graph_test.cpp)

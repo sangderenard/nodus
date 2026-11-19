@@ -600,6 +600,7 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
     std::vector<TrailerPort> trailer_ports;
     struct ModulePolicy { int32_t module; int32_t exec; int32_t stack; };
     std::vector<ModulePolicy> trailer_policies;
+    std::vector<std::pair<int32_t, int32_t>> trailer_loopbacks;  // MODULE_STACK_LOOPBACK module on
     std::vector<nodus::contracts::CanvasContractPorts::Record> trailer_contract_ports;
     {
         std::ifstream ifs(path);
@@ -637,6 +638,13 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
                     return 0;
                 }
                 trailer_policies.push_back(policy);
+            } else if (tag == "MODULE_STACK_LOOPBACK") {
+                int32_t module = -1, on = 0;
+                if (!(ss >> module >> on) || module < 0 || (on != 0 && on != 1)) {
+                    std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                    return 0;
+                }
+                trailer_loopbacks.emplace_back(module, on);
             }
         }
     }
@@ -645,6 +653,12 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
         if (!nodus_headless_set_module_exec_mode(g, policy.module, policy.exec) ||
             !nodus_headless_set_module_stack_contract(g, policy.module, policy.stack)) {
             std::fprintf(stderr, "nodus_headless_load_file: cannot restore MODULE_POLICY %d\n", policy.module);
+            return 0;
+        }
+    }
+    for (const auto& lb : trailer_loopbacks) {
+        if (!nodus_headless_set_module_stack_loopback(g, lb.first, lb.second)) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot restore MODULE_STACK_LOOPBACK %d\n", lb.first);
             return 0;
         }
     }
@@ -732,6 +746,9 @@ extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* p
         if (!nodus_headless_get_module_exec_mode(g, module, &exec) ||
             !nodus_headless_get_module_stack_contract(g, module, &stack)) return 0;
         trailer << "MODULE_POLICY " << module << " " << exec << " " << stack << "\n";
+        int32_t loopback = 0;
+        if (!nodus_headless_get_module_stack_loopback(g, module, &loopback)) return 0;
+        if (loopback) trailer << "MODULE_STACK_LOOPBACK " << module << " 1\n";
     }
     for (const auto& e : g->edges) {
         if (!e.configured) continue;
@@ -850,6 +867,18 @@ extern "C" int32_t nodus_headless_get_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract) {
     if (!g || !g->ctx) return 0;
     return gp_canvas_get_module_stack_contract(g->ctx, module_idx, out_contract);
+}
+
+extern "C" int32_t nodus_headless_set_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t on) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_set_module_stack_loopback(g->ctx, module_idx, on);
+}
+
+extern "C" int32_t nodus_headless_get_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_on) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_stack_loopback(g->ctx, module_idx, out_on);
 }
 
 extern "C" int32_t nodus_headless_set_module_exec_mode(

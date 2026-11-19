@@ -883,6 +883,7 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     ctx->module_output_layout.clear();
     ctx->module_io_rows.clear();
     ctx->graph->module_stack_contract.clear();
+    ctx->graph->module_stack_loopback.clear();
     ctx->module_table_rows.clear();
     ctx->module_frame_leds.clear();
     ctx->module_frame_links.clear();
@@ -1093,6 +1094,7 @@ static void canvas_destroy_module(GP_CanvasContextImpl* ctx, int module_idx) {
     erase_at(ctx->module_output_layout);
     erase_at(ctx->module_io_rows);
     erase_at(ctx->graph->module_stack_contract);
+    erase_at(ctx->graph->module_stack_loopback);
     erase_at(ctx->module_table_rows);
     erase_at(ctx->module_frame_leds);
     erase_at(ctx->module_frame_links);
@@ -5960,6 +5962,23 @@ extern "C" int gp_canvas_set_module_stack_contract(GP_CanvasContext* ctx_, int m
     }
     ctx->graph->module_stack_contract[static_cast<size_t>(module_idx)] =
         static_cast<ModuleStackContract>(contract);
+    return 1;
+}
+
+extern "C" int gp_canvas_set_module_stack_loopback(GP_CanvasContext* ctx_, int module_idx, int on) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size()) || (on != 0 && on != 1)) return 0;
+    if (module_idx >= static_cast<int>(ctx->graph->module_stack_loopback.size()))
+        ctx->graph->module_stack_loopback.resize(static_cast<size_t>(module_idx) + 1, 0);
+    ctx->graph->module_stack_loopback[static_cast<size_t>(module_idx)] = static_cast<uint8_t>(on);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_module_stack_loopback(GP_CanvasContext* ctx_, int module_idx, int* out_on) {
+    auto* ctx = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!ctx || !out_on || module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return 0;
+    *out_on = module_idx < static_cast<int>(ctx->graph->module_stack_loopback.size())
+        ? ctx->graph->module_stack_loopback[static_cast<size_t>(module_idx)] : 0;
     return 1;
 }
 

@@ -1,11 +1,11 @@
 #pragma once
 // The Nodus link on a canvas: two rows, modelled on TcpByteStreamTool, sharing one link endpoint.
-//   <id>.control   Argument = control.out, Return = control.in   U8 [256] tensors, one encoded ControlPacket each
-//   <id>.bulk      Argument = bulk.out,    Return = bulk.in      any dense tensor; it arrives with the sender's dtype
-//                                                                and shape (nodus_tensor_create)
+//   <id>.control   Argument = control.out, row port "received" = control.in   U8 [256] tensors, one ControlPacket each
+//   <id>.bulk      Argument = bulk.out,    row port "received" = bulk.in      any dense tensor; it arrives with the
+//                                                                             sender's dtype and shape
 // The endpoint is a host (a LinkListener on 127.0.0.1, one peer at a time) or a dialer (a LinkDialer, one dial: tickets
 // are single use). Both rows poll it; nothing blocks. Inputs are copied when accepted and stay the caller's; outputs
-// belong to whoever pops them. A refused input is restored to the stack with succeeded=false, as TcpByteStreamTool does.
+// belong to whoever pops them. A refused input is restored to the stack with succeeded=false and the rows below it run.
 // Research case 98d49cb8520e44d092c5d134c37c3c32, stage 2. Include before <windows.h> (winsock).
 #include "nodus_link.h"
 #include "nodus_link_wss.h"
@@ -48,10 +48,9 @@ public:
     const char* id_cstr() const noexcept override { return id_.c_str(); }
     const char* name_cstr() const noexcept override { return bulk_ ? "Link bulk" : "Link control"; }
     ToolCaps caps() const override { return ToolCaps::None; }
-    int32_t port_count() const override { return 2; }
+    int32_t port_count() const override { return 1; }
     ToolPortSpec port_spec(int32_t index) const override {
         if (index == 0) return {ToolPortKind::Argument, 1};
-        if (index == 1) return {ToolPortKind::Return, 1};
         return {};
     }
     void initialize(const ToolInitContext&) override;
@@ -59,6 +58,17 @@ public:
     void tick(double, HostAPI&) override;
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext& context) override;
+    // What arrives goes out on the row's own port "received" (8-byte handle tokens), never onto the stack: below the
+    // row the stack holds only what it refused (owner, 2026-11-19). An arrival waits in the endpoint until that port's
+    // edge can take it.
+    int32_t row_port_count() const override { return 1; }
+    ToolRowPort row_port(int32_t index) const override {
+        if (index == 0) return ToolRowPort{ToolPortKind::Return, 1.0f, 0.5f, "received", 8};
+        return ToolRowPort{};
+    }
+    // It copies what it sends and never keeps or destroys it (tool_api.h ToolTensorRole): in a table with a Returns
+    // row a sent tensor goes back to the mint, e.g. a volunteer cycle batch once it is on the wire.
+    ToolTensorRole tensor_role() const override { return ToolTensorRole::Borrower; }
 
 private:
     bool accept_control(uint64_t h);

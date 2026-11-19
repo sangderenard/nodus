@@ -299,6 +299,9 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
                     (mi >= 0 && mi < static_cast<int>(c->graph->module_stack_contract.size()))
                     ? c->graph->module_stack_contract[static_cast<size_t>(mi)]
                     : ModuleStackContract::Opaque;
+                mod.stack_loopback =
+                    (mi >= 0 && mi < static_cast<int>(c->graph->module_stack_loopback.size()))
+                    ? c->graph->module_stack_loopback[static_cast<size_t>(mi)] : 0;
                         // propagate per-module sim-enabled flag (default to enabled)
                         if (mi >= 0 && mi < static_cast<int>(c->module_sim_enabled.size())) mod.sim_enabled = c->module_sim_enabled[mi];
                         else mod.sim_enabled = 1;
