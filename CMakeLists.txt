@@ -592,6 +592,7 @@ file(GLOB NODUS_ROW_TOOL_SOURCES CONFIGURE_DEPENDS "${NODUS_ROW_TOOL_DIR}/*.cpp"
 list(FILTER NODUS_ROW_TOOL_SOURCES EXCLUDE REGEX "_ver_[^/]*\.cpp$")
 # Adopter-generated wrappers for Turing-compiled rows are built by the adopter itself (src/artifact_importer.cpp).
 list(FILTER NODUS_ROW_TOOL_SOURCES EXCLUDE REGEX "/imported_[^/]*\.cpp$")
+list(FILTER NODUS_ROW_TOOL_SOURCES EXCLUDE REGEX "/compiled_table_[^/]*\.cpp$")
 set(NODUS_ROW_TOOL_TARGETS)
 foreach(row_source IN LISTS NODUS_ROW_TOOL_SOURCES)
   get_filename_component(row_id "${row_source}" NAME_WE)

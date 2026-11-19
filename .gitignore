@@ -19,6 +19,7 @@
 # Wrapper sources the Turing product adopter generates for compiled rows (src/artifact_importer.cpp). A compiled
 # row's source is its AbstractTensor Python (abstract_tensor_<op>.py); its product is module_library/products.
 /module_library/source/tools/imported_*.cpp
+/module_library/source/tools/compiled_table_*.cpp
 
 
 # Visual Studio

@@ -13,6 +13,7 @@
 #include "table_abi.h"
 #include "value_types.h"
 #include "plugin_manager.h"
+#include "artifact_importer.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -349,6 +350,21 @@ extern "C" int32_t nodus_headless_build_plugin_source(
     return gp_plugin_build_module_and_load(
         source_path, nodus_root, bin.string().c_str(), nullptr,
         out_tool_id, out_tool_id_cap);
+}
+
+extern "C" int32_t nodus_headless_import_buffer_abi(
+    const char* descriptor_path, const char* artifact_path,
+    const char* module_library_root,
+    char* out_wrapper_path, int32_t out_wrapper_path_cap) {
+    if (!descriptor_path || !artifact_path || !module_library_root ||
+        !out_wrapper_path || out_wrapper_path_cap <= 0) return 0;
+    GP_ArtifactImportReport report{};
+    char package_path[4096] = {};
+    if (!gp_artifact_import_buffer_abi(descriptor_path, artifact_path, module_library_root, &report,
+                                       out_wrapper_path, out_wrapper_path_cap,
+                                       package_path, static_cast<int32_t>(sizeof(package_path))))
+        return 0;
+    return report.wrappers_written == 1 ? 1 : 0;
 }
 
 extern "C" int32_t nodus_headless_compile_turing_row(

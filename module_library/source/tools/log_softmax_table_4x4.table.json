@@ -1,0 +1,17 @@
+{
+  "table": "log_softmax_table_4x4",
+  "about": "log_softmax as AbstractTensor's numpy backend defines it (log(exp(x - max) / sum(exp(x - max)))), composed from Turing-compiled AbstractTensor rows and compiled into one row by tools/compile_row_table.py (research case 6393486c). Each row's source is its abstract_tensor_*.py beside this file.",
+  "inputs": [{"name": "x", "dtype": "f64", "shape": [4, 4]}],
+  "rows": [
+    "tensor_handle_dup",
+    "abstract_tensor_max_keepdim_4x4",
+    "abstract_tensor_sub_4x4_4x1",
+    "abstract_tensor_exp_4x4",
+    "tensor_handle_dup",
+    "abstract_tensor_sum_keepdim_4x4",
+    "abstract_tensor_truediv_4x4_4x1",
+    "abstract_tensor_log_4x4",
+    "tensor_returns"
+  ],
+  "outputs": ["result"]
+}

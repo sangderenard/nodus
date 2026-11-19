@@ -1056,6 +1056,24 @@ class Graph:
             raise RuntimeError(f"native plugin build/load failed: {source_path}")
         return tool_id.value.decode()
 
+    def import_buffer_abi(
+        self, descriptor_path: Union[str, pathlib.Path], artifact_path: Union[str, pathlib.Path], *,
+        module_library_root: Union[str, pathlib.Path],
+    ) -> pathlib.Path:
+        """Write the row wrapper for a NODUS BUFFER ABI descriptor and its library; returns the wrapper's path.
+
+        The artifact importer's own generation (the Turing product adopter's call). Build and load the wrapper with
+        ``build_plugin_source``. A compiled table (research case 6393486c) is adopted this way.
+        """
+        fn = self.lib.nodus_headless_import_buffer_abi
+        fn.restype = ctypes.c_int32
+        fn.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32)
+        wrapper = ctypes.create_string_buffer(4096)
+        if not fn(str(descriptor_path).encode(), str(artifact_path).encode(), str(module_library_root).encode(),
+                  wrapper, len(wrapper)):
+            raise RuntimeError(f"buffer ABI import failed: {descriptor_path}")
+        return pathlib.Path(wrapper.value.decode())
+
     def compile_turing_row(
         self, request_json: Union[str, pathlib.Path], *,
         python_executable: Union[str, pathlib.Path],

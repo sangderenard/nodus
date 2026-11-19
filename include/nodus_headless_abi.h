@@ -283,6 +283,14 @@ NODUS_HEADLESS_API int32_t nodus_headless_build_plugin_source(
     const char* source_path, const char* nodus_root,
     const char* module_library_root,
     char* out_tool_id, int32_t out_tool_id_cap);
+// Generate the ordinary row wrapper for a NODUS BUFFER ABI descriptor and its native library (the artifact importer's
+// gp_artifact_import_buffer_abi, the same call the Turing product adopter makes). The wrapper is written to
+// <module_library_root>/source/tools/<stem>.cpp and its path returned; nodus_headless_build_plugin_source then builds
+// and loads it. A compiled table (its rows' LLVM joined into one library, research case 6393486c) is adopted this way.
+NODUS_HEADLESS_API int32_t nodus_headless_import_buffer_abi(
+    const char* descriptor_path, const char* artifact_path,
+    const char* module_library_root,
+    char* out_wrapper_path, int32_t out_wrapper_path_cap);
 NODUS_HEADLESS_API int32_t nodus_headless_compile_turing_row(
     const char* python_executable, const char* request_json,
     const char* turing_root, const char* product_dir,
