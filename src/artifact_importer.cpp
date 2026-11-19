@@ -838,8 +838,13 @@ std::string generate_wrapper_source(const ApiDoc& doc,
     return ss.str();
 }
 
+// `library_relative` is the artifact's path relative to the module library root when the artifact lies under it
+// (module_library/products/<entry>/backend/...). The wrapper is installed in <root>/bin, so at run time it resolves
+// the product as <its own directory>/../<library_relative>: the module library can move with its products. The
+// absolute path stays as the fallback (a wrapper compiled into another image is not in <root>/bin).
 std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
-                                           const fs::path& artifact_path) {
+                                           const fs::path& artifact_path,
+                                           const fs::path& library_relative = {}) {
     std::vector<size_t> input_indices;
     std::vector<size_t> output_indices;
     std::vector<size_t> workspace_indices;
@@ -876,6 +881,9 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "using EntryFn = void (*)(void**, Extent*);\n";
     ss << "using ValidationResetFn = void (*)();\n";
     ss << "using ValidationTakeFn = uint32_t (*)();\n";
+    if (!library_relative.empty()) {
+        ss << "#ifdef _WIN32\n#include <string>\nstatic void ImportedBufferTool_" << sym << "_anchor() {}\n#endif\n";
+    }
     ss << "class ImportedBufferTool_" << sym << " final : public ITool {\npublic:\n";
     ss << "    const char* id_cstr() const noexcept override { return \""
        << escape_cpp_string(doc.tool_id) << "\"; }\n";
@@ -884,7 +892,25 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "    ToolCaps caps() const override { return static_cast<ToolCaps>(0); }\n";
     ss << "    void initialize(const ToolInitContext&) override {\n#ifdef _WIN32\n";
     ss << "        if (!module_) {\n";
-    ss << "            module_ = LoadLibraryExA(\"" << escape_native_path(artifact_path)
+    if (!library_relative.empty()) {
+        ss << "            {\n";
+        ss << "                HMODULE self = nullptr;\n";
+        ss << "                char here[MAX_PATH] = {};\n";
+        ss << "                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,\n";
+        ss << "                        reinterpret_cast<LPCSTR>(&ImportedBufferTool_" << sym << "_anchor), &self) &&\n";
+        ss << "                    GetModuleFileNameA(self, here, MAX_PATH) > 0) {\n";
+        ss << "                    std::string path(here);\n";
+        ss << "                    const size_t slash = path.find_last_of(\"\\\\/\");\n";
+        ss << "                    if (slash != std::string::npos) {\n";
+        ss << "                        path = path.substr(0, slash) + \"\\\\..\\\\\" + \""
+           << escape_native_path(library_relative) << "\";\n";
+        ss << "                        module_ = LoadLibraryExA(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);\n";
+        ss << "                    }\n";
+        ss << "                }\n";
+        ss << "            }\n";
+    }
+    // The absolute path is the fallback inside the same block, so the entry is resolved whichever load succeeded.
+    ss << "            if (!module_) module_ = LoadLibraryExA(\"" << escape_native_path(artifact_path)
        << "\", nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);\n";
     ss << "            if (!module_) {\n";
     ss << "                fprintf(stderr, \"[imported-buffer:" << sym
@@ -1234,7 +1260,16 @@ extern "C" int gp_artifact_import_buffer_abi(const char* descriptor_path,
     const fs::path root = output_root;
     const std::string stem = backend_qualified_stem(doc.tool_id, doc.backend);
     const fs::path wrapper_path = root / "source" / "tools" / (stem + ".cpp");
-    if (!write_file(wrapper_path, generate_buffer_wrapper_source(doc, fs::absolute(artifact_path)), &err)) {
+    // Relative to the module library when the product lives in it (module_library/products/<entry>/...).
+    fs::path library_relative;
+    {
+        std::error_code ec;
+        const fs::path abs_root = fs::weakly_canonical(fs::absolute(root), ec);
+        const fs::path abs_artifact = fs::weakly_canonical(fs::absolute(artifact_path), ec);
+        const fs::path rel = abs_artifact.lexically_relative(abs_root);
+        if (!rel.empty() && *rel.begin() != "..") library_relative = rel;
+    }
+    if (!write_file(wrapper_path, generate_buffer_wrapper_source(doc, fs::absolute(artifact_path), library_relative), &err)) {
         std::cerr << "artifact_importer: " << err << "\n";
         if (report) *report = local;
         return 0;

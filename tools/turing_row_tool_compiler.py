@@ -550,7 +550,14 @@ def _buffer_abi(
     root: str,
 ) -> tuple[dict[str, Any], str]:
     function = _root_function(module, root)
-    argument_ids = [_value_id(value) for value in tuple(getattr(function, "args", ()) or ())]
+    # The program's inputs are the root formals that are not the compiler's frame workspace (Turing's
+    # compiled_program_api.is_frame_workspace). Program: ``a.to_dtype('int64')``; the literal 'int64' left two frame
+    # formals (its length and capacity cells), counted as inputs: "column count does not match root argument count:
+    # 1 != 3" (2026-11-18, case 6393486c). The backend owns those frames; they are not in buffer_order.
+    argument_ids = [
+        _value_id(value) for value in tuple(getattr(function, "args", ()) or ())
+        if _TURING_IS_FRAME_WORKSPACE is None or not _TURING_IS_FRAME_WORKSPACE(value)
+    ]
     output_ids = [_value_id(value) for value in _published_outputs(outputs, root)]
     overlap = set(argument_ids) & set(output_ids)
     if overlap:
@@ -839,6 +846,9 @@ def _compiler_head(root: Path) -> str:
         return "unknown"
 
 
+_TURING_IS_FRAME_WORKSPACE: Any = None   # set by TuringBoundary from Turing's compiled_program_api
+
+
 class TuringBoundary:
     """Late imports keep Turing external to Nodus and easy to test."""
 
@@ -867,8 +877,14 @@ class TuringBoundary:
                 c_backend_repository_ssa_reference,
             )
             from src.common.tensors.abstraction import AbstractTensor
+            # Turing's own classification of a root formal the compiler gave the entry frame (a sequence's length and
+            # capacity cells, a linked call's or returned record's storage): role "workspace" in its compiled program
+            # API, never an input column.
+            from src.compiler.compiled_program_api import is_frame_workspace
         finally:
             sys.path.pop(0)
+        global _TURING_IS_FRAME_WORKSPACE
+        _TURING_IS_FRAME_WORKSPACE = is_frame_workspace
         self._lower = lower_ast_source_to_ssa
         self._tensor_reference = c_backend_repository_ssa_reference
         self._abstract_tensor = AbstractTensor
