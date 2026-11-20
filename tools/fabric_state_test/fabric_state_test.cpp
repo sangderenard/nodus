@@ -8,10 +8,30 @@
 #include "kernel_library_session.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
+// ---- platform region: run-time library loading and environment (the only OS calls in this file) ----
+#if defined(_WIN32)
 #include <windows.h>
+namespace {
+void* platform_library_open(const char* path) { return reinterpret_cast<void*>(LoadLibraryA(path)); }
+void* platform_library_symbol(void* module, const char* name) {
+    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module), name));
+}
+void platform_set_env(const char* name, const char* value) { _putenv_s(name, value); }
+}
+#else
+#include <dlfcn.h>
+#include <stdlib.h>
+namespace {
+void* platform_library_open(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+void* platform_library_symbol(void* module, const char* name) { return dlsym(module, name); }
+void platform_set_env(const char* name, const char* value) { setenv(name, value, 1); }
+}
+#endif
+// ---- end platform region ----
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -73,12 +93,12 @@ int main(int argc, char** argv) {
     const std::string backend = argv[4];
     const int ticks = argc > 5 ? std::atoi(argv[5]) : 120;
     const bool gpu = backend.rfind("vulkan.", 0) == 0;
-    _putenv_s("NODUS_FABRIC_UDP_HOST", "127.0.0.1"); _putenv_s("NODUS_FABRIC_UDP_PORT", "48771");
-    if (gpu) _putenv_s("NODUS_FABRIC_BACKEND", "vulkan");
+    platform_set_env("NODUS_FABRIC_UDP_HOST", "127.0.0.1"); platform_set_env("NODUS_FABRIC_UDP_PORT", "48771");
+    if (gpu) platform_set_env("NODUS_FABRIC_BACKEND", "vulkan");
 
-    HMODULE plugin = LoadLibraryA(argv[1]);
-    auto create = plugin ? reinterpret_cast<ITool* (*)()>(GetProcAddress(plugin, "create_tool")) : nullptr;
-    auto destroy = plugin ? reinterpret_cast<void (*)(ITool*)>(GetProcAddress(plugin, "destroy_tool")) : nullptr;
+    void* plugin = platform_library_open(argv[1]);
+    auto create = plugin ? reinterpret_cast<ITool* (*)()>(platform_library_symbol(plugin, "create_tool")) : nullptr;
+    auto destroy = plugin ? reinterpret_cast<void (*)(ITool*)>(platform_library_symbol(plugin, "destroy_tool")) : nullptr;
     if (!create || !destroy) { std::printf("reference row did not load\n"); return 2; }
     ITool* reference = create(); reference->initialize({});
 

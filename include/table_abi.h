@@ -5,6 +5,7 @@
 // Text is carried through the API (label + per-cell text) but this minimal raster
 // does not render text; callers can overlay text separately using their text system.
 
+#include <stddef.h>
 #include <stdint.h>
 // Forward-declare LassoConfig (defined in lasso_config.h). We avoid including
 // the header here to keep this file friendly to C/C++ consumers and

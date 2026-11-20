@@ -38,6 +38,23 @@
 
 namespace nodus::exec {
 
+// ---- platform region: the process environment ----
+// The process environment itself, not a C runtime's copy of it: a row built as its own DLL has its own runtime (Windows).
+// On POSIX every shared object sees the one process environment, so getenv is that environment.
+inline std::string process_environment(const char* variable) {
+#if defined(_WIN32)
+    const DWORD needed = GetEnvironmentVariableA(variable, nullptr, 0);
+    if (needed == 0) return {};
+    std::string value(needed, '\0');
+    value.resize(GetEnvironmentVariableA(variable, value.data(), needed));
+    return value;
+#else
+    const char* value = std::getenv(variable);
+    return value ? std::string(value) : std::string();
+#endif
+}
+// ---- end platform region ----
+
 inline constexpr uint32_t kRowSettingsMagic = 0x57525845u;   // "EXRW"
 inline constexpr uint32_t kRowSettingsVersion = 2;
 inline constexpr uint32_t kRowSettingsLimit = 1u << 16;      // longest string and most arguments a saved form may hold
@@ -98,11 +115,8 @@ inline bool read_settings(InputArchive& in, RowSettings& settings) {
 // Paths separated by ';' from one variable of the process environment. Empty when it is not set.
 inline std::vector<std::string> environment_paths(const char* variable) {
     std::vector<std::string> roots;
-    // The process environment itself, not a C runtime's copy of it: a row built as its own DLL has its own runtime.
-    const DWORD needed = GetEnvironmentVariableA(variable, nullptr, 0);
-    if (needed == 0) return roots;
-    std::string all(needed, '\0');
-    all.resize(GetEnvironmentVariableA(variable, all.data(), needed));
+    const std::string all = process_environment(variable);
+    if (all.empty()) return roots;
     size_t start = 0;
     while (start <= all.size()) {
         const size_t end = all.find(';', start);
@@ -180,11 +194,7 @@ inline bool read_declared_rows(const std::string& path, std::vector<DeclaredRow>
 
 // The declarations file the host named for this process; empty when it named none.
 inline std::string declared_rows_file() {
-    const DWORD needed = GetEnvironmentVariableA("NODUS_EXEC_ROWS", nullptr, 0);
-    if (needed == 0) return {};
-    std::string path(needed, '\0');
-    path.resize(GetEnvironmentVariableA("NODUS_EXEC_ROWS", path.data(), needed));
-    return path;
+    return process_environment("NODUS_EXEC_ROWS");
 }
 
 // The program a row with these settings would start, held to the host's declaration of the core.

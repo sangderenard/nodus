@@ -17,20 +17,181 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
+namespace fs = std::filesystem;
+// ---------------------------------------------------------------------------
+// Platform region: every OS call in this file (child process, library naming) lives here.
+// run_process runs one program to completion in `cwd`; with a cancel token it polls every 20 ms and, when a cancel is
+// requested, ends the program and everything it started (job object on Windows, process group on POSIX).
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+
+namespace adopter_platform {
+inline const char* shared_library_prefix() { return ""; }
+inline const char* shared_library_suffix() { return ".dll"; }
+
+inline std::wstring quote_windows_argument(const std::wstring& value) {
+    if (value.find_first_of(L" \t\"") == std::wstring::npos) return value;
+    std::wstring out = L"\"";
+    size_t slashes = 0;
+    for (wchar_t c : value) {
+        if (c == L'\\') { ++slashes; continue; }
+        if (c == L'\"') {
+            out.append(slashes * 2 + 1, L'\\');
+            out.push_back(c);
+        } else {
+            out.append(slashes, L'\\');
+            out.push_back(c);
+        }
+        slashes = 0;
+    }
+    out.append(slashes * 2, L'\\');
+    out.push_back(L'\"');
+    return out;
+}
+
+inline bool run_process(const std::vector<fs::path>& args,
+                        const fs::path& cwd_path,
+                        GP_TuringCompileCancel* cancel,
+                        bool* cancelled,
+                        std::string* error) {
+    std::wstring command;
+    for (const auto& arg : args) {
+        if (!command.empty()) command.push_back(L' ');
+        command += quote_windows_argument(arg.wstring());
+    }
+    std::vector<wchar_t> mutable_command(command.begin(), command.end());
+    mutable_command.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const std::wstring application = args.front().wstring();
+    const std::wstring cwd = cwd_path.wstring();
+    if (!CreateProcessW(application.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
+                        0, nullptr, cwd.c_str(), &startup, &process)) {
+        *error = "failed to launch compiler driver: " + std::to_string(GetLastError());
+        return false;
+    }
+    if (!cancel) {
+        WaitForSingleObject(process.hProcess, INFINITE);
+    } else {
+        // Kill-on-close job so a cancel also ends the driver's own children.
+        HANDLE job = CreateJobObjectW(nullptr, nullptr);
+        if (job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof(info));
+            AssignProcessToJobObject(job, process.hProcess);
+        }
+        while (WaitForSingleObject(process.hProcess, 20) == WAIT_TIMEOUT) {
+            if (cancel->requested.load()) {
+                if (job) TerminateJobObject(job, 1);
+                TerminateProcess(process.hProcess, 1);
+                WaitForSingleObject(process.hProcess, 5000);
+                if (cancelled) *cancelled = true;
+                break;
+            }
+        }
+        if (job) CloseHandle(job);
+    }
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    if (cancelled && *cancelled) {
+        *error = "compiler driver cancelled";
+        return false;
+    }
+    if (exit_code != 0) {
+        *error = "compiler driver failed with exit code " + std::to_string(exit_code);
+        return false;
+    }
+    return true;
+}
+}  // namespace adopter_platform
 #else
+#include <errno.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <unistd.h>
+
+extern char** environ;
+
+namespace adopter_platform {
+inline const char* shared_library_prefix() { return "lib"; }
+#if defined(__APPLE__)
+inline const char* shared_library_suffix() { return ".dylib"; }
+#else
+inline const char* shared_library_suffix() { return ".so"; }
 #endif
 
-namespace fs = std::filesystem;
+inline bool run_process(const std::vector<fs::path>& args,
+                        const fs::path& cwd,
+                        GP_TuringCompileCancel* cancel,
+                        bool* cancelled,
+                        std::string* error) {
+    // argv is a vector, never a shell line.
+    std::vector<std::string> storage;
+    std::vector<char*> argv;
+    for (const auto& arg : args) storage.push_back(arg.string());
+    for (auto& arg : storage) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawnattr_init(&attributes);
+    const std::string cwd_string = cwd.string();
+    posix_spawn_file_actions_addchdir_np(&actions, cwd_string.c_str());
+    // Its own process group, so a cancel also ends the driver's own children.
+    posix_spawnattr_setpgroup(&attributes, 0);
+    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+    pid_t child = -1;
+    const int rc = posix_spawn(&child, storage.front().c_str(), &actions, &attributes, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attributes);
+    if (rc != 0) {
+        *error = "failed to launch compiler driver: " + std::to_string(rc);
+        return false;
+    }
+
+    int status = 0;
+    pid_t done = 0;
+    if (cancel) {
+        while ((done = waitpid(child, &status, WNOHANG)) == 0) {
+            if (cancel->requested.load()) {
+                kill(-child, SIGKILL);
+                kill(child, SIGKILL);
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+                if (cancelled) *cancelled = true;
+                *error = "compiler driver cancelled";
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    } else {
+        while ((done = waitpid(child, &status, 0)) < 0 && errno == EINTR) {}
+    }
+    if (done < 0) {
+        *error = "compiler driver could not be waited for: " + std::to_string(errno);
+        return false;
+    }
+    const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    if (exit_code != 0) {
+        *error = "compiler driver failed with exit code " + std::to_string(exit_code);
+        return false;
+    }
+    return true;
+}
+}  // namespace adopter_platform
+#endif
+// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -299,38 +460,6 @@ bool read_package_tool(const fs::path& package_path,
     return false;
 }
 
-std::string shared_library_extension() {
-#ifdef _WIN32
-    return ".dll";
-#elif defined(__APPLE__)
-    return ".dylib";
-#else
-    return ".so";
-#endif
-}
-
-#ifdef _WIN32
-std::wstring quote_windows_argument(const std::wstring& value) {
-    if (value.find_first_of(L" \t\"") == std::wstring::npos) return value;
-    std::wstring out = L"\"";
-    size_t slashes = 0;
-    for (wchar_t c : value) {
-        if (c == L'\\') { ++slashes; continue; }
-        if (c == L'\"') {
-            out.append(slashes * 2 + 1, L'\\');
-            out.push_back(c);
-        } else {
-            out.append(slashes, L'\\');
-            out.push_back(c);
-        }
-        slashes = 0;
-    }
-    out.append(slashes * 2, L'\\');
-    out.push_back(L'\"');
-    return out;
-}
-#endif
-
 bool run_compiler_driver(const fs::path& python,
                          const fs::path& driver,
                          const fs::path& request,
@@ -344,97 +473,7 @@ bool run_compiler_driver(const fs::path& python,
         python, driver, "--request", request, "--output-dir", product_dir,
         "--turing-root", turing_root,
     };
-#ifdef _WIN32
-    std::wstring command;
-    for (const auto& arg : args) {
-        if (!command.empty()) command.push_back(L' ');
-        command += quote_windows_argument(arg.wstring());
-    }
-    std::vector<wchar_t> mutable_command(command.begin(), command.end());
-    mutable_command.push_back(L'\0');
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    const std::wstring application = python.wstring();
-    const std::wstring cwd = nodus_root.wstring();
-    if (!CreateProcessW(application.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
-                        0, nullptr, cwd.c_str(), &startup, &process)) {
-        *error = "failed to launch compiler driver: " + std::to_string(GetLastError());
-        return false;
-    }
-    if (!cancel) {
-        WaitForSingleObject(process.hProcess, INFINITE);
-    } else {
-        // Kill-on-close job so a cancel also ends the driver's own children.
-        HANDLE job = CreateJobObjectW(nullptr, nullptr);
-        if (job) {
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof(info));
-            AssignProcessToJobObject(job, process.hProcess);
-        }
-        while (WaitForSingleObject(process.hProcess, 20) == WAIT_TIMEOUT) {
-            if (cancel->requested.load()) {
-                if (job) TerminateJobObject(job, 1);
-                TerminateProcess(process.hProcess, 1);
-                WaitForSingleObject(process.hProcess, 5000);
-                if (cancelled) *cancelled = true;
-                break;
-            }
-        }
-        if (job) CloseHandle(job);
-    }
-    DWORD exit_code = 1;
-    GetExitCodeProcess(process.hProcess, &exit_code);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    if (cancelled && *cancelled) {
-        *error = "compiler driver cancelled";
-        return false;
-    }
-    if (exit_code != 0) {
-        *error = "compiler driver failed with exit code " + std::to_string(exit_code);
-        return false;
-    }
-    return true;
-#else
-    std::vector<std::string> storage;
-    std::vector<char*> argv;
-    for (const auto& arg : args) storage.push_back(arg.string());
-    for (auto& arg : storage) argv.push_back(arg.data());
-    argv.push_back(nullptr);
-    const pid_t child = fork();
-    if (child < 0) { *error = "fork failed"; return false; }
-    if (child == 0) {
-        chdir(nodus_root.string().c_str());
-        execv(storage.front().c_str(), argv.data());
-        _exit(127);
-    }
-    int status = 0;
-    if (cancel) {
-        pid_t done = 0;
-        while ((done = waitpid(child, &status, WNOHANG)) == 0) {
-            if (cancel->requested.load()) {
-                kill(child, SIGKILL);
-                waitpid(child, &status, 0);
-                if (cancelled) *cancelled = true;
-                *error = "compiler driver cancelled";
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        if (done < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            *error = "compiler driver failed";
-            return false;
-        }
-        return true;
-    }
-    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        *error = "compiler driver failed";
-        return false;
-    }
-    return true;
-#endif
+    return adopter_platform::run_process(args, nodus_root, cancel, cancelled, error);
 }
 
 } // namespace
@@ -554,7 +593,7 @@ extern "C" int gp_turing_product_adopt_and_load(
         if (report) *report = local;
         return 0;
     }
-    const fs::path retained_binary = module_root / "bin" / (staged_source.stem().string() + shared_library_extension());
+    const fs::path retained_binary = module_root / "bin" / (adopter_platform::shared_library_prefix() + staged_source.stem().string() + adopter_platform::shared_library_suffix());
     if (!fs::is_regular_file(retained_binary)) {
         std::cerr << "turing_product_adopter: plugin loaded but retained same-stem binary is missing\n";
         gp_plugin_unload(loaded_id);

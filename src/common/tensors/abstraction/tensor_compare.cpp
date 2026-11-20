@@ -1,3 +1,4 @@
+#include <cstring>
 #include "common/tensors/abstraction/tensor_compare.h"
 
 #include "common/tensors/abstraction/in_memory_backend.h"

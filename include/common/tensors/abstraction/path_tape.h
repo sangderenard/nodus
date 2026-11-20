@@ -94,11 +94,9 @@ class StepTape {
   std::vector<float> channel_values_;  // channel_count * step_count
   std::vector<StepProvenance> provenance_;  // size = step_count
 
-  size_t index(AxisIndex axis, StepIndex step) const {
-    return static_cast<size_t>(axis) * layout_.step_count + step;
-  }
-  size_t index(ChannelIndex channel, StepIndex step) const {
-    return static_cast<size_t>(channel) * layout_.step_count + step;
+  // One index for axes and channels alike: AxisIndex and ChannelIndex are both uint32_t (two overloads were one).
+  size_t index(uint32_t row, StepIndex step) const {
+    return static_cast<size_t>(row) * layout_.step_count + step;
   }
   std::span<const float> axis_span(AxisIndex axis) const {
     size_t start = static_cast<size_t>(axis) * layout_.step_count;

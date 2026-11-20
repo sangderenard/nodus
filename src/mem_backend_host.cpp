@@ -252,7 +252,7 @@ static int cpu_wait_event(gp_mem_backend_handle_t h, const void* event, size_t e
 static uintptr_t cpu_get_native_stream(gp_mem_backend_handle_t h) { (void)h; return 0; }
 
 // Populate vtable (order must match mem_backend.h)
-static const gp_mem_backend_vtable_t g_cpu_vtable = {
+const gp_mem_backend_vtable_t g_cpu_vtable = {
     &cpu_map,
     &cpu_unmap,
     &cpu_alloc,

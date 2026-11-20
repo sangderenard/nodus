@@ -71,6 +71,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Platform libraries (owner, 2026-11-19: Windows work is regionalized; Nodus ships for Linux too). NODUS_NET_LIBS: sockets;
+# NODUS_LINK_LIBS: the Nodus link (nodus_link.h crypto, nodus_link_wss.h TLS WebSocket, nodus_link_udp.h AES-GCM).
+if(WIN32)
+  set(NODUS_NET_LIBS ws2_32)
+  set(NODUS_LINK_LIBS ws2_32 bcrypt winhttp crypt32)
+else()
+  find_package(Threads REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  set(NODUS_NET_LIBS Threads::Threads)
+  set(NODUS_LINK_LIBS OpenSSL::SSL OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
 ## Dependencies are built in isolation under dev_bundle/deps/*
 ## The main project only consumes already-installed packages.
 
@@ -569,7 +581,7 @@ target_include_directories(nodus_headless PUBLIC
 target_link_libraries(nodus_headless PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
   # contract ports: loopback listener and socket adapters (include/contract_listener.h)
-  target_link_libraries(nodus_headless PRIVATE ws2_32 SDL3::SDL3)
+  target_link_libraries(nodus_headless PRIVATE ${NODUS_NET_LIBS} SDL3::SDL3)
   # The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
   # refers to that object, so from the static library the linker would leave it out; this keeps it in.
   target_link_options(nodus_headless PRIVATE "/INCLUDE:nodus_exec_row_source")
@@ -715,7 +727,7 @@ if(TRUE)
   endif()
   if(WIN32)
     # contract ports hosted by the GUI canvas: loopback listener + socket adapters
-    target_link_libraries(frontend_shell PRIVATE ws2_32)
+    target_link_libraries(frontend_shell PRIVATE ${NODUS_NET_LIBS})
   endif()
   if(NODUS_ENABLE_TORCH AND TARGET nodus_torch_includes)
     target_link_libraries(frontend_shell PRIVATE nodus_torch_includes)
@@ -778,7 +790,7 @@ target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables PUBLIC nodus_runtime)
 if(WIN32)
-  target_link_libraries(canvas_tables PUBLIC ws2_32 bcrypt winhttp crypt32)  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
+  target_link_libraries(canvas_tables PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
 endif()
 target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
@@ -811,7 +823,7 @@ target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables_static PUBLIC nodus_runtime)
 if(WIN32)
-  target_link_libraries(canvas_tables_static PUBLIC ws2_32 bcrypt winhttp crypt32)  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
+  target_link_libraries(canvas_tables_static PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
 endif()
 target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
@@ -879,7 +891,7 @@ add_library(nodus_contract_service SHARED
 target_compile_definitions(nodus_contract_service PRIVATE NODUS_HEADLESS_BUILD=1)
 target_link_libraries(nodus_contract_service PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(nodus_contract_service PRIVATE ws2_32)
+  target_link_libraries(nodus_contract_service PRIVATE ${NODUS_NET_LIBS})
 endif()
 # The volunteer cycle end to end (case a11b5c9b1be74c9b9fb684790f7fd5a3): its session and its headless graph share
 # one registry image, as the socket graph qualification below does.
@@ -889,7 +901,7 @@ target_compile_definitions(test_volunteer_cycle PRIVATE NODUS_HEADLESS_BUILD=1 N
 target_link_libraries(test_volunteer_cycle PRIVATE canvas_tables_static nodus_runtime)
 target_compile_features(test_volunteer_cycle PRIVATE cxx_std_20)
 if(WIN32)
-  target_link_libraries(test_volunteer_cycle PRIVATE ws2_32)
+  target_link_libraries(test_volunteer_cycle PRIVATE ${NODUS_NET_LIBS})
 endif()
 # The cycle across the Nodus link: the library on this host, the work on a volunteer child process.
 #   test_volunteer_cycle_link run <glslangValidator> <nodus root> <module library root> <work dir>
@@ -898,7 +910,7 @@ target_compile_definitions(test_volunteer_cycle_link PRIVATE NODUS_HEADLESS_BUIL
 target_link_libraries(test_volunteer_cycle_link PRIVATE canvas_tables_static nodus_runtime)
 target_compile_features(test_volunteer_cycle_link PRIVATE cxx_std_20)
 if(WIN32)
-  target_link_libraries(test_volunteer_cycle_link PRIVATE ws2_32 bcrypt winhttp crypt32)
+  target_link_libraries(test_volunteer_cycle_link PRIVATE ${NODUS_LINK_LIBS})
 endif()
 
 # Socket qualification uses the same native registry image as its headless graph.
@@ -910,8 +922,8 @@ target_compile_definitions(contract_socket_graph_test PRIVATE
   NODUS_HEADLESS_BUILD=1 CONTRACT_SOCKET_GRAPH_TEST=1)
 target_link_libraries(contract_socket_graph_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(contract_socket_test PRIVATE ws2_32)
-  target_link_libraries(contract_socket_graph_test PRIVATE ws2_32)
+  target_link_libraries(contract_socket_test PRIVATE ${NODUS_NET_LIBS})
+  target_link_libraries(contract_socket_graph_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/contract-loopback-isolated")
 foreach(_contract_target contract_socket_test contract_socket_graph_test)
@@ -931,7 +943,7 @@ set_tests_properties(contract_negotiator_test PROPERTIES TIMEOUT 30)
 add_executable(turing_compile_host_test tests/turing_compile_host_test.cpp)
 target_link_libraries(turing_compile_host_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(turing_compile_host_test PRIVATE ws2_32)
+  target_link_libraries(turing_compile_host_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 add_test(NAME turing_compile_host_test COMMAND turing_compile_host_test)
 set_tests_properties(turing_compile_host_test PROPERTIES TIMEOUT 60)
@@ -944,7 +956,7 @@ target_compile_definitions(turing_compile_host_abi_test PRIVATE NODUS_HEADLESS_B
 target_include_directories(turing_compile_host_abi_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(turing_compile_host_abi_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(turing_compile_host_abi_test PRIVATE ws2_32)
+  target_link_libraries(turing_compile_host_abi_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 add_test(NAME turing_compile_host_abi_test COMMAND turing_compile_host_abi_test)
 set_tests_properties(turing_compile_host_abi_test PROPERTIES TIMEOUT 60)
@@ -967,7 +979,7 @@ set_tests_properties(cron_tool_test PROPERTIES TIMEOUT 30)
 add_executable(contract_engine_socket_test tests/contract_engine_socket_test.cpp)
 target_link_libraries(contract_engine_socket_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(contract_engine_socket_test PRIVATE ws2_32)
+  target_link_libraries(contract_engine_socket_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 add_test(NAME contract_engine_socket_test COMMAND contract_engine_socket_test)
 set_tests_properties(contract_engine_socket_test PROPERTIES TIMEOUT 30)
@@ -1037,7 +1049,7 @@ add_executable(nodus_headless_runtime_test
 target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
 if(WIN32)
-  target_link_libraries(nodus_headless_runtime_test PRIVATE ws2_32 bcrypt winhttp crypt32)  # the link tests sign tickets (nodus_link.h, nodus_link_wss.h)
+  target_link_libraries(nodus_headless_runtime_test PRIVATE ${NODUS_LINK_LIBS})  # the link tests sign tickets (nodus_link.h, nodus_link_wss.h)
 endif()
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
@@ -1455,7 +1467,7 @@ target_compile_features(test_spectral_wave_vulkan PRIVATE cxx_std_20)
 #   link_gpu_exchange run <turing spring shader dir> <work dir> <glslangValidator>
 if(WIN32)
   add_executable(link_gpu_exchange tools/link_gpu_exchange/link_gpu_exchange.cpp)
-  target_link_libraries(link_gpu_exchange PRIVATE canvas_tables_static ws2_32 bcrypt)
+  target_link_libraries(link_gpu_exchange PRIVATE canvas_tables_static ${NODUS_LINK_LIBS})
   target_compile_features(link_gpu_exchange PRIVATE cxx_std_20)
 endif()
 add_executable(test_tcp_byte_stream_tool tests/tcp_byte_stream_tool_test.cpp)

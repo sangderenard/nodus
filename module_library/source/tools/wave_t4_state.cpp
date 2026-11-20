@@ -16,24 +16,37 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#ifdef _WIN32
+// ---- platform region: run-time library loading (the only OS calls in this file) ----
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+namespace {
+void* platform_library_open(const char* path){
+    return LoadLibraryExA(path,nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+}
+void* platform_library_symbol(void* module,const char* name){
+    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module),name));
+}
+void platform_library_close(void* module){
+    if(module)FreeLibrary(static_cast<HMODULE>(module));
+}
+}
 #else
 #include <dlfcn.h>
+namespace {
+void* platform_library_open(const char* path){return dlopen(path,RTLD_NOW|RTLD_LOCAL);}
+void* platform_library_symbol(void* module,const char* name){return dlsym(module,name);}
+void platform_library_close(void* module){if(module)dlclose(module);}
+}
 #endif
+// ---- end platform region ----
 
 namespace nodus::gpu {
 namespace {
-void* symbol(void* module,const char* name){
-#ifdef _WIN32
-    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module),name));
-#else
-    return dlsym(module,name);
-#endif
-}
+void* symbol(void* module,const char* name){return platform_library_symbol(module,name);}
 double double_word(std::uint64_t value){
     double result=0;
     std::memcpy(&result,&value,sizeof(result));
@@ -122,33 +135,20 @@ void WaveT4StateTool::initialize(const ToolInitContext& ctx){
     }
     std::lock_guard<std::mutex> lock(mutex_);
     if(module_||dll_.empty())return;
-#ifdef _WIN32
-    module_=LoadLibraryExA(dll_.c_str(),nullptr,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-#else
-    module_=dlopen(dll_.c_str(),RTLD_NOW|RTLD_LOCAL);
-#endif
+    module_=platform_library_open(dll_.c_str());
     if(!module_)return;
     create_=reinterpret_cast<decltype(create_)>(symbol(module_,"wave_t4_batch_plan_create"));
     destroy_=reinterpret_cast<decltype(destroy_)>(symbol(module_,"wave_t4_batch_plan_destroy"));
     step_=reinterpret_cast<decltype(step_)>(symbol(module_,"wave_t4_batch_angular_step"));
     if(create_&&destroy_&&step_)return;
-#ifdef _WIN32
-    FreeLibrary(static_cast<HMODULE>(module_));
-#else
-    dlclose(module_);
-#endif
+    platform_library_close(module_);
     module_=nullptr;create_=nullptr;destroy_=nullptr;step_=nullptr;
 }
 void WaveT4StateTool::shutdown(){
     std::lock_guard<std::mutex> lock(mutex_);
     if(plan_&&destroy_)destroy_(plan_);
     plan_=nullptr;plan_nx_=plan_ny_=0;
-#ifdef _WIN32
-    if(module_)FreeLibrary(static_cast<HMODULE>(module_));
-#else
-    if(module_)dlclose(module_);
-#endif
+    platform_library_close(module_);
     module_=nullptr;create_=nullptr;destroy_=nullptr;step_=nullptr;
 }
 void WaveT4StateTool::execute_stack(ToolStackContext& context){

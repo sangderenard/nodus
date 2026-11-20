@@ -15,24 +15,37 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#ifdef _WIN32
+// ---- platform region: run-time library loading (the only OS calls in this file) ----
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+namespace {
+void* platform_library_open(const char* path){
+    return LoadLibraryExA(path,nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+}
+void* platform_library_symbol(void* module,const char* name){
+    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module),name));
+}
+void platform_library_close(void* module){
+    if(module)FreeLibrary(static_cast<HMODULE>(module));
+}
+}
 #else
 #include <dlfcn.h>
+namespace {
+void* platform_library_open(const char* path){return dlopen(path,RTLD_NOW|RTLD_LOCAL);}
+void* platform_library_symbol(void* module,const char* name){return dlsym(module,name);}
+void platform_library_close(void* module){if(module)dlclose(module);}
+}
 #endif
+// ---- end platform region ----
 
 namespace nodus::gpu {
 namespace {
-void* symbol(void* module,const char* name){
-#ifdef _WIN32
-    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module),name));
-#else
-    return dlsym(module,name);
-#endif
-}
+void* symbol(void* module,const char* name){return platform_library_symbol(module,name);}
 bool read_words(std::uint64_t handle,std::uint64_t* words,std::size_t count){
     NodusTensorDesc desc{};
     return nodus_tensor_describe(handle,&desc)==NODUS_OK&&
@@ -108,12 +121,7 @@ void FftFreeTool::initialize(const ToolInitContext& ctx){
     }
     std::lock_guard<std::mutex> lock(mutex_);
     if(module_||dll_.empty())return;
-#ifdef _WIN32
-    module_=LoadLibraryExA(dll_.c_str(),nullptr,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-#else
-    module_=dlopen(dll_.c_str(),RTLD_NOW|RTLD_LOCAL);
-#endif
+    module_=platform_library_open(dll_.c_str());
     if(!module_)return;
     init_=reinterpret_cast<Init>(symbol(module_,"fft_init_full_v2"));
     execute_real_=reinterpret_cast<ExecuteReal>(symbol(module_,"fft_execute_batched"));
@@ -121,11 +129,7 @@ void FftFreeTool::initialize(const ToolInitContext& ctx){
     plan_size_=reinterpret_cast<decltype(plan_size_)>(symbol(module_,"fft_ctx_size"));
     free_=reinterpret_cast<decltype(free_)>(symbol(module_,"fft_free"));
     if(init_&&execute_real_&&execute_complex_&&plan_size_&&free_)return;
-#ifdef _WIN32
-    FreeLibrary(static_cast<HMODULE>(module_));
-#else
-    dlclose(module_);
-#endif
+    platform_library_close(module_);
     module_=nullptr;init_=nullptr;execute_real_=nullptr;
     execute_complex_=nullptr;plan_size_=nullptr;free_=nullptr;
 }
@@ -133,11 +137,7 @@ void FftFreeTool::shutdown(){
     std::lock_guard<std::mutex> lock(mutex_);
     if(plan_&&free_)free_(plan_);
     plan_=nullptr;cached_valid_=false;
-#ifdef _WIN32
-    if(module_)FreeLibrary(static_cast<HMODULE>(module_));
-#else
-    if(module_)dlclose(module_);
-#endif
+    platform_library_close(module_);
     module_=nullptr;init_=nullptr;execute_real_=nullptr;
     execute_complex_=nullptr;plan_size_=nullptr;free_=nullptr;
 }

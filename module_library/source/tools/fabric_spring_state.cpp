@@ -5,17 +5,60 @@
 // The row tool's source, in the module library: the Menu lists it, the canvas compiler inlines it, it builds as its own
 // plugin DLL, and the image registers it from it (src/fabric_spring_state_tool.cpp).
 // Its settings (id, pipeline id, backend, card, base) are its saved state (serialize/deserialize); a row with no library or
-// no registry refuses. Windows only, as the UDP frames are.
+// no registry refuses. The UDP frames go out over Winsock on Windows and BSD sockets elsewhere (the platform region).
 #include "fabric_spring_state_tool.h"
 
 #include "common/tensors/abstraction/tensor_abi.h"
 
+// ---- platform region: sockets and calling convention (the only OS calls in this file) ----
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+namespace {
+namespace platform {
+using socket_handle = SOCKET;
+constexpr socket_handle kInvalidSocket = INVALID_SOCKET;
+using socket_length = int;
+inline bool network_start() { WSADATA data{}; return WSAStartup(MAKEWORD(2, 2), &data) == 0; }
+inline void network_stop() { WSACleanup(); }
+inline void close_socket(socket_handle s) { closesocket(s); }
+inline void set_nonblocking(socket_handle s) { u_long nonblocking = 1; ioctlsocket(s, FIONBIO, &nonblocking); }
+inline int send_datagram(socket_handle s, const void* data, size_t bytes, const sockaddr* to, int to_bytes) {
+    return sendto(s, static_cast<const char*>(data), static_cast<int>(bytes), 0, to, to_bytes);
+}
+} // namespace platform
+}
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+namespace {
+namespace platform {
+using socket_handle = int;
+constexpr socket_handle kInvalidSocket = -1;
+using socket_length = socklen_t;
+inline bool network_start() { return true; }
+inline void network_stop() {}
+inline void close_socket(socket_handle s) { ::close(s); }
+inline void set_nonblocking(socket_handle s) {
+    const int flags = fcntl(s, F_GETFL, 0);
+    if (flags >= 0) fcntl(s, F_SETFL, flags | O_NONBLOCK);
+}
+inline int send_datagram(socket_handle s, const void* data, size_t bytes, const sockaddr* to, int to_bytes) {
+    return static_cast<int>(sendto(s, data, bytes, MSG_NOSIGNAL, to, static_cast<socklen_t>(to_bytes)));
+}
+} // namespace platform
+}
+#endif
+// ---- end platform region ----
 
 #include <algorithm>
 #include <array>
@@ -107,8 +150,7 @@ public:
         if (registry_) pipeline_ = registry_->create(pipeline_id_);
         if (pipeline_) pipeline_->initialize({});
         std::fprintf(stderr, "[spring] state library, backend=%s\n", gpu_ ? "vulkan" : "llvm");
-        WSADATA wsa{};
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
+        if (platform::network_start()) {
             winsock_ = true;
             const char* host = std::getenv("NODUS_FABRIC_UDP_HOST");
             const char* port = std::getenv("NODUS_FABRIC_UDP_PORT");
@@ -116,10 +158,10 @@ public:
             addrinfo* addresses = nullptr;
             if (getaddrinfo(host && *host ? host : "239.255.78.68", port && *port ? port : "48768", &hints, &addresses) == 0) {
                 socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                if (socket_ != INVALID_SOCKET && addresses->ai_addrlen <= sizeof(destination_)) {
+                if (socket_ != platform::kInvalidSocket && addresses->ai_addrlen <= sizeof(destination_)) {
                     std::memcpy(&destination_, addresses->ai_addr, addresses->ai_addrlen);
                     destination_bytes_ = int(addresses->ai_addrlen);
-                    u_long nonblocking = 1; ioctlsocket(socket_, FIONBIO, &nonblocking);
+                    platform::set_nonblocking(socket_);
                     int ttl = 4; setsockopt(socket_, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<const char*>(&ttl), sizeof(ttl));
                 }
                 freeaddrinfo(addresses);
@@ -128,8 +170,8 @@ public:
     }
     void shutdown() override {
         if (pipeline_) { pipeline_->shutdown(); pipeline_.reset(); }
-        if (socket_ != INVALID_SOCKET) { closesocket(socket_); socket_ = INVALID_SOCKET; }
-        if (winsock_) { WSACleanup(); winsock_ = false; }
+        if (socket_ != platform::kInvalidSocket) { platform::close_socket(socket_); socket_ = platform::kInvalidSocket; }
+        if (winsock_) { platform::network_stop(); winsock_ = false; }
         ready_ = false;
     }
     void tick(double, HostAPI&) override {}
@@ -366,7 +408,7 @@ private:
         return put_contact();
     }
     void publish() {
-        if (socket_ == INVALID_SOCKET || !destination_bytes_ || !ready_) return;
+        if (socket_ == platform::kInvalidSocket || !destination_bytes_ || !ready_) return;
         const auto positions = read(kCommittedP);
         if (positions.size() != std::size_t(kFabricBatch)) return;
         // NFAB v1 little-endian: 32-byte header, then up to 48 (node id, xyz) pairs.
@@ -395,7 +437,7 @@ private:
                 }
                 std::memcpy(packet.data() + count_offset, &count, 2);
                 emitted += count;
-                sendto(socket_, reinterpret_cast<const char*>(packet.data()), int(size), 0, reinterpret_cast<const sockaddr*>(&destination_), destination_bytes_);
+                platform::send_datagram(socket_, packet.data(), size, reinterpret_cast<const sockaddr*>(&destination_), destination_bytes_);
             }
         }
     }
@@ -411,7 +453,7 @@ private:
     double target_ms_ = 0; std::array<double, 8> recent_step_ms_{}; int step_samples_ = 0, step_window_next_ = 0;
     std::vector<double> occupied_;
     std::array<std::uint64_t, kFabricNetworks> fabric_ids_{}; std::uint64_t frame_ = 0;
-    bool winsock_ = false; SOCKET socket_ = INVALID_SOCKET;
+    bool winsock_ = false; platform::socket_handle socket_ = platform::kInvalidSocket;
     bool tabletop_enabled_ = false, floor_enabled_ = false; double floor_y_ = 0;
     double tabletop_y_ = 0, table_min_x_ = 0, table_max_x_ = 0, table_min_z_ = 0, table_max_z_ = 0;
     sockaddr_storage destination_{}; int destination_bytes_ = 0;

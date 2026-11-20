@@ -68,7 +68,8 @@ public:
         TensorDesc pool_desc_{};
     };
 
-    explicit AbstractTensorPool(Options options = {});
+    AbstractTensorPool();
+    explicit AbstractTensorPool(Options options);
     AbstractTensorPool(const AbstractTensorPool&) = delete;
     AbstractTensorPool& operator=(const AbstractTensorPool&) = delete;
     ~AbstractTensorPool();

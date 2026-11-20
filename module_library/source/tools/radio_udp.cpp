@@ -4,7 +4,6 @@
 // state: it lives in Shared (radio_shared.h). Shared is process state (the registration captures it in the factory); a row made with no Shared refuses in execute_stack.
 #include "radio_shared.h"
 
-#if defined(_WIN32)
 namespace nodus::radio {
 
 class RadioUdp final : public ITool {
@@ -16,8 +15,7 @@ public:
     const char* name_cstr() const noexcept override { return "Radio UDP broadcast"; }
     void initialize(const ToolInitContext&) override {
         if (!shared_) return;
-        WSADATA data{};
-        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return;
+        if (!platform::network_start()) return;
         winsock_ready_ = true;
         addrinfo hints{};
         hints.ai_family = AF_INET;
@@ -28,28 +26,27 @@ public:
         if (getaddrinfo(shared_->config.host.c_str(), service.c_str(), &hints, &addresses) != 0)
             return;
         socket_ = socket(addresses->ai_family, addresses->ai_socktype, addresses->ai_protocol);
-        if (socket_ != INVALID_SOCKET && addresses->ai_addrlen <= sizeof(destination_)) {
+        if (socket_ != platform::kInvalidSocket && addresses->ai_addrlen <= sizeof(destination_)) {
             std::memcpy(&destination_, addresses->ai_addr, addresses->ai_addrlen);
             destination_bytes_ = static_cast<int>(addresses->ai_addrlen);
             sockaddr_in local{};
             local.sin_family = AF_INET;
             local.sin_addr.s_addr = htonl(INADDR_ANY);
             if (bind(socket_, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
-                closesocket(socket_); socket_ = INVALID_SOCKET; freeaddrinfo(addresses); return;
+                platform::close_socket(socket_); socket_ = platform::kInvalidSocket; freeaddrinfo(addresses); return;
             }
-            int local_size = sizeof(local);
+            platform::socket_length local_size = sizeof(local);
             if (getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &local_size) == 0) {
                 std::printf("radio_udp_source_port=%u\n", static_cast<unsigned>(ntohs(local.sin_port)));
                 std::fflush(stdout);
             }
-            u_long nonblocking = 1;
-            ioctlsocket(socket_, FIONBIO, &nonblocking);
+            platform::set_nonblocking(socket_);
         }
         freeaddrinfo(addresses);
     }
     void shutdown() override {
-        if (socket_ != INVALID_SOCKET) { closesocket(socket_); socket_ = INVALID_SOCKET; }
-        if (winsock_ready_) { WSACleanup(); winsock_ready_ = false; }
+        if (socket_ != platform::kInvalidSocket) { platform::close_socket(socket_); socket_ = platform::kInvalidSocket; }
+        if (winsock_ready_) { platform::network_stop(); winsock_ready_ = false; }
     }
     void tick(double, HostAPI&) override {}
     void render(RenderContext&) override {}
@@ -64,7 +61,7 @@ public:
         const auto* frame = static_cast<const RadioFrame*>(frame_ptr);
         if (frame && frame->magic == kFrameMagic && frame->terminal) return;
         if (!frame || frame->magic != kFrameMagic || frame->band_count != shared_->config.bands ||
-            socket_ == INVALID_SOCKET || !destination_bytes_) {
+            socket_ == platform::kInvalidSocket || !destination_bytes_) {
             shared_->dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -84,8 +81,7 @@ public:
         append(&frame->captured_frames, sizeof(frame->captured_frames));
         append(&frame->rms, sizeof(frame->rms));
         append(frame->power.data(), frame->band_count * sizeof(float));
-        const int sent = sendto(socket_, reinterpret_cast<const char*>(packet.data()),
-                                static_cast<int>(offset), 0,
+        const int sent = platform::send_datagram(socket_, packet.data(), offset,
                                 reinterpret_cast<const sockaddr*>(&destination_), destination_bytes_);
         if (sent == static_cast<int>(offset)) shared_->emitted.fetch_add(1, std::memory_order_relaxed);
         else shared_->dropped.fetch_add(1, std::memory_order_relaxed);
@@ -93,7 +89,7 @@ public:
 private:
     std::shared_ptr<Shared> shared_;
     bool winsock_ready_ = false;
-    SOCKET socket_ = INVALID_SOCKET;
+    platform::socket_handle socket_ = platform::kInvalidSocket;
     sockaddr_storage destination_{};
     int destination_bytes_ = 0;
 };
@@ -103,4 +99,3 @@ private:
 extern "C" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new nodus::radio::RadioUdp(); }
 extern "C" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* tool) { delete tool; }
 extern "C" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME() { return __FILE__; }
-#endif

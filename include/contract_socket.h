@@ -3,19 +3,47 @@
 // no listener or authentication policy inside this file (see contract_listener.h).
 // Caller authenticates/authorizes the connection before providing its socket.
 // Fixed 72-byte little-endian v1 frames; bounded queues; never blocks a graph tick.
-#ifdef _WIN32
+// ====================== platform region: Windows (Winsock) / POSIX (BSD sockets) ======================
+// The only OS calls of this file: socket headers, the SOCKET type, would_block, nonblocking mode, close.
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <winsock2.h>
 #else
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
 using SOCKET=int;
 static constexpr SOCKET INVALID_SOCKET=-1;
 #endif
+namespace nodus::contracts::platform {
+#if defined(_WIN32)
+inline bool would_block(){return WSAGetLastError()==WSAEWOULDBLOCK;}
+inline bool set_nonblocking(SOCKET s){u_long on=1;return ioctlsocket(s,FIONBIO,&on)==0;}
+inline void close_socket(SOCKET s){closesocket(s);}
+constexpr int kSendFlags=0;
+#else
+inline bool would_block(){return errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR;}
+inline bool set_nonblocking(SOCKET s){
+    int flags=fcntl(s,F_GETFL,0);
+    return flags>=0 && fcntl(s,F_SETFL,flags|O_NONBLOCK)>=0;
+}
+inline void close_socket(SOCKET s){close(s);}
+#ifdef MSG_NOSIGNAL
+constexpr int kSendFlags=MSG_NOSIGNAL;   // a closed peer is an error return, not SIGPIPE
+#else
+constexpr int kSendFlags=0;
+#endif
+#endif
+}
+// ============================================ end of the platform region ============================================
 #include "contract_negotiator.h"
 #include <array>
 #include <deque>
@@ -48,11 +76,7 @@ public:
         // Fixed work bound even if a peer continuously sends data.
         for(size_t i=0;i<capacity_ && !outgoing_.empty();++i){
             auto& frame=outgoing_.front();
-            int flags=0;
-#ifdef MSG_NOSIGNAL
-            flags=MSG_NOSIGNAL;
-#endif
-            int n=::send(socket_,reinterpret_cast<const char*>(frame.data()+sent_),int(frame.size()-sent_),flags);
+            int n=::send(socket_,reinterpret_cast<const char*>(frame.data()+sent_),int(frame.size()-sent_),platform::kSendFlags);
             if(n<0){if(!would_block())closed_=true;break;}if(n==0){closed_=true;break;}
             sent_+=size_t(n);if(sent_==frame.size()){outgoing_.pop_front();sent_=0;}
         }
@@ -72,7 +96,8 @@ public:
         Frame f{};put(f,0,0x31434E4E,4);put(f,4,uint32_t(m.kind),4);
         const auto& l=m.result.loan;
         uint64_t values[]={l.work.id,l.work.engine,l.work.revision,l.work.payload,l.generation,l.host,l.deadline,m.result.payload};
-        for(size_t i=0;i<8;++i)put(f,8+8*i,values[i],8);return f;
+        for(size_t i=0;i<8;++i)put(f,8+8*i,values[i],8);
+        return f;
     }
     static bool decode(const Frame& f,WireMessage& m){
         if(get(f,0,4)!=0x31434E4E)return false;
@@ -80,28 +105,9 @@ public:
         uint64_t v[8];for(size_t i=0;i<8;++i)v[i]=get(f,8+8*i,8);
         m.result={{{v[0],v[1],v[2],v[3]},v[4],v[5],v[6]},v[7]};return true;
     }
-    static bool would_block(){
-#ifdef _WIN32
-        return WSAGetLastError()==WSAEWOULDBLOCK;
-#else
-        return errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR;
-#endif
-    }
-    static bool set_nonblocking(SOCKET s){
-#ifdef _WIN32
-        u_long on=1;return ioctlsocket(s,FIONBIO,&on)==0;
-#else
-        int flags=fcntl(s,F_GETFL,0);
-        return flags>=0 && fcntl(s,F_SETFL,flags|O_NONBLOCK)>=0;
-#endif
-    }
-    static void close_socket(SOCKET s){
-#ifdef _WIN32
-        closesocket(s);
-#else
-        close(s);
-#endif
-    }
+    static bool would_block(){return platform::would_block();}
+    static bool set_nonblocking(SOCKET s){return platform::set_nonblocking(s);}
+    static void close_socket(SOCKET s){platform::close_socket(s);}
 protected:
     WireSocket(SOCKET socket,size_t capacity):socket_(socket),capacity_(capacity){
         if(socket==INVALID_SOCKET || !capacity) throw std::invalid_argument("invalid contract socket");

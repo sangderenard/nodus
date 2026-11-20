@@ -24,25 +24,17 @@
 //   ACK 5: next expected seq u64 | bitmap u64 (bit i: seq next+1+i already held).
 // Reliability is selective-ack with a fixed window and a fixed resend time; every message arrives once, in order.
 //
-// Platform: the two classes in the platform region (UdpSocket, Aead) are the only system calls. This is the Windows
-// region (Winsock, CNG); another platform supplies the same two classes and nothing else changes.
+// Platform: the classes in the platform region (UdpSocket, Aead, secure_zero) are the only system calls: Windows uses
+// Winsock and CNG, POSIX uses BSD sockets and OpenSSL libcrypto (-lcrypto).
 #include "nodus_link.h"
 
 #include <future>
 #include <map>
 
-namespace nodus::link {
-
-constexpr uint32_t kRendezvousMagic = 0x31524C4E;   // "NLR1"
-constexpr uint32_t kUdpMagic = 0x31554C4E;          // "NLU1"
-enum class UdpKind : uint8_t { Hello = 1, Intro = 2, Punch = 3, Data = 4, Ack = 5, Keepalive = 6, Close = 7 };
-constexpr size_t kUdpHeaderBytes = 16, kUdpTagBytes = 16, kUdpDataHead = 8;
-constexpr size_t kUdpSegmentBytes = 1200;           // message bytes per DATA datagram: 1240 on the wire, under a 1472 MTU
-constexpr size_t kUdpWindow = 2048;                 // segments in flight per channel
-constexpr int kUdpResendMs = 250, kUdpHelloMs = 500, kUdpPunchMs = 100, kUdpKeepaliveMs = 5000, kUdpDeadMs = 30000;
-
-// ================================ platform region: Windows (Winsock UDP, CNG AES-256-GCM) ================================
+// ============ platform region: Windows (Winsock UDP, CNG AES-256-GCM) / POSIX (BSD sockets, OpenSSL AES-256-GCM) ============
+// UdpSocket, Aead and secure_zero are the only system calls of this file.
 #if defined(_WIN32)
+namespace nodus::link {
 class UdpSocket {
 public:
     UdpSocket() {
@@ -135,10 +127,120 @@ public:
 private:
     BCRYPT_KEY_HANDLE key_ = nullptr;
 };
+inline void secure_zero(void* p, size_t n) { SecureZeroMemory(p, n); }
+}  // namespace nodus::link
 #else
-#error "nodus_link_udp.h: supply UdpSocket and Aead for this platform (the Windows region above is the reference)"
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
+namespace nodus::link {
+class UdpSocket {
+public:
+    UdpSocket() {
+        s_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s_ < 0) return;
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = 0;
+        if (bind(s_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || !contracts::platform::set_nonblocking(s_)) { ::close(s_); s_ = -1; return; }
+        // A full window in flight is kUdpWindow datagrams per channel; the default buffers (about 200 KB) drop most of it.
+        int buffer = 16 << 20;
+        setsockopt(s_, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
+        setsockopt(s_, SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
+    }
+    ~UdpSocket() { if (s_ >= 0) ::close(s_); }
+    UdpSocket(const UdpSocket&) = delete; UdpSocket& operator=(const UdpSocket&) = delete;
+    bool ok() const { return s_ >= 0; }
+    // ip in network order, port in host order
+    bool send(uint32_t ip, uint16_t port, const uint8_t* p, size_t n) {
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = ip; a.sin_port = htons(port);
+        return sendto(s_, p, n, platform::kSendFlags, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == ssize_t(n);
+    }
+    // bytes received (0 when nothing is waiting)
+    int receive(uint8_t* p, size_t cap, uint32_t& ip, uint16_t& port) {
+        sockaddr_in a{}; socklen_t al = sizeof(a);
+        ssize_t n = recvfrom(s_, p, cap, 0, reinterpret_cast<sockaddr*>(&a), &al);
+        if (n <= 0) return 0;
+        ip = a.sin_addr.s_addr; port = ntohs(a.sin_port); return int(n);
+    }
+    uint16_t local_port() const {
+        sockaddr_in a{}; socklen_t al = sizeof(a);
+        return getsockname(s_, reinterpret_cast<sockaddr*>(&a), &al) == 0 ? ntohs(a.sin_port) : 0;
+    }
+    // This machine's address on the interface that reaches `ip` (network order); 0 when unknown. Sends nothing.
+    static uint32_t local_ip_toward(uint32_t ip, uint16_t port) {
+        int t = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (t < 0) return 0;
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = ip; a.sin_port = htons(port);
+        uint32_t out = 0;
+        if (connect(t, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
+            sockaddr_in l{}; socklen_t ll = sizeof(l);
+            if (getsockname(t, reinterpret_cast<sockaddr*>(&l), &ll) == 0) out = l.sin_addr.s_addr;
+        }
+        ::close(t); return out;
+    }
+    // A name to an IPv4 address (network order); blocking, so callers run it off the polling thread.
+    static bool resolve(const std::string& host, uint32_t& ip) {
+        addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
+        addrinfo* r = nullptr; bool ok = getaddrinfo(host.c_str(), nullptr, &hints, &r) == 0 && r;
+        if (ok) ip = reinterpret_cast<sockaddr_in*>(r->ai_addr)->sin_addr.s_addr;
+        if (r) freeaddrinfo(r);
+        return ok;
+    }
+private:
+    int s_ = -1;
+};
+
+class Aead {   // AES-256-GCM, 12-byte nonce, 16-byte tag (OpenSSL EVP)
+public:
+    explicit Aead(const uint8_t* key32) { std::memcpy(key_, key32, 32); ok_ = EVP_aes_256_gcm() != nullptr; }
+    ~Aead() { OPENSSL_cleanse(key_, sizeof(key_)); }
+    Aead(const Aead&) = delete; Aead& operator=(const Aead&) = delete;
+    bool ok() const { return ok_; }
+    // out holds n + 16 bytes (ciphertext then tag)
+    bool seal(const uint8_t* nonce, const uint8_t* aad, size_t aad_n, const uint8_t* in, size_t n, uint8_t* out) const {
+        Ctx c; if (!c.ctx) return false;
+        int len = 0;
+        if (EVP_EncryptInit_ex(c.ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1
+            || EVP_CIPHER_CTX_ctrl(c.ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1
+            || EVP_EncryptInit_ex(c.ctx, nullptr, nullptr, key_, nonce) != 1) return false;
+        if (aad_n && EVP_EncryptUpdate(c.ctx, nullptr, &len, aad, int(aad_n)) != 1) return false;
+        int done = 0;
+        if (n) { if (EVP_EncryptUpdate(c.ctx, out, &len, in, int(n)) != 1) return false; done = len; }
+        if (EVP_EncryptFinal_ex(c.ctx, out + done, &len) != 1) return false;
+        done += len;
+        return size_t(done) == n && EVP_CIPHER_CTX_ctrl(c.ctx, EVP_CTRL_GCM_GET_TAG, 16, out + n) == 1;
+    }
+    // in holds n bytes (ciphertext then tag); out holds n - 16; false when it does not authenticate
+    bool open(const uint8_t* nonce, const uint8_t* aad, size_t aad_n, const uint8_t* in, size_t n, uint8_t* out) const {
+        if (n < 16) return false;
+        Ctx c; if (!c.ctx) return false;
+        int len = 0; const size_t body = n - 16;
+        if (EVP_DecryptInit_ex(c.ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1
+            || EVP_CIPHER_CTX_ctrl(c.ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1
+            || EVP_DecryptInit_ex(c.ctx, nullptr, nullptr, key_, nonce) != 1) return false;
+        if (aad_n && EVP_DecryptUpdate(c.ctx, nullptr, &len, aad, int(aad_n)) != 1) return false;
+        int done = 0;
+        if (body) { if (EVP_DecryptUpdate(c.ctx, out, &len, in, int(body)) != 1) return false; done = len; }
+        uint8_t tag[16]; std::memcpy(tag, in + body, 16);
+        if (EVP_CIPHER_CTX_ctrl(c.ctx, EVP_CTRL_GCM_SET_TAG, 16, tag) != 1) return false;
+        return EVP_DecryptFinal_ex(c.ctx, out + done, &len) > 0;
+    }
+private:
+    struct Ctx { EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new(); ~Ctx() { EVP_CIPHER_CTX_free(ctx); } };
+    uint8_t key_[32]; bool ok_ = false;
+};
+inline void secure_zero(void* p, size_t n) { OPENSSL_cleanse(p, n); }
+}  // namespace nodus::link
 #endif
 // ============================================ end of the platform region ============================================
+
+namespace nodus::link {
+
+constexpr uint32_t kRendezvousMagic = 0x31524C4E;   // "NLR1"
+constexpr uint32_t kUdpMagic = 0x31554C4E;          // "NLU1"
+enum class UdpKind : uint8_t { Hello = 1, Intro = 2, Punch = 3, Data = 4, Ack = 5, Keepalive = 6, Close = 7 };
+constexpr size_t kUdpHeaderBytes = 16, kUdpTagBytes = 16, kUdpDataHead = 8;
+constexpr size_t kUdpSegmentBytes = 1200;           // message bytes per DATA datagram: 1240 on the wire, under a 1472 MTU
+constexpr size_t kUdpWindow = 2048;                 // segments in flight per channel
+constexpr int kUdpResendMs = 250, kUdpHelloMs = 500, kUdpPunchMs = 100, kUdpKeepaliveMs = 5000, kUdpDeadMs = 30000;
 
 struct UdpTarget {
     std::string broker_host;        // the name the rendezvous answered with
@@ -267,7 +369,7 @@ private:
         if (plain[6] != peer_role()) return false;
         std::memcpy(pair_.data(), plain + 8, 16);
         session_ = std::make_unique<Aead>(plain + 24);
-        SecureZeroMemory(plain, sizeof(plain));
+        secure_zero(plain, sizeof(plain));
         if (!session_->ok()) { fail("session key refused"); return false; }
         state_ = State::Punching; start_ = Clock::now(); return true;
     }

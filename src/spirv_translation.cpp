@@ -38,15 +38,6 @@
 #include <variant>
 #include <vector>
 
-#if defined(_WIN32)
-  #define NOMINMAX
-  #include <windows.h>
-#else
-  #include <sys/types.h>
-  #include <sys/wait.h>
-  #include <unistd.h>
-#endif
-
 // Public translation interface + Tier-0 GLSL emitter
 #include "spirv_translation.h"
 #include "kernel_ir_glsl_emitter.h" // nodus::kernel::{KernelIR, GlslEmitter, GlslEmitOptions}
@@ -54,6 +45,256 @@
 #if defined(NODUS_HAVE_SHADERC) && NODUS_HAVE_SHADERC
   #include <shaderc/shaderc.hpp>
 #endif
+
+// ===========================================================================
+// PLATFORM REGION BEGIN: every OS call of this file (external compiler process) lives here.
+//   spirv_platform::default_glslang_validator()  the program name looked up on PATH
+//   spirv_platform::run_process_capture(argv)    argv (UTF-8) -> exit code + merged stdout/stderr; no shell involved
+// Windows builds a CreateProcessW command line (quoted, not shell-interpreted); POSIX uses posix_spawnp with an argv
+// vector.
+// ===========================================================================
+#if defined(_WIN32)
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace spirv_platform {
+
+struct ProcessResult {
+  int exit_code = 1;
+  std::string output;
+};
+
+inline const char* default_glslang_validator() { return "glslangValidator.exe"; }
+
+static inline std::wstring widen(std::string_view s) {
+  if (s.empty()) return {};
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+  if (wlen <= 0) return {};
+  std::wstring w;
+  w.resize((size_t)wlen);
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), wlen);
+  return w;
+}
+
+static inline std::wstring quote_windows_arg(const std::wstring& a) {
+  // CreateProcess-compatible quoting as consumed by CommandLineToArgvW/the
+  // Microsoft C runtime. Backslashes immediately before a quote (and trailing
+  // backslashes before the closing quote) must be doubled.
+  if (a.empty()) return L"\"\"";
+  bool needs = false;
+  for (wchar_t c : a) {
+    if (c == L' ' || c == L'\t' || c == L'"') { needs = true; break; }
+  }
+  if (!needs) return a;
+
+  std::wstring out = L"\"";
+  size_t backslashes = 0;
+  for (wchar_t c : a) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (c == L'"') {
+      out.append(backslashes * 2 + 1, L'\\');
+      out.push_back(L'"');
+    } else {
+      out.append(backslashes, L'\\');
+      out.push_back(c);
+    }
+    backslashes = 0;
+  }
+  out.append(backslashes * 2, L'\\');
+  out += L"\"";
+  return out;
+}
+
+static ProcessResult run_process_capture(const std::vector<std::string>& utf8_argv) {
+  if (utf8_argv.empty()) throw std::runtime_error("run_process_capture: empty argv");
+  std::vector<std::wstring> argv;
+  argv.reserve(utf8_argv.size());
+  for (const auto& a : utf8_argv) argv.push_back(widen(a));
+
+  // Build command line (CreateProcess requires mutable buffer).
+  std::wstring cmd;
+  for (size_t i = 0; i < argv.size(); ++i) {
+    if (i) cmd.push_back(L' ');
+    cmd += quote_windows_arg(argv[i]);
+  }
+  std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
+  cmdline.push_back(L'\0');
+
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE out_read = nullptr, out_write = nullptr;
+  if (!CreatePipe(&out_read, &out_write, &sa, 0)) {
+    throw std::runtime_error("CreatePipe failed");
+  }
+  // Ensure read handle is not inherited.
+  SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
+
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = out_write;
+  si.hStdError  = out_write;
+  si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+
+  PROCESS_INFORMATION pi{};
+  BOOL ok = CreateProcessW(
+    /*lpApplicationName*/ nullptr,
+    /*lpCommandLine*/ cmdline.data(),
+    /*lpProcessAttributes*/ nullptr,
+    /*lpThreadAttributes*/ nullptr,
+    /*bInheritHandles*/ TRUE,
+    /*dwCreationFlags*/ CREATE_NO_WINDOW,
+    /*lpEnvironment*/ nullptr,
+    /*lpCurrentDirectory*/ nullptr,
+    /*lpStartupInfo*/ &si,
+    /*lpProcessInformation*/ &pi
+  );
+
+  CloseHandle(out_write); // parent closes write end
+
+  if (!ok) {
+    CloseHandle(out_read);
+    throw std::runtime_error("CreateProcessW failed");
+  }
+
+  std::string output;
+  output.reserve(4096);
+
+  auto drain_pipe = [&]() {
+    for (;;) {
+      DWORD avail = 0;
+      if (!PeekNamedPipe(out_read, nullptr, 0, nullptr, &avail, nullptr)) break;
+      if (avail == 0) break;
+
+      char buf[4096];
+      DWORD nread = 0;
+      if (!ReadFile(out_read, buf, (DWORD)std::min<DWORD>(avail, sizeof(buf)), &nread, nullptr)) break;
+      if (nread == 0) break;
+      output.append(buf, buf + nread);
+    }
+  };
+
+  // Drain while running to avoid pipe deadlock.
+  for (;;) {
+    drain_pipe();
+    DWORD w = WaitForSingleObject(pi.hProcess, 25);
+    if (w == WAIT_OBJECT_0) break;
+  }
+  // Drain remaining
+  for (;;) {
+    DWORD avail = 0;
+    if (!PeekNamedPipe(out_read, nullptr, 0, nullptr, &avail, nullptr)) break;
+    if (avail == 0) break;
+    char buf[4096];
+    DWORD nread = 0;
+    if (!ReadFile(out_read, buf, sizeof(buf), &nread, nullptr)) break;
+    if (nread == 0) break;
+    output.append(buf, buf + nread);
+  }
+
+  DWORD exit_code = 1;
+  GetExitCodeProcess(pi.hProcess, &exit_code);
+
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  CloseHandle(out_read);
+
+  ProcessResult r;
+  r.exit_code = static_cast<int>(exit_code);
+  r.output = std::move(output);
+  return r;
+}
+
+}  // namespace spirv_platform
+
+#else  // POSIX
+
+#include <errno.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char** environ;
+
+namespace spirv_platform {
+
+struct ProcessResult {
+  int exit_code = 1;
+  std::string output;
+};
+
+inline const char* default_glslang_validator() { return "glslangValidator"; }
+
+static ProcessResult run_process_capture(const std::vector<std::string>& argv) {
+  if (argv.empty()) throw std::runtime_error("run_process_capture: empty argv");
+
+  int pipefd[2];
+#if defined(__linux__)
+  if (pipe2(pipefd, O_CLOEXEC) != 0) throw std::runtime_error("pipe failed");
+#else
+  if (pipe(pipefd) != 0) throw std::runtime_error("pipe failed");
+  fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+  fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+#endif
+
+  // The child's stdout and stderr are the pipe's write end; stdin is inherited. The program is looked up on PATH
+  // (as CreateProcessW does for a bare name); argv is a vector, never a shell line.
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+  posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO);
+
+  std::vector<char*> args;
+  args.reserve(argv.size() + 1);
+  for (const auto& s : argv) args.push_back(const_cast<char*>(s.c_str()));
+  args.push_back(nullptr);
+
+  pid_t pid = -1;
+  const int rc = posix_spawnp(&pid, args[0], &actions, nullptr, args.data(), environ);
+  posix_spawn_file_actions_destroy(&actions);
+  close(pipefd[1]);  // parent closes write end
+  if (rc != 0) {
+    close(pipefd[0]);
+    throw std::runtime_error("posix_spawnp failed");
+  }
+
+  std::string output;
+  output.reserve(4096);
+  char buf[4096];
+  for (;;) {
+    ssize_t n = read(pipefd[0], buf, sizeof(buf));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    output.append(buf, buf + n);
+  }
+  close(pipefd[0]);
+
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  int exit_code = (WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+
+  ProcessResult r;
+  r.exit_code = exit_code;
+  r.output = std::move(output);
+  return r;
+}
+
+}  // namespace spirv_platform
+
+#endif
+// ===========================================================================
+// PLATFORM REGION END
+// ===========================================================================
 
 namespace nodus::spirv {
 
@@ -165,211 +406,14 @@ static inline SpirvBinary read_spirv_file(const std::filesystem::path& p) {
 }
 
 // ------------------------------
-// Process invocation (external compiler)
-// ------------------------------
-
-struct ProcessResult {
-  int exit_code = 1;
-  std::string output;
-};
-
-#if defined(_WIN32)
-
-static inline std::wstring widen(std::string_view s) {
-  if (s.empty()) return {};
-  int wlen = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-  if (wlen <= 0) return {};
-  std::wstring w;
-  w.resize((size_t)wlen);
-  MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), wlen);
-  return w;
-}
-
-static inline std::wstring quote_windows_arg(const std::wstring& a) {
-  // CreateProcess-compatible quoting as consumed by CommandLineToArgvW/the
-  // Microsoft C runtime. Backslashes immediately before a quote (and trailing
-  // backslashes before the closing quote) must be doubled.
-  if (a.empty()) return L"\"\"";
-  bool needs = false;
-  for (wchar_t c : a) {
-    if (c == L' ' || c == L'\t' || c == L'"') { needs = true; break; }
-  }
-  if (!needs) return a;
-
-  std::wstring out = L"\"";
-  size_t backslashes = 0;
-  for (wchar_t c : a) {
-    if (c == L'\\') {
-      ++backslashes;
-      continue;
-    }
-    if (c == L'"') {
-      out.append(backslashes * 2 + 1, L'\\');
-      out.push_back(L'"');
-    } else {
-      out.append(backslashes, L'\\');
-      out.push_back(c);
-    }
-    backslashes = 0;
-  }
-  out.append(backslashes * 2, L'\\');
-  out += L"\"";
-  return out;
-}
-
-static ProcessResult run_process_capture(const std::vector<std::wstring>& argv) {
-  if (argv.empty()) throw std::runtime_error("run_process_capture: empty argv");
-
-  // Build command line (CreateProcess requires mutable buffer).
-  std::wstring cmd;
-  for (size_t i = 0; i < argv.size(); ++i) {
-    if (i) cmd.push_back(L' ');
-    cmd += quote_windows_arg(argv[i]);
-  }
-  std::vector<wchar_t> cmdline(cmd.begin(), cmd.end());
-  cmdline.push_back(L'\0');
-
-  SECURITY_ATTRIBUTES sa{};
-  sa.nLength = sizeof(sa);
-  sa.bInheritHandle = TRUE;
-
-  HANDLE out_read = nullptr, out_write = nullptr;
-  if (!CreatePipe(&out_read, &out_write, &sa, 0)) {
-    throw std::runtime_error("CreatePipe failed");
-  }
-  // Ensure read handle is not inherited.
-  SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
-
-  STARTUPINFOW si{};
-  si.cb = sizeof(si);
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdOutput = out_write;
-  si.hStdError  = out_write;
-  si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
-
-  PROCESS_INFORMATION pi{};
-  BOOL ok = CreateProcessW(
-    /*lpApplicationName*/ nullptr,
-    /*lpCommandLine*/ cmdline.data(),
-    /*lpProcessAttributes*/ nullptr,
-    /*lpThreadAttributes*/ nullptr,
-    /*bInheritHandles*/ TRUE,
-    /*dwCreationFlags*/ CREATE_NO_WINDOW,
-    /*lpEnvironment*/ nullptr,
-    /*lpCurrentDirectory*/ nullptr,
-    /*lpStartupInfo*/ &si,
-    /*lpProcessInformation*/ &pi
-  );
-
-  CloseHandle(out_write); // parent closes write end
-
-  if (!ok) {
-    CloseHandle(out_read);
-    throw std::runtime_error("CreateProcessW failed");
-  }
-
-  std::string output;
-  output.reserve(4096);
-
-  auto drain_pipe = [&]() {
-    for (;;) {
-      DWORD avail = 0;
-      if (!PeekNamedPipe(out_read, nullptr, 0, nullptr, &avail, nullptr)) break;
-      if (avail == 0) break;
-
-      char buf[4096];
-      DWORD nread = 0;
-      if (!ReadFile(out_read, buf, (DWORD)std::min<DWORD>(avail, sizeof(buf)), &nread, nullptr)) break;
-      if (nread == 0) break;
-      output.append(buf, buf + nread);
-    }
-  };
-
-  // Drain while running to avoid pipe deadlock.
-  for (;;) {
-    drain_pipe();
-    DWORD w = WaitForSingleObject(pi.hProcess, 25);
-    if (w == WAIT_OBJECT_0) break;
-  }
-  // Drain remaining
-  for (;;) {
-    DWORD avail = 0;
-    if (!PeekNamedPipe(out_read, nullptr, 0, nullptr, &avail, nullptr)) break;
-    if (avail == 0) break;
-    char buf[4096];
-    DWORD nread = 0;
-    if (!ReadFile(out_read, buf, sizeof(buf), &nread, nullptr)) break;
-    if (nread == 0) break;
-    output.append(buf, buf + nread);
-  }
-
-  DWORD exit_code = 1;
-  GetExitCodeProcess(pi.hProcess, &exit_code);
-
-  CloseHandle(pi.hThread);
-  CloseHandle(pi.hProcess);
-  CloseHandle(out_read);
-
-  ProcessResult r;
-  r.exit_code = static_cast<int>(exit_code);
-  r.output = std::move(output);
-  return r;
-}
-
-#else
-
-static ProcessResult run_process_capture(const std::vector<std::string>& argv) {
-  if (argv.empty()) throw std::runtime_error("run_process_capture: empty argv");
-
-  int pipefd[2];
-  if (pipe(pipefd) != 0) throw std::runtime_error("pipe failed");
-
-  pid_t pid = fork();
-  if (pid == -1) throw std::runtime_error("fork failed");
-
-  if (pid == 0) {
-    // child
-    dup2(pipefd[1], STDOUT_FILENO);
-    dup2(pipefd[1], STDERR_FILENO);
-    close(pipefd[0]);
-    close(pipefd[1]);
-
-    std::vector<char*> args;
-    args.reserve(argv.size() + 1);
-    for (const auto& s : argv) args.push_back(const_cast<char*>(s.c_str()));
-    args.push_back(nullptr);
-
-    execvp(args[0], args.data());
-    _exit(127);
-  }
-
-  // parent
-  close(pipefd[1]);
-  std::string output;
-  output.reserve(4096);
-  char buf[4096];
-  ssize_t n;
-  while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
-    output.append(buf, buf + n);
-  }
-  close(pipefd[0]);
-
-  int status = 0;
-  waitpid(pid, &status, 0);
-  int exit_code = (WIFEXITED(status) ? WEXITSTATUS(status) : 1);
-
-  ProcessResult r;
-  r.exit_code = exit_code;
-  r.output = std::move(output);
-  return r;
-}
-
-#endif
-
-// ------------------------------
 // Compiler interface
 // ------------------------------
 
+
+static inline std::string path_utf8(const std::filesystem::path& p) {
+  const auto u8 = p.u8string();
+  return std::string(u8.begin(), u8.end());
+}
 static inline const char* target_env_arg(TargetEnv env) {
   switch (env) {
     case TargetEnv::Vulkan_1_1: return "vulkan1.1";
@@ -459,39 +503,9 @@ public:
 
     write_text_file(out_glsl_path, request.source);
 
-#if defined(_WIN32)
-    const std::wstring exe = opt.glslang_validator_path.empty()
-      ? L"glslangValidator.exe"
-      : opt.glslang_validator_path.wstring();
-
-    std::vector<std::wstring> argv;
-    argv.push_back(exe);
-    argv.push_back(L"-V");
-    argv.push_back(L"--target-env");
-    argv.push_back(widen(target_env_arg(request.target_env)));
-    argv.push_back(L"-S");
-    argv.push_back(widen(glslang_stage_arg(request.stage)));
-    argv.push_back(L"-e");
-    argv.push_back(widen(request.entry_point));
-    // -D NAME=VALUE
-    for (const auto& d : request.defines) {
-      std::wstring w = L"-D";
-      w += widen(d.first);
-      if (!d.second.empty()) {
-        w += L"=";
-        w += widen(d.second);
-      }
-      argv.push_back(std::move(w));
-    }
-    argv.push_back(out_glsl_path.wstring());
-    argv.push_back(L"-o");
-    argv.push_back(out_spv_path.wstring());
-
-    auto pr = run_process_capture(argv);
-#else
     const std::string exe = opt.glslang_validator_path.empty()
-      ? "glslangValidator"
-      : opt.glslang_validator_path.string();
+      ? std::string(spirv_platform::default_glslang_validator())
+      : path_utf8(opt.glslang_validator_path);
 
     std::vector<std::string> argv;
     argv.push_back(exe);
@@ -502,17 +516,17 @@ public:
     argv.push_back(glslang_stage_arg(request.stage));
     argv.push_back("-e");
     argv.push_back(request.entry_point);
+    // -D NAME=VALUE
     for (const auto& d : request.defines) {
       std::string s = "-D" + d.first;
       if (!d.second.empty()) s += "=" + d.second;
       argv.push_back(std::move(s));
     }
-    argv.push_back(out_glsl_path.string());
+    argv.push_back(path_utf8(out_glsl_path));
     argv.push_back("-o");
-    argv.push_back(out_spv_path.string());
+    argv.push_back(path_utf8(out_spv_path));
 
-    auto pr = run_process_capture(argv);
-#endif
+    auto pr = spirv_platform::run_process_capture(argv);
 
     if (opt.verbose) {
       std::fprintf(stderr, "[glslangValidator] exit=%d\n%s\n", pr.exit_code, pr.output.c_str());

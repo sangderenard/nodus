@@ -64,6 +64,8 @@ AbstractTensorPool::PooledTensor::~PooledTensor() {
     }
 }
 
+AbstractTensorPool::AbstractTensorPool() : AbstractTensorPool(Options{}) {}
+
 AbstractTensorPool::AbstractTensorPool(Options options)
     : options_(options) {}
 

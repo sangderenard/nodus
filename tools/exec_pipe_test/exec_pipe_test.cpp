@@ -2,6 +2,8 @@
 // Drives a real native compressor through nodus::exec::Child: a byte span in, compressed bytes out, and back.
 // The compressor must compress standard input to standard output with "-c" and decompress with "-d -c"
 // (brotli, xz, gzip, bzip2 and zstd all do).
+#include <chrono>
+#include <thread>
 #include "exec_pipe.h"
 
 #include <chrono>
@@ -28,7 +30,7 @@ static bool run_span(const Program& program, const std::string& input, std::stri
     while (!child.finished()) {
         child.take(output);
         if (std::chrono::steady_clock::now() > deadline) { why = "timed out"; child.kill(); return false; }
-        Sleep(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     child.take(output);
     if (child.exit_code() != 0) { why = "exit code " + std::to_string(child.exit_code()); return false; }
@@ -94,7 +96,7 @@ int main(int argc, char** argv) {
         const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - before).count();
         check(waited < 200 && child.running(), "send and take return at once while it waits");
         child.kill();
-        for (int i = 0; i < 2000 && child.running(); ++i) Sleep(1);
+        for (int i = 0; i < 2000 && child.running(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         check(!child.running(), "kill ends it");
     }
     {

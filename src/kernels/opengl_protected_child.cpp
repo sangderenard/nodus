@@ -1,33 +1,106 @@
 #include "opengl_protected_protocol.h"
+#include <algorithm>
 #include <cstring>
 #include <cwchar>
 #include <limits>
 #include <string>
-#ifdef _WIN32
+
+// ===== PLATFORM REGION (the only OS-specific code in this file) =====
+// Child-side transport and containment primitives. Windows: inherited file
+// mapping handles and a verified JobObject. POSIX: inherited memfd descriptors
+// and verified rlimit/process-group/parent-death containment.
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+namespace nodus::gpu::protected_detail::platform {
+using Native=HANDLE;
+// Parses one inherited transport handle from argv. Rejects empty, signed,
+// zero, overflowing or trailing-garbage text.
+bool parse_handle(const wchar_t* text,Native& out) {
+    if(!text || !*text || *text==L'-' || *text==L'+')return false;
+    wchar_t* end=nullptr;const auto value=std::wcstoull(text,&end,10);
+    if(!end || *end || !value || value>std::numeric_limits<uintptr_t>::max())return false;
+    out=reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));return true;
+}
+void close_native(Native h){CloseHandle(h);}
+// Read-only view of exactly `bytes` of the request section (nullptr on failure).
+const void* map_request(Native h,size_t bytes){return MapViewOfFile(h,FILE_MAP_READ,0,0,bytes);}
+void* map_result(Native h,size_t bytes){return MapViewOfFile(h,FILE_MAP_WRITE,0,0,bytes);}
+void unmap(const void* p,size_t){UnmapViewOfFile(p);}
+// True only when this process is inside the supervisor's verified containment
+// with exactly the requested memory limits.
+bool contained(uint64_t process_bytes,uint64_t job_bytes) {
+    BOOL assigned=FALSE;JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    constexpr DWORD required=JOB_OBJECT_LIMIT_PROCESS_MEMORY|JOB_OBJECT_LIMIT_JOB_MEMORY|
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE|JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    return IsProcessInJob(GetCurrentProcess(),nullptr,&assigned) && assigned &&
+        QueryInformationJobObject(nullptr,JobObjectExtendedLimitInformation,&limits,sizeof(limits),nullptr) &&
+        (limits.BasicLimitInformation.LimitFlags&required)==required && limits.BasicLimitInformation.ActiveProcessLimit==1 &&
+        limits.ProcessMemoryLimit==process_bytes && limits.JobMemoryLimit==job_bytes;
+}
+}
+#else
+#include <csignal>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
+namespace nodus::gpu::protected_detail::platform {
+using Native=int;
+bool parse_handle(const wchar_t* text,Native& out) {
+    if(!text || !*text || *text==L'-' || *text==L'+')return false;
+    wchar_t* end=nullptr;const auto value=std::wcstoull(text,&end,10);
+    // 0..2 are the standard streams, never transport descriptors.
+    if(!end || *end || value<3 || value>static_cast<unsigned long long>(std::numeric_limits<int>::max()))return false;
+    out=static_cast<int>(value);return true;
+}
+void close_native(Native fd){::close(fd);}
+void* map_section(Native fd,size_t bytes,int protection,int sharing) {
+    struct stat info{};
+    // A mapping beyond the section would fault on access, so refuse it here
+    // (Windows MapViewOfFile refuses the same request).
+    if(fstat(fd,&info)!=0 || info.st_size<0 || static_cast<size_t>(info.st_size)<bytes)return nullptr;
+    void* p=mmap(nullptr,bytes,protection,sharing,fd,0);
+    return p==MAP_FAILED?nullptr:p;
+}
+const void* map_request(Native fd,size_t bytes){return map_section(fd,bytes,PROT_READ,MAP_PRIVATE);}  // sealed section: a shared mapping of it is refused
+void* map_result(Native fd,size_t bytes){return map_section(fd,bytes,PROT_READ|PROT_WRITE,MAP_SHARED);}
+void unmap(const void* p,size_t bytes){munmap(const_cast<void*>(p),bytes);}
+// The supervisor set the memory limit, own process group and parent-death
+// kill before releasing this process; verify each from the inside.
+bool contained(uint64_t process_bytes,uint64_t) {
+    struct rlimit data{};int death=0;
+    return getrlimit(RLIMIT_DATA,&data)==0 && data.rlim_cur==process_bytes && data.rlim_max==process_bytes &&
+        getpgrp()==getpid() && prctl(PR_GET_PDEATHSIG,&death)==0 && death==SIGKILL;
+}
+}
 #endif
+// ===== END PLATFORM REGION =====
 
 namespace nodus::gpu::protected_detail {
+namespace {
+struct Handles {
+    platform::Native a,b;
+    ~Handles(){platform::close_native(a);platform::close_native(b);}
+};
+struct Views {
+    const void* a;size_t a_bytes;void* b;size_t b_bytes;
+    ~Views(){if(a)platform::unmap(a,a_bytes);if(b)platform::unmap(b,b_bytes);}
+};
+}
 int protected_child_main(int argc,wchar_t** argv,ChildLink callback) {
-#ifndef _WIN32
-    (void)argc;(void)argv;(void)callback;return 90;
-#else
     // Standalone invocation cannot create a context or reach the callback.
     if(argc!=4 || !argv || std::wcscmp(argv[1],L"--nodus-protected-gl-worker") || !callback)return 91;
-    const auto parse=[](const wchar_t* text)->HANDLE {
-        if(!text || !*text || *text==L'-' || *text==L'+')return nullptr;
-        wchar_t* end=nullptr;const auto value=std::wcstoull(text,&end,10);
-        if(!end || *end || !value || value>std::numeric_limits<uintptr_t>::max())return nullptr;
-        return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));
-    };
-    HANDLE request_handle=parse(argv[2]),result_handle=parse(argv[3]);
-    if(!request_handle || !result_handle || request_handle==result_handle)return 92;
-    struct Handles {HANDLE a,b;~Handles(){CloseHandle(a);CloseHandle(b);}} handles{request_handle,result_handle};
+    platform::Native request_handle{},result_handle{};
+    if(!platform::parse_handle(argv[2],request_handle) || !platform::parse_handle(argv[3],result_handle) ||
+       request_handle==result_handle)return 92;
+    Handles handles{request_handle,result_handle};
     // Query only the header first; never trust an input's allocation length.
-    auto* initial=static_cast<const WireRequest*>(MapViewOfFile(request_handle,FILE_MAP_READ,0,0,sizeof(WireRequest)));
+    auto* initial=static_cast<const WireRequest*>(platform::map_request(request_handle,sizeof(WireRequest)));
     if(!initial)return 93;
     const uint32_t total=initial->total_bytes;
     const bool header_valid=initial->magic==request_magic && initial->version==protocol_version &&
@@ -35,19 +108,13 @@ int protected_child_main(int argc,wchar_t** argv,ChildLink callback) {
         initial->source_count && initial->source_count<=object_limit &&
         initial->context_policy<=static_cast<uint32_t>(ProtectedContextPolicy::VerifiedDefaultDc) &&
         initial->host_id && initial->contract_id && initial->generation;
-    UnmapViewOfFile(initial);
+    platform::unmap(initial,sizeof(WireRequest));
     if(!header_valid)return 94;
-    const auto* request=static_cast<const WireRequest*>(MapViewOfFile(request_handle,FILE_MAP_READ,0,0,total));
-    auto* response=static_cast<WireResult*>(MapViewOfFile(result_handle,FILE_MAP_WRITE,0,0,sizeof(WireResult)));
-    struct Views {const void* a;void* b;~Views(){if(a)UnmapViewOfFile(a);if(b)UnmapViewOfFile(b);}} views{request,response};
+    const auto* request=static_cast<const WireRequest*>(platform::map_request(request_handle,total));
+    auto* response=static_cast<WireResult*>(platform::map_result(result_handle,sizeof(WireResult)));
+    Views views{request,total,response,sizeof(WireResult)};
     if(!request || !response)return 95;
-    BOOL assigned=FALSE;JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-    constexpr DWORD required=JOB_OBJECT_LIMIT_PROCESS_MEMORY|JOB_OBJECT_LIMIT_JOB_MEMORY|
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE|JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-    if(!IsProcessInJob(GetCurrentProcess(),nullptr,&assigned) || !assigned ||
-       !QueryInformationJobObject(nullptr,JobObjectExtendedLimitInformation,&limits,sizeof(limits),nullptr) ||
-       (limits.BasicLimitInformation.LimitFlags&required)!=required || limits.BasicLimitInformation.ActiveProcessLimit!=1 ||
-       limits.ProcessMemoryLimit!=request->process_memory_bytes || limits.JobMemoryLimit!=request->job_memory_bytes ||
+    if(!platform::contained(request->process_memory_bytes,request->job_memory_bytes) ||
        request->process_memory_bytes>4ull*1024*1024*1024 || request->job_memory_bytes>4ull*1024*1024*1024 ||
        request->job_memory_bytes<request->process_memory_bytes)return 96;
     try {
@@ -82,6 +149,5 @@ int protected_child_main(int argc,wchar_t** argv,ChildLink callback) {
         // validates magic, size, version, exact loan, digest and adapter again.
         result.magic=result_magic;std::memcpy(response,&result,sizeof(result));return 0;
     } catch(...) {return 99;}
-#endif
 }
 } // namespace nodus::gpu::protected_detail

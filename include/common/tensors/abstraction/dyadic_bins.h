@@ -10,6 +10,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <climits>
+#include <cmath>
 #include <limits>
 #include <type_traits>
 #include <cstdio>
@@ -1097,9 +1098,11 @@ struct DyadicScheduleWriter {
 template <uint32_t Bin>
 consteval void dyadic_emit_lower_cycle(DyadicScheduleWriter& w) {
     if constexpr (Bin > 0u) {
-        w.emit(DYADIC_OP_BIN_SWAP_INBOX(Bin));
-        w.emit(DYADIC_OP_BIN_SORT(Bin));
-        w.emit(DYADIC_OP_BIN_SWAP_RETAIN(Bin));
+        // Bin is a template parameter: token pasting would make the name Bin##Bin; the ops of bin n are the bin-0 op plus
+        // n (the enum lists them in order), as the schedulers below index them.
+        w.emit(static_cast<DyadicScheduleOp>(static_cast<uint32_t>(DyadicScheduleOp::Bin0SwapInbox) + Bin));
+        w.emit(static_cast<DyadicScheduleOp>(static_cast<uint32_t>(DyadicScheduleOp::Bin0Sort) + Bin));
+        w.emit(static_cast<DyadicScheduleOp>(static_cast<uint32_t>(DyadicScheduleOp::Bin0SwapRetain) + Bin));
         dyadic_emit_lower_cycle<Bin - 1u>(w);
     } else {
         w.emit(DYADIC_OP_BIN_SWAP_INBOX(0));
@@ -1111,8 +1114,9 @@ consteval void dyadic_emit_lower_cycle(DyadicScheduleWriter& w) {
 template <uint32_t Bin, uint32_t MaxBins>
 consteval void dyadic_emit_recursive_bins(DyadicScheduleWriter& w) {
     if constexpr (Bin < MaxBins) {
-        w.emit(DYADIC_OP_BIN_SORT(Bin));
-        w.emit(DYADIC_OP_BIN_SWAP_RETAIN(Bin));
+        // Bin is a template parameter (see dyadic_emit_lower_cycle): the bin-0 op plus Bin.
+        w.emit(static_cast<DyadicScheduleOp>(static_cast<uint32_t>(DyadicScheduleOp::Bin0Sort) + Bin));
+        w.emit(static_cast<DyadicScheduleOp>(static_cast<uint32_t>(DyadicScheduleOp::Bin0SwapRetain) + Bin));
         dyadic_emit_lower_cycle<Bin - 1u>(w);
         dyadic_emit_lower_cycle<Bin - 1u>(w);
         dyadic_emit_recursive_bins<Bin + 1u, MaxBins>(w);
@@ -1276,11 +1280,11 @@ inline void dyadic_exec_bin_sort(
     uint32_t stage_bits,
     uint32_t bin_id,
     uint8_t* phase_counter,
-    DyadicJobCtx* job,
-    bool tick_or_block,
-    bool use_msb_override,
-    INDEX_T msb_mask,
-    uint32_t sort_epoch);
+    DyadicJobCtx* job = nullptr,
+    bool tick_or_block = false,  /* TICK, defined below */
+    bool use_msb_override = false,
+    INDEX_T msb_mask = 0,
+    uint32_t sort_epoch = 0u);  // the defaults live on this first declaration only (a later one may not repeat them)
 
 template <typename INDEX_T, typename VALUE_T, typename PremixValuePol, typename PremixIndexPol>
 inline bool run_dyadic_schedule_step(
@@ -1624,6 +1628,9 @@ inline bool dyadic_job_enqueue_terminal_blocking(DyadicBinIO3<INDEX_T, VALUE_T>&
     (void)enqueue_ready;
     return dyadic_job_ring_enqueue(job, entry, &stage_pages, true);
 }
+
+// Defined below; a template that calls it needs the declaration first (two-phase lookup).
+inline bool dyadic_job_ring_dequeue(DyadicJobCtx& job, DyadicJobRingEntry* out_entry);
 
 template <typename INDEX_T, typename VALUE_T, typename PremixValuePol, typename PremixIndexPol>
 inline bool dyadic_sort_classifier_tick(DyadicSortClassifierCtx<INDEX_T, VALUE_T, PremixValuePol, PremixIndexPol>& ctx) {
@@ -2588,11 +2595,11 @@ inline void dyadic_exec_bin_sort(
     uint32_t stage_bits,
     uint32_t bin_id,
     uint8_t* phase_counter,
-    DyadicJobCtx* job = nullptr,
-    bool tick_or_block = TICK,
-    bool use_msb_override = false,
-    INDEX_T msb_mask = 0,
-    uint32_t sort_epoch = 0) {
+    DyadicJobCtx* job,
+    bool tick_or_block,
+    bool use_msb_override,
+    INDEX_T msb_mask,
+    uint32_t sort_epoch) {  // defaults: on the first declaration
     DYADIC_LOGGING("[dyadic] Sorting bin %u\n", bin_id);
     DYADIC_LOGGING("[dyadic]   use_msb_override=%d msb_mask=0x%llx sort_epoch=%u\n",
            use_msb_override ? 1 : 0,

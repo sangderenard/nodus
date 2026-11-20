@@ -16,7 +16,18 @@
 #include "kernel_vulkan_runner.h"
 #include "exec_pipe.h"
 
+// ---- platform region: CPU identification and the executable search path ----
+#if defined(_WIN32)
 #include <intrin.h>
+#else
+#include <sys/utsname.h>
+#include <unistd.h>
+#include <thread>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
+#endif
+// ---- end platform region (includes) ----
 
 #include <filesystem>
 #include <fstream>
@@ -111,10 +122,58 @@ inline void put_str(std::vector<uint8_t>& b, const std::string& s, size_t n) {
 }
 inline void put_u(std::vector<uint8_t>& b, uint64_t v, size_t n) { const size_t at = b.size(); b.resize(at + n); put_le(b.data() + at, v, n); }
 inline std::string get_str(const uint8_t* p, size_t n) { size_t l = 0; while (l < n && p[l]) ++l; return std::string(reinterpret_cast<const char*>(p), l); }
+// ---- platform region: the executable search path, threads, triple and x86 feature leaves ----
+#if defined(_WIN32)
 inline std::string find_on_path(const char* exe) {
     char out[MAX_PATH] = {}; char* file = nullptr;
     return SearchPathA(nullptr, exe, nullptr, MAX_PATH, out, &file) ? std::string(out) : std::string();
 }
+constexpr const char* kExeSuffix = ".exe";
+inline void cpu_threads_and_triple(uint32_t& threads, std::string& triple) {
+    SYSTEM_INFO si{}; GetNativeSystemInfo(&si);
+    threads = si.dwNumberOfProcessors;
+    triple = si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? "x86_64-pc-windows-msvc"
+           : si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? "aarch64-pc-windows-msvc" : "unknown-pc-windows-msvc";
+}
+#if defined(_M_X64)
+#define NODUS_HAS_CPUID 1
+inline void cpuid(int regs[4], int leaf, int sub = 0) { __cpuidex(regs, leaf, sub); }
+#endif
+#else
+inline std::string find_on_path(const char* exe) {
+    const char* path = std::getenv("PATH");
+    if (!path) return {};
+    std::string all(path);
+    for (size_t start = 0; start <= all.size();) {
+        const size_t end = all.find(':', start);
+        const std::string dir = all.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        const std::string candidate = (dir.empty() ? std::string(".") : dir) + "/" + exe;
+        if (::access(candidate.c_str(), X_OK) == 0) return candidate;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return {};
+}
+constexpr const char* kExeSuffix = "";
+inline void cpu_threads_and_triple(uint32_t& threads, std::string& triple) {
+    threads = std::thread::hardware_concurrency();
+    utsname u{};
+    const std::string machine = ::uname(&u) == 0 ? std::string(u.machine) : std::string("unknown");
+#if defined(__APPLE__)
+    triple = (machine == "arm64" ? std::string("aarch64") : machine) + "-apple-darwin";
+#else
+    triple = machine + "-unknown-linux-gnu";
+#endif
+}
+#if defined(__x86_64__)
+#define NODUS_HAS_CPUID 1
+inline void cpuid(int regs[4], int leaf, int sub = 0) {
+    unsigned a = 0, b = 0, c = 0, d = 0; __cpuid_count(unsigned(leaf), unsigned(sub), a, b, c, d);
+    regs[0] = int(a); regs[1] = int(b); regs[2] = int(c); regs[3] = int(d);
+}
+#endif
+#endif
+// ---- end platform region ----
 }  // namespace detail
 
 // Fixed layout (152-byte header): magic "NLS1" u32 | version u16 | gpu count u16 | cpu triple [64] | cpu brand [64] |
@@ -169,28 +228,25 @@ inline SettingsRecord collect_settings() {
         g.max_size = d.max_compute_size; g.subgroup = d.subgroup_size; g.max_storage_buffers = d.max_storage_buffers;
         g.max_storage_bytes = d.max_storage_buffer_bytes; r.gpus.push_back(std::move(g));
     }
-    SYSTEM_INFO si{}; GetNativeSystemInfo(&si);
-    r.cpu_threads = si.dwNumberOfProcessors;
-    r.cpu_triple = si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? "x86_64-pc-windows-msvc"
-                 : si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? "aarch64-pc-windows-msvc" : "unknown-pc-windows-msvc";
-#if defined(_M_X64)
+    { uint32_t threads = 0; detail::cpu_threads_and_triple(threads, r.cpu_triple); r.cpu_threads = threads; }
+#if defined(NODUS_HAS_CPUID)
     int regs[4] = {}; char brand[49] = {};
-    __cpuid(regs, 0x80000000);
-    if (unsigned(regs[0]) >= 0x80000004u) for (int i = 0; i < 3; ++i) { __cpuid(regs, 0x80000002 + i); std::memcpy(brand + 16 * i, regs, 16); }
+    detail::cpuid(regs, int(0x80000000u));
+    if (unsigned(regs[0]) >= 0x80000004u) for (int i = 0; i < 3; ++i) { detail::cpuid(regs, int(0x80000002u) + i); std::memcpy(brand + 16 * i, regs, 16); }
     r.cpu_brand = brand;
-    __cpuid(regs, 1);
+    detail::cpuid(regs, 1);
     if (regs[2] & (1 << 20)) r.cpu_features |= kSse42;
     if (regs[2] & (1 << 28)) r.cpu_features |= kAvx;
     if (regs[2] & (1 << 12)) r.cpu_features |= kFma;
     if (regs[2] & (1 << 29)) r.cpu_features |= kF16c;
     if (regs[2] & (1 << 23)) r.cpu_features |= kPopcnt;
-    __cpuidex(regs, 7, 0);
+    detail::cpuid(regs, 7, 0);
     if (regs[1] & (1 << 5)) r.cpu_features |= kAvx2;
     if (regs[1] & (1 << 8)) r.cpu_features |= kBmi2;
     if (regs[1] & (1 << 16)) r.cpu_features |= kAvx512f;
 #endif
-    r.glslang_path = detail::find_on_path("glslangValidator.exe"); r.has_glslang = !r.glslang_path.empty();
-    r.clang_path = detail::find_on_path("clang.exe"); r.has_clang = !r.clang_path.empty();
+    r.glslang_path = detail::find_on_path((std::string("glslangValidator") + detail::kExeSuffix).c_str()); r.has_glslang = !r.glslang_path.empty();
+    r.clang_path = detail::find_on_path((std::string("clang") + detail::kExeSuffix).c_str()); r.has_clang = !r.clang_path.empty();
     return r;
 }
 

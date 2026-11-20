@@ -12,11 +12,30 @@
 #include <string>
 #include <type_traits>
 #include <vector>
-#ifdef _WIN32
+// ---- platform region: run-time library loading (the only OS calls in this file) ----
+#if defined(_WIN32)
 #include <windows.h>
+namespace {
+void* platform_library_open(const char* path){
+    return LoadLibraryExA(path,nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+}
+void* platform_library_symbol(void* module,const char* name){
+    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module),name));
+}
+void platform_library_close(void* module){
+    if(module)FreeLibrary(static_cast<HMODULE>(module));
+}
+}
 #else
 #include <dlfcn.h>
+namespace {
+void* platform_library_open(const char* path){return dlopen(path,RTLD_NOW|RTLD_LOCAL);}
+void* platform_library_symbol(void* module,const char* name){return dlsym(module,name);}
+void platform_library_close(void* module){if(module)dlclose(module);}
+}
 #endif
+// ---- end platform region ----
 
 namespace nodus::gpu {
 CpuFabricDispatchTool::CpuFabricDispatchTool(
@@ -84,35 +103,17 @@ void CpuFabricDispatchTool::initialize(const ToolInitContext& ctx){
         if(in.ok())deserialize(in);
     }
     if(module_)return;
-#ifdef _WIN32
-    module_=LoadLibraryExA(dll_.c_str(),nullptr,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-#else
-    module_=dlopen(dll_.c_str(),RTLD_NOW|RTLD_LOCAL);
-#endif
+    module_=platform_library_open(dll_.c_str());
     if(!module_)return;
-#ifdef _WIN32
     entry_=reinterpret_cast<void (*)(void**,int32_t*)>(
-        GetProcAddress(static_cast<HMODULE>(module_),entry_name_.c_str()));
-    reset_=reinterpret_cast<void (*)()>(GetProcAddress(
-        static_cast<HMODULE>(module_),"turing_validation_error_reset"));
-    take_=reinterpret_cast<std::uint32_t (*)()>(GetProcAddress(
-        static_cast<HMODULE>(module_),"turing_validation_error_take"));
-#else
-    entry_=reinterpret_cast<void (*)(void**,int32_t*)>(
-        dlsym(module_,entry_name_.c_str()));
-    reset_=reinterpret_cast<void (*)()>(dlsym(module_,"turing_validation_error_reset"));
+        platform_library_symbol(module_,entry_name_.c_str()));
+    reset_=reinterpret_cast<void (*)()>(platform_library_symbol(module_,"turing_validation_error_reset"));
     take_=reinterpret_cast<std::uint32_t (*)()>(
-        dlsym(module_,"turing_validation_error_take"));
-#endif
+        platform_library_symbol(module_,"turing_validation_error_take"));
     if(!entry_||((reset_==nullptr)!=(take_==nullptr)))shutdown();
 }
 void CpuFabricDispatchTool::shutdown(){
-#ifdef _WIN32
-    if(module_)FreeLibrary(static_cast<HMODULE>(module_));
-#else
-    if(module_)dlclose(module_);
-#endif
+    platform_library_close(module_);
     module_=nullptr;entry_=nullptr;reset_=nullptr;take_=nullptr;
 }
 void CpuFabricDispatchTool::execute_stack(ToolStackContext& context){

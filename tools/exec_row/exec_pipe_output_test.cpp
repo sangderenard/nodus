@@ -2,12 +2,18 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#if defined(_WIN32)
+#include <fcntl.h>
 #include <io.h>
+#define NODUS_BINARY_STDOUT() _setmode(_fileno(stdout), _O_BINARY)
+#else
+#define NODUS_BINARY_STDOUT() ((void)0)
+#endif
 #include <fcntl.h>
 using namespace nodus::exec;
 using Clock=std::chrono::steady_clock;
 int main(int argc,char**argv) {
- if(argc>1 && std::string(argv[1])=="emit") { _setmode(_fileno(stdout),_O_BINARY); for(int i=0;i<1048576;i++) if(std::putchar(i%251)==EOF) return 2; return 0; }
+ if(argc>1 && std::string(argv[1])=="emit") { NODUS_BINARY_STDOUT(); for(int i=0;i<1048576;i++) if(std::putchar(i%251)==EOF) return 2; return 0; }
  auto check=[](bool yes,const char*name){ if(!yes){std::fprintf(stderr,"FAIL %s\n",name);std::exit(1);} std::printf("PASS %s\n",name); };
  Program p{std::filesystem::absolute(argv[0]).string(),{"emit"},std::filesystem::current_path().string(),{}, {}};
  Child c; std::string why;

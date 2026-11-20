@@ -14,15 +14,8 @@
 //
 // Nonblocking, bounded work per poll(); every queue is bounded and refuses when full; when an incoming queue is full
 // the socket is simply not read (TCP backpressure), counted in LinkStats. Nothing blocks: listener, dialer and
-// link are all advanced by poll(). Windows: crypto from CNG (bcrypt.lib), sockets from ws2_32.
+// link are all advanced by poll(). OS calls live in the one platform region below: Windows CNG (bcrypt.lib) + ws2_32; POSIX OpenSSL libcrypto + BSD sockets.
 #include "contract_listener.h"   // ensure_sockets, WireSocket socket helpers
-#ifdef _WIN32
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <bcrypt.h>
-#else
-#error "nodus_link.h: the SHA-1/SHA-256/HMAC provider is Windows CNG; no other provider is wired"
-#endif
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -36,6 +29,113 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// ================================ platform region: Windows (CNG, Winsock) / POSIX (OpenSSL, BSD sockets) ================================
+// Every OS call of this file is here; the rest of the file is platform-free.
+#if defined(_WIN32)
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <bcrypt.h>
+namespace nodus::link {
+namespace detail {   // CNG providers; nodus_link_udp.h's Aead uses detail::provider too
+inline BCRYPT_ALG_HANDLE provider(LPCWSTR alg, bool hmac) {
+    BCRYPT_ALG_HANDLE h = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&h, alg, nullptr, hmac ? BCRYPT_ALG_HANDLE_HMAC_FLAG : 0)))
+        throw std::runtime_error("CNG provider refused");
+    return h;   // process lifetime
+}
+inline void hash(BCRYPT_ALG_HANDLE h, const uint8_t* key, size_t key_n, const uint8_t* data, size_t n, uint8_t* out, size_t out_n) {
+    if (!BCRYPT_SUCCESS(BCryptHash(h, const_cast<PUCHAR>(key), ULONG(key_n), const_cast<PUCHAR>(data), ULONG(n), out, ULONG(out_n))))
+        throw std::runtime_error("CNG hash refused");
+}
+}  // namespace detail
+namespace platform {
+using socklen = int;
+constexpr int kSendFlags = 0;
+// After a nonblocking connect() reported failure: true when it is merely in progress.
+inline bool connect_would_block() { return WSAGetLastError() == WSAEWOULDBLOCK; }
+// Readiness query for a nonblocking connect, never waits: 1 connected, 0 in progress, -1 refused, -2 query failed.
+inline int connect_state(SOCKET s) {
+    fd_set w, e; FD_ZERO(&w); FD_ZERO(&e); FD_SET(s, &w); FD_SET(s, &e);
+    timeval zero{0, 0};
+    int n = select(0, nullptr, &w, &e, &zero);           // zero timeout: a readiness query, not a wait
+    if (n < 0) return -2;
+    if (n == 0) return 0;
+    int err = 0; int len = sizeof(err);
+    getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+    if (FD_ISSET(s, &e) || err) return -1;
+    return 1;
+}
+inline void sha1(const void* data, size_t n, uint8_t* out) {
+    static BCRYPT_ALG_HANDLE h = detail::provider(BCRYPT_SHA1_ALGORITHM, false);
+    detail::hash(h, nullptr, 0, static_cast<const uint8_t*>(data), n, out, 20);
+}
+inline void sha256(const void* data, size_t n, uint8_t* out) {
+    static BCRYPT_ALG_HANDLE h = detail::provider(BCRYPT_SHA256_ALGORITHM, false);
+    detail::hash(h, nullptr, 0, static_cast<const uint8_t*>(data), n, out, 32);
+}
+inline void hmac_sha256(const uint8_t* key, size_t key_n, const void* data, size_t n, uint8_t* out) {
+    static BCRYPT_ALG_HANDLE h = detail::provider(BCRYPT_SHA256_ALGORITHM, true);
+    detail::hash(h, key, key_n, static_cast<const uint8_t*>(data), n, out, 32);
+}
+inline void random_bytes(void* out, size_t n) {
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, static_cast<PUCHAR>(out), ULONG(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        throw std::runtime_error("CNG random refused");
+}
+}  // namespace platform
+}  // namespace nodus::link
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
+#include <unistd.h>
+#include <cerrno>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+namespace nodus::link {
+namespace platform {
+using socklen = socklen_t;
+#ifdef MSG_NOSIGNAL
+constexpr int kSendFlags = MSG_NOSIGNAL;                 // a closed peer is an error return, not SIGPIPE
+#else
+constexpr int kSendFlags = 0;
+#endif
+inline bool connect_would_block() { return errno == EINPROGRESS || errno == EINTR; }
+inline int connect_state(SOCKET s) {
+    pollfd p{}; p.fd = s; p.events = POLLOUT;
+    int n = ::poll(&p, 1, 0);                            // zero timeout: a readiness query, not a wait
+    if (n < 0) return errno == EINTR ? 0 : -2;
+    if (n == 0) return 0;
+    int err = 0; socklen len = sizeof(err);
+    getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+    if ((p.revents & (POLLERR | POLLNVAL)) || err) return -1;
+    if (p.revents & POLLOUT) return 1;
+    return (p.revents & POLLHUP) ? -1 : 0;
+}
+inline void sha1(const void* data, size_t n, uint8_t* out) {
+    unsigned len = 0;
+    if (EVP_Digest(data, n, out, &len, EVP_sha1(), nullptr) != 1 || len != 20) throw std::runtime_error("OpenSSL hash refused");
+}
+inline void sha256(const void* data, size_t n, uint8_t* out) {
+    unsigned len = 0;
+    if (EVP_Digest(data, n, out, &len, EVP_sha256(), nullptr) != 1 || len != 32) throw std::runtime_error("OpenSSL hash refused");
+}
+inline void hmac_sha256(const uint8_t* key, size_t key_n, const void* data, size_t n, uint8_t* out) {
+    unsigned len = 0;
+    if (!HMAC(EVP_sha256(), key, int(key_n), static_cast<const unsigned char*>(data), n, out, &len) || len != 32)
+        throw std::runtime_error("OpenSSL HMAC refused");
+}
+inline void random_bytes(void* out, size_t n) {
+    if (RAND_bytes(static_cast<unsigned char*>(out), int(n)) != 1) throw std::runtime_error("OpenSSL random refused");
+}
+}  // namespace platform
+}  // namespace nodus::link
+#endif
+// ============================================ end of the platform region ============================================
 
 namespace nodus::link {
 using contracts::WireSocket;
@@ -67,35 +167,13 @@ inline void put_le(uint8_t* p, uint64_t v, size_t n) { for (size_t i = 0; i < n;
 inline uint64_t get_le(const uint8_t* p, size_t n) { uint64_t v = 0; for (size_t i = 0; i < n; ++i) v |= uint64_t(p[i]) << (8 * i); return v; }
 inline const char* channel_name(Channel c) { return c == Channel::Control ? "control" : "bulk"; }
 
-// ---- CNG crypto -----------------------------------------------------------------------------------------------------
-namespace detail {
-inline BCRYPT_ALG_HANDLE provider(LPCWSTR alg, bool hmac) {
-    BCRYPT_ALG_HANDLE h = nullptr;
-    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&h, alg, nullptr, hmac ? BCRYPT_ALG_HANDLE_HMAC_FLAG : 0)))
-        throw std::runtime_error("CNG provider refused");
-    return h;   // process lifetime
-}
-inline void hash(BCRYPT_ALG_HANDLE h, const uint8_t* key, size_t key_n, const uint8_t* data, size_t n, uint8_t* out, size_t out_n) {
-    if (!BCRYPT_SUCCESS(BCryptHash(h, const_cast<PUCHAR>(key), ULONG(key_n), const_cast<PUCHAR>(data), ULONG(n), out, ULONG(out_n))))
-        throw std::runtime_error("CNG hash refused");
-}
-}  // namespace detail
-inline std::array<uint8_t, 20> sha1(const void* data, size_t n) {
-    static BCRYPT_ALG_HANDLE h = detail::provider(BCRYPT_SHA1_ALGORITHM, false);
-    std::array<uint8_t, 20> out{}; detail::hash(h, nullptr, 0, static_cast<const uint8_t*>(data), n, out.data(), out.size()); return out;
-}
-inline std::array<uint8_t, 32> sha256(const void* data, size_t n) {
-    static BCRYPT_ALG_HANDLE h = detail::provider(BCRYPT_SHA256_ALGORITHM, false);
-    std::array<uint8_t, 32> out{}; detail::hash(h, nullptr, 0, static_cast<const uint8_t*>(data), n, out.data(), out.size()); return out;
-}
+// ---- crypto (the platform region holds the provider) ----------------------------------------------------------------------
+inline std::array<uint8_t, 20> sha1(const void* data, size_t n) { std::array<uint8_t, 20> out{}; platform::sha1(data, n, out.data()); return out; }
+inline std::array<uint8_t, 32> sha256(const void* data, size_t n) { std::array<uint8_t, 32> out{}; platform::sha256(data, n, out.data()); return out; }
 inline std::array<uint8_t, 32> hmac_sha256(const Key& key, const void* data, size_t n) {
-    static BCRYPT_ALG_HANDLE h = detail::provider(BCRYPT_SHA256_ALGORITHM, true);
-    std::array<uint8_t, 32> out{}; detail::hash(h, key.data(), key.size(), static_cast<const uint8_t*>(data), n, out.data(), out.size()); return out;
+    std::array<uint8_t, 32> out{}; platform::hmac_sha256(key.data(), key.size(), data, n, out.data()); return out;
 }
-inline void random_bytes(void* out, size_t n) {
-    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, static_cast<PUCHAR>(out), ULONG(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
-        throw std::runtime_error("CNG random refused");
-}
+inline void random_bytes(void* out, size_t n) { platform::random_bytes(out, n); }
 inline bool equal_constant_time(const uint8_t* a, const uint8_t* b, size_t n) {
     uint8_t d = 0; for (size_t i = 0; i < n; ++i) d |= uint8_t(a[i] ^ b[i]); return d == 0;
 }
@@ -187,8 +265,8 @@ inline void encode_bulk_header(uint8_t* b, BulkKind kind, uint64_t stream, uint6
 }
 
 // ---- one message stream: what a Link needs from each of its two sockets ---------------------------------------------
-// WsStream (a raw nonblocking socket, the listener side and the loopback dialer) and nodus_link_wss.h's WinHTTP stream
-// (wss:// through TLS) implement it. Every call returns at once.
+// WsStream (a raw nonblocking socket, the listener side and the loopback dialer) and nodus_link_wss.h's wss:// stream
+// (WinHTTP on Windows, OpenSSL on POSIX) implement it. Every call returns at once.
 class Stream {
 public:
     virtual ~Stream() = default;
@@ -204,7 +282,7 @@ public:
 // ---- one WebSocket over one nonblocking socket ----------------------------------------------------------------------
 // Binary messages only (text is a protocol violation); ping answered, close echoed; fragments reassembled up to
 // max_message. The client side masks what it sends and requires unmasked input; the server side the reverse.
-class WsStream final : public Stream {
+class WsStream : public Stream {
 public:
     WsStream(SOCKET s, bool client, size_t max_message, size_t out_limit, std::vector<uint8_t> leftover = {})
         : socket_(s), client_(client), max_message_(max_message), out_limit_(out_limit), rx_(std::move(leftover)) {
@@ -235,9 +313,9 @@ public:
         while (!closed_ && !out_.empty() && budget) {
             auto& f = out_.front();
             size_t want = std::min(budget, f.size() - sent_);
-            int n = ::send(socket_, reinterpret_cast<const char*>(f.data() + sent_), int(std::min<size_t>(want, 1 << 30)), 0);
-            if (n < 0) { if (!WireSocket::would_block()) closed_ = true; return; }
-            if (n == 0) { closed_ = true; return; }
+            long n = io_send(f.data() + sent_, want);
+            if (n == kIoAgain) return;
+            if (n <= 0) { closed_ = true; return; }
             sent_ += size_t(n); budget -= std::min(budget, size_t(n));
             if (sent_ == f.size()) { out_bytes_ -= f.size(); out_.pop_front(); sent_ = 0; }
         }
@@ -250,13 +328,28 @@ public:
         while (budget && !closed_) {
             size_t room = max_message_ + 14 + buf.size();
             if (rx_.size() - rx_pos_ >= room) break;                 // a whole frame plus one read is already held
-            int n = ::recv(socket_, buf.data(), int(std::min(budget, buf.size())), 0);
-            if (n < 0) { if (!WireSocket::would_block()) closed_ = true; break; }
-            if (n == 0) { closed_ = true; break; }
+            long n = io_recv(buf.data(), std::min(budget, buf.size()));
+            if (n == kIoAgain) break;
+            if (n <= 0) { closed_ = true; break; }
             rx_.insert(rx_.end(), buf.data(), buf.data() + n); budget -= std::min(budget, size_t(n));
             if (parse(out)) return true;
         }
         return false;
+    }
+
+protected:
+    // The byte transport under the framing: bytes moved, kIoAgain when it would block, 0 or kIoError when the peer or the
+    // transport is gone. The default is the raw socket; a TLS stream (nodus_link_wss.h) overrides both.
+    static constexpr long kIoAgain = -1, kIoError = -2;
+    virtual long io_send(const uint8_t* p, size_t n) {
+        int r = ::send(socket_, reinterpret_cast<const char*>(p), int(std::min<size_t>(n, 1 << 30)), platform::kSendFlags);
+        if (r < 0) return WireSocket::would_block() ? kIoAgain : kIoError;
+        return r;
+    }
+    virtual long io_recv(char* p, size_t n) {
+        int r = ::recv(socket_, p, int(n), 0);
+        if (r < 0) return WireSocket::would_block() ? kIoAgain : kIoError;
+        return r;
     }
 
 private:
@@ -270,7 +363,7 @@ private:
         else { f.push_back(uint8_t(m | 127)); for (int i = 7; i >= 0; --i) f.push_back(uint8_t(uint64_t(n) >> (8 * i))); }
         uint8_t key[4] = {};
         if (client_) {
-            // Masking is not security (TLS is); RFC 6455 asks for an unpredictable key, xorshift seeded from CNG.
+            // Masking is not security (TLS is); RFC 6455 asks for an unpredictable key, xorshift seeded from the platform RNG.
             mask_state_ ^= mask_state_ << 13; mask_state_ ^= mask_state_ >> 7; mask_state_ ^= mask_state_ << 17;
             put_le(key, mask_state_, 4); f.insert(f.end(), key, key + 4);
         }
@@ -503,7 +596,7 @@ public:
         if (bind(listener_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(listener_, 16) != 0 || !WireSocket::set_nonblocking(listener_)) {
             WireSocket::close_socket(listener_); throw std::runtime_error("link listener bind/listen refused");
         }
-        int len = sizeof(a);
+        platform::socklen len = sizeof(a);
         if (getsockname(listener_, reinterpret_cast<sockaddr*>(&a), &len) != 0) { WireSocket::close_socket(listener_); throw std::runtime_error("getsockname failed"); }
         port_ = ntohs(a.sin_port);
     }
@@ -546,7 +639,7 @@ private:
 
     void refuse_http(Pending& p) {
         static const char r[] = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-        ::send(p.s, r, int(sizeof(r) - 1), 0); WireSocket::close_socket(p.s); p.s = INVALID_SOCKET; ++counters_.refused_handshake;
+        ::send(p.s, r, int(sizeof(r) - 1), platform::kSendFlags); WireSocket::close_socket(p.s); p.s = INVALID_SOCKET; ++counters_.refused_handshake;
     }
     // True when the pending socket is finished with (handed on, refused or timed out).
     bool advance(Pending& p, uint64_t now) {
@@ -580,7 +673,7 @@ private:
             p.stage = Stage::Response;
         }
         if (p.stage == Stage::Response) {
-            int n = ::send(p.s, p.response.data() + p.sent, int(p.response.size() - p.sent), 0);
+            int n = ::send(p.s, p.response.data() + p.sent, int(p.response.size() - p.sent), platform::kSendFlags);
             if (n < 0 && !WireSocket::would_block()) { WireSocket::close_socket(p.s); ++counters_.refused_handshake; return true; }
             if (n > 0) p.sent += size_t(n);
             if (p.sent < p.response.size()) return false;
@@ -680,7 +773,7 @@ private:
         if (h.s == INVALID_SOCKET || !WireSocket::set_nonblocking(h.s)) { reason_ = "socket refused"; return false; }
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(target_.port);
         if (inet_pton(AF_INET, target_.host.c_str(), &a.sin_addr) != 1) { reason_ = "host is not a numeric IPv4 address"; return false; }
-        if (connect(h.s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 && WSAGetLastError() != WSAEWOULDBLOCK) { reason_ = "connect refused"; return false; }
+        if (connect(h.s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 && !platform::connect_would_block()) { reason_ = "connect refused"; return false; }
         uint8_t raw[16]; random_bytes(raw, sizeof(raw)); h.key = base64(raw, sizeof(raw));
         h.request = "GET /ws/link/" + target_.prefix + "/" + channel_name(h.channel) + " HTTP/1.1\r\nHost: " + target_.host + ":"
             + std::to_string(target_.port) + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + h.key
@@ -690,18 +783,14 @@ private:
     // False on refusal (reason_ set); true while in progress or done.
     bool advance(Half& h) {
         if (h.stage == Stage::Connect) {
-            fd_set w, e; FD_ZERO(&w); FD_ZERO(&e); FD_SET(h.s, &w); FD_SET(h.s, &e);
-            timeval zero{0, 0};
-            int n = select(0, nullptr, &w, &e, &zero);           // zero timeout: a readiness query, not a wait
-            if (n < 0) { reason_ = "select refused"; return false; }
-            if (n == 0) return true;
-            int err = 0; int len = sizeof(err);
-            getsockopt(h.s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
-            if (FD_ISSET(h.s, &e) || err) { reason_ = "connect refused"; return false; }
+            int state = platform::connect_state(h.s);
+            if (state == -2) { reason_ = "select refused"; return false; }
+            if (state == 0) return true;                         // still connecting
+            if (state < 0) { reason_ = "connect refused"; return false; }
             h.stage = Stage::Send;
         }
         if (h.stage == Stage::Send) {
-            int n = ::send(h.s, h.request.data() + h.sent, int(h.request.size() - h.sent), 0);
+            int n = ::send(h.s, h.request.data() + h.sent, int(h.request.size() - h.sent), platform::kSendFlags);
             if (n < 0 && !WireSocket::would_block()) { reason_ = "send refused"; return false; }
             if (n > 0) h.sent += size_t(n);
             if (h.sent < h.request.size()) return true;

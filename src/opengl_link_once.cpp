@@ -17,23 +17,110 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <chrono>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+// ===== PLATFORM REGION (the only OS-specific code in this file) =====
+// Console/terminal cancellation, the millisecond clock and sleep, wide<->UTF-8
+// conversion, and the process entry point (wmain on Windows; main on POSIX,
+// which widens its UTF-8 arguments and calls the same nodus_link_once_main).
+// Windows: SetConsoleCtrlHandler, GetTickCount64, Sleep, WideCharToMultiByte.
+// POSIX: SIGINT/SIGTERM handlers, CLOCK_MONOTONIC, UTF-8 <-> UTF-32.
+int nodus_link_once_main(int argc,wchar_t** argv);
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
-
-namespace {
-using namespace nodus::gpu;
+namespace link_once_platform {
 std::atomic<bool> cancelled=false;
 BOOL WINAPI console_control(DWORD event) {
     if(event==CTRL_C_EVENT || event==CTRL_BREAK_EVENT){cancelled.store(true);return TRUE;}return FALSE;
 }
+bool install_cancel_handler(){return SetConsoleCtrlHandler(console_control,TRUE)!=0;}
+void remove_cancel_handler(){SetConsoleCtrlHandler(console_control,FALSE);}
+uint64_t tick_ms(){return GetTickCount64();}
+void sleep_ms(unsigned ms){Sleep(ms);}
+// false on invalid Unicode
+bool to_utf8(const std::wstring& value,std::string& out) {
+    out.clear();if(value.empty())return true;
+    const int count=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value.data(),static_cast<int>(value.size()),nullptr,0,nullptr,nullptr);
+    if(count<=0)return false;out.assign(count,'\0');
+    return WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value.data(),static_cast<int>(value.size()),out.data(),count,nullptr,nullptr)==count;
+}
+}
+int wmain(int argc,wchar_t** argv){return nodus_link_once_main(argc,argv);}
+#else
+#include <csignal>
+#include <time.h>
+namespace link_once_platform {
+std::atomic<bool> cancelled=false;
+extern "C" void on_cancel_signal(int){cancelled.store(true);}   // lock-free atomic store only
+bool install_cancel_handler() {
+    struct sigaction action{};action.sa_handler=on_cancel_signal;sigemptyset(&action.sa_mask);
+    return sigaction(SIGINT,&action,nullptr)==0 && sigaction(SIGTERM,&action,nullptr)==0;
+}
+void remove_cancel_handler() {
+    struct sigaction action{};action.sa_handler=SIG_DFL;sigemptyset(&action.sa_mask);
+    sigaction(SIGINT,&action,nullptr);sigaction(SIGTERM,&action,nullptr);
+}
+uint64_t tick_ms() {
+    timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);
+    return static_cast<uint64_t>(t.tv_sec)*1000u+static_cast<uint64_t>(t.tv_nsec)/1000000u;
+}
+void sleep_ms(unsigned ms){std::this_thread::sleep_for(std::chrono::milliseconds(ms));}
+// wchar_t is UTF-32 here. false on invalid Unicode.
+bool to_utf8(const std::wstring& value,std::string& out) {
+    out.clear();
+    for(wchar_t w:value) {
+        const uint32_t c=static_cast<uint32_t>(w);
+        if(c>0x10ffffu || (c>=0xd800u && c<=0xdfffu))return false;
+        if(c<0x80u)out.push_back(static_cast<char>(c));
+        else if(c<0x800u){out.push_back(static_cast<char>(0xc0|(c>>6)));out.push_back(static_cast<char>(0x80|(c&0x3f)));}
+        else if(c<0x10000u){out.push_back(static_cast<char>(0xe0|(c>>12)));out.push_back(static_cast<char>(0x80|((c>>6)&0x3f)));out.push_back(static_cast<char>(0x80|(c&0x3f)));}
+        else{out.push_back(static_cast<char>(0xf0|(c>>18)));out.push_back(static_cast<char>(0x80|((c>>12)&0x3f)));out.push_back(static_cast<char>(0x80|((c>>6)&0x3f)));out.push_back(static_cast<char>(0x80|(c&0x3f)));}
+    }
+    return true;
+}
+// Strict UTF-8 -> UTF-32; false on malformed input.
+bool from_utf8(const char* text,std::wstring& out) {
+    out.clear();
+    const auto* p=reinterpret_cast<const unsigned char*>(text);
+    while(*p) {
+        uint32_t c=*p;int more=0;
+        if(c<0x80u)more=0;
+        else if((c&0xe0u)==0xc0u){c&=0x1fu;more=1;}
+        else if((c&0xf0u)==0xe0u){c&=0x0fu;more=2;}
+        else if((c&0xf8u)==0xf0u){c&=0x07u;more=3;}
+        else return false;
+        ++p;
+        for(int i=0;i<more;++i,++p){if((*p&0xc0u)!=0x80u)return false;c=(c<<6)|(*p&0x3fu);}
+        if(c>0x10ffffu || (c>=0xd800u && c<=0xdfffu))return false;
+        out.push_back(static_cast<wchar_t>(c));
+    }
+    return true;
+}
+}
+int main(int argc,char** argv) {
+    std::vector<std::wstring> wide(static_cast<size_t>(argc));std::vector<wchar_t*> pointers;
+    for(int i=0;i<argc;++i) {
+        if(!link_once_platform::from_utf8(argv[i],wide[static_cast<size_t>(i)])){std::cerr<<"REFUSED: Invalid Unicode argument\n";return 2;}
+        pointers.push_back(wide[static_cast<size_t>(i)].data());
+    }
+    pointers.push_back(nullptr);
+    return nodus_link_once_main(argc,pointers.data());
+}
+#endif
+// ===== END PLATFORM REGION =====
+
+namespace {
+using namespace nodus::gpu;
+using link_once_platform::cancelled;
 void require(bool value,const std::string& message){if(!value)throw std::runtime_error(message);}
 std::string utf8(const std::wstring& value) {
-    if(value.empty())return {};
-    const int count=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value.data(),static_cast<int>(value.size()),nullptr,0,nullptr,nullptr);
-    require(count>0,"Invalid Unicode argument");std::string out(count,'\0');
-    require(WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value.data(),static_cast<int>(value.size()),out.data(),count,nullptr,nullptr)==count,"UTF-8 argument conversion failed");return out;
+    std::string out;require(link_once_platform::to_utf8(value,out),"Invalid Unicode argument");return out;
 }
 uint64_t number(const std::wstring& value) {
     require(!value.empty() && value[0]!=L'-' && value[0]!=L'+',"Invalid unsigned number");size_t used=0;
@@ -145,16 +232,16 @@ int run_once(const std::shared_ptr<const Work>& work,const ProtectedProcessOptio
     auto& manager=*graph.thread_mgr;
     struct ManagerLifetime {
         ThreadManager& manager;bool handler=false;
-        void stop(){manager.stop();if(handler){SetConsoleCtrlHandler(console_control,FALSE);handler=false;}}
+        void stop(){manager.stop();if(handler){link_once_platform::remove_cancel_handler();handler=false;}}
         ~ManagerLifetime(){stop();}
     } manager_lifetime{manager}; // destroyed before every callback-captured local
-    manager_lifetime.handler=SetConsoleCtrlHandler(console_control,TRUE)!=0;
+    manager_lifetime.handler=link_once_platform::install_cancel_handler();
     require(manager_lifetime.handler,"Could not install native cancellation handler; no child created");
-    manager.start();const auto start=GetTickCount64();
+    manager.start();const auto start=link_once_platform::tick_ms();
     // This is graph driving, not a second scheduling queue. Every operation
     // still traverses the same manager lane and typed Control/Telemetry FIFOs.
-    for(tick=0;!commits && callback_error.empty() && GetTickCount64()-start<105000;++tick){
-        manager.submit_tick(request,true);Sleep(25);
+    for(tick=0;!commits && callback_error.empty() && link_once_platform::tick_ms()-start<105000;++tick){
+        manager.submit_tick(request,true);link_once_platform::sleep_ms(25);
     }
     if(!commits){provider->cancel();std::cerr<<"No committed final result; retained/uncertain ownership is not retry permission\n";}
     manager_lifetime.stop();
@@ -166,7 +253,7 @@ int run_once(const std::shared_ptr<const Work>& work,const ProtectedProcessOptio
 }
 }
 
-int wmain(int argc,wchar_t** argv) {
+int nodus_link_once_main(int argc,wchar_t** argv) {
     try {
         require(argc>=2,"Specify --prepare or --link-once and explicit source/worker/device/loan fields");
         const std::wstring mode=argv[1];require(mode==L"--prepare" || mode==L"--link-once","Unknown mode; no operation performed");

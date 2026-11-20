@@ -4,8 +4,8 @@
 #include <filesystem>
 #include <chrono>
 
-#include "..\src\plugin_loader.cpp"
-#include "..\src\tool_registry.cpp"
+#include "../src/plugin_loader.cpp"
+#include "../src/tool_registry.cpp"
 
 namespace fs = std::filesystem;
 

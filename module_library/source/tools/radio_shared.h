@@ -10,11 +10,53 @@
 #include "common/tensors/abstraction/tensor_abi.h"
 #include "common/tensors/abstraction/abstract_tensor_handle.h"
 
+// ---- platform region: sockets and calling convention (the only OS calls in this file) ----
 #if defined(_WIN32)
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#define NODUS_RADIO_CALL __cdecl
+namespace nodus::radio::platform {
+using socket_handle = SOCKET;
+constexpr socket_handle kInvalidSocket = INVALID_SOCKET;
+using socket_length = int;
+inline bool network_start() { WSADATA data{}; return WSAStartup(MAKEWORD(2, 2), &data) == 0; }
+inline void network_stop() { WSACleanup(); }
+inline void close_socket(socket_handle s) { closesocket(s); }
+inline void set_nonblocking(socket_handle s) { u_long nonblocking = 1; ioctlsocket(s, FIONBIO, &nonblocking); }
+inline int send_datagram(socket_handle s, const void* data, size_t bytes, const sockaddr* to, int to_bytes) {
+    return sendto(s, static_cast<const char*>(data), static_cast<int>(bytes), 0, to, to_bytes);
+}
+} // namespace nodus::radio::platform
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#define NODUS_RADIO_CALL
+namespace nodus::radio::platform {
+using socket_handle = int;
+constexpr socket_handle kInvalidSocket = -1;
+using socket_length = socklen_t;
+inline bool network_start() { return true; }
+inline void network_stop() {}
+inline void close_socket(socket_handle s) { ::close(s); }
+inline void set_nonblocking(socket_handle s) {
+    const int flags = fcntl(s, F_GETFL, 0);
+    if (flags >= 0) fcntl(s, F_SETFL, flags | O_NONBLOCK);
+}
+inline int send_datagram(socket_handle s, const void* data, size_t bytes, const sockaddr* to, int to_bytes) {
+    return static_cast<int>(sendto(s, data, bytes, MSG_NOSIGNAL, to, static_cast<socklen_t>(to_bytes)));
+}
+} // namespace nodus::radio::platform
+#endif
+// ---- end platform region ----
 #include <SDL3/SDL.h>
 #include "exec_row.h"
 
@@ -99,13 +141,13 @@ struct RadioFrame {
     bool terminal = false; // Internal row control, never part of NRAD.
 };
 
-using scope_create_capture_fn = void* (__cdecl *)();
-using scope_start_fn = int (__cdecl *)(void*);
-using scope_read_fn = size_t (__cdecl *)(void*, uint64_t*, float*, size_t, uint32_t*, uint64_t*);
-using scope_running_fn = int (__cdecl *)(void*);
-using scope_frame_count_fn = uint64_t (__cdecl *)(void*);
-using scope_feed_fn = int (__cdecl *)(void*, const float*, size_t, uint32_t);
-using scope_free_fn = void (__cdecl *)(void*);
+using scope_create_capture_fn = void* (NODUS_RADIO_CALL *)();
+using scope_start_fn = int (NODUS_RADIO_CALL *)(void*);
+using scope_read_fn = size_t (NODUS_RADIO_CALL *)(void*, uint64_t*, float*, size_t, uint32_t*, uint64_t*);
+using scope_running_fn = int (NODUS_RADIO_CALL *)(void*);
+using scope_frame_count_fn = uint64_t (NODUS_RADIO_CALL *)(void*);
+using scope_feed_fn = int (NODUS_RADIO_CALL *)(void*, const float*, size_t, uint32_t);
+using scope_free_fn = void (NODUS_RADIO_CALL *)(void*);
 
 inline bool radio_state_request(nodus::gpu::TensorStateLibraryTool& library,
                          const std::array<uint64_t, 12>& words, uint64_t payload) {
@@ -165,4 +207,3 @@ inline uint64_t radio_words_tensor(const std::array<uint64_t, N>& words) {
 }
 
 } // namespace nodus::radio
-#endif
