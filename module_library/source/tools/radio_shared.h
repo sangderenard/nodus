@@ -53,6 +53,8 @@ struct Config {
     bool linear_bands = false;
     std::wstring wav;
     bool loop = false;
+    bool analysis_only = false;
+    std::wstring analysis_file;
     uint16_t pcm_port = 0;
 };
 

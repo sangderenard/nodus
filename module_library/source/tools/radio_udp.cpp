@@ -16,6 +16,11 @@ public:
     const char* name_cstr() const noexcept override { return "Radio UDP broadcast"; }
     void initialize(const ToolInitContext&) override {
         if (!shared_) return;
+        if (shared_->config.analysis_only) {
+            file_ = CreateFileW(shared_->config.analysis_file.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            return;
+        }
         WSADATA data{};
         if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return;
         winsock_ready_ = true;
@@ -48,6 +53,13 @@ public:
         freeaddrinfo(addresses);
     }
     void shutdown() override {
+        if (file_ != INVALID_HANDLE_VALUE) {
+            const bool flushed = FlushFileBuffers(file_) != 0;
+            const bool closed = CloseHandle(file_) != 0;
+            if (!flushed || !closed)
+                shared_->dropped.fetch_add(1, std::memory_order_relaxed);
+            file_ = INVALID_HANDLE_VALUE;
+        }
         if (socket_ != INVALID_SOCKET) { closesocket(socket_); socket_ = INVALID_SOCKET; }
         if (winsock_ready_) { WSACleanup(); winsock_ready_ = false; }
     }
@@ -64,7 +76,8 @@ public:
         const auto* frame = static_cast<const RadioFrame*>(frame_ptr);
         if (frame && frame->magic == kFrameMagic && frame->terminal) return;
         if (!frame || frame->magic != kFrameMagic || frame->band_count != shared_->config.bands ||
-            socket_ == INVALID_SOCKET || !destination_bytes_) {
+            (shared_->config.analysis_only ? file_ == INVALID_HANDLE_VALUE :
+             socket_ == INVALID_SOCKET || !destination_bytes_)) {
             shared_->dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -84,15 +97,28 @@ public:
         append(&frame->captured_frames, sizeof(frame->captured_frames));
         append(&frame->rms, sizeof(frame->rms));
         append(frame->power.data(), frame->band_count * sizeof(float));
-        const int sent = sendto(socket_, reinterpret_cast<const char*>(packet.data()),
-                                static_cast<int>(offset), 0,
-                                reinterpret_cast<const sockaddr*>(&destination_), destination_bytes_);
-        if (sent == static_cast<int>(offset)) shared_->emitted.fetch_add(1, std::memory_order_relaxed);
+        bool sent = false;
+        if (shared_->config.analysis_only) {
+            // 15 minutes at five bands and a 256-frame hop fits below this bound.
+            if (offset <= kMaxAnalysisBytes - written_) {
+                DWORD count = 0;
+                sent = WriteFile(file_, packet.data(), static_cast<DWORD>(offset), &count, nullptr) && count == offset;
+                if (sent) written_ += offset;
+            }
+        } else {
+            sent = sendto(socket_, reinterpret_cast<const char*>(packet.data()),
+                          static_cast<int>(offset), 0,
+                          reinterpret_cast<const sockaddr*>(&destination_), destination_bytes_) == static_cast<int>(offset);
+        }
+        if (sent) shared_->emitted.fetch_add(1, std::memory_order_relaxed);
         else shared_->dropped.fetch_add(1, std::memory_order_relaxed);
     }
 private:
     std::shared_ptr<Shared> shared_;
     bool winsock_ready_ = false;
+    static constexpr size_t kMaxAnalysisBytes = 16 * 1024 * 1024;
+    size_t written_ = 0;
+    HANDLE file_ = INVALID_HANDLE_VALUE;
     SOCKET socket_ = INVALID_SOCKET;
     sockaddr_storage destination_{};
     int destination_bytes_ = 0;

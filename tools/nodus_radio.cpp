@@ -20,9 +20,9 @@ std::wstring path_from_utf8(const char* source) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 5 || argc > 14) {
+    if (argc < 5 || argc > 15) {
         std::fprintf(stderr,
-            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port] [wait-for-start=0] [hls=0] [band-scale=log|linear]\n");
+            "usage: nodus_radio <audio_scope.dll> <fft_cffi.dll> <destination-host> <udp-port> [seconds=0] [bands=5] [fft_size=1024] [wav-file] [loop=0] [pcm-loopback-port] [wait-for-start=0] [hls=0] [band-scale=log|linear] [analysis-file]\n");
         return 2;
     }
     const int port = std::atoi(argv[4]);
@@ -51,6 +51,11 @@ int main(int argc, char** argv) {
     const bool wait_for_start = argc > 11 && std::atoi(argv[11]) == 1;
     const bool hls = argc > 12 && std::strcmp(argv[12], "1") == 0;
     if (argc > 12 && (std::strcmp(argv[12], "0") && !hls)) return 2;
+    const bool analysis_only = argc > 14;
+    if (analysis_only && (argc <= 8 || (argc > 9 && std::atoi(argv[9])) || pcm_port || wait_for_start || hls ||
+                          bands != 5 || fft_size != 1024 ||
+                          !std::getenv("NODUS_RADIO_DECODER") || !*std::getenv("NODUS_RADIO_DECODER") ||
+                          !nodus_headless_radio_analysis_file(path_from_utf8(argv[14]).c_str()))) return 2;
     if (hls && (!pcm_port || argc <= 8)) return 2;
     if (wait_for_start && (!pcm_port || !nodus_headless_radio_hold(1))) return 2;
     NodusHeadlessGraph* graph = nodus_headless_create();
@@ -127,12 +132,16 @@ int main(int argc, char** argv) {
         if (argc > 8 && !status.capture_running) break;
         if (seconds > 0 && std::chrono::steady_clock::now() - started >= std::chrono::seconds(seconds)) break;
     }
-    NodusRadioStatus status{};
-    nodus_headless_radio_status(&status);
     const auto stop_begin = std::chrono::steady_clock::now();
     nodus_headless_destroy(graph);
+    NodusRadioStatus status{};
+    nodus_headless_radio_status(&status);
     const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - stop_begin).count();
     std::printf("shutdown_ms=%lld\n", static_cast<long long>(stop_ms));
-    return status.emitted_packets ? 0 : 1;
+    if (analysis_only) std::printf("analysis_frames=%llu analysis_packets=%llu analysis_dropped=%llu\n",
+        static_cast<unsigned long long>(status.captured_frames),
+        static_cast<unsigned long long>(status.emitted_packets),
+        static_cast<unsigned long long>(status.dropped_packets));
+    return status.emitted_packets && (!analysis_only || !status.dropped_packets) ? 0 : 1;
 }

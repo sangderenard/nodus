@@ -35,8 +35,11 @@ public:
             if (!start_(scope_)) { free_(scope_); scope_ = nullptr; }
         } else {
             feed_ = reinterpret_cast<scope_feed_fn>(GetProcAddress(module_, "openrgb_audio_scope_feed_stereo"));
-            if (!feed_ || !SDL_InitSubSystem(SDL_INIT_AUDIO)) return;
-            audio_ready_ = true;
+            if (!feed_) return;
+            if (!c.analysis_only) {
+                if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) return;
+                audio_ready_ = true;
+            }
             SDL_AudioSpec target{SDL_AUDIO_F32, 2, 48000};
             const auto decoders = nodus::exec::environment_paths("NODUS_RADIO_DECODER");
             if (!decoders.empty()) {
@@ -50,6 +53,7 @@ public:
                 decoding_ = true;
                 rate_ = 48000;
             } else {
+            if (c.analysis_only) return; // Offline analysis requires bounded streaming decode.
             std::error_code size_error;
             const auto bytes = std::filesystem::file_size(c.wav, size_error);
             if (size_error || bytes > kMaxFilePcmBytes) return;
@@ -77,8 +81,10 @@ public:
             for (float value : samples_) if (!std::isfinite(value)) { samples_.clear(); return; }
             rate_ = static_cast<uint32_t>(target.freq);
             }
-            stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &target, nullptr, nullptr);
-            if (!stream_ || !SDL_ResumeAudioStreamDevice(stream_)) return;
+            if (!c.analysis_only) {
+                stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &target, nullptr, nullptr);
+                if (!stream_ || !SDL_ResumeAudioStreamDevice(stream_)) return;
+            }
             shared_->running.store(1);
         }
         std::array<uint64_t, nodus::gpu::FftFreeTool::kConfigWords> config{};
@@ -125,11 +131,11 @@ public:
         }
         frame_.pcm.frames = 0;
         if (!shared_->config.wav.empty()) {
-            if (!stream_ || !feed_) { shared_->running.store(0); std::this_thread::sleep_for(std::chrono::milliseconds(2)); ctx.succeeded = false; return; }
+            if ((!shared_->config.analysis_only && !stream_) || !feed_) { shared_->running.store(0); std::this_thread::sleep_for(std::chrono::milliseconds(2)); ctx.succeeded = false; return; }
             const size_t hop = shared_->config.fft_size / shared_->config.overlap;
-            const int queued = SDL_GetAudioStreamQueued(stream_);
+            const int queued = shared_->config.analysis_only ? 0 : SDL_GetAudioStreamQueued(stream_);
             if (queued < 0) { shared_->running.store(0); ctx.succeeded = false; return; }
-            if (queued >= static_cast<int>(shared_->config.fft_size * 2 * 2 * sizeof(float))) {
+            if (!shared_->config.analysis_only && queued >= static_cast<int>(shared_->config.fft_size * 2 * 2 * sizeof(float))) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1)); ctx.succeeded = false; return;
             }
             if (decoding_ && position_ == samples_.size()) {
@@ -173,7 +179,7 @@ public:
                 }
             }
             const size_t count = std::min({hop, size_t{256}, (samples_.size() - position_) / 2});
-            if (!SDL_PutAudioStreamData(stream_, samples_.data() + position_, static_cast<int>(count * 2 * sizeof(float))) ||
+            if ((!shared_->config.analysis_only && !SDL_PutAudioStreamData(stream_, samples_.data() + position_, static_cast<int>(count * 2 * sizeof(float)))) ||
                 !feed_(scope_, samples_.data() + position_, count, rate_)) {
                 shared_->running.store(0); ctx.succeeded = false; return;
             }

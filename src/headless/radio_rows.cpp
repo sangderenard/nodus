@@ -120,6 +120,16 @@ extern "C" int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int
         [shared] { return ToolRegistry::Factory::result_type(new RadioSource(shared), [](ITool* p) { nodus_radio_source_destroy(p); }); })) ? 1 : 0;
 }
 
+extern "C" int32_t nodus_headless_radio_analysis_file(const wchar_t* path) {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (!configured || !path || !*path || !std::filesystem::path(path).is_absolute() ||
+        configured->config.wav.empty() || configured->config.loop || configured->config.pcm_port ||
+        configured->running.load() || configured->captured.load()) return 0;
+    configured->config.analysis_only = true;
+    configured->config.analysis_file = path;
+    return 1;
+}
+
 extern "C" int32_t nodus_headless_radio_band_scale(int32_t linear) {
     std::lock_guard<std::mutex> lock(config_mutex);
     if (!configured || configured->running.load() || configured->captured.load() ||
@@ -195,6 +205,7 @@ extern "C" int32_t nodus_headless_radio_configure(
     const wchar_t*, const wchar_t*, const char*, uint16_t,
     uint32_t, uint32_t, uint32_t, float, float) { return 0; }
 extern "C" int32_t nodus_headless_radio_file_source(const wchar_t*, int32_t) { return 0; }
+extern "C" int32_t nodus_headless_radio_analysis_file(const wchar_t*) { return 0; }
 extern "C" int32_t nodus_headless_radio_band_scale(int32_t) { return 0; }
 extern "C" int32_t nodus_headless_radio_pcm_configure(uint16_t) { return 0; }
 extern "C" int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph*, int32_t) { return 0; }
