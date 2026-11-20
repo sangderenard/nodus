@@ -15,7 +15,11 @@
         #define NODUS_RESTRICT __restrict
     #endif
 #else
-    #include <immintrin.h>
+    // x86 intrinsics exist only on x86; every use below is inside the __AVX2__ region, and other targets (arm64-linux on
+    // the Oracle A1 host) take the scalar path.
+    #if defined(__x86_64__) || defined(__i386__)
+        #include <immintrin.h>
+    #endif
     #ifndef NODUS_FORCEINLINE
         #define NODUS_FORCEINLINE __attribute__((always_inline)) inline
     #endif
