@@ -248,6 +248,9 @@ struct GP_CanvasContextImpl {
     double autosave_accum_s = 0.0;
     // In-memory last serialized save signature buffer (double-buffered) to avoid unnecessary disk writes.
     std::array<std::string, 2> last_save_buf{};
+    // The file each signature was written to: an unchanged canvas is skipped only for that same file (a save to any
+    // other path, such as a console snapshot, must not make the next save of the canvas's own file a no-op).
+    std::array<std::string, 2> last_save_path_buf{};
     std::atomic<int> last_save_idx{0}; // index of the currently active signature
     // Action-driven autosave controls
     std::vector<int> autosave_action_whitelist; // actions that may trigger autosave when policy==ACTION

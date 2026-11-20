@@ -19,17 +19,28 @@ Version 2 uses HELLO nodus-console/2 <token> and adds
 ACTION <n>\n<n bytes of JSON>. Each action supplies expected_revision and one
 canvas UI operation. The stepping thread applies it, saves changed canvas state,
 then replies JSON ACTION <n>\n<n bytes of JSON>.
+
+Nodus links (research case 98d49cb8) are opened on a running canvas by the same ACTION, never by how the process was
+started:
+  {"op": "link_host", "id", "prefix", "port", "key_file"}   accept links on 127.0.0.1:port for /ws/link/<prefix>/
+  {"op": "link_dial", "id", "host", "port", "prefix", "control_ticket", "bulk_ticket"[, "secure", "pin"]}
+        dial ws(s)://host:port/ws/link/<prefix>/ with the two issued tickets (base64; from POST /api/link/ticket/<prefix>)
+  {"op": "link_report", "id"}                                the endpoint's state and counters
+link_host and link_dial put the rows <id>.control and <id>.bulk on the canvas table "link <id>" (made once, kept with
+the canvas), so the canvas polls the link every step.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import hmac
 import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -41,7 +52,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from nodus_graph import Graph  # noqa: E402
-from nodus_graph.native import _NativeFifoConfig  # noqa: E402
+from nodus_graph.native import CanvasModuleDesc, _NativeFifoConfig, _NativeRow  # noqa: E402
 from nodus_graph import console_views  # noqa: E402
 
 _stop = False
@@ -167,6 +178,10 @@ class ConsoleServer:
             if any(type(v) is not int or abs(v) > 65535 for v in values):
                 raise ValueError("invalid canvas key action")
             handled = graph.ui_key(*values)
+        elif op in ("link_host", "link_dial", "link_report"):
+            handled, report = self._apply_link(graph, request)
+            if op == "link_report":
+                return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "link": report}
         else:
             raise ValueError("unknown canvas UI action")
         previous_revision = self._revision
@@ -179,6 +194,72 @@ class ConsoleServer:
             self._cond.notify_all()
         return {"handled": bool(handled), "revision": self._revision,
                 "canvas": self._canvas_name}
+
+    _LINK_NAME = re.compile(r"^[A-Za-z0-9._-]{1,60}$")
+
+    def _apply_link(self, graph, request: dict):
+        """Open (or report) a Nodus link on this running canvas; returns (handled, report)."""
+        op = request["op"]
+        link_id = request.get("id")
+        if not isinstance(link_id, str) or not self._LINK_NAME.match(link_id):
+            raise ValueError("link id: 1-60 of A-Z a-z 0-9 . _ -")
+        if op == "link_report":
+            if set(request) != {"op", "expected_revision", "id"}:
+                raise ValueError("link_report takes op, expected_revision, id")
+            return True, graph.link_report(link_id)
+        prefix, port = request.get("prefix"), request.get("port")
+        if not isinstance(prefix, str) or not self._LINK_NAME.match(prefix):
+            raise ValueError("link prefix: 1-60 of A-Z a-z 0-9 . _ -")
+        if type(port) is not int or not 0 < port < 65536:
+            raise ValueError("link port is 1-65535")
+        if op == "link_host":
+            if set(request) != {"op", "expected_revision", "id", "prefix", "port", "key_file"}:
+                raise ValueError("link_host takes op, expected_revision, id, prefix, port, key_file")
+            with open(str(request["key_file"]), "rb") as handle:
+                key = handle.read()
+            graph.register_link_host(link_id, prefix, key, port)
+        else:
+            if not set(request) >= {"op", "expected_revision", "id", "host", "port", "prefix", "control_ticket", "bulk_ticket"} \
+                    or not set(request) <= {"op", "expected_revision", "id", "host", "port", "prefix", "control_ticket",
+                                            "bulk_ticket", "secure", "pin"}:
+                raise ValueError("link_dial takes op, expected_revision, id, host, port, prefix, control_ticket, "
+                                 "bulk_ticket[, secure, pin]")
+            host = request["host"]
+            if not isinstance(host, str) or not 0 < len(host) <= 253:
+                raise ValueError("link host is a name or an address")
+            try:
+                control = base64.b64decode(request["control_ticket"], validate=True)
+                bulk = base64.b64decode(request["bulk_ticket"], validate=True)
+                pin = bytes.fromhex(request["pin"]) if request.get("pin") is not None else None
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"link tickets are base64, a pin is hex: {exc}") from None
+            secure = request.get("secure", True)
+            if type(secure) is not bool:
+                raise ValueError("secure is true or false")
+            graph.register_link_wss_dialer(link_id, host, port, prefix, control, bulk, secure=secure, pin_sha256=pin)
+        self._bind_link_table(graph, link_id)
+        return True, None
+
+    @staticmethod
+    def _bind_link_table(graph, link_id: str) -> None:
+        """The canvas table "link <id>" holds the link's two rows; made once, rebound when the canvas already has it."""
+        lib, label = graph.lib, f"link {link_id}"
+        index = -1
+        for i in range(max(0, int(lib.nodus_headless_get_module_count(graph._handle)))):
+            desc = CanvasModuleDesc()
+            if not lib.nodus_headless_get_module_desc(graph._handle, i, ctypes.byref(desc)):
+                continue
+            if bytes(desc.label).split(b"\0", 1)[0].decode("utf-8", "replace") == label:
+                index = i
+                break
+        if index < 0:
+            index = graph.add_module(label, x=40, y=40).index
+        names = [f"{link_id}.control".encode("utf-8"), f"{link_id}.bulk".encode("utf-8")]
+        rows = (_NativeRow * 2)(*[_NativeRow(1, 0, 0, 1, name) for name in names])
+        if not lib.nodus_headless_set_module_rows(graph._handle, index, rows, 2):
+            raise RuntimeError(f"the link rows of {link_id} could not be placed")
+        if not lib.nodus_headless_set_module_stack_contract(graph._handle, index, 1):
+            raise RuntimeError("the link table's stack contract was refused")
 
     def _build(self, graph, wanted=frozenset()):
         path = os.path.join(self._tmp, "snapshot.nodus.txt")

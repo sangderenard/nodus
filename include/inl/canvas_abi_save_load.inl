@@ -47,7 +47,8 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     std::string sig = gp_canvas_compute_signature(c);
     // compare against active buffer slot
     int cur_idx = c->last_save_idx.load(std::memory_order_acquire);
-    if (!c->last_save_buf[cur_idx].empty() && c->last_save_buf[cur_idx] == sig) {
+    if (!c->last_save_buf[cur_idx].empty() && c->last_save_buf[cur_idx] == sig &&
+        c->last_save_path_buf[cur_idx] == path) {
         try { if (std::filesystem::exists(path)) return 1; } catch (...) { /* fallthrough */ }
     }
     std::ofstream ofs(path);
@@ -423,6 +424,7 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     try {
         int other = (c->last_save_idx.load(std::memory_order_acquire) ^ 1);
         c->last_save_buf[other] = sig;
+        c->last_save_path_buf[other] = path;
         c->last_save_idx.store(other, std::memory_order_release);
     } catch (...) { }
     return 1;
@@ -432,8 +434,10 @@ extern "C" int gp_canvas_update_last_save_signature(GP_CanvasContext* ctx_) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     std::string sig = gp_canvas_compute_signature(c);
-    int other = (c->last_save_idx.load(std::memory_order_acquire) ^ 1);
+    const int cur = c->last_save_idx.load(std::memory_order_acquire);
+    int other = cur ^ 1;
     c->last_save_buf[other] = sig;
+    c->last_save_path_buf[other] = c->last_save_path_buf[cur];  // the same file as the last save
     c->last_save_idx.store(other, std::memory_order_release);
     return 1;
 }
