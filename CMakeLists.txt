@@ -70,6 +70,9 @@ project(canvas_tables LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# Static libraries here (canvas_tables_static) are linked into shared ones (nodus_headless): on ELF platforms that needs
+# position-independent code. MSVC has no such requirement, so Windows builds are unchanged.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Platform libraries (owner, 2026-11-19: Windows work is regionalized; Nodus ships for Linux too). NODUS_NET_LIBS: sockets;
 # NODUS_LINK_LIBS: the Nodus link (nodus_link.h crypto, nodus_link_wss.h TLS WebSocket, nodus_link_udp.h AES-GCM).
@@ -120,7 +123,13 @@ set(NODUS_TORCH_PYTHON_INCLUDE_DIRS
   "Torch include dirs from python site-packages (semicolon-separated); leave empty to auto-derive from NODUS_TORCH_ROOT if possible"
 )
 set(NODUS_TORCH_VERSION "v2.9.1" CACHE STRING "Torch version to fetch (tag or branch, e.g. v2.4.1 or main)")
-set(NODUS_CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)")
+# The CUDA toolkit only matters for a CUDA-enabled Torch build; its default is the Windows install, and other platforms
+# name it themselves (it stays empty there, so nothing is checked).
+if(WIN32)
+  set(NODUS_CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)")
+else()
+  set(NODUS_CUDA_TOOLKIT_ROOT "" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)")
+endif()
 set(NODUS_CUDA_BIN_DIR "" CACHE PATH "CUDA bin dir override (optional; defaults to <root>/bin)")
 set(NODUS_CUDA_LIB_DIR "" CACHE PATH "CUDA lib dir override (optional; defaults to <root>/lib/x64 on Windows)")
 set(NODUS_CUDA_INCLUDE_DIR "" CACHE PATH "CUDA include dir override (optional; defaults to <root>/include)")
@@ -265,7 +274,7 @@ endif()
 
 # Optional CUDA toolkit verification (for CUDA-enabled Torch). Only runs when a CUDA path is supplied.
 set(_NODUS_CUDA_WANTS_CHECK FALSE)
-if(NOT NODUS_CUDA_TOOLKIT_ROOT STREQUAL "")
+if(NODUS_ENABLE_TORCH AND NOT NODUS_CUDA_TOOLKIT_ROOT STREQUAL "")   # only CUDA-enabled Torch needs it
   set(_NODUS_CUDA_WANTS_CHECK TRUE)
 endif()
 if(NOT NODUS_CUDA_BIN_DIR STREQUAL "")
@@ -579,12 +588,16 @@ target_include_directories(nodus_headless PUBLIC
 # contract ports hold a ContractNegotiator, whose standalone FIFO is the
 # nodus_edge_runtime ABI exported by nodus_runtime.
 target_link_libraries(nodus_headless PRIVATE canvas_tables_static nodus_runtime)
+# contract ports and the link rows: sockets, crypto, TLS (NODUS_LINK_LIBS is the platform's set)
+target_link_libraries(nodus_headless PRIVATE ${NODUS_LINK_LIBS} SDL3::SDL3)
+# The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
+# refers to that object, so from the static library the linker would leave it out; this keeps it in.
 if(WIN32)
-  # contract ports: loopback listener and socket adapters (include/contract_listener.h)
-  target_link_libraries(nodus_headless PRIVATE ${NODUS_NET_LIBS} SDL3::SDL3)
-  # The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
-  # refers to that object, so from the static library the linker would leave it out; this keeps it in.
   target_link_options(nodus_headless PRIVATE "/INCLUDE:nodus_exec_row_source")
+elseif(APPLE)
+  target_link_options(nodus_headless PRIVATE "LINKER:-u,_nodus_exec_row_source")
+else()
+  target_link_options(nodus_headless PRIVATE "LINKER:--undefined=nodus_exec_row_source")
 endif()
 target_compile_features(nodus_headless PUBLIC cxx_std_20)
 
@@ -773,7 +786,7 @@ endif()
 find_package(Eigen3 REQUIRED)
 find_package(PNG CONFIG REQUIRED)
 find_package(Freetype REQUIRED)
-find_package(HarfBuzz CONFIG REQUIRED)
+find_package(harfbuzz CONFIG REQUIRED)   # vcpkg installs harfbuzzConfig.cmake: lower case (Windows' case-insensitive files hid it)
         # vcpkg provides a lowercase harfbuzz target; alias the canonical HarfBuzz::HarfBuzz name for compatibility.
         if(TARGET harfbuzz AND NOT TARGET HarfBuzz::HarfBuzz)
           add_library(HarfBuzz::HarfBuzz ALIAS harfbuzz)
@@ -789,9 +802,7 @@ target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # contract_negotiator_registry.cpp / contract_port_canvas.cpp (src glob) hold a
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables PUBLIC nodus_runtime)
-if(WIN32)
-  target_link_libraries(canvas_tables PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
-endif()
+target_link_libraries(canvas_tables PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h, nodus_link.h, nodus_link_wss.h (the platform's set)
 target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables PUBLIC Torch::Torch)
@@ -822,9 +833,7 @@ target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 # contract_negotiator_registry.cpp / contract_port_canvas.cpp (src glob) hold a
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables_static PUBLIC nodus_runtime)
-if(WIN32)
-  target_link_libraries(canvas_tables_static PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h; bcrypt: nodus_link.h (CNG); winhttp/crypt32: nodus_link_wss.h
-endif()
+target_link_libraries(canvas_tables_static PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h, nodus_link.h, nodus_link_wss.h (the platform's set)
 target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables_static PUBLIC Torch::Torch)

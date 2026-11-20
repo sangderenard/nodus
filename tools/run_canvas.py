@@ -287,7 +287,8 @@ class ConsoleServer:
     @staticmethod
     def _tensor_core(graph):
         """The nodus tensor core the headless library uses (the same module: loaded beside it)."""
-        lib = ctypes.CDLL(os.path.join(os.path.dirname(graph.lib._name), "nodus_tensor_core.dll"))
+        name = "nodus_tensor_core.dll" if os.name == "nt" else ("libnodus_tensor_core.dylib" if sys.platform == "darwin" else "libnodus_tensor_core.so")
+        lib = ctypes.CDLL(os.path.join(os.path.dirname(graph.lib._name), name))
         lib.nodus_tensor_create.restype = ctypes.c_uint64
         lib.nodus_tensor_create.argtypes = (ctypes.c_int32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64))
         lib.nodus_tensor_write.restype = ctypes.c_int64
