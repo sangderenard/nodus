@@ -202,6 +202,10 @@ typedef struct NodusRadioStatus {
 } NodusRadioStatus;
 // Select WAV playback before constructing/launching the Radio table. No loopback capture.
 NODUS_HEADLESS_API int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int32_t loop);
+// Record finite-file NRAD levels through the same fftfree/Radio rows without
+// SDL playback pacing. The output path must not exist. Requires the declared
+// NODUS_RADIO_DECODER, a non-looping file, and no PCM/HLS rows.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_analysis_file(const wchar_t* path);
 // Opt-in private PCM RTP sender; configure before binding rows, then bind its
 // canonical canvas output FIFO before launching. Requires file source, hop 256.
 // Hold source advancement until a trusted receiver has pinned the announced stream.

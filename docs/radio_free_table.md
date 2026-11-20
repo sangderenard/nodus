@@ -11,7 +11,8 @@ this order:
    single transform call.
 3. `radio.fft_bands` projects the transform magnitude into the configured
    logarithmic or linear-Hz Radio bands and keeps the original NRAD packet layout.
-4. `radio.udp_broadcast` sends that frame over a nonblocking UDP socket.
+4. `radio.udp_broadcast` sends that frame over a nonblocking UDP socket, or
+   writes the same NRAD record to a bounded file in offline analysis mode.
 
 The table has `ExecMode::Free` and an `Opaque` row-stack contract. Its source,
 FFT and projection rows exchange typed work/receipt tokens in order, without
@@ -58,6 +59,18 @@ it as dropped and continues with the next live frame. There is no inbound
 socket and no manager handoff between rows. UDP itself has no delivery or
 authentication guarantee; use a local destination unless the surrounding
 network supplies the needed controls.
+
+For ingestion analysis, the caller passes a finite file source with looping,
+PCM, HLS, and gated start disabled, sets `NODUS_RADIO_DECODER` to the declared
+FFmpeg executable, then supplies the final optional `analysis-file` argument.
+The CLI calls `nodus_headless_radio_analysis_file` before launching the same
+Free table. The file source streams decoded float32 stereo to the scope ring
+without opening an SDL speaker or pacing to device playback. The last row
+writes NRAD v1 records with `CREATE_NEW`, flushes at shutdown, and refuses to
+exceed 16 MiB. An existing output file is never replaced. The CLI returns
+failure if any record is dropped or none is written and prints final captured
+frame, record, and drop counts for ingestion validation. The consuming service
+owns track identity, publication, and aggregate storage limits.
 
 Before the fftfree row split, on this machine (Windows, 48 kHz loopback, five bands), a five-second local
 receiver run with FFT size 1024 received 293 packets. Median interpacket gap
