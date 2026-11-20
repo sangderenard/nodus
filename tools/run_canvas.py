@@ -28,6 +28,8 @@ started:
   {"op": "link_udp", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"[, "account"]}
         meet the peer at the UDP broker and link directly over UDP (the rendezvous from POST /api/link/rendezvous/<prefix>;
         link_id and key in hex, role 1 host / 2 dialer)
+  {"op": "link_send", "id", "bytes"[, "fill"]}               a U8 [bytes] tensor (every byte `fill`) into the table's
+        Input row through the declared port <id>.send; the bulk row sends it over the link
   {"op": "link_report", "id"}                                the endpoint's state and counters
 link_host and link_dial put the rows <id>.control and <id>.bulk on the canvas table "link <id>" (made once, kept with
 the canvas), so the canvas polls the link every step.
@@ -47,6 +49,7 @@ import re
 import shutil
 import signal
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -181,7 +184,7 @@ class ConsoleServer:
             if any(type(v) is not int or abs(v) > 65535 for v in values):
                 raise ValueError("invalid canvas key action")
             handled = graph.ui_key(*values)
-        elif op in ("link_host", "link_dial", "link_udp", "link_report"):
+        elif op in ("link_host", "link_dial", "link_udp", "link_send", "link_report"):
             handled, report = self._apply_link(graph, request)
             if op == "link_report":
                 return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "link": report}
@@ -210,6 +213,26 @@ class ConsoleServer:
             if set(request) != {"op", "expected_revision", "id"}:
                 raise ValueError("link_report takes op, expected_revision, id")
             return True, graph.link_report(link_id)
+        if op == "link_send":
+            if not set(request) >= {"op", "expected_revision", "id", "bytes"} or not set(request) <= {"op", "expected_revision", "id", "bytes", "fill"}:
+                raise ValueError("link_send takes op, expected_revision, id, bytes[, fill]")
+            size, fill = request["bytes"], request.get("fill", 0)
+            if type(size) is not int or not 0 < size <= (64 << 20) or type(fill) is not int or not 0 <= fill <= 255:
+                raise ValueError("link_send: bytes 1..64 MiB, fill 0..255")
+            core = self._tensor_core(graph)
+            shape = (ctypes.c_uint64 * 1)(size)
+            handle = int(core.nodus_tensor_create(7, 1, shape))          # NODUS_DTYPE_U8
+            if not handle:
+                raise RuntimeError("the tensor core refused the tensor")
+            data = bytes([fill]) * size
+            if core.nodus_tensor_write(handle, 0, data, size) != size:
+                core.nodus_tensor_destroy(handle)
+                raise RuntimeError("the tensor could not be written")
+            result = graph.try_push_bytes(f"{link_id}.send", struct.pack("<Q", handle))
+            if not result.accepted:
+                core.nodus_tensor_destroy(handle)
+                raise RuntimeError(f"{link_id}.send is full")
+            return True, {"handle": handle, "bytes": size}
         if op == "link_udp":
             keys = {"op", "expected_revision", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"}
             if not set(request) >= keys or not set(request) <= keys | {"account"}:
@@ -262,8 +285,21 @@ class ConsoleServer:
         return True, None
 
     @staticmethod
+    def _tensor_core(graph):
+        """The nodus tensor core the headless library uses (the same module: loaded beside it)."""
+        lib = ctypes.CDLL(os.path.join(os.path.dirname(graph.lib._name), "nodus_tensor_core.dll"))
+        lib.nodus_tensor_create.restype = ctypes.c_uint64
+        lib.nodus_tensor_create.argtypes = (ctypes.c_int32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64))
+        lib.nodus_tensor_write.restype = ctypes.c_int64
+        lib.nodus_tensor_write.argtypes = (ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64)
+        lib.nodus_tensor_destroy.restype = None
+        lib.nodus_tensor_destroy.argtypes = (ctypes.c_uint64,)
+        return lib
+
+    @staticmethod
     def _bind_link_table(graph, link_id: str) -> None:
-        """The canvas table "link <id>" holds the link's two rows; made once, rebound when the canvas already has it."""
+        """The canvas table "link <id>" holds the link's rows: Input (fed by the declared port <id>.send), <id>.bulk, which
+        sends what the Input row pushes, and <id>.control. Made once, rebound when the canvas already has it."""
         lib, label = graph.lib, f"link {link_id}"
         index = -1
         for i in range(max(0, int(lib.nodus_headless_get_module_count(graph._handle)))):
@@ -275,12 +311,14 @@ class ConsoleServer:
                 break
         if index < 0:
             index = graph.add_module(label, x=40, y=40).index
-        names = [f"{link_id}.control".encode("utf-8"), f"{link_id}.bulk".encode("utf-8")]
-        rows = (_NativeRow * 2)(*[_NativeRow(1, 0, 0, 1, name) for name in names])
-        if not lib.nodus_headless_set_module_rows(graph._handle, index, rows, 2):
+        names = [f"{link_id}.bulk".encode("utf-8"), f"{link_id}.control".encode("utf-8")]
+        rows = (_NativeRow * 3)(_NativeRow(0, 0, 1, 0, None), *[_NativeRow(1, 0, 0, 1, name) for name in names])
+        if not lib.nodus_headless_set_module_rows(graph._handle, index, rows, 3):
             raise RuntimeError(f"the link rows of {link_id} could not be placed")
         if not lib.nodus_headless_set_module_stack_contract(graph._handle, index, 1):
             raise RuntimeError("the link table's stack contract was refused")
+        fifo = _NativeFifoConfig(8, 4, 0, graph.abstract_tensor_type_id, 2, 16, 0)     # one tensor handle a token, lossless
+        lib.nodus_headless_declare_input_port_ex(graph._handle, f"{link_id}.send".encode("utf-8"), index, 0, ctypes.byref(fifo))
 
     def _build(self, graph, wanted=frozenset()):
         path = os.path.join(self._tmp, "snapshot.nodus.txt")

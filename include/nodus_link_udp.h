@@ -52,7 +52,11 @@ public:
         if (s_ == INVALID_SOCKET) return;
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = 0;
         u_long nb = 1;
-        if (bind(s_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ioctlsocket(s_, FIONBIO, &nb) != 0) { closesocket(s_); s_ = INVALID_SOCKET; }
+        if (bind(s_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ioctlsocket(s_, FIONBIO, &nb) != 0) { closesocket(s_); s_ = INVALID_SOCKET; return; }
+        // A full window in flight is kUdpWindow datagrams per channel; the default buffers (about 64 KB) drop most of it.
+        int buffer = 16 << 20;
+        setsockopt(s_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buffer), sizeof(buffer));
+        setsockopt(s_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buffer), sizeof(buffer));
     }
     ~UdpSocket() { if (s_ != INVALID_SOCKET) closesocket(s_); if (started_) WSACleanup(); }
     UdpSocket(const UdpSocket&) = delete; UdpSocket& operator=(const UdpSocket&) = delete;
