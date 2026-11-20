@@ -59,9 +59,30 @@ def wsl_path(p: Path) -> str:
     return f"/mnt/{s[0].lower()}{s[2:]}" if len(s) > 1 and s[1] == ":" else s
 
 
+def ensure_distro(distro: str, log) -> None:
+    """The WSL2 distro the Linux builds run in belongs to the account this service runs as. When it is missing, import
+    it from the verified Ubuntu image in <state>/tools/wsl (owner, 2026-11-19: no password for the service account is
+    needed, because the service imports its own distro the first time it runs)."""
+    listed = subprocess.run(["wsl.exe", "-l", "-q"], capture_output=True, stdin=subprocess.DEVNULL)
+    names = listed.stdout.decode("utf-16-le", "replace").replace("\x00", "").split()
+    if distro in names:
+        return
+    state = Path(os.environ.get("NODUS_BUILD_STATE", "C:/dev/Powershell/srv/state"))
+    image = Path(os.environ.get("NODUS_BUILD_IMAGE", state / "tools/wsl/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz"))
+    home = state / "wsl" / distro
+    home.mkdir(parents=True, exist_ok=True)
+    log.write(f"importing WSL distro {distro} from {image} into {home}\n".encode("utf-8"))
+    log.flush()
+    result = subprocess.run(["wsl.exe", "--import", distro, str(home), str(image), "--version", "2"],
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        raise RuntimeError(f"could not import the WSL distro {distro} (exit {result.returncode})")
+
+
 def build_linux(job: Path, key: str, triplet: str, log) -> Path:
     out = job / "product.tar.gz"
     distro = os.environ.get("NODUS_BUILD_DISTRO", "nodus-build")
+    ensure_distro(distro, log)
     script = wsl_path(HERE / "build_linux.sh")
     command = ["wsl.exe", "-d", distro, "-u", "root", "--", "bash", script,
                wsl_path(job / "source.tar"), key, wsl_path(out), triplet]
