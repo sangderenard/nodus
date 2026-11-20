@@ -143,6 +143,14 @@ NODUS_HEADLESS_API int32_t nodus_headless_register_link_dialer(
 // Dialer through WinHTTP (stage 4): `host` is a name or an address, `path_base` the public path before the prefix
 // (null = "/ws/link/"), secure 1 = wss:// (0 = ws://). pin32: SHA-256 of the server certificate's DER, or null for
 // Windows certificate validation. Nothing blocks; the rows advance the dial. 1 on success.
+// A link that meets its peer at a UDP broker (rendezvous from POST /api/link/rendezvous/<prefix>) and then runs directly
+// over UDP (include/nodus_link_udp.h). role 1 host, 2 dialer; link_id16 and key32 are the rendezvous's.
+// Why a link endpoint failed (empty while it has not); the reason's length, or -1 for an unknown id.
+NODUS_HEADLESS_API int32_t nodus_headless_link_reason(const char* tool_id, char* out, int32_t capacity);
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_udp_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* broker_host, uint16_t broker_port, const char* prefix,
+    int32_t role, const uint8_t* link_id16, uint64_t expires_at, const uint8_t* key32, uint64_t account,
+    int32_t timeout_ms, uint64_t maximum_bulk_bytes);
 NODUS_HEADLESS_API int32_t nodus_headless_register_link_wss_dialer(
     NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* path_base,
     const char* prefix, int32_t secure, const uint8_t* pin32, const uint8_t* control_ticket128,

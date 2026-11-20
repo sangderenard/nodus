@@ -515,6 +515,39 @@ extern "C" int32_t nodus_headless_register_link_wss_dialer(
     return 1;
 }
 
+extern "C" int32_t nodus_headless_register_link_udp_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* broker_host, uint16_t broker_port, const char* prefix,
+    int32_t role, const uint8_t* link_id16, uint64_t expires_at, const uint8_t* key32, uint64_t account,
+    int32_t timeout_ms, uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !broker_host || !*broker_host || !broker_port || !prefix || !*prefix ||
+        (role != 1 && role != 2) || !link_id16 || !key32) return 0;
+    nodus::link::LinkDialConfig config;
+    config.id = tool_id; config.udp = true;
+    auto& t = config.udp_target;
+    t.broker_host = broker_host; t.broker_port = broker_port; t.prefix = prefix;
+    t.role = static_cast<nodus::link::Role>(role); t.expires_at = expires_at; t.account = account;
+    std::memcpy(t.link_id.data(), link_id16, 16); std::memcpy(t.key.data(), key32, 32);
+    if (timeout_ms > 0) t.timeout_ms = timeout_ms;
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    std::string error;
+    if (!nodus::link::register_link_dialer(tool_registry_global(), std::move(config), &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_udp_dialer: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_link_reason(const char* tool_id, char* out, int32_t capacity) {
+    nodus::link::EndpointReport r;
+    if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return -1;
+    if (out && capacity > 0) {
+        const size_t n = std::min(r.reason.size(), size_t(capacity - 1));
+        std::memcpy(out, r.reason.data(), n); out[n] = 0;
+    }
+    return int32_t(r.reason.size());
+}
+
 extern "C" int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16) {
     nodus::link::EndpointReport r;
     if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;

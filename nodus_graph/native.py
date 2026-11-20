@@ -1359,6 +1359,12 @@ class Graph:
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p,
                 ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_uint64)
             lib.nodus_headless_link_report.restype = ctypes.c_int32
+        lib._link_udp_abi = lib._link_abi and hasattr(lib, "nodus_headless_register_link_udp_dialer")
+        if lib._link_udp_abi:
+            lib.nodus_headless_register_link_udp_dialer.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_udp_dialer.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p, ctypes.c_int32,
+                ctypes.c_char_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_int32, ctypes.c_uint64)
         lib._link_wss_abi = lib._link_abi and hasattr(lib, "nodus_headless_register_link_wss_dialer")
         if lib._link_wss_abi:
             lib.nodus_headless_register_link_wss_dialer.restype = ctypes.c_int32
@@ -1421,6 +1427,21 @@ class Graph:
                 bytes(control_ticket), bytes(bulk_ticket), int(timeout_ms), int(maximum_bulk_bytes)):
             raise RuntimeError(f"native wss link dialer registration refused: {tool_id}")
 
+    def register_link_udp_dialer(self, tool_id: str, broker_host: str, broker_port: int, prefix: str, role: int,
+                                 link_id: bytes, expires_at: int, key: bytes, *, account: int = 0, timeout_ms: int = 15000,
+                                 maximum_bulk_bytes: int = 0) -> None:
+        """Admit <tool_id>.control and <tool_id>.bulk over a link that meets its peer at the UDP broker, then runs directly
+        over UDP. `role` 1 host / 2 dialer, `link_id` (16 bytes), `expires_at` and `key` (32 bytes) are the rendezvous's."""
+        lib = self._link_lib()
+        if not lib._link_udp_abi:
+            raise RuntimeError("this nodus_headless library has no UDP link (nodus_headless_register_link_udp_dialer)")
+        if role not in (1, 2) or len(link_id) != 16 or len(key) != 32:
+            raise ValueError("role is 1 or 2, the link id 16 bytes and the key 32")
+        if not lib.nodus_headless_register_link_udp_dialer(
+                self._handle, tool_id.encode("utf-8"), broker_host.encode("utf-8"), int(broker_port), prefix.encode("utf-8"),
+                int(role), bytes(link_id), int(expires_at), bytes(key), int(account), int(timeout_ms), int(maximum_bulk_bytes)):
+            raise RuntimeError(f"native UDP link registration refused: {tool_id}")
+
     def link_report(self, tool_id: str) -> Optional[dict]:
         """{"state": waiting|linked|closed|failed, counters...} of a registered link endpoint, or None."""
         lib = self._link_lib()
@@ -1429,6 +1450,12 @@ class Graph:
             return None
         report = {name: int(value) for name, value in zip(self._LINK_COUNTERS, out)}
         report["state"] = self._LINK_STATES[state.value] if 0 <= state.value < 4 else str(state.value)
+        if hasattr(lib, "nodus_headless_link_reason"):
+            buf = ctypes.create_string_buffer(512)
+            lib.nodus_headless_link_reason.restype = ctypes.c_int32
+            lib.nodus_headless_link_reason.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32)
+            if lib.nodus_headless_link_reason(tool_id.encode("utf-8"), buf, len(buf)) > 0:
+                report["reason"] = buf.value.decode("utf-8", "replace")
         return report
 
     def acquire_contract_pair(self, prefix: str, capacity: int, loan_ticks: Optional[int] = None) -> None:

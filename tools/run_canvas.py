@@ -25,6 +25,9 @@ started:
   {"op": "link_host", "id", "prefix", "port", "key_file"}   accept links on 127.0.0.1:port for /ws/link/<prefix>/
   {"op": "link_dial", "id", "host", "port", "prefix", "control_ticket", "bulk_ticket"[, "secure", "pin"]}
         dial ws(s)://host:port/ws/link/<prefix>/ with the two issued tickets (base64; from POST /api/link/ticket/<prefix>)
+  {"op": "link_udp", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"[, "account"]}
+        meet the peer at the UDP broker and link directly over UDP (the rendezvous from POST /api/link/rendezvous/<prefix>;
+        link_id and key in hex, role 1 host / 2 dialer)
   {"op": "link_report", "id"}                                the endpoint's state and counters
 link_host and link_dial put the rows <id>.control and <id>.bulk on the canvas table "link <id>" (made once, kept with
 the canvas), so the canvas polls the link every step.
@@ -178,7 +181,7 @@ class ConsoleServer:
             if any(type(v) is not int or abs(v) > 65535 for v in values):
                 raise ValueError("invalid canvas key action")
             handled = graph.ui_key(*values)
-        elif op in ("link_host", "link_dial", "link_report"):
+        elif op in ("link_host", "link_dial", "link_udp", "link_report"):
             handled, report = self._apply_link(graph, request)
             if op == "link_report":
                 return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "link": report}
@@ -200,13 +203,31 @@ class ConsoleServer:
     def _apply_link(self, graph, request: dict):
         """Open (or report) a Nodus link on this running canvas; returns (handled, report)."""
         op = request["op"]
-        link_id = request.get("id")
+        link_id = link_id_name = request.get("id")
         if not isinstance(link_id, str) or not self._LINK_NAME.match(link_id):
             raise ValueError("link id: 1-60 of A-Z a-z 0-9 . _ -")
         if op == "link_report":
             if set(request) != {"op", "expected_revision", "id"}:
                 raise ValueError("link_report takes op, expected_revision, id")
             return True, graph.link_report(link_id)
+        if op == "link_udp":
+            keys = {"op", "expected_revision", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"}
+            if not set(request) >= keys or not set(request) <= keys | {"account"}:
+                raise ValueError("link_udp takes op, expected_revision, id, broker_host, broker_port, prefix, role, link_id, key, "
+                                 "expires_at[, account]")
+            prefix, port, role = request["prefix"], request["broker_port"], request["role"]
+            if not isinstance(prefix, str) or not self._LINK_NAME.match(prefix) or type(port) is not int or not 0 < port < 65536 \
+                    or role not in (1, 2) or type(request["expires_at"]) is not int or not isinstance(request["broker_host"], str):
+                raise ValueError("link_udp: a prefix, a broker port 1-65535, role 1 or 2, an integer expiry and a broker host")
+            try:
+                link_id, key = bytes.fromhex(request["link_id"]), bytes.fromhex(request["key"])
+            except (TypeError, ValueError):
+                raise ValueError("link_id and key are hex") from None
+            graph.register_link_udp_dialer(link_id=link_id, key=key, tool_id=link_id_name, broker_host=request["broker_host"],
+                                           broker_port=port, prefix=prefix, role=role, expires_at=request["expires_at"],
+                                           account=int(request.get("account") or 0))
+            self._bind_link_table(graph, link_id_name)
+            return True, None
         prefix, port = request.get("prefix"), request.get("port")
         if not isinstance(prefix, str) or not self._LINK_NAME.match(prefix):
             raise ValueError("link prefix: 1-60 of A-Z a-z 0-9 . _ -")

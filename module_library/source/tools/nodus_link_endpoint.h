@@ -47,7 +47,8 @@ public:
         report_.listen_port = listener_->port();
     }
     explicit LinkEndpoint(LinkDialConfig c) : maximum_(c.maximum_bulk_bytes) {
-        if (c.wss) wss_ = std::make_unique<WssDialer>(c.wss_target, c.control_ticket, c.bulk_ticket);
+        if (c.udp) udp_ = std::make_unique<UdpDialer>(c.udp_target);
+        else if (c.wss) wss_ = std::make_unique<WssDialer>(c.wss_target, c.control_ticket, c.bulk_ticket);
         else dialer_ = std::make_unique<LinkDialer>(c.target, c.control_ticket, c.bulk_ticket);
     }
     ~LinkEndpoint() {
@@ -69,6 +70,10 @@ public:
             dialer_->poll();
             if (dialer_->failed()) report_.state = EndpointState::Failed;
             else if (dialer_->ready()) adopt(dialer_->take());
+        } else if (udp_ && !link_) {
+            udp_->poll();
+            if (udp_->failed()) { report_.state = EndpointState::Failed; if (udp_->reason()) report_.reason = udp_->reason(); }
+            else if (udp_->ready()) adopt(udp_->take());
         } else if (wss_ && !link_) {
             wss_->poll();
             if (wss_->failed()) { report_.state = EndpointState::Failed; if (wss_->reason()) report_.reason = wss_->reason(); }
@@ -156,6 +161,7 @@ private:
     std::unique_ptr<LinkListener> listener_;
     std::unique_ptr<LinkDialer> dialer_;
     std::unique_ptr<WssDialer> wss_;
+    std::unique_ptr<UdpDialer> udp_;
     std::unique_ptr<Link> link_;
     std::deque<Out> out_;
     std::unordered_map<uint64_t, Partial> partial_;

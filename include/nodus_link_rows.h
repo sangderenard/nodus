@@ -9,6 +9,7 @@
 // Research case 98d49cb8520e44d092c5d134c37c3c32, stage 2. Include before <windows.h> (winsock).
 #include "nodus_link.h"
 #include "nodus_link_wss.h"
+#include "nodus_link_udp.h"
 #include "tool_registry.h"
 
 #include <cstdint>
@@ -29,6 +30,8 @@ struct LinkDialConfig {
     DialTarget target;              // the loopback passage (LinkDialer), used when `wss` is false
     bool wss = false;               // dial with WinHTTP instead (WssDialer): wss:// or ws://, a name or an address
     WssTarget wss_target;
+    bool udp = false;               // rendezvous at a broker, then direct UDP (nodus_link_udp.h); `target`, `wss_target`
+    UdpTarget udp_target;           // and the tickets are unused
     TicketBytes control_ticket{}, bulk_ticket{};
     uint64_t maximum_bulk_bytes = uint64_t(256) << 20;
 };

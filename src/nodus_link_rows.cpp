@@ -52,7 +52,8 @@ bool register_link_host(ToolRegistry& registry, LinkHostConfig config, uint16_t*
 }
 
 bool register_link_dialer(ToolRegistry& registry, LinkDialConfig config, std::string* error) {
-    const bool target_ok = config.wss ? !config.wss_target.host.empty() && !config.wss_target.prefix.empty() && config.wss_target.port
+    const bool target_ok = config.udp ? !config.udp_target.broker_host.empty() && !config.udp_target.prefix.empty() && config.udp_target.broker_port
+                         : config.wss ? !config.wss_target.host.empty() && !config.wss_target.prefix.empty() && config.wss_target.port
                                       : !config.target.prefix.empty() && config.target.port;
     if (config.id.empty() || !target_ok || !config.maximum_bulk_bytes) {
         if (error) *error = "id, prefix, port and size are required"; return false;
