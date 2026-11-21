@@ -176,6 +176,14 @@ class ConsoleReadProtocolTest(unittest.TestCase):
         for key in ("accepted", "completed", "refused", "acknowledged", "in_flight"):
             self.assertIn(key, host)
 
+    def test_meta_shape_and_never_mutates(self) -> None:
+        client = self.client()
+        before = client.snapshot()["canvas"]
+        meta = client.meta()
+        self.assertEqual(set(meta), {"tick", "groups", "links"})
+        self.assertEqual((meta["groups"], meta["links"]), ([], []))   # no meta group or link on this canvas
+        self.assertEqual(client.snapshot()["canvas"], before)
+
     def test_framing_and_compact_sorted_json(self) -> None:
         with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
             sock.sendall(f"HELLO nodus-console/1 {TOKEN}\nDIGEST\n".encode())
@@ -215,6 +223,34 @@ class ConsoleReadProtocolTest(unittest.TestCase):
         with ConsoleClient("127.0.0.1", self.port, TOKEN) as client:
             self.assertEqual(client.digest()["canvas"], self.canvas_name)
             self.assertEqual(client.graph()["schema"], "nodus.graph-definition.v1")
+
+
+class MetaDocumentTest(unittest.TestCase):
+    """meta_document over a stand-in graph: groups with named records, links with their report."""
+
+    def test_groups_and_links(self) -> None:
+        from nodus_graph import console_views
+
+        class FakeGraph:
+            def meta_group_ids(self):
+                return [3, 5]
+
+            def meta_group(self, group_id):
+                if group_id == 5:
+                    return None
+                return {"id": 3, "channel_group": 9, "vertices": 2, "records": 4, "feed_refused": 0, "slots": 8,
+                        "members": [{"tick": 7, "edge_idx": 0, "rope_id": (1 << 60) + 1, "occupancy": 2, "flags": 3,
+                                     "canvas_edge_idx": 0}]}
+
+            def link_report(self, link_id):
+                return {"state": "linked", "control_sent": 5} if link_id == "a" else None
+
+        doc = console_views.meta_document(FakeGraph(), tick=11, link_ids=["b", "a", "a"])
+        self.assertEqual(doc["tick"], 11)
+        self.assertEqual([g["id"] for g in doc["groups"]], [3])
+        self.assertEqual(doc["groups"][0]["members"][0]["occupancy"], 2)
+        self.assertEqual(doc["links"], [{"id": "a", "state": "linked", "control_sent": 5}])
+        self.assertEqual(json.loads(console_views.dumps(doc)), doc)
 
 
 if __name__ == "__main__":

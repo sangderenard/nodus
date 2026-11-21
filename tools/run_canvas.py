@@ -10,7 +10,7 @@ Optional managed console (--console-port / --console-token-file), newline-delimi
 UTF-8 over 127.0.0.1. Version 1 remains read-only:
   HELLO nodus-console/1 <token>  -> OK console <canvas-basename> read-only | REFUSED <reason> (closes)
   SNAPSHOT -> CANVAS <revision> <n>\\n<n bytes>\\nSTATE <json>\\n
-  DIGEST | GRAPH | TOOLS | ACTIVITY -> JSON <VERB> <n>
+  DIGEST | GRAPH | TOOLS | ACTIVITY | META -> JSON <VERB> <n>
 <n bytes of compact sorted-key UTF-8 JSON>
   anything else -> REFUSED read-only
 (docs/NODUS_CONSOLE_READ_PROTOCOL_2026-11-10.md)
@@ -106,6 +106,7 @@ class ConsoleServer:
         self._rate = 0.0
         self._started = time.time()
         self._hosts = []  # [(prefix, host_id)], read on the stepping thread only
+        self._link_ids = []  # registered link ids (the graph cannot enumerate them); stepping thread only
         self._generation = 0
         self._last_bytes = None
         self._revision = 0
@@ -134,6 +135,11 @@ class ConsoleServer:
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     # ---- stepping thread -------------------------------------------------
+    def add_links(self, link_ids) -> None:
+        for link_id in link_ids:
+            if link_id not in self._link_ids:
+                self._link_ids.append(link_id)
+
     def service(self, graph) -> None:
         if not self._wanted.is_set():
             return
@@ -195,6 +201,8 @@ class ConsoleServer:
             handled = graph.ui_key(*values)
         elif op in ("link_host", "link_dial", "link_udp", "link_send", "link_report"):
             handled, report = self._apply_link(graph, request)
+            if op in ("link_host", "link_dial", "link_udp") and request["id"] not in self._link_ids:
+                self._link_ids.append(request["id"])
             if op == "link_report":
                 return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "link": report}
         elif op in ("meta_group", "meta_report", "meta_destroy"):
@@ -463,6 +471,9 @@ class ConsoleServer:
                 views["graph"] = console_views.dumps(graph_doc)
             if "tools" in wanted:
                 views["tools"] = console_views.dumps(console_views.tools_document(graph, graph_doc))
+            if "meta" in wanted:
+                views["meta"] = console_views.dumps(console_views.meta_document(
+                    graph, tick=tick, link_ids=list(self._link_ids)))
             if "activity" in wanted:
                 views["activity"] = console_views.dumps(console_views.activity_document(
                     graph, tick=tick, compile_hosts=list(self._hosts)))
@@ -574,7 +585,7 @@ class ConsoleServer:
             except OSError:
                 pass
 
-    _VERBS = {b"DIGEST": "digest", b"GRAPH": "graph", b"TOOLS": "tools", b"ACTIVITY": "activity"}
+    _VERBS = {b"DIGEST": "digest", b"GRAPH": "graph", b"TOOLS": "tools", b"ACTIVITY": "activity", b"META": "meta"}
 
     def _snapshot(self, view="digest"):
         with self._cond:
@@ -754,6 +765,7 @@ def main(argv=None) -> int:
                     cron_report.append({"prefix": prefix, "engine": engine_id, "attached": False, "reason": str(exc)})
             if console is not None:
                 console.set_context(args.rate, attached)
+                console.add_links([link["id"] for link in links])
             ports = []
             for prefix, capacity, edge, declared in graph.contract_ports():
                 bound = graph.contract_port(prefix)

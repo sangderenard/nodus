@@ -112,3 +112,6 @@ class ConsoleClient:
 
     def activity(self) -> dict:
         return self._json("ACTIVITY")
+
+    def meta(self) -> dict:
+        return self._json("META")

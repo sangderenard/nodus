@@ -6,7 +6,7 @@ Server: `ConsoleServer` in `tools/run_canvas.py`. Document builders: `nodus_grap
 
 ## Threading rule (unchanged)
 
-Client threads never touch the `Graph`. A request marks which views it wants; the stepping thread builds them in `ConsoleServer.service()` between ticks, together with the canvas bytes, so every view of one build is consistent with one revision. Results are coalesced for 100 ms; a request that needs a view the cached build lacks forces a new build. Only SNAPSHOT/DIGEST content costs the tick anything unless GRAPH/TOOLS/ACTIVITY are asked for. If a build fails the verb answers `REFUSED unavailable`.
+Client threads never touch the `Graph`. A request marks which views it wants; the stepping thread builds them in `ConsoleServer.service()` between ticks, together with the canvas bytes, so every view of one build is consistent with one revision. Results are coalesced for 100 ms; a request that needs a view the cached build lacks forces a new build. Only SNAPSHOT/DIGEST content costs the tick anything unless GRAPH/TOOLS/ACTIVITY/META are asked for. If a build fails the verb answers `REFUSED unavailable`.
 
 ## Protocol v1 (unchanged)
 
@@ -22,7 +22,7 @@ Up to 8 clients; the 9th gets `REFUSED too many clients`. Idle connections close
 
 ## Protocol 2 verbs
 
-Authenticated clients may send `DIGEST`, `GRAPH`, `TOOLS`, `ACTIVITY` (exact upper-case, no arguments). Answer framing:
+Authenticated clients may send `DIGEST`, `GRAPH`, `TOOLS`, `ACTIVITY`, `META` (exact upper-case, no arguments). Answer framing:
 
 ```
 JSON <VERB> <byte-length>\n
@@ -70,12 +70,21 @@ Fallback shape. `Graph.definition()` is strict: it raises when an edge names a c
 - `contract_ports[].engines`/`hosts` = connected peer counts from `nodus_headless_get_contract_port`; null if the port cannot be read. `pending` is ALWAYS null (no pending-contract query in the ABI).
 - `compile_hosts`: one entry per attached host (`compile_host_stats`); a host that cannot be read is omitted.
 
+### META
+
+`{"tick":int,"groups":[{"id","channel_group","vertices","records","feed_refused","slots","members":[<record>]}],"links":[{"id","state","reason"?,<16 counters>}]}`
+
+Read-only; the same readers as the console-v2 `meta_report` and `link_report` ops (`Graph.meta_group`, `Graph.link_report`) without the edit capability.
+
+- `groups`: every meta group in id order. `members[]` is each member edge's latest observation record by field name (include/table_abi.h `GP_MetaRecordWord`): `tick, time_ns, dt_ns, ordinal, edge_idx, rope_id, write_seq, write_delta, read_seq, read_delta, occupancy, slots, refused_total, refused_delta, bytes_delta, flags`, plus `canvas_edge_idx`. `flags` bits 0..7: 1 full, 2 configured, 4 has readers, 8 edge lost; bits 8.. count drops. `rope_id` and other uint64 fields are JSON integers and may exceed 2^53.
+- `links`: every link registered through this console process (`--link-host` at start, or ACTION link_host/link_dial/link_udp), sorted by id; `state` is waiting|linked|closed|failed, with the counters `listen_port, account, control_sent, control_received, bulk_bytes_sent, bulk_bytes_received, bulk_tensors_sent, bulk_tensors_received, control_refused, bulk_refused, bulk_dropped, peers_refused, control_read_stalls, bulk_read_stalls, protocol_violations, refused_full`. The ABI cannot enumerate links, so a link registered outside this process is not listed.
+
 ## Client
 
 ```python
 from nodus_graph.console_client import ConsoleClient, ConsoleError
 with ConsoleClient("127.0.0.1", port, token, timeout=10.0) as c:   # hello() on enter
-    c.digest(); c.graph(); c.tools(); c.activity()
+    c.digest(); c.graph(); c.tools(); c.activity(); c.meta()
     c.snapshot()   # {"revision", "canvas": bytes, "state": dict}
 ```
 

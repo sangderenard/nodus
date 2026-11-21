@@ -157,6 +157,21 @@ def activity_document(graph: Graph, *, tick: int, compile_hosts: Iterable) -> di
     return {"tick": tick, "edges": edges, "contract_ports": ports, "compile_hosts": hosts}
 
 
+def meta_document(graph: Graph, *, tick: int, link_ids: Iterable) -> dict:
+    """Read-only meta-edge observations and link reports: the same readers as the meta_report / link_report ops."""
+    groups = []
+    for group_id in graph.meta_group_ids():
+        group = graph.meta_group(group_id)
+        if group is not None:
+            groups.append(group)
+    links = []
+    for link_id in sorted(set(link_ids)):
+        report = graph.link_report(link_id)
+        if report is not None:
+            links.append({"id": link_id, **report})
+    return {"tick": tick, "groups": groups, "links": links}
+
+
 def _native_document(graph: Graph, revision: int, reason: str) -> dict:
     """Tolerant read of the same native queries Graph.definition() uses.  Same module and
     row field names as graph-definition v1; edges name native indices because stable
