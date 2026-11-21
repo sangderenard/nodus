@@ -96,7 +96,17 @@ struct EndpointReport {
     std::string reason;                     // why a wss dial failed (WinHTTP, TLS, pin), when it did
 };
 
-// Registers <id>.control and <id>.bulk; the listener is open on return (port in report). False on refusal.
+// The 16 counters of nodus_headless_link_report, in its order (one definition: the report and the metrics row use it).
+inline void link_report_counters(const EndpointReport& r, uint64_t out[16]) {
+    const uint64_t v[16] = {r.listen_port, r.account, r.link.control_sent, r.link.control_received,
+        r.link.bulk_bytes_sent, r.link.bulk_bytes_received, r.bulk_tensors_sent, r.bulk_tensors_received,
+        r.control_refused, r.bulk_refused, r.bulk_dropped, r.peers_refused, r.link.control_read_stalls,
+        r.link.bulk_read_stalls, r.link.protocol_violations, r.link.control_refused_full + r.link.bulk_refused_full};
+    for (int i = 0; i < 16; ++i) out[i] = v[i];
+}
+
+// Registers <id>.control and <id>.bulk, and <id>.metrics (the metrics row bound to this link; also the generic
+// "nodus.link.metrics", whose link comes from saved state; module_library/source/tools/link_metrics.cpp); the listener is open on return (port in report). False on refusal.
 bool register_link_host(ToolRegistry& registry, LinkHostConfig config, uint16_t* listen_port = nullptr, std::string* error = nullptr);
 bool register_link_dialer(ToolRegistry& registry, LinkDialConfig config, std::string* error = nullptr);
 // State and counters of a registered endpoint (by the id given at registration).

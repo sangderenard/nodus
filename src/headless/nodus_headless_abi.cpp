@@ -553,11 +553,7 @@ extern "C" int32_t nodus_headless_link_report(const char* tool_id, int32_t* stat
     if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;
     if (state) *state = static_cast<int32_t>(r.state);
     if (out16) {
-        const uint64_t v[16] = {r.listen_port, r.account, r.link.control_sent, r.link.control_received,
-            r.link.bulk_bytes_sent, r.link.bulk_bytes_received, r.bulk_tensors_sent, r.bulk_tensors_received,
-            r.control_refused, r.bulk_refused, r.bulk_dropped, r.peers_refused, r.link.control_read_stalls,
-            r.link.bulk_read_stalls, r.link.protocol_violations, r.link.control_refused_full + r.link.bulk_refused_full};
-        std::memcpy(out16, v, sizeof(v));
+        nodus::link::link_report_counters(r, out16);
     }
     return 1;
 }

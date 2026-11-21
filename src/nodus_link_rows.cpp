@@ -7,6 +7,14 @@
 #define NODUS_PLUGIN_DESTROY_NAME nodus_link_destroy
 #define NODUS_PLUGIN_SOURCE_NAME nodus_link_source
 #include "../module_library/source/tools/nodus_link.cpp"
+// The metrics row (module_library/source/tools/link_metrics.cpp), likewise: registered per link as <id>.metrics.
+#undef NODUS_PLUGIN_FACTORY_NAME
+#undef NODUS_PLUGIN_DESTROY_NAME
+#undef NODUS_PLUGIN_SOURCE_NAME
+#define NODUS_PLUGIN_FACTORY_NAME nodus_link_metrics_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_link_metrics_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_link_metrics_source
+#include "../module_library/source/tools/link_metrics.cpp"
 
 namespace nodus::link {
 namespace {
@@ -33,6 +41,26 @@ bool register_rows(ToolRegistry& registry, const std::string& id, std::shared_pt
             if (error) *error = "tool registry refused " + id;
             return false;
         }
+    }
+    {   // The metrics row bound to this link, and the generic one (a canvas-loaded copy takes its link from saved state).
+        ToolRegistry::Entry entry;
+        entry.id = id + ".metrics"; entry.name = "Link metrics"; entry.caps = ToolCaps::Table;
+        entry.source_path = nodus_link_metrics_source();
+        entry.factory = [rid = entry.id, id] {
+            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkMetricsRow(rid, id), [](ITool* t) { nodus_link_metrics_destroy(t); });
+        };
+        if (!registry.register_tool(std::move(entry))) {
+            registry.unregister_tool(id + ".control"); registry.unregister_tool(id + ".bulk");
+            if (error) *error = "tool registry refused " + id + ".metrics";
+            return false;
+        }
+        ToolRegistry::Entry generic;
+        generic.id = "nodus.link.metrics"; generic.name = "Link metrics"; generic.caps = ToolCaps::Table;
+        generic.source_path = nodus_link_metrics_source();
+        generic.factory = [] {
+            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkMetricsRow(), [](ITool* t) { nodus_link_metrics_destroy(t); });
+        };
+        registry.register_tool(std::move(generic));   // already there from an earlier link: fine
     }
     std::lock_guard<std::mutex> g(endpoints_mutex());
     endpoints()[id] = std::move(ep);
@@ -78,7 +106,7 @@ bool link_endpoint_report(const std::string& id, EndpointReport* out) {
 }
 
 void unregister_link(ToolRegistry& registry, const std::string& id) {
-    registry.unregister_tool(id + ".control"); registry.unregister_tool(id + ".bulk");
+    registry.unregister_tool(id + ".control"); registry.unregister_tool(id + ".bulk"); registry.unregister_tool(id + ".metrics");
     std::lock_guard<std::mutex> g(endpoints_mutex());
     endpoints().erase(id);
 }
