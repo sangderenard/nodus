@@ -56,7 +56,7 @@
 
 // Defined in the static canvas library (also used by thread_manager.cpp); writes the
 // stack tail of a module on the primary canvas context. Attach mode reuses it.
-extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
+extern void canvas_set_module_stack_tail(GP_CanvasContext* canvas, int module_idx, const float* values, int count);
 
 namespace {
 
@@ -2811,7 +2811,7 @@ void attach_apply_pending(FrontendResources& resources) {
         const int module_count = gp_canvas_get_module_count(head.context);
         for (const auto& t : g_attach.last_tails) {
             if (t.first < 0 || t.first >= module_count) continue;
-            canvas_set_module_stack_tail(t.first, t.second.data(), static_cast<int>(t.second.size()));
+            canvas_set_module_stack_tail(head.context, t.first, t.second.data(), static_cast<int>(t.second.size()));
         }
     }
     if (dirty) {
