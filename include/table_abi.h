@@ -756,6 +756,8 @@ int32_t gp_table_meta_get_latest_records(GP_TableContext* ctx, GP_MetaGroup* mg,
 // Records from the group FIFO with sequence >= from_seq that are still in the ring, oldest first; *out_write_seq = next sequence.
 int32_t gp_table_meta_read_records(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t from_seq, uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq);
 int32_t gp_table_meta_snapshot_u64(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t* out_words, int32_t capacity);
+// A replica's records: another node's records of its members, appended as they were (latest per member, and the FIFO).
+int32_t gp_table_meta_append_records(GP_TableContext* ctx, GP_MetaGroup* mg, const uint64_t* words, int32_t count);
 // Enable/disable edge-springs for a meta-group. Springs connect consecutive
 // vertices in the group's member list and will reduce their rest length
 // over time until `min_rest` at the given `reduce_rate` (units per second).

@@ -1177,6 +1177,11 @@ extern "C" int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint6
     GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
     return mg ? gp_table_meta_read_records(g->table, mg, from_seq, out_words, max_records, out_write_seq) : 0;
 }
+extern "C" int32_t nodus_headless_meta_append_records(NodusHeadlessGraph* g, uint64_t group_id, const uint64_t* words,
+                                                     int32_t count) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_append_records(g->table, mg, words, count) : 0;
+}
 extern "C" int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words) {
     GP_TableContext* table = process_container_table();
     if (!table || !out_words || capacity_words < GP_META_RECORD_WORDS) return 0;

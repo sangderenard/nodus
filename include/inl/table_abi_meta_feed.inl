@@ -188,6 +188,33 @@ extern "C" int32_t gp_table_meta_get_member(GP_TableContext* ctx, GP_MetaGroup* 
     return 1;
 }
 
+// A replica's records (docs/MESH_CANVAS_UP_PORTS_2026-11-21.md): records another node's feed took of its own members,
+// carried over the link with that node's canvas state, appended to this group as they were. Each record becomes its
+// member's latest (by rope id) and enters the group FIFO in order, so every reader of this group (edge_introspect, the
+// link metrics row, gp_table_meta_read_records) sees the other node's traffic. Nothing here touches a member edge. A
+// replica is never stepped, so its own feed never mixes records of its idle copies in. Returns records appended.
+extern "C" int32_t gp_table_meta_append_records(GP_TableContext* ctx, GP_MetaGroup* mg, const uint64_t* words, int32_t count) {
+    if (!ctx || !mg || !words || count <= 0) return 0;
+    std::lock_guard<std::mutex> lk(mg->feed_mu);
+    meta_sync_members(ctx, mg);
+    if (!meta_feed_configure(mg)) return 0;
+    int32_t n = 0;
+    for (int32_t i = 0; i < count; ++i) {
+        const uint64_t* rec = words + static_cast<size_t>(i) * GP_META_RECORD_WORDS;
+        for (auto& m : mg->members) {
+            if (m.rope_id != rec[GP_META_REC_ROPE_ID]) continue;
+            std::memcpy(m.latest, rec, sizeof(m.latest));
+            m.has_latest = true;
+            break;
+        }
+        bool dropped_oldest = false;
+        if (!mg->fifo.push(/*edge_id=*/0, /*writer_id=*/mg->id ? mg->id : 1ull, rec, GP_META_RECORD_WORDS * sizeof(uint64_t),
+                           &dropped_oldest)) { ++mg->feed_refused; continue; }
+        ++n;
+    }
+    return n;
+}
+
 extern "C" int32_t gp_table_meta_get_latest_records(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t* out_words, int32_t max_records) {
     if (!ctx || !mg || !out_words || max_records <= 0) return 0;
     std::lock_guard<std::mutex> lk(mg->feed_mu);

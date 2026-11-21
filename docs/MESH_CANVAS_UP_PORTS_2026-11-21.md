@@ -143,3 +143,19 @@ for an add on development work we haven't implemented yet".
   each), byte for byte, sender 22 sent / receiver 22 received. canvas_row_test, nodus_headless_runtime_test and
   link_rows_test pass again. Tests with tensor-typed Output rows that need a GPU (volunteer cycle, GPU inventory, OpenGL
   rows) have not run on this change.
+- **Replicas: the canvas state with its traffic metrics.** Owner, 2026-11-21: "by having the canvas state we should
+  collect also any meta edges supplying traffic metrics". A canvas row is a host (the canvas runs here; with a publish
+  interval it puts the canvas's snapshot on a Return port "state" every that many ticks) or a replica (another node's
+  canvas, read only, never stepped; each snapshot arriving on its Argument port "state" replaces it). A snapshot is the
+  canvas file, the files a save writes beside it (`<file>.modules/`: the container table's rope ids, which meta members
+  resolve through), and every meta group's records. A replica's meta groups carry those records
+  (`gp_table_meta_append_records`, `nodus_headless_meta_append_records`), so every reader of a meta edge sees the
+  writer's traffic. Only the node that runs a canvas publishes it.
+  `tests/mesh_replica_test.cpp` (Oracle A1, 2026-11-21): 40/40 values through the writer's canvas while 80 snapshots
+  crossed the link (80 sent, 80 received); the replica's meta group holds 800 of the writer's 804 records, an exact
+  prefix (the last snapshot that crossed), and they survive the reader canvas's save and load.
+- **A load fault found on the way:** a meta group saved from the ROOT module's table (the container) was restored onto
+  the table a loaded ROOT module gets of its own, out of reach of every reader of the container's groups; and save then
+  read the ROOT module's own table. Both now take the root/container table for the ROOT module.
+- **Not this change:** `meta_edge_headless_test` fails its edge_introspect check on Linux: `nodus_meta_channel.h` finds
+  the headless image only on Windows (`GetModuleHandleA`), so a row reading meta channels sees nothing elsewhere.

@@ -174,7 +174,10 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     // canvas save/load cycles. For each module table enumerate its meta-groups
     // and emit a small, textual block describing vertices and restored fields.
     for (size_t i = 0; i < c->modules.size(); ++i) {
-        GP_TableContext* t = (i < c->module_tables.size()) ? c->module_tables[i] : nullptr;
+        // The ROOT module's groups are the root/container table's (see the restore below): a loaded ROOT module has a
+        // table of its own, which holds none of them.
+        GP_TableContext* t = (static_cast<int>(i) == c->root_module_idx) ? canvas_ensure_root_table(c)
+                           : (i < c->module_tables.size()) ? c->module_tables[i] : nullptr;
         if (!t) continue;
         int mgcount = gp_table_get_meta_group_count(t);
         for (int mgi = 0; mgi < mgcount; ++mgi) {
@@ -956,7 +959,12 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             }
             return nullptr;
         };
-        if (ms.module_idx >= 0 && ms.module_idx < static_cast<int>(c->module_tables.size())) {
+        if (ms.module_idx >= 0 && ms.module_idx == c->root_module_idx) {
+            // The ROOT module mirrors the root/container table (canvas_ensure_root_module); its groups live there, which
+            // is where save read them and where every reader of the container's groups looks. A loaded ROOT module has
+            // a table of its own, so module_tables would put the group out of their reach (Oracle A1, 2026-11-21).
+            t = canvas_ensure_root_table(c);
+        } else if (ms.module_idx >= 0 && ms.module_idx < static_cast<int>(c->module_tables.size())) {
             t = c->module_tables[static_cast<size_t>(ms.module_idx)];
         } else if (ms.module_idx < 0) {
             int overlay_idx = ms.meta_slot;

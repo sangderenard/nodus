@@ -283,6 +283,10 @@ NODUS_HEADLESS_API int32_t nodus_headless_meta_snapshot(NodusHeadlessGraph* g, u
 // Records still in the group FIFO with sequence >= from_seq, oldest first; *out_write_seq is the next sequence.
 NODUS_HEADLESS_API int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint64_t group_id, uint64_t from_seq,
     uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq);
+// A replica's records: another node's records of this group's members (GP_META_RECORD_WORDS words each), appended as
+// they were taken. Returns records appended.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_append_records(NodusHeadlessGraph* g, uint64_t group_id, const uint64_t* words,
+                                                             int32_t count);
 // Process-wide readers for rows (a row has no graph handle; they read the canvas of this process): the latest record of
 // every member of every group whose channel group is `channel`, groups then members in order. Returns words written.
 NODUS_HEADLESS_API int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words);

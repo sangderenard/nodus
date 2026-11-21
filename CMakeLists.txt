@@ -686,6 +686,17 @@ if(TARGET canvas_row)
   add_dependencies(canvas_row_test canvas_row)
 endif()
 
+# The mesh: a node's canvas (host canvas row) publishes its snapshot -- canvas file and meta edge records -- over the
+# link to another node's replica canvas row. Run it with the canvas_row plugin's path.
+add_executable(mesh_replica_test tests/mesh_replica_test.cpp)
+target_include_directories(mesh_replica_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mesh_replica_test PRIVATE nodus_headless ${NODUS_LINK_LIBS})
+target_compile_features(mesh_replica_test PUBLIC cxx_std_20)
+if(TARGET canvas_row)
+  add_dependencies(mesh_replica_test canvas_row)
+endif()
+
 # The file rows (file_read, file_write) composed with the link's split rows in tables: files from a source folder to a
 # destination folder, in one canvas and across a link between two canvases. Run it with both plugins' paths.
 add_executable(file_link_test tests/file_link_test.cpp)
