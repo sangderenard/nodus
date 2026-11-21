@@ -1,21 +1,21 @@
+// edge_introspect: hears the meta edges of a channel group. Meta groups listen to their member edges once per scheduler
+// tick (include/table_abi.h "Meta edges listen to their member edges"); this row reads what they heard.
+//   execute_stack: pops the channel group (a number), then for each meta group of that channel pushes
+//                  <count> <v0> ... <v(count-1)>, the group's float snapshot (gp_table_meta_get_fifo_snapshot: the FIFO
+//                  header, then the members block). The contract is the one this row always had.
+//   render_table:  paints the groups of the channel last asked for (0 until a stack asks): per member edge its
+//                  occupancy, its throughput and its refusals, from the latest observation records.
+// Both read through nodus_headless's process-wide readers (include/nodus_meta_channel.h), so the same source works as a
+// plugin DLL and inside the image.
 #include "tool_api.h"
 #include "table_abi.h"
-#include "canvas_abi.h"
+#include "nodus_meta_channel.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
-#include <sstream>
-
-// Source string for later piecewise compiling/exporting
-static const char* kEdgeIntrospectToolSource = R"SRC(
-// Edge Introspection Tool (source)
-// This source is provided as a string for later piecewise compilation.
-// It inspects per-edge FIFO state and renders a multi-row report.
-
-// NOTE: This is a placeholder textual source; the compiled tool below
-// implements similar functionality in C++ directly linked into the
-// executable for convenience.
-
-)SRC";
 
 class EdgeIntrospectTool : public ITool {
 public:
@@ -24,107 +24,101 @@ public:
 
     const char* id_cstr() const noexcept override { return "edge_introspect"; }
     const char* name_cstr() const noexcept override { return "Edge Introspect"; }
-    // rely on base `id()`/`name()` which call `id_cstr()`/`name_cstr()`
     ToolCaps caps() const override { return ToolCaps::Table | ToolCaps::Text; }
 
-    void initialize(const ToolInitContext& ctx) override {
-        (void)ctx;
-    }
+    void initialize(const ToolInitContext& ctx) override { (void)ctx; }
     void shutdown() override {}
-
-    void tick(double dt, HostAPI& host) override {
-        (void)dt; (void)host;
-    }
-
-    void render(RenderContext& ctx) override {
-        // Not used; canvas will call render_table/render_text as appropriate.
-        (void)ctx;
-    }
-
-    void render_text(TextRenderArgs& args) override {
-        // Minimal: draw a static help string when the tool's text rendering is invoked.
-        if (!args.text) return;
-        // Use HostAPI::draw_text if available via a host, but here we just ignore.
-        (void)args;
-    }
+    void tick(double dt, HostAPI& host) override { (void)dt; (void)host; }
+    void render(RenderContext& ctx) override { (void)ctx; }
+    void render_text(TextRenderArgs& args) override { (void)args; }
 
     void render_table(TableRenderArgs& args) override {
-        if (!args.frame_buffer || args.rows <= 0 || args.cols <= 0) return;
+        if (!args.frame_buffer || args.cell_w < 1.0f || args.cell_h < 1.0f) return;
+        const int32_t channel = channel_;
+        std::vector<uint64_t> words(static_cast<size_t>(GP_META_RECORD_WORDS) * kMaxMembers);
+        const int32_t got = nodus::meta::channel_records(channel, words.data(), static_cast<int32_t>(words.size()));
+        const int32_t members = got / GP_META_RECORD_WORDS;
 
-        // Do NOT enumerate or read all edges by default. The intended
-        // workflow is that this tool will be configured to target a small
-        // list of meta-edges (the 'meta group') which are the only edges
-        // allowed to affix to ropes. Until such a configuration exists we
-        // render a helpful placeholder and avoid scanning the full edge
-        // list which can be large.
-        int32_t ccount = args.cols;
-        int32_t rcount = args.rows;
-        std::vector<GP_TableColumn> cols(static_cast<size_t>(ccount));
-        for (int32_t c = 0; c < ccount; ++c) {
-            cols[static_cast<size_t>(c)].kind = GP_TABLE_CELL_TEXT;
-            cols[static_cast<size_t>(c)].width_px = static_cast<int32_t>(std::max(4.0f, args.cell_w));
-            cols[static_cast<size_t>(c)].align = 0;
+        std::vector<GP_TableRow> rows(static_cast<size_t>(members) + 2);
+        std::memset(rows.data(), 0, rows.size() * sizeof(GP_TableRow));
+        auto text = [](GP_TableCell& c, const char* s) { c.kind = GP_TABLE_CELL_TEXT; std::snprintf(c.text, sizeof(c.text), "%s", s); };
+        {
+            GP_TableRow& h = rows[0]; h.kind = GP_TABLE_ROW_HEADER; h.expanded = 1; h.cell_count = 4;
+            char b[96];
+            std::snprintf(b, sizeof(b), "Edge Introspect  channel %d", channel);
+            text(h.cells[0], b);
+            std::snprintf(b, sizeof(b), "%d member edge(s)", members);
+            text(h.cells[1], b);
+            text(h.cells[2], "throughput");
+            text(h.cells[3], "refused");
+        }
+        if (members == 0) {
+            GP_TableRow& r = rows[1]; r.kind = GP_TABLE_ROW_NOTE; r.expanded = 1; r.cell_count = 1;
+            text(r.cells[0], "no meta group listens on this channel yet");
+        }
+        for (int32_t i = 0; i < members; ++i) {
+            const uint64_t* w = &words[static_cast<size_t>(i) * GP_META_RECORD_WORDS];
+            GP_TableRow& r = rows[static_cast<size_t>(i) + 1]; r.kind = GP_TABLE_ROW_DEVICE; r.expanded = 1; r.cell_count = 4;
+            char b[96];
+            if (w[GP_META_REC_EDGE_IDX] == ~0ull) std::snprintf(b, sizeof(b), "edge gone (rope %llu)", static_cast<unsigned long long>(w[GP_META_REC_ROPE_ID]));
+            else std::snprintf(b, sizeof(b), "edge %llu", static_cast<unsigned long long>(w[GP_META_REC_EDGE_IDX]));
+            text(r.cells[0], b);
+            std::snprintf(b, sizeof(b), "%llu/%llu%s", static_cast<unsigned long long>(w[GP_META_REC_OCCUPANCY]),
+                          static_cast<unsigned long long>(w[GP_META_REC_SLOTS]), (w[GP_META_REC_FLAGS] & GP_META_FLAG_FULL) ? " FULL" : "");
+            text(r.cells[1], b);
+            const double seconds = static_cast<double>(w[GP_META_REC_DT_NS]) * 1e-9;
+            const double per_s = seconds > 0.0 ? static_cast<double>(w[GP_META_REC_BYTES_DELTA]) / seconds : 0.0;
+            std::snprintf(b, sizeof(b), "%llu wr (+%llu)  %.0f B/s", static_cast<unsigned long long>(w[GP_META_REC_WRITE_SEQ]),
+                          static_cast<unsigned long long>(w[GP_META_REC_WRITE_DELTA]), per_s);
+            text(r.cells[2], b);
+            std::snprintf(b, sizeof(b), "%llu (+%llu)", static_cast<unsigned long long>(w[GP_META_REC_REFUSED_TOTAL]),
+                          static_cast<unsigned long long>(w[GP_META_REC_REFUSED_DELTA]));
+            text(r.cells[3], b);
         }
 
-        std::vector<GP_TableRow> rows(static_cast<size_t>(rcount));
-
-        // Render a small instruction until the tool is explicitly provided
-        // with a list of target meta-edges (via future UI/API). This avoids
-        // scanning or reading the full edge table.
-        if (rcount > 0) {
-            GP_TableRow h; memset(&h, 0, sizeof(h));
-            h.kind = GP_TABLE_ROW_HEADER; h.depth = 0; h.expanded = 1; h.cell_count = std::min(8, ccount);
-            std::snprintf(h.cells[0].text, sizeof(h.cells[0].text), "Edge Introspect (meta-group only)");
-            rows[0] = h;
-        }
-        if (rcount > 1) {
-            GP_TableRow pr; memset(&pr, 0, sizeof(pr));
-            pr.kind = GP_TABLE_ROW_DEVICE; pr.depth = 0; pr.expanded = 1; pr.cell_count = std::min(8, ccount);
-            pr.cells[0].kind = GP_TABLE_CELL_TEXT;
-            std::snprintf(pr.cells[0].text, sizeof(pr.cells[0].text), "No meta-edge group configured. Use the tool UI to bind a meta group.");
-            rows[1] = pr;
-        }
-
-        GP_TableStyle st{};
-        st.width_px = static_cast<int32_t>(std::max(1.0f, args.cell_w * args.cols));
-        st.row_h_px = static_cast<int32_t>(std::max(8.0f, args.cell_h));
-        st.name_w_px = 140;
-
+        const int32_t width = std::max<int32_t>(1, static_cast<int32_t>(args.cell_w));
+        const int32_t height = std::max<int32_t>(1, static_cast<int32_t>(args.cell_h));
+        std::vector<GP_TableColumn> cols(4);
+        for (auto& c : cols) { c.kind = GP_TABLE_CELL_TEXT; c.width_px = std::max<int32_t>(4, width / 4); c.align = 0; }
+        GP_TableStyle style{};
+        style.width_px = width;
+        style.row_h_px = std::max<int32_t>(8, std::min<int32_t>(height / static_cast<int32_t>(rows.size()), 14));
+        style.name_w_px = 0;
+        const uint8_t bg[4] = {18, 22, 28, 255}, hdr[4] = {40, 54, 74, 255}, ink[4] = {222, 228, 236, 255}, hink[4] = {255, 255, 255, 255};
+        std::memcpy(style.bg_rgba, bg, 4); std::memcpy(style.bg_sel_rgba, hdr, 4); std::memcpy(style.hdr_rgba, hdr, 4);
+        std::memcpy(style.text_rgba, ink, 4); std::memcpy(style.text_hdr_rgba, hink, 4);
         GP_TableGeom geom{};
-        uint8_t* out_rgba = reinterpret_cast<uint8_t*>(args.frame_buffer);
-        int32_t out_len = args.pitch * static_cast<int32_t>(std::max(1, static_cast<int>(args.rows)));
-        gp_table_raster_rgba(rows.data(), rcount, cols.data(), ccount, &st, out_rgba, out_len, &geom);
+        if (!gp_table_calc_size(&style, static_cast<int32_t>(rows.size()), 4, &geom) || geom.width_px < 1 || geom.height_px < 1) return;
+        std::vector<uint8_t> pixels(static_cast<size_t>(geom.width_px) * static_cast<size_t>(geom.height_px) * 4);
+        if (!gp_table_raster_rgba(rows.data(), static_cast<int32_t>(rows.size()), cols.data(), 4, &style, pixels.data(),
+                                  static_cast<int32_t>(pixels.size()), &geom)) return;
+        auto* out = static_cast<uint8_t*>(args.frame_buffer);
+        const int32_t copy_w = std::min(geom.width_px, width), copy_h = std::min(geom.height_px, height);
+        for (int32_t y = 0; y < copy_h; ++y)
+            std::memcpy(out + static_cast<size_t>(y) * static_cast<size_t>(args.pitch), pixels.data() + static_cast<size_t>(y) * static_cast<size_t>(geom.width_px) * 4,
+                        static_cast<size_t>(copy_w) * 4);
     }
 
     void execute_stack(ToolStackContext& ctx) override {
-        // Stack form: pop desired channel group (float -> int). For each
-        // meta-group on the container table whose `channel_group` equals
-        // the requested group, push a FIFO-metadata snapshot onto the
-        // tool stack as: <count> <v0> <v1> ... where <count> is the number
-        // of floats in the snapshot.
-        float chf = tool_stack_pop(ctx.stack);
-        int channel = static_cast<int>(chf);
-        GP_CanvasContext* cvs = gp_canvas_get_singleton();
-        if (!cvs) return;
-        GP_TableContext* tbl = gp_canvas_get_container_table(cvs);
-        if (!tbl) return;
-        int mgcount = gp_table_get_meta_group_count(tbl);
-        for (int mgi = 0; mgi < mgcount; ++mgi) {
-            GP_MetaGroup* mg = gp_table_get_meta_group(tbl, mgi);
-            if (!mg) continue;
-            int mg_ch = 0; gp_table_meta_get_channel_group(tbl, mg, &mg_ch);
-            if (mg_ch != channel) continue;
-            // snapshot
-            float buf[128]; int32_t wrote = gp_table_meta_get_fifo_snapshot(tbl, mg, buf, static_cast<int32_t>(sizeof(buf)/sizeof(buf[0])));
-            if (wrote <= 0) continue;
-            // push count then values (if room)
+        // Stack form: pop the desired channel group (float -> int). For each meta group whose channel group equals it,
+        // push the group's float snapshot as: <count> <v0> <v1> ... where <count> is the number of floats.
+        const float chf = tool_stack_pop(ctx.stack);
+        const int channel = static_cast<int>(chf);
+        channel_ = channel;
+        for (int32_t ordinal = 0;; ++ordinal) {
+            float buf[512];
+            const int32_t wrote = nodus::meta::channel_floats(channel, ordinal, buf, static_cast<int32_t>(sizeof(buf) / sizeof(buf[0])));
+            if (wrote <= 0) break;
             tool_stack_push(ctx.stack, static_cast<float>(wrote));
             for (int i = 0; i < wrote; ++i) tool_stack_push(ctx.stack, buf[i]);
         }
     }
+
+private:
+    static constexpr size_t kMaxMembers = 64;
+    int32_t channel_ = 0;   // the channel the last stack asked for; what the picture shows
 };
 
 extern "C" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new EdgeIntrospectTool(); }
 extern "C" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* tool) { delete tool; }
 extern "C" NODUS_PLUGIN_EXPORT const char* NODUS_PLUGIN_SOURCE_NAME() { return __FILE__; }
-

@@ -1062,6 +1062,18 @@ if(WIN32)
 endif()
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
+
+# Meta edges listen: a meta group over an edge is fed by the real scheduler, saved and loaded, and heard by edge_introspect.
+add_executable(meta_edge_headless_test tests/meta_edge_headless_test.cpp)
+target_include_directories(meta_edge_headless_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(meta_edge_headless_test PRIVATE nodus_headless canvas_tables)
+if(WIN32)
+  target_link_libraries(meta_edge_headless_test PRIVATE ${NODUS_LINK_LIBS})
+endif()
+target_compile_features(meta_edge_headless_test PUBLIC cxx_std_20)
+target_compile_definitions(meta_edge_headless_test PRIVATE NOMINMAX)
+add_test(NAME meta_edge_headless_test COMMAND meta_edge_headless_test)
+set_tests_properties(meta_edge_headless_test PROPERTIES TIMEOUT 60)
 set_tests_properties(nodus_headless_runtime_test PROPERTIES TIMEOUT 30)
 
 # Python smoke test: exercises nodus_headless via the ctypes bridge

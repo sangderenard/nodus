@@ -688,6 +688,9 @@ void ThreadManager::run_loop() {
         TickRequest scheduled = req;
         for (auto& mod : scheduled.modules) if (mod.exec_mode == ExecMode::Free) mod.module_skip = 1;
         run_scheduled_tick(scheduled, preserve_free);
+        // Meta edges listen to their members: one observation record per member edge per tick, taken here on the
+        // manager thread after the tick's rows ran. One branch when the root table has no meta groups.
+        if (req.root_table) gp_table_meta_feed_tick(req.root_table, req.tick_id);
         if (!preserve_free) start_free_workers(req);
 
         {

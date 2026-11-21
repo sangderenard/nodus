@@ -20,6 +20,13 @@ add_executable(link_metrics_test link_metrics_test.cpp "${NODUS_ROOT}/src/nodus_
 target_include_directories(link_metrics_test PRIVATE "${NODUS_ROOT}" "${NODUS_ROOT}/include")
 target_link_libraries(link_metrics_test PRIVATE "${NODUS_TENSOR_CORE_DIR}/nodus_tensor_core.lib" "${NODUS_TENSOR_CORE_DIR}/canvas_tables.lib" ws2_32 bcrypt winhttp crypt32)
 target_compile_definitions(link_metrics_test PRIVATE NOMINMAX)
+# The channel-group columns read the meta edges of a real headless canvas: give NODUS_HEADLESS_DIR the folder of a Nodus
+# build that holds nodus_headless.lib (and, on PATH at run time, nodus_headless.dll) to include that part of the test.
+set(NODUS_HEADLESS_DIR "" CACHE PATH "Optional: folder that holds nodus_headless.lib; adds the channel-group test")
+if(EXISTS "${NODUS_HEADLESS_DIR}/nodus_headless.lib")
+  target_link_libraries(link_metrics_test PRIVATE "${NODUS_HEADLESS_DIR}/nodus_headless.lib")
+  target_compile_definitions(link_metrics_test PRIVATE LINK_METRICS_TEST_HEADLESS)
+endif()
 if(MSVC)
   target_compile_options(link_metrics_test PRIVATE /W4)
 endif()

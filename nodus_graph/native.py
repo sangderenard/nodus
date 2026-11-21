@@ -1442,6 +1442,109 @@ class Graph:
                 int(role), bytes(link_id), int(expires_at), bytes(key), int(account), int(timeout_ms), int(maximum_bulk_bytes)):
             raise RuntimeError(f"native UDP link registration refused: {tool_id}")
 
+    # ---- Meta edges: listening groups over edges (include/nodus_headless_abi.h "Meta edges") -------------------------
+    # A meta group is made over edges with a channel group. Every scheduler tick it appends one observation record per
+    # member edge to its own FIFO; it observes and never changes a member. Groups are saved and loaded with the graph.
+    META_RECORD_WORDS = 16
+    META_SNAPSHOT_HEADER_WORDS = 8
+    _META_RECORD_FIELDS = ("tick", "time_ns", "dt_ns", "ordinal", "edge_idx", "rope_id", "write_seq", "write_delta",
+                           "read_seq", "read_delta", "occupancy", "slots", "refused_total", "refused_delta", "bytes_delta", "flags")
+
+    def _meta_lib(self):
+        lib = self.lib
+        if getattr(lib, "_meta_abi_declared", False):
+            return lib
+        if not hasattr(lib, "nodus_headless_meta_create"):
+            raise RuntimeError("this nodus_headless library has no meta edges (nodus_headless_meta_create)")
+        u64, i32, vp = ctypes.c_uint64, ctypes.c_int32, ctypes.c_void_p
+        lib.nodus_headless_meta_create.restype = u64
+        lib.nodus_headless_meta_create.argtypes = (vp, ctypes.POINTER(i32), i32, i32)
+        lib.nodus_headless_meta_count.restype = i32
+        lib.nodus_headless_meta_count.argtypes = (vp,)
+        lib.nodus_headless_meta_id_at.restype = u64
+        lib.nodus_headless_meta_id_at.argtypes = (vp, i32)
+        lib.nodus_headless_meta_set_channel_group.restype = i32
+        lib.nodus_headless_meta_set_channel_group.argtypes = (vp, u64, i32)
+        lib.nodus_headless_meta_get_channel_group.restype = i32
+        lib.nodus_headless_meta_get_channel_group.argtypes = (vp, u64, ctypes.POINTER(i32))
+        lib.nodus_headless_meta_destroy.restype = i32
+        lib.nodus_headless_meta_destroy.argtypes = (vp, u64)
+        lib.nodus_headless_meta_member_count.restype = i32
+        lib.nodus_headless_meta_member_count.argtypes = (vp, u64)
+        lib.nodus_headless_meta_member.restype = i32
+        lib.nodus_headless_meta_member.argtypes = (vp, u64, i32, ctypes.POINTER(i32), ctypes.POINTER(i32), ctypes.POINTER(u64))
+        lib.nodus_headless_meta_snapshot.restype = i32
+        lib.nodus_headless_meta_snapshot.argtypes = (vp, u64, ctypes.POINTER(u64), i32)
+        lib.nodus_headless_meta_read_records.restype = i32
+        lib.nodus_headless_meta_read_records.argtypes = (vp, u64, u64, ctypes.POINTER(u64), i32, ctypes.POINTER(u64))
+        lib._meta_abi_declared = True
+        return lib
+
+    def meta_create(self, edges, channel_group: int = 0) -> int:
+        """A meta group over `edges` (Edge objects or canvas edge indices); returns its id (stable, non-zero)."""
+        lib = self._meta_lib()
+        indices = [int(e.native_index) if hasattr(e, "native_index") else int(e) for e in edges]
+        if not indices:
+            raise ValueError("a meta group needs at least one edge")
+        array = (ctypes.c_int32 * len(indices))(*indices)
+        group = int(lib.nodus_headless_meta_create(self._handle, array, len(indices), int(channel_group)))
+        if not group:
+            raise RuntimeError(f"native meta group refused over edges {indices}")
+        return group
+
+    def meta_group_ids(self) -> list:
+        lib = self._meta_lib()
+        return [int(lib.nodus_headless_meta_id_at(self._handle, i)) for i in range(int(lib.nodus_headless_meta_count(self._handle)))]
+
+    def meta_set_channel_group(self, group_id: int, channel_group: int) -> None:
+        if not self._meta_lib().nodus_headless_meta_set_channel_group(self._handle, int(group_id), int(channel_group)):
+            raise RuntimeError(f"no meta group {group_id}")
+
+    def meta_destroy(self, group_id: int) -> None:
+        if not self._meta_lib().nodus_headless_meta_destroy(self._handle, int(group_id)):
+            raise RuntimeError(f"no meta group {group_id}")
+
+    def meta_group(self, group_id: int) -> Optional[dict]:
+        """{"id", "channel_group", "vertices", "records", "feed_refused", "slots", "members": [record dict ...]} or None.
+
+        Each member is its latest observation record (META record fields: tick, time_ns, dt_ns, ordinal, edge_idx,
+        rope_id, write_seq, write_delta, read_seq, read_delta, occupancy, slots, refused_total, refused_delta,
+        bytes_delta, flags); flags bits 0..7 are 1 full, 2 configured, 4 has readers, 8 edge lost; bits 8.. count drops."""
+        lib = self._meta_lib()
+        count = int(lib.nodus_headless_meta_member_count(self._handle, int(group_id)))
+        capacity = self.META_SNAPSHOT_HEADER_WORDS + max(count, 1) * self.META_RECORD_WORDS
+        out = (ctypes.c_uint64 * capacity)()
+        if not lib.nodus_headless_meta_snapshot(self._handle, int(group_id), out, capacity):
+            return None
+        signed_channel = out[1] - (1 << 64) if out[1] >= (1 << 63) else out[1]
+        members = []
+        for m in range(int(out[3])):
+            base = self.META_SNAPSHOT_HEADER_WORDS + m * self.META_RECORD_WORDS
+            record = {name: int(out[base + i]) for i, name in enumerate(self._META_RECORD_FIELDS)}
+            canvas, table, rope = ctypes.c_int32(-1), ctypes.c_int32(-1), ctypes.c_uint64(0)
+            if lib.nodus_headless_meta_member(self._handle, int(group_id), m, ctypes.byref(canvas), ctypes.byref(table), ctypes.byref(rope)):
+                record["canvas_edge_idx"] = canvas.value
+            members.append(record)
+        return {"id": int(out[0]), "channel_group": int(signed_channel), "vertices": int(out[2]), "records": int(out[4]),
+                "feed_refused": int(out[5]), "slots": int(out[6]), "members": members}
+
+    def meta_records(self, group_id: int, from_seq: int = 0, limit: int = 64) -> tuple:
+        """(records, next_seq): the observation records still in the group FIFO from `from_seq`, oldest first."""
+        lib = self._meta_lib()
+        out = (ctypes.c_uint64 * (self.META_RECORD_WORDS * max(1, limit)))()
+        nxt = ctypes.c_uint64(0)
+        n = int(lib.nodus_headless_meta_read_records(self._handle, int(group_id), int(from_seq), out, int(limit), ctypes.byref(nxt)))
+        records = [{name: int(out[r * self.META_RECORD_WORDS + i]) for i, name in enumerate(self._META_RECORD_FIELDS)} for r in range(n)]
+        return records, int(nxt.value)
+
+    def set_link_metrics_channel(self, tool_id: str, channel_group: int) -> None:
+        """The meta channel the next "<tool_id>.metrics" row of that link starts with (0 = none)."""
+        lib = self._link_lib()
+        lib.nodus_headless_set_link_metrics_channel.restype = ctypes.c_int32
+        lib.nodus_headless_set_link_metrics_channel.argtypes = (ctypes.c_char_p, ctypes.c_int32)
+        if not lib.nodus_headless_set_link_metrics_channel(tool_id.encode("utf-8"), int(channel_group)):
+            raise RuntimeError(f"no registered link {tool_id}")
+
     def link_report(self, tool_id: str) -> Optional[dict]:
         """{"state": waiting|linked|closed|failed, counters...} of a registered link endpoint, or None."""
         lib = self._link_lib()

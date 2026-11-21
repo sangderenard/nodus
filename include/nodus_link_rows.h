@@ -111,6 +111,10 @@ bool register_link_host(ToolRegistry& registry, LinkHostConfig config, uint16_t*
 bool register_link_dialer(ToolRegistry& registry, LinkDialConfig config, std::string* error = nullptr);
 // State and counters of a registered endpoint (by the id given at registration).
 bool link_endpoint_report(const std::string& id, EndpointReport* out);
+// The meta-edge channel group the NEXT "<id>.metrics" row created for this link starts with (0 = none, the default):
+// the row then appends the meta-edge observations of that channel to its samples (module_library/source/tools/link_metrics.cpp).
+// A row already created keeps its own (saved state); a canvas-loaded copy takes it from its saved state.
+void set_link_metrics_channel(const std::string& id, int32_t channel);
 // Forget the endpoint and unregister both rows; live rows keep their endpoint until they are destroyed.
 void unregister_link(ToolRegistry& registry, const std::string& id);
 

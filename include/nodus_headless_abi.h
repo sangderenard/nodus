@@ -159,6 +159,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_register_link_wss_dialer(
 // control_sent, control_received, bulk_bytes_sent, bulk_bytes_received, bulk_tensors_sent, bulk_tensors_received,
 // control_refused, bulk_refused, bulk_dropped, peers_refused, control_read_stalls, bulk_read_stalls,
 // protocol_violations, refused_full (control + bulk). 1 when the endpoint is registered.
+// The meta-edge channel group the next "<tool_id>.metrics" row of that link starts with (0 = none); see nodus_link_rows.h.
+NODUS_HEADLESS_API int32_t nodus_headless_set_link_metrics_channel(const char* tool_id, int32_t channel);
 NODUS_HEADLESS_API int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
     NodusHeadlessGraph* g, int32_t module_idx,
@@ -258,6 +260,33 @@ NODUS_HEADLESS_API int32_t nodus_headless_publish_edge_token(
 NODUS_HEADLESS_API int32_t nodus_headless_consume_edge_token(
     NodusHeadlessGraph* g, int32_t edge_idx, void* bytes, size_t capacity,
     size_t* written);
+// ---- Meta edges: listening groups over edges (table_abi.h "Meta edges listen to their member edges") --------------
+// A meta group is made over canvas edges (the indices nodus_headless_add_edge returns) with a channel group. Every
+// scheduler tick it appends one fixed-size observation record per member edge to its own FIFO (GP_MetaRecordWord); it
+// observes, never copies tokens, never changes a member. Groups live in the table blob, so nodus_headless_save_file and
+// nodus_headless_load_file carry them (ids, members, channel group); live observations are not saved. Group ids are
+// stable and non-zero. Call these between steps, as nodus_headless_publish_edge_token.
+NODUS_HEADLESS_API uint64_t nodus_headless_meta_create(NodusHeadlessGraph* g, const int32_t* canvas_edge_idx, int32_t count, int32_t channel_group);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API uint64_t nodus_headless_meta_id_at(NodusHeadlessGraph* g, int32_t ordinal);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_set_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t channel_group);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_get_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t* out_channel_group);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_destroy(NodusHeadlessGraph* g, uint64_t group_id);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_member_count(NodusHeadlessGraph* g, uint64_t group_id);
+// Member `ordinal`: its canvas edge index (-1 when it is not a canvas edge of this graph), table edge index (-1 when gone), rope id.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_member(NodusHeadlessGraph* g, uint64_t group_id, int32_t ordinal,
+    int32_t* out_canvas_edge_idx, int32_t* out_table_edge_idx, uint64_t* out_rope_id);
+// The group snapshot as uint64 words: GP_META_SNAPSHOT_HEADER_WORDS then a GP_META_RECORD_WORDS record per member.
+// Returns words written, 0 on error.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_snapshot(NodusHeadlessGraph* g, uint64_t group_id, uint64_t* out_words, int32_t capacity_words);
+// Records still in the group FIFO with sequence >= from_seq, oldest first; *out_write_seq is the next sequence.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint64_t group_id, uint64_t from_seq,
+    uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq);
+// Process-wide readers for rows (a row has no graph handle; they read the canvas of this process): the latest record of
+// every member of every group whose channel group is `channel`, groups then members in order. Returns words written.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words);
+// The edge_introspect float snapshot (gp_table_meta_get_fifo_snapshot) of the `ordinal`-th group of `channel`; 0 when none.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_channel_floats(int32_t channel, int32_t ordinal, float* out, int32_t capacity);
 NODUS_HEADLESS_API int32_t nodus_headless_get_edge_unread(
     NodusHeadlessGraph* g, int32_t canvas_edge_idx, int32_t* out_unread);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_uuid(

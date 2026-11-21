@@ -5,6 +5,9 @@
 // [N, 18], the newest sample is the last row, control_sent / control_received grew as packets were sent, the stack is
 // left as found, the link is only read, and render_table paints.
 #include "nodus_link_rows.h"
+#if defined(LINK_METRICS_TEST_HEADLESS)
+#include "nodus_headless_abi.h"
+#endif
 #include "common/tensors/abstraction/tensor_abi.h"
 
 #include <chrono>
@@ -60,15 +63,15 @@ static uint64_t packet_tensor(uint32_t seq) {
     uint64_t t = nodus_tensor_create(NODUS_DTYPE_U8, 1, shape); nodus_tensor_write(t, 0, b, sizeof(b)); return t;
 }
 // The newest published matrix: drains the edge, keeps the last, checks the shape; false when none arrived.
-static bool newest_matrix(Edge& edge, uint64_t window, std::vector<double>& out) {   // false: nothing new; `out` keeps the older one
+static bool newest_matrix(Edge& edge, uint64_t window, std::vector<double>& out, uint64_t columns = 18) {   // false: nothing new; `out` keeps the older one
     uint64_t last = 0;
     while (!edge.tokens.empty()) { if (last) nodus_tensor_destroy(last); last = edge.tokens.front(); edge.tokens.pop_front(); }
     if (!last) return false;
     NodusTensorDesc d{};
-    bool ok = nodus_tensor_describe(last, &d) == NODUS_OK && d.dtype == NODUS_DTYPE_F64 && d.rank == 2 && d.shape[0] == window && d.shape[1] == 18
-              && d.total_bytes == window * 18 * sizeof(double);
-    CHECK(ok, "published tensor is float64 [%llu,18]", (unsigned long long)window);
-    if (ok) { out.resize(size_t(window) * 18); ok = nodus_tensor_read(last, 0, out.data(), d.total_bytes) == int64_t(d.total_bytes); }
+    bool ok = nodus_tensor_describe(last, &d) == NODUS_OK && d.dtype == NODUS_DTYPE_F64 && d.rank == 2 && d.shape[0] == window && d.shape[1] == columns
+              && d.total_bytes == window * columns * sizeof(double);
+    CHECK(ok, "published tensor is float64 [%llu,%llu]", (unsigned long long)window, (unsigned long long)columns);
+    if (ok) { out.resize(size_t(window) * size_t(columns)); ok = nodus_tensor_read(last, 0, out.data(), d.total_bytes) == int64_t(d.total_bytes); }
     nodus_tensor_destroy(last);
     return ok;
 }
@@ -178,6 +181,66 @@ int main() {
     }
     std::printf("dialer last row: state %.0f control_sent %.0f; host last row: control_received %.0f\n",
                 dm.size() == N * 18 ? dm[(N - 1) * 18] : -1.0, dm.size() == N * 18 ? dm[(N - 1) * 18 + 3] : -1.0, hm.size() == N * 18 ? hm[(N - 1) * 18 + 4] : -1.0);
+
+#if defined(LINK_METRICS_TEST_HEADLESS)
+    // Channel group: the same row, given a meta channel, appends what the meta edges of that channel heard (columns 18..25).
+    // A real headless canvas (nodus_headless.dll) holds two tables and an edge carrying tokens, a meta group on channel 7 over
+    // it, and is stepped by the real scheduler; the row reads it through nodus_headless's process-wide reader.
+    {
+        constexpr int32_t kChannel = 7;
+        NodusHeadlessGraph* graph = nodus_headless_create();
+        CHECK(graph, "a headless canvas");
+        if (graph) {
+            GP_CanvasModuleDesc ma{}, mb{}; ma.w = ma.h = mb.w = mb.h = 64; mb.x = 100;
+            std::strncpy(ma.label, "alloc", sizeof(ma.label) - 1); std::strncpy(mb.label, "tool", sizeof(mb.label) - 1);
+            const int32_t a = nodus_headless_add_module(graph, &ma), b = nodus_headless_add_module(graph, &mb);
+            const int32_t ra = nodus_headless_bind_builtin_tool(graph, a, 12), rb = nodus_headless_bind_builtin_tool(graph, b, 13);
+            GP_CanvasEdgeDesc e{}; e.a_module = a; e.a_contact_idx = ra; e.b_module = b; e.b_contact_idx = rb;
+            const int32_t edge_idx = nodus_headless_add_edge(graph, &e, 0);
+            NodusHeadlessFifoConfig fc{}; fc.token_bytes = 16; fc.slots = 4; fc.top_k = 0; fc.type_id = 0x4D455441; fc.layout = 2; fc.dtype = 8;
+            CHECK(edge_idx >= 0 && nodus_headless_configure_edge_fifo(graph, edge_idx, &fc), "the member edge");
+            const uint64_t group = nodus_headless_meta_create(graph, &edge_idx, 1, kChannel);
+            CHECK(group != 0, "a meta group on channel %d", kChannel);
+            uint8_t token[16] = {9};
+            for (int i = 0; i < 6; ++i) { NodusHeadlessPublishResult pr{}; nodus_headless_publish_edge_token(graph, edge_idx, token, sizeof(token), &pr); }
+            CHECK(nodus_headless_step(graph, 1.0 / 60.0) && nodus_headless_step(graph, 1.0 / 60.0), "two scheduler ticks");
+
+            set_link_metrics_channel("proof.metrics.dialer", kChannel);   // the next dialer.metrics row starts on the channel
+            Row cm = reg.create("proof.metrics.dialer.metrics"), plain = reg.create("proof.metrics.host.metrics");
+            CHECK(cm && plain, "rows");
+            Frame fcm, fpl; Edge cedge, pedge; ToolRowPortAccess cport = cedge.access(), pport = pedge.access();
+            uint64_t o;
+            for (int i = 0; i < 3; ++i) {
+                o = visit(*cm, fcm, 0, nullptr, nullptr, &cport); if (o) nodus_tensor_destroy(o);
+                o = visit(*plain, fpl, 0, nullptr, nullptr, &pport); if (o) nodus_tensor_destroy(o);
+                std::vector<double> sink; if (i < 2) { newest_matrix(cedge, N, sink, 26); newest_matrix(pedge, N, sink, 18); }
+            }
+            std::vector<double> m26, m18;
+            CHECK(newest_matrix(cedge, N, m26, 26), "a channel row publishes [64,26]");
+            CHECK(newest_matrix(pedge, N, m18, 18), "a row with no channel still publishes [64,18]");
+            if (m26.size() == N * 26) {
+                const double* last = &m26[(N - 1) * 26];
+                CHECK(last[3] >= kPackets, "link columns intact: control_sent %.0f", last[3]);
+                CHECK(last[18] == 1.0, "meta_members %.0f", last[18]);
+                CHECK(last[19] >= 4.0, "meta_write_seq %.0f (the edge took four of six tokens)", last[19]);
+                CHECK(last[23] == 4.0 && last[22] <= 4.0, "meta_slots %.0f occupancy %.0f", last[23], last[22]);
+                std::printf("meta columns: members %.0f write_seq %.0f write_delta %.0f read_delta %.0f occupancy %.0f/%.0f refused_delta %.0f bytes_delta %.0f\n",
+                            last[18], last[19], last[20], last[21], last[22], last[23], last[24], last[25]);
+            }
+            // The channel travels in saved state: a bound row's state loads into the generic row with 26 columns.
+            {
+                std::string path = "link_metrics_test.state26.bin";
+                { FileOutputArchive out(path.c_str()); CHECK(out.ok() && cm->serialize(out), "serialize with a channel"); }
+                Row gen = reg.create("nodus.link.metrics"); Frame fg; Edge gedge2; ToolRowPortAccess gp2 = gedge2.access();
+                { FileInputArchive in(path.c_str()); CHECK(in.ok() && gen->deserialize(in), "deserialize the channel"); }
+                std::remove(path.c_str());
+                o = visit(*gen, fg, 0, nullptr, nullptr, &gp2); if (o) nodus_tensor_destroy(o);
+                std::vector<double> mg; CHECK(newest_matrix(gedge2, N, mg, 26), "a loaded row keeps its channel (26 columns)");
+            }
+            nodus_headless_destroy(graph);
+        }
+    }
+#endif
 
     hcon.reset(); dcon.reset(); hmet.reset(); dmet.reset(); generic.reset();
     unregister_link(reg, "proof.metrics.host"); unregister_link(reg, "proof.metrics.dialer");

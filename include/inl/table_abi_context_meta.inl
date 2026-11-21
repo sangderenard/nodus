@@ -243,6 +243,25 @@ struct GP_MetaGroup {
     float dangling_hang_len = 0.0f;
     // ring topology mode: 0=ribbon (chain), 1=closed loop, 2=dense cross-links
     int ring_mode = 0;
+
+    // ---- Meta edge as a listener (include/inl/table_abi_meta_feed.inl) ----------------------------------------------
+    // The group FIFO receives, once per scheduler tick, one fixed-size record per member edge (kMetaRecordWords uint64
+    // words, layout in table_abi.h). The records are observations of the member edges' FIFOs: they are never copies of
+    // the member data and nothing here writes to a member edge. `members` are the distinct ropes of `vertices`, resolved
+    // to table edges by persistent rope id; `latest` is each member's most recent record.
+    struct MetaMember {
+        uint64_t rope_id = 0ull;
+        int32_t edge_idx = -1;
+        bool primed = false;
+        uint64_t last_write_seq = 0, last_read_seq = 0, last_refused = 0, last_dropped = 0;
+        bool has_latest = false;
+        uint64_t latest[16] = {};
+    };
+    std::mutex feed_mu;                 // guards members and the feed counters below (the FIFO itself is atomic)
+    std::vector<MetaMember> members;
+    size_t members_built_for = static_cast<size_t>(-1);   // vertices.size() when `members` was last derived
+    uint64_t feed_last_ns = 0;          // steady-clock ns of the previous feed of this group
+    uint64_t feed_refused = 0;          // records the group FIFO refused (it never blocks the feed or a member edge)
 };
 
 // Thin adaptor type used to store meta-groups in the context vector.
@@ -837,6 +856,22 @@ extern "C" int32_t gp_table_meta_get_fifo_snapshot(GP_TableContext* ctx, GP_Meta
     pushf(static_cast<float>(static_cast<int>(ef.shape.size())));
     for (size_t i = 0; i < ef.shape.size(); ++i) {
         pushf(static_cast<float>(ef.shape[i]));
+    }
+    // members block (table_abi.h): what the group listens to, 64-bit sequences as hi/lo floats
+    {
+        std::lock_guard<std::mutex> lk(mg->feed_mu);
+        const uint64_t records = ef.impl ? ef.impl->write_seq.load(std::memory_order_relaxed) : 0ull;
+        pushf(static_cast<float>(mg->members.size()));
+        pushf(static_cast<float>(static_cast<uint32_t>(records >> 32)));
+        pushf(static_cast<float>(static_cast<uint32_t>(records & 0xFFFFFFFFu)));
+        for (const auto& m : mg->members) {
+            if (pos + 9 > out_len) break;
+            const uint64_t* r = m.latest;
+            pushf(static_cast<float>(m.edge_idx));
+            pushf(static_cast<float>(r[10])); pushf(static_cast<float>(r[11]));
+            pushf(static_cast<float>(static_cast<uint32_t>(r[6] >> 32))); pushf(static_cast<float>(static_cast<uint32_t>(r[6] & 0xFFFFFFFFu)));
+            pushf(static_cast<float>(r[7])); pushf(static_cast<float>(r[9])); pushf(static_cast<float>(r[13])); pushf(static_cast<float>(r[14]));
+        }
     }
     return pos;
 }

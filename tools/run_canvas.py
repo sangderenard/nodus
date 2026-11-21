@@ -32,7 +32,16 @@ started:
         Input row through the declared port <id>.send; the bulk row sends it over the link
   {"op": "link_report", "id"}                                the endpoint's state and counters
 link_host and link_dial put the rows <id>.control and <id>.bulk on the canvas table "link <id>" (made once, kept with
-the canvas), so the canvas polls the link every step.
+the canvas), so the canvas polls the link every step. Any of link_host / link_dial / link_udp may add "metrics": true (and
+"metrics_channel": <meta channel group>) to put the row <id>.metrics on that table as well: it publishes the link's
+counters (and, with a channel, the traffic of the meta edges on that channel) as a float64 matrix on its row port "metrics".
+
+Meta edges listen to their member edges (nodus_headless_abi.h "Meta edges"): every scheduler tick a meta group records
+what its member edges are doing (occupancy, sequences, refusals). Edges are named by canvas edge index or by
+"<from module label> > <to module label>":
+  {"op": "meta_group", "edges": [<edge>, ...], "channel_group": <int>}   make a group; replies "meta": {"id": ...}
+  {"op": "meta_report"[, "id"]}                                          the groups (or one group) with each member's latest record
+  {"op": "meta_destroy", "id"}                                           remove a group
 """
 
 from __future__ import annotations
@@ -58,7 +67,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from nodus_graph import Graph  # noqa: E402
-from nodus_graph.native import CanvasModuleDesc, _NativeFifoConfig, _NativeRow  # noqa: E402
+from nodus_graph.native import CanvasEdgeDesc, CanvasModuleDesc, _NativeFifoConfig, _NativeRow  # noqa: E402
 from nodus_graph import console_views  # noqa: E402
 
 _stop = False
@@ -188,6 +197,11 @@ class ConsoleServer:
             handled, report = self._apply_link(graph, request)
             if op == "link_report":
                 return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "link": report}
+        elif op in ("meta_group", "meta_report", "meta_destroy"):
+            meta = self._apply_meta(graph, request)
+            if op == "meta_report":
+                return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "meta": meta}
+            handled = True
         else:
             raise ValueError("unknown canvas UI action")
         previous_revision = self._revision
@@ -198,8 +212,59 @@ class ConsoleServer:
             self._snap = snap
             self._generation += 1
             self._cond.notify_all()
-        return {"handled": bool(handled), "revision": self._revision,
-                "canvas": self._canvas_name}
+        reply = {"handled": bool(handled), "revision": self._revision, "canvas": self._canvas_name}
+        if op in ("meta_group", "meta_destroy"):
+            reply["meta"] = meta
+        return reply
+
+    @staticmethod
+    def _module_label(graph, index: int) -> str:
+        desc = CanvasModuleDesc()
+        if not graph.lib.nodus_headless_get_module_desc(graph._handle, index, ctypes.byref(desc)):
+            return ""
+        return bytes(desc.label).split(b"\0", 1)[0].decode("utf-8", "replace")
+
+    def _canvas_edge(self, graph, name) -> int:
+        """A canvas edge index from an index or "<from module label> > <to module label>"."""
+        lib = graph.lib
+        count = int(lib.nodus_headless_get_edge_count(graph._handle))
+        if type(name) is int:
+            if not 0 <= name < count:
+                raise ValueError(f"no canvas edge {name}")
+            return name
+        if not isinstance(name, str) or ">" not in name:
+            raise ValueError("an edge is a canvas edge index or '<from module label> > <to module label>'")
+        source, target = (part.strip() for part in name.split(">", 1))
+        found = []
+        for index in range(count):
+            desc, type_id = CanvasEdgeDesc(), ctypes.c_int32()
+            if lib.nodus_headless_get_edge(graph._handle, index, ctypes.byref(desc), ctypes.byref(type_id)) \
+                    and self._module_label(graph, desc.a_module) == source and self._module_label(graph, desc.b_module) == target:
+                found.append(index)
+        if len(found) != 1:
+            raise ValueError(f"edge '{name}' names {len(found)} canvas edges")
+        return found[0]
+
+    def _apply_meta(self, graph, request: dict):
+        """Make, report or remove a meta group (listening edges); returns the reply's "meta" value."""
+        op = request["op"]
+        if op == "meta_group":
+            if set(request) != {"op", "expected_revision", "edges", "channel_group"}:
+                raise ValueError("meta_group takes op, expected_revision, edges, channel_group")
+            edges, channel = request["edges"], request["channel_group"]
+            if not isinstance(edges, list) or not 0 < len(edges) <= 64 or type(channel) is not int or not 0 <= channel <= 0x7FFFFFFF:
+                raise ValueError("meta_group: 1-64 edges and a channel group 0..2147483647")
+            group = graph.meta_create([self._canvas_edge(graph, e) for e in edges], channel)
+            return {"id": group, "group": graph.meta_group(group)}
+        if op == "meta_destroy":
+            if set(request) != {"op", "expected_revision", "id"} or type(request["id"]) is not int:
+                raise ValueError("meta_destroy takes op, expected_revision, id")
+            graph.meta_destroy(request["id"])
+            return {"id": request["id"], "destroyed": True}
+        if not set(request) <= {"op", "expected_revision", "id"}:
+            raise ValueError("meta_report takes op, expected_revision[, id]")
+        ids = [request["id"]] if "id" in request else graph.meta_group_ids()
+        return [group for group in (graph.meta_group(i) for i in ids) if group is not None]
 
     _LINK_NAME = re.compile(r"^[A-Za-z0-9._-]{1,60}$")
 
@@ -235,9 +300,9 @@ class ConsoleServer:
             return True, {"handle": handle, "bytes": size}
         if op == "link_udp":
             keys = {"op", "expected_revision", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"}
-            if not set(request) >= keys or not set(request) <= keys | {"account"}:
+            if not set(request) >= keys or not set(request) <= keys | {"account", "metrics", "metrics_channel"}:
                 raise ValueError("link_udp takes op, expected_revision, id, broker_host, broker_port, prefix, role, link_id, key, "
-                                 "expires_at[, account]")
+                                 "expires_at[, account, metrics, metrics_channel]")
             prefix, port, role = request["prefix"], request["broker_port"], request["role"]
             if not isinstance(prefix, str) or not self._LINK_NAME.match(prefix) or type(port) is not int or not 0 < port < 65536 \
                     or role not in (1, 2) or type(request["expires_at"]) is not int or not isinstance(request["broker_host"], str):
@@ -249,7 +314,7 @@ class ConsoleServer:
             graph.register_link_udp_dialer(link_id=link_id, key=key, tool_id=link_id_name, broker_host=request["broker_host"],
                                            broker_port=port, prefix=prefix, role=role, expires_at=request["expires_at"],
                                            account=int(request.get("account") or 0))
-            self._bind_link_table(graph, link_id_name)
+            self._bind_link_table(graph, link_id_name, **self._metrics_options(graph, link_id_name, request))
             return True, None
         prefix, port = request.get("prefix"), request.get("port")
         if not isinstance(prefix, str) or not self._LINK_NAME.match(prefix):
@@ -257,17 +322,18 @@ class ConsoleServer:
         if type(port) is not int or not 0 < port < 65536:
             raise ValueError("link port is 1-65535")
         if op == "link_host":
-            if set(request) != {"op", "expected_revision", "id", "prefix", "port", "key_file"}:
-                raise ValueError("link_host takes op, expected_revision, id, prefix, port, key_file")
+            if not {"op", "expected_revision", "id", "prefix", "port", "key_file"} <= set(request) <= {
+                    "op", "expected_revision", "id", "prefix", "port", "key_file", "metrics", "metrics_channel"}:
+                raise ValueError("link_host takes op, expected_revision, id, prefix, port, key_file[, metrics, metrics_channel]")
             with open(str(request["key_file"]), "rb") as handle:
                 key = handle.read()
             graph.register_link_host(link_id, prefix, key, port)
         else:
             if not set(request) >= {"op", "expected_revision", "id", "host", "port", "prefix", "control_ticket", "bulk_ticket"} \
                     or not set(request) <= {"op", "expected_revision", "id", "host", "port", "prefix", "control_ticket",
-                                            "bulk_ticket", "secure", "pin"}:
+                                            "bulk_ticket", "secure", "pin", "metrics", "metrics_channel"}:
                 raise ValueError("link_dial takes op, expected_revision, id, host, port, prefix, control_ticket, "
-                                 "bulk_ticket[, secure, pin]")
+                                 "bulk_ticket[, secure, pin, metrics, metrics_channel]")
             host = request["host"]
             if not isinstance(host, str) or not 0 < len(host) <= 253:
                 raise ValueError("link host is a name or an address")
@@ -281,8 +347,20 @@ class ConsoleServer:
             if type(secure) is not bool:
                 raise ValueError("secure is true or false")
             graph.register_link_wss_dialer(link_id, host, port, prefix, control, bulk, secure=secure, pin_sha256=pin)
-        self._bind_link_table(graph, link_id)
+        self._bind_link_table(graph, link_id, **self._metrics_options(graph, link_id, request))
         return True, None
+
+    @staticmethod
+    def _metrics_options(graph, link_id: str, request: dict) -> dict:
+        """The optional "metrics" / "metrics_channel" of a link op: the channel is set before the row is made."""
+        metrics, channel = request.get("metrics", False), request.get("metrics_channel", 0)
+        if type(metrics) is not bool or type(channel) is not int or not 0 <= channel <= 0x7FFFFFFF:
+            raise ValueError("metrics is true or false; metrics_channel is a meta channel group 0..2147483647")
+        if channel and not metrics:
+            raise ValueError("metrics_channel needs metrics: true")
+        if metrics:
+            graph.set_link_metrics_channel(link_id, channel)
+        return {"metrics": metrics}
 
     @staticmethod
     def _tensor_core(graph):
@@ -298,9 +376,10 @@ class ConsoleServer:
         return lib
 
     @staticmethod
-    def _bind_link_table(graph, link_id: str) -> None:
+    def _bind_link_table(graph, link_id: str, metrics: bool = False) -> None:
         """The canvas table "link <id>" holds the link's rows: Input (fed by the declared port <id>.send), <id>.bulk, which
-        sends what the Input row pushes, and <id>.control. Made once, rebound when the canvas already has it."""
+        sends what the Input row pushes, and <id>.control; with `metrics`, also <id>.metrics (it only reads: its matrix
+        leaves on its row port "metrics"). Made once, rebound when the canvas already has it."""
         lib, label = graph.lib, f"link {link_id}"
         index = -1
         for i in range(max(0, int(lib.nodus_headless_get_module_count(graph._handle)))):
@@ -313,8 +392,10 @@ class ConsoleServer:
         if index < 0:
             index = graph.add_module(label, x=40, y=40).index
         names = [f"{link_id}.bulk".encode("utf-8"), f"{link_id}.control".encode("utf-8")]
-        rows = (_NativeRow * 3)(_NativeRow(0, 0, 1, 0, None), *[_NativeRow(1, 0, 0, 1, name) for name in names])
-        if not lib.nodus_headless_set_module_rows(graph._handle, index, rows, 3):
+        if metrics:
+            names.append(f"{link_id}.metrics".encode("utf-8"))
+        rows = (_NativeRow * (1 + len(names)))(_NativeRow(0, 0, 1, 0, None), *[_NativeRow(1, 0, 0, 1, name) for name in names])
+        if not lib.nodus_headless_set_module_rows(graph._handle, index, rows, 1 + len(names)):
             raise RuntimeError(f"the link rows of {link_id} could not be placed")
         if not lib.nodus_headless_set_module_stack_contract(graph._handle, index, 1):
             raise RuntimeError("the link table's stack contract was refused")

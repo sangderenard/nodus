@@ -351,6 +351,13 @@ EXPORTS
     gp_table_meta_get_dangling_rope_info
     gp_table_meta_get_dangling_widget_id
     gp_table_meta_get_fifo_snapshot
+    gp_table_meta_create_over_edges
+    gp_table_meta_get_member_count
+    gp_table_meta_get_member
+    gp_table_meta_feed_tick
+    gp_table_meta_get_latest_records
+    gp_table_meta_read_records
+    gp_table_meta_snapshot_u64
     gp_table_meta_get_id
     gp_table_meta_get_lasso_config
     gp_table_meta_get_lasso_fields

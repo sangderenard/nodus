@@ -23,6 +23,14 @@ std::mutex& endpoints_mutex() { static std::mutex m; return m; }
 std::unordered_map<std::string, std::shared_ptr<LinkEndpoint>>& endpoints() {
     static std::unordered_map<std::string, std::shared_ptr<LinkEndpoint>> e; return e;
 }
+std::unordered_map<std::string, int32_t>& metrics_channels() {   // guarded by endpoints_mutex()
+    static std::unordered_map<std::string, int32_t> c; return c;
+}
+int32_t metrics_channel_of(const std::string& id) {
+    std::lock_guard<std::mutex> g(endpoints_mutex());
+    auto it = metrics_channels().find(id);
+    return it == metrics_channels().end() ? 0 : it->second;
+}
 
 bool register_rows(ToolRegistry& registry, const std::string& id, std::shared_ptr<LinkEndpoint> ep, std::string* error) {
     {
@@ -47,7 +55,7 @@ bool register_rows(ToolRegistry& registry, const std::string& id, std::shared_pt
         entry.id = id + ".metrics"; entry.name = "Link metrics"; entry.caps = ToolCaps::Table;
         entry.source_path = nodus_link_metrics_source();
         entry.factory = [rid = entry.id, id] {
-            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkMetricsRow(rid, id), [](ITool* t) { nodus_link_metrics_destroy(t); });
+            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkMetricsRow(rid, id, LinkMetricsRow::kDefaultWindow, metrics_channel_of(id)), [](ITool* t) { nodus_link_metrics_destroy(t); });
         };
         if (!registry.register_tool(std::move(entry))) {
             registry.unregister_tool(id + ".control"); registry.unregister_tool(id + ".bulk");
@@ -105,10 +113,16 @@ bool link_endpoint_report(const std::string& id, EndpointReport* out) {
     return true;
 }
 
+void set_link_metrics_channel(const std::string& id, int32_t channel) {
+    std::lock_guard<std::mutex> g(endpoints_mutex());
+    if (channel > 0) metrics_channels()[id] = channel; else metrics_channels().erase(id);
+}
+
 void unregister_link(ToolRegistry& registry, const std::string& id) {
     registry.unregister_tool(id + ".control"); registry.unregister_tool(id + ".bulk"); registry.unregister_tool(id + ".metrics");
     std::lock_guard<std::mutex> g(endpoints_mutex());
     endpoints().erase(id);
+    metrics_channels().erase(id);
 }
 
 }  // namespace nodus::link

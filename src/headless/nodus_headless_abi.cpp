@@ -548,6 +548,13 @@ extern "C" int32_t nodus_headless_link_reason(const char* tool_id, char* out, in
     return int32_t(r.reason.size());
 }
 
+extern "C" int32_t nodus_headless_set_link_metrics_channel(const char* tool_id, int32_t channel) {
+    nodus::link::EndpointReport r;
+    if (!tool_id || channel < 0 || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;
+    nodus::link::set_link_metrics_channel(tool_id, channel);
+    return 1;
+}
+
 extern "C" int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16) {
     nodus::link::EndpointReport r;
     if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;
@@ -1091,6 +1098,111 @@ extern "C" int32_t nodus_headless_get_edge_unread(
     return gp_table_edge_unread(
         g->table, edge.table_edge_idx,
         scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx), out_unread);
+}
+
+namespace {
+GP_MetaGroup* find_meta_group(GP_TableContext* table, uint64_t id) {
+    if (!table || !id) return nullptr;
+    const int32_t n = gp_table_get_meta_group_count(table);
+    for (int32_t i = 0; i < n; ++i) {
+        GP_MetaGroup* mg = gp_table_get_meta_group(table, i);
+        unsigned long long mid = 0;
+        if (mg && gp_table_meta_get_id(table, mg, &mid) && mid == id) return mg;
+    }
+    return nullptr;
+}
+GP_TableContext* process_container_table() {
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    return cvs ? gp_canvas_get_container_table(cvs) : nullptr;
+}
+}  // namespace
+
+extern "C" uint64_t nodus_headless_meta_create(NodusHeadlessGraph* g, const int32_t* canvas_edge_idx, int32_t count, int32_t channel_group) {
+    if (!g || !g->table || !canvas_edge_idx || count <= 0) return 0;
+    std::vector<int32_t> table_edges;
+    for (int32_t i = 0; i < count; ++i) {
+        const int32_t c = canvas_edge_idx[i];
+        if (c < 0 || static_cast<size_t>(c) >= g->edges.size() || g->edges[static_cast<size_t>(c)].table_edge_idx < 0) return 0;
+        table_edges.push_back(g->edges[static_cast<size_t>(c)].table_edge_idx);
+    }
+    GP_MetaGroup* mg = gp_table_meta_create_over_edges(g->table, table_edges.data(), count, channel_group);
+    unsigned long long id = 0;
+    if (!mg || !gp_table_meta_get_id(g->table, mg, &id)) return 0;
+    return id;
+}
+extern "C" int32_t nodus_headless_meta_count(NodusHeadlessGraph* g) { return g && g->table ? gp_table_get_meta_group_count(g->table) : 0; }
+extern "C" uint64_t nodus_headless_meta_id_at(NodusHeadlessGraph* g, int32_t ordinal) {
+    if (!g || !g->table) return 0;
+    GP_MetaGroup* mg = gp_table_get_meta_group(g->table, ordinal);
+    unsigned long long id = 0;
+    return mg && gp_table_meta_get_id(g->table, mg, &id) ? id : 0;
+}
+extern "C" int32_t nodus_headless_meta_set_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t channel_group) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_set_channel_group(g->table, mg, channel_group) : 0;
+}
+extern "C" int32_t nodus_headless_meta_get_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t* out_channel_group) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg && out_channel_group ? gp_table_meta_get_channel_group(g->table, mg, out_channel_group) : 0;
+}
+extern "C" int32_t nodus_headless_meta_destroy(NodusHeadlessGraph* g, uint64_t group_id) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_destroy(g->table, mg) : 0;
+}
+extern "C" int32_t nodus_headless_meta_member_count(NodusHeadlessGraph* g, uint64_t group_id) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_get_member_count(g->table, mg) : 0;
+}
+extern "C" int32_t nodus_headless_meta_member(NodusHeadlessGraph* g, uint64_t group_id, int32_t ordinal,
+    int32_t* out_canvas_edge_idx, int32_t* out_table_edge_idx, uint64_t* out_rope_id) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    int32_t table_edge = -1; uint64_t rope = 0;
+    if (!mg || !gp_table_meta_get_member(g->table, mg, ordinal, &table_edge, &rope)) return 0;
+    if (out_table_edge_idx) *out_table_edge_idx = table_edge;
+    if (out_rope_id) *out_rope_id = rope;
+    if (out_canvas_edge_idx) {
+        *out_canvas_edge_idx = -1;
+        for (size_t i = 0; i < g->edges.size(); ++i)
+            if (g->edges[i].table_edge_idx == table_edge) { *out_canvas_edge_idx = static_cast<int32_t>(i); break; }
+    }
+    return 1;
+}
+extern "C" int32_t nodus_headless_meta_snapshot(NodusHeadlessGraph* g, uint64_t group_id, uint64_t* out_words, int32_t capacity_words) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_snapshot_u64(g->table, mg, out_words, capacity_words) : 0;
+}
+extern "C" int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint64_t group_id, uint64_t from_seq,
+    uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_read_records(g->table, mg, from_seq, out_words, max_records, out_write_seq) : 0;
+}
+extern "C" int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words) {
+    GP_TableContext* table = process_container_table();
+    if (!table || !out_words || capacity_words < GP_META_RECORD_WORDS) return 0;
+    int32_t words = 0;
+    const int32_t n = gp_table_get_meta_group_count(table);
+    for (int32_t i = 0; i < n; ++i) {
+        GP_MetaGroup* mg = gp_table_get_meta_group(table, i);
+        int32_t ch = 0;
+        if (!mg || !gp_table_meta_get_channel_group(table, mg, &ch) || ch != channel) continue;
+        const int32_t room = (capacity_words - words) / GP_META_RECORD_WORDS;
+        if (room <= 0) break;
+        words += gp_table_meta_get_latest_records(table, mg, out_words + words, room) * GP_META_RECORD_WORDS;
+    }
+    return words;
+}
+extern "C" int32_t nodus_headless_meta_channel_floats(int32_t channel, int32_t ordinal, float* out, int32_t capacity) {
+    GP_TableContext* table = process_container_table();
+    if (!table || !out || capacity <= 0 || ordinal < 0) return 0;
+    const int32_t n = gp_table_get_meta_group_count(table);
+    int32_t seen = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        GP_MetaGroup* mg = gp_table_get_meta_group(table, i);
+        int32_t ch = 0;
+        if (!mg || !gp_table_meta_get_channel_group(table, mg, &ch) || ch != channel) continue;
+        if (seen++ == ordinal) return gp_table_meta_get_fifo_snapshot(table, mg, out, capacity);
+    }
+    return 0;
 }
 
 extern "C" int32_t nodus_headless_set_module_uuid(
