@@ -1330,6 +1330,49 @@ extern "C" int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* 
     return ok;
 }
 
+// ---- canvas ports: the canvas's own boundary (canvas_abi.h GP_CANVAS_PORT_*) --------------------------------------
+extern "C" int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph* g, const char* name, int32_t direction,
+                                                      int32_t up) {
+    if (!g || !g->ctx) return -1;
+    return gp_canvas_declare_port(g->ctx, name, direction, up);
+}
+
+extern "C" int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g) {
+    return (g && g->ctx) ? gp_canvas_root_module_of(g->ctx) : -1;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_count(NodusHeadlessGraph* g) {
+    return (g && g->ctx) ? gp_canvas_port_count(g->ctx) : -1;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_at(NodusHeadlessGraph* g, int32_t ordinal, char* out_name,
+                                                 int32_t out_name_capacity, int32_t* out_direction,
+                                                 int32_t* out_contact, int32_t* out_up) {
+    if (!g || !g->ctx) return 0;
+    int direction = 0, contact = 0, up = 0;
+    const int ok = gp_canvas_port_at(g->ctx, ordinal, out_name, out_name_capacity, &direction, &contact, &up);
+    if (out_direction) *out_direction = direction;
+    if (out_contact) *out_contact = contact;
+    if (out_up) *out_up = up;
+    return ok;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, const char* name, void* out_bytes,
+                                                      size_t cap, size_t* out_written) {
+    if (out_written) *out_written = 0;
+    if (!g || !g->ctx) return 0;
+    int written = 0;
+    const int ok = gp_canvas_port_consume(g->ctx, name, out_bytes, static_cast<int>(cap), &written);
+    if (out_written) *out_written = static_cast<size_t>(written);
+    return ok;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
+                                                      size_t len) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_port_publish(g->ctx, name, bytes, static_cast<int>(len));
+}
+
 extern "C" int32_t nodus_headless_get_port_fifo_config(
     NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
     NodusHeadlessFifoConfig* out_config) {

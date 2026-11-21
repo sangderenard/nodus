@@ -388,6 +388,20 @@ NODUS_HEADLESS_API int32_t nodus_headless_publish_output_token(
     NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
     NodusHeadlessPublishResult* out_result);
 NODUS_HEADLESS_API int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written);
+// Canvas ports (canvas_abi.h GP_CANVAS_PORT_*): the canvas's own boundary, contacts of its ROOT module, saved with the
+// canvas. declare returns the port's ROOT contact (draw an edge to or from (root module, contact)), or -1.
+// direction 0 = OUT (an inside edge ends there; consume reads it), 1 = IN (publish writes it; an inside edge starts there).
+NODUS_HEADLESS_API int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph* g, const char* name, int32_t direction,
+                                                               int32_t up);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_at(NodusHeadlessGraph* g, int32_t ordinal, char* out_name,
+                                                          int32_t out_name_capacity, int32_t* out_direction,
+                                                          int32_t* out_contact, int32_t* out_up);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, const char* name, void* out_bytes,
+                                                               size_t cap, size_t* out_written);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
+                                                               size_t len);
 NODUS_HEADLESS_API int32_t nodus_headless_get_port_fifo_config(
     NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
     NodusHeadlessFifoConfig* out_config);

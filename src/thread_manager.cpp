@@ -1713,6 +1713,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req, bool preserve_fre
                     if (e.b_module == root_mod) contact_idx = e.b_contact_idx;
                     else if (e.a_module == root_mod) contact_idx = e.a_contact_idx;
                     else continue;
+                    // Canvas ports (canvas_abi.h GP_CANVAS_PORT_*) are the canvas's boundary: whoever is above reads or
+                    // writes them (gp_canvas_port_consume / _publish). This block must neither take their samples as
+                    // toolbar colours nor hold a never-draining reader on their lossless edges.
+                    if (contact_idx >= GP_CANVAS_PORT_CONTACT_BASE &&
+                        contact_idx < GP_CANVAS_PORT_CONTACT_BASE + GP_CANVAS_PORT_MAX) continue;
                     uint64_t reader_key = canvas_contact_key(root_mod, contact_idx);
                     if (reader_key == 0) reader_key = 0x8000000000000000ull;
                     gp_table_edge_subscribe_ex(req.root_table, edge_idx, reader_key, /*start_at_head=*/1);

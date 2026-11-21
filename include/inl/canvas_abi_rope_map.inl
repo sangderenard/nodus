@@ -860,6 +860,7 @@ static void canvas_clear_workspace(GP_CanvasContextImpl* ctx) {
     // root key to every edge touching "the root", which fills any lossless edge (the contract result edge)
     // after `slots` tokens. Every path that clears the workspace (create, load) goes through here.
     ctx->root_module_idx = -1;
+    ctx->canvas_ports.clear();   // they are contacts of the ROOT module just forgotten
     ctx->modules.clear();
     ctx->module_tables.clear();
     ctx->module_table_owned.clear();

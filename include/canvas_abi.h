@@ -367,6 +367,31 @@ int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx, const GP_CanvasEdgeDesc*
 // is the row's index in its module and port the row's declared port index.
 #define GP_CANVAS_ROW_PORT_CONTACT_BASE 20000
 #define GP_CANVAS_ROW_PORT_STRIDE 64
+
+// Canvas ports (docs/MESH_CANVAS_UP_PORTS_2026-11-21.md, stage 1): named contacts on the canvas's ROOT module, the
+// canvas's own boundary in the top tools area. Port i is the ROOT contact GP_CANVAS_PORT_CONTACT_BASE + i (clear of the
+// frame LEDs 10000-10079 and the row ports 20000+, and below 65536: a contact sits at bits 16+ of an edge key).
+//   OUT: an edge inside the canvas ENDS at the port; whoever is above (an upper layer; the host until there is one)
+//        reads it with gp_canvas_port_consume. A full port refuses its writer, as every lossless edge does.
+//   IN:  whoever is above writes it with gp_canvas_port_publish; an edge inside the canvas STARTS at the port.
+// `up` marks a port that the canvas carries to its upper layer (stage 2). Declaring the first port makes the ROOT
+// module, also on a headless canvas. Ports are saved with the canvas (CANVAS_PORT records).
+#define GP_CANVAS_PORT_CONTACT_BASE 12000
+#define GP_CANVAS_PORT_MAX 256
+#define GP_CANVAS_PORT_OUT 0
+#define GP_CANVAS_PORT_IN 1
+// The contact of the port (>= GP_CANVAS_PORT_CONTACT_BASE), or -1. Declaring an existing name again updates `up` and
+// returns its contact; a different direction for an existing name is refused. Names: 1-63 bytes, no whitespace.
+int gp_canvas_declare_port(GP_CanvasContext* ctx, const char* name, int direction, int up);
+int gp_canvas_port_count(GP_CanvasContext* ctx);
+int gp_canvas_port_at(GP_CanvasContext* ctx, int ordinal, char* out_name, int out_name_capacity, int* out_direction,
+                      int* out_contact, int* out_up);
+// This canvas's ROOT module index (the context-taking form of gp_canvas_get_root_module_idx), or -1.
+int gp_canvas_root_module_of(GP_CanvasContext* ctx);
+// OUT port: take the next sample of the edge that ends at it. 1 and *out_written > 0 when one was taken.
+int gp_canvas_port_consume(GP_CanvasContext* ctx, const char* name, void* out_bytes, int capacity, int* out_written);
+// IN port: write one sample onto the edge that starts at it. 1 when accepted; 0 when full or unconnected.
+int gp_canvas_port_publish(GP_CanvasContext* ctx, const char* name, const void* bytes, int len);
 int gp_canvas_resolve_port_pair(GP_CanvasContext* ctx, const char* pair, GP_CanvasEdgeDesc* out_desc, char* error, int error_capacity);
 int gp_canvas_apply_port_pair(GP_CanvasContext* ctx, const char* pair, char* error, int error_capacity);
 

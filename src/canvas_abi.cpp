@@ -38,6 +38,7 @@
 #include <chrono>
 #include <mutex>
 #include <cstdlib>
+#include <cctype>
 
 
 // Segmented implementation pieces (see .inl files for details).
@@ -47,6 +48,7 @@
 #include "inl/canvas_abi_create.inl"
 #include "inl/canvas_abi_table_step.inl"
 #include "inl/canvas_abi_actions_edges.inl"
+#include "inl/canvas_abi_canvas_ports.inl"
 #include "inl/canvas_abi_save_load.inl"
 #include "inl/canvas_abi_overlay_raster.inl"
 

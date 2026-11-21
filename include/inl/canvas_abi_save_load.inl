@@ -28,6 +28,8 @@ static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
         ss << e.desc.a_module << ',' << e.desc.a_contact_idx << ',' << e.desc.b_module << ',' << e.desc.b_contact_idx << ',' << e.type_id << ',' << e.subgroup_flags << ';';
     }
     ss << "|O:" << cc->overlays.size();
+    ss << "|P:" << cc->canvas_ports.size() << ":";       // a port-only change must still autosave
+    for (const auto &p : cc->canvas_ports) ss << p.contact << ',' << p.direction << ',' << p.up << ',' << p.name << ';';
     return ss.str();
 }
 
@@ -417,8 +419,12 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     }
     // Declared root-reflection module (canvas_ensure_root_module); written only when one exists. A headless
     // canvas has none, so its files carry no such record.
-    if (c->root_module_idx >= 0 && c->root_module_idx < static_cast<int>(c->modules.size()))
+    if (c->root_module_idx >= 0 && c->root_module_idx < static_cast<int>(c->modules.size())) {
         ofs << "ROOT_MODULE " << c->root_module_idx << "\n";
+        // Canvas ports: contacts of that ROOT module, in declaration order (canvas_abi.h GP_CANVAS_PORT_*).
+        for (const auto &p : c->canvas_ports)
+            ofs << "CANVAS_PORT " << p.contact << " " << p.direction << " " << p.up << " " << p.name << "\n";
+    }
     ofs.close();
     // Update in-memory signature to reflect this successful save using atomic flip
     try {
@@ -529,6 +535,7 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     }
 
     int saved_root_module_idx = -1;  // declared by the file's ROOT_MODULE record, -1 if absent
+    std::vector<GP_CanvasContextImpl::CanvasPortDecl> saved_ports;   // CANVAS_PORT records, restored after the edges
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
         std::istringstream ss(line);
@@ -614,6 +621,12 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             int out_count = 0; ss >> out_count;
             for (int i = 0; i < out_count; ++i) { int t; ss >> t; nc.output_types.push_back(t); }
             nodes.push_back(std::move(nc));
+        } else if (tag == "CANVAS_PORT") {
+            GP_CanvasContextImpl::CanvasPortDecl p;
+            if (ss >> p.contact >> p.direction >> p.up >> p.name && canvas_port_name_ok(p.name.c_str()) &&
+                p.contact >= GP_CANVAS_PORT_CONTACT_BASE && p.contact < GP_CANVAS_PORT_CONTACT_BASE + GP_CANVAS_PORT_MAX &&
+                (p.direction == GP_CANVAS_PORT_OUT || p.direction == GP_CANVAS_PORT_IN))
+                saved_ports.push_back(p);
         } else if (tag == "ROOT_MODULE") {
             ss >> saved_root_module_idx;
         } else if (tag == "OFFSET") {
@@ -842,6 +855,8 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             canvas_apply_subgroup_to_edge_idx(c, edge_idx, es.subgroup_flags);
         }
     }
+    // Canvas ports belong to the ROOT module the file declared; without one they have nothing to be contacts of.
+    if (c->root_module_idx >= 0) c->canvas_ports = saved_ports;
 
     // Register per-table rope UIDs with the canvas so overlay attachments
     // can resolve persisted stable rope IDs to runtime indices. Doing this

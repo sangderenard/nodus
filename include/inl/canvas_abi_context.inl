@@ -336,7 +336,15 @@ struct GP_CanvasContextImpl {
     int container_table_owned = 0;
     int root_actions_installed = 0;
     int root_module_idx = -1; // synthetic module that mirrors the canvas root table
-    
+    // Canvas ports (canvas_abi.h GP_CANVAS_PORT_*): named contacts on the ROOT module, in declaration order.
+    struct CanvasPortDecl {
+        std::string name;
+        int direction = 0;   // GP_CANVAS_PORT_OUT / _IN
+        int up = 0;          // carried to the upper layer (stage 2)
+        int contact = 0;     // GP_CANVAS_PORT_CONTACT_BASE + index
+    };
+    std::vector<CanvasPortDecl> canvas_ports;
+
     bool thread_mgr_paused = true;
     int thread_mgr_delay_ms = 0;
     double thread_mgr_delay_accum_s = 0.0;
