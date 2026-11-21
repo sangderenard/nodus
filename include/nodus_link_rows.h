@@ -61,9 +61,11 @@ public:
     void tick(double, HostAPI&) override;
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext& context) override;
-    // What arrives goes out on the row's own port "received" (8-byte handle tokens), never onto the stack: below the
-    // row the stack holds only what it refused (owner, 2026-11-19). An arrival waits in the endpoint until that port's
-    // edge can take it.
+    // What arrives goes out on the row's own port "received" (8-byte handle tokens), not onto the stack; an arrival
+    // waits in the endpoint until that port's edge can take it. This routing was an agent's design (commit e053ef6,
+    // 2026-11-19), not the owner's: the owner never said arrivals should go to a port instead of the stack (2026-11-21).
+    // The owner's words that day were that a row may have authority over its own ports, and that refused work stays on
+    // the stack, since a FIFO is never refused.
     int32_t row_port_count() const override { return 1; }
     ToolRowPort row_port(int32_t index) const override {
         if (index == 0) return ToolRowPort{ToolPortKind::Return, 1.0f, 0.5f, "received", 8};
