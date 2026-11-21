@@ -31,6 +31,13 @@ started:
   {"op": "link_send", "id", "bytes"[, "fill"]}               a U8 [bytes] tensor (every byte `fill`) into the table's
         Input row through the declared port <id>.send; the bulk row sends it over the link
   {"op": "link_report", "id"}                                the endpoint's state and counters
+  {"op": "link_send_file", "id", "path"}                     the file as one U8 bulk tensor (<= 256 MiB) through <id>.send;
+        {"sent": false} when the port is full: send it again
+  {"op": "link_receive", "id", "spool"[, "max"]}             arrivals as files <spool>/<n>.arrival, in arrival order
+        (written whole, then renamed); {"arrived": [{"file", "bytes"}], "waiting"}. Arrivals cross the canvas: the bulk
+        row's row port "received" -> table "link <id> received" (Input, Output) -> declared output port <id>.received,
+        drained after every step so the Input row's null pads never fill it. One file per tensor carries the regional
+        state broadcast (turing examples/meowdoku/state_broadcast.py records).
 link_host and link_dial put the rows <id>.control and <id>.bulk on the canvas table "link <id>" (made once, kept with
 the canvas), so the canvas polls the link every step. Any of link_host / link_dial / link_udp may add "metrics": true (and
 "metrics_channel": <meta channel group>) to put the row <id>.metrics on that table as well: it publishes the link's
@@ -76,6 +83,19 @@ CONSOLE_MAX_CLIENTS = 8
 CONSOLE_IDLE_SECONDS = 60.0
 CONSOLE_COALESCE_SECONDS = 0.1
 CONSOLE_STEP_WAIT_SECONDS = 5.0
+# A row's own port p is the contact BASE + row x STRIDE + p (canvas_abi.h GP_CANVAS_ROW_PORT_CONTACT_BASE / _STRIDE).
+LINK_ROW_PORT_CONTACT_BASE = 20000
+LINK_ROW_PORT_STRIDE = 64
+# link_send_file: one file is one U8 bulk tensor; the link endpoint refuses more than its maximum (256 MiB by default).
+LINK_FILE_MAX_BYTES = 256 << 20
+
+
+class _TensorDesc(ctypes.Structure):
+    """tensor_abi.h NodusTensorDesc (NODUS_TENSOR_MAX_RANK 8)."""
+    _fields_ = [("dtype", ctypes.c_uint8), ("layout", ctypes.c_uint8), ("is_readonly", ctypes.c_uint8),
+                ("is_buffer", ctypes.c_uint8), ("rank", ctypes.c_uint32), ("shape", ctypes.c_uint64 * 8),
+                ("strides", ctypes.c_uint64 * 8), ("element_count", ctypes.c_uint64), ("element_bytes", ctypes.c_uint32),
+                ("reserved", ctypes.c_uint32), ("total_bytes", ctypes.c_uint64)]
 
 
 def _on_signal(signum, frame) -> None:
@@ -107,6 +127,11 @@ class ConsoleServer:
         self._started = time.time()
         self._hosts = []  # [(prefix, host_id)], read on the stepping thread only
         self._link_ids = []  # registered link ids (the graph cannot enumerate them); stepping thread only
+        self._link_received = {}  # link id -> arrivals spooled so far (names the next spool file); stepping thread only
+        # link id -> tensor handles that arrived and await link_receive. The stepping thread drains <id>.received after
+        # EVERY step: the received table's Input row pads its empty edge with the null handle each tick, so a port drained
+        # only when asked fills with pads and an arrival meeting a full port is lost (Oracle, 2026-11-21).
+        self._link_arrivals = {}
         self._generation = 0
         self._last_bytes = None
         self._revision = 0
@@ -140,7 +165,25 @@ class ConsoleServer:
             if link_id not in self._link_ids:
                 self._link_ids.append(link_id)
 
+    def _drain_link_arrivals(self, graph) -> None:
+        """Pull every token waiting on each link's <id>.received port: keep the tensor handles (an arrival belongs to whoever
+        pops it; link_receive spools and frees them), drop the null pads. One step publishes at most one token per port,
+        so draining after every step never lets the 16-slot port fill."""
+        for link_id in self._link_ids:
+            name = f"{link_id}.received"
+            for _ in range(64):
+                try:
+                    token = graph.pull_bytes(name, 8)
+                except (RuntimeError, ValueError):
+                    break                                        # no such port on this canvas (yet)
+                if not token or len(token) != 8:
+                    break
+                (handle,) = struct.unpack("<Q", token)
+                if handle:
+                    self._link_arrivals.setdefault(link_id, []).append(handle)
+
     def service(self, graph) -> None:
+        self._drain_link_arrivals(graph)
         if not self._wanted.is_set():
             return
         with self._lock:
@@ -199,12 +242,14 @@ class ConsoleServer:
             if any(type(v) is not int or abs(v) > 65535 for v in values):
                 raise ValueError("invalid canvas key action")
             handled = graph.ui_key(*values)
-        elif op in ("link_host", "link_dial", "link_udp", "link_send", "link_report"):
+        elif op in ("link_host", "link_dial", "link_udp", "link_send", "link_report", "link_send_file", "link_receive"):
             handled, report = self._apply_link(graph, request)
             if op in ("link_host", "link_dial", "link_udp") and request["id"] not in self._link_ids:
                 self._link_ids.append(request["id"])
             if op == "link_report":
                 return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "link": report}
+            if op in ("link_send_file", "link_receive"):
+                return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, op: report}
         elif op in ("meta_group", "meta_report", "meta_destroy"):
             meta = self._apply_meta(graph, request)
             if op == "meta_report":
@@ -306,6 +351,57 @@ class ConsoleServer:
                 core.nodus_tensor_destroy(handle)
                 raise RuntimeError(f"{link_id}.send is full")
             return True, {"handle": handle, "bytes": size}
+        if op == "link_send_file":
+            if set(request) != {"op", "expected_revision", "id", "path"} or not isinstance(request["path"], str):
+                raise ValueError("link_send_file takes op, expected_revision, id, path")
+            path = pathlib.Path(request["path"])
+            size = path.stat().st_size if path.is_file() else -1
+            if not 0 < size <= LINK_FILE_MAX_BYTES:
+                raise ValueError(f"link_send_file: a file of 1..{LINK_FILE_MAX_BYTES} bytes")
+            data = path.read_bytes()
+            core = self._tensor_core(graph)
+            handle = int(core.nodus_tensor_create(7, 1, (ctypes.c_uint64 * 1)(len(data))))      # NODUS_DTYPE_U8
+            if not handle:
+                raise RuntimeError("the tensor core refused the tensor")
+            if core.nodus_tensor_write(handle, 0, data, len(data)) != len(data):
+                core.nodus_tensor_destroy(handle)
+                raise RuntimeError("the tensor could not be written")
+            result = graph.try_push_bytes(f"{link_id}.send", struct.pack("<Q", handle))
+            if not result.accepted:
+                core.nodus_tensor_destroy(handle)
+                return True, {"sent": False, "why": f"{link_id}.send is full; send it again"}
+            return True, {"sent": True, "bytes": len(data)}
+        if op == "link_receive":
+            if not {"op", "expected_revision", "id", "spool"} <= set(request) <= {"op", "expected_revision", "id", "spool", "max"}:
+                raise ValueError("link_receive takes op, expected_revision, id, spool[, max]")
+            spool, most = pathlib.Path(request["spool"]), request.get("max", 16)
+            if type(most) is not int or not 0 < most <= 256:
+                raise ValueError("link_receive: max 1..256")
+            spool.mkdir(parents=True, exist_ok=True)
+            core = self._tensor_core(graph)
+            self._drain_link_arrivals(graph)
+            queue = self._link_arrivals.get(link_id, [])
+            arrived = []
+            while queue and len(arrived) < most:
+                handle = queue.pop(0)
+                desc = _TensorDesc()
+                try:
+                    # The tensor's own length (total_bytes), not its arena slot, which rounds up.
+                    if core.nodus_tensor_describe(handle, ctypes.byref(desc)) != 0:
+                        raise RuntimeError(f"an arrival on {link_id} could not be described")
+                    data = ctypes.create_string_buffer(int(desc.total_bytes))
+                    if core.nodus_tensor_read(handle, 0, data, desc.total_bytes) != desc.total_bytes:
+                        raise RuntimeError(f"an arrival on {link_id} could not be read")
+                    data = data.raw
+                finally:
+                    core.nodus_tensor_destroy(handle)            # an arrival belongs to whoever pops it
+                self._link_received[link_id] = self._link_received.get(link_id, 0) + 1
+                name = spool / f"{self._link_received[link_id]:08d}.arrival"
+                partial = name.with_suffix(".partial")
+                partial.write_bytes(data)
+                os.replace(partial, name)                    # a reader never sees a half-written arrival
+                arrived.append({"file": str(name), "bytes": len(data)})
+            return True, {"arrived": arrived, "waiting": len(queue)}
         if op == "link_udp":
             keys = {"op", "expected_revision", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"}
             if not set(request) >= keys or not set(request) <= keys | {"account", "metrics", "metrics_channel"}:
@@ -381,6 +477,10 @@ class ConsoleServer:
         lib.nodus_tensor_write.argtypes = (ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64)
         lib.nodus_tensor_destroy.restype = None
         lib.nodus_tensor_destroy.argtypes = (ctypes.c_uint64,)
+        lib.nodus_tensor_describe.restype = ctypes.c_int32
+        lib.nodus_tensor_describe.argtypes = (ctypes.c_uint64, ctypes.POINTER(_TensorDesc))
+        lib.nodus_tensor_read.restype = ctypes.c_int64
+        lib.nodus_tensor_read.argtypes = (ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64)
         return lib
 
     @staticmethod
@@ -409,6 +509,47 @@ class ConsoleServer:
             raise RuntimeError("the link table's stack contract was refused")
         fifo = _NativeFifoConfig(8, 4, 0, graph.abstract_tensor_type_id, 2, 16, 0)     # one tensor handle a token, lossless
         lib.nodus_headless_declare_input_port_ex(graph._handle, f"{link_id}.send".encode("utf-8"), index, 0, ctypes.byref(fifo))
+        ConsoleServer._bind_link_received(graph, link_id, index)
+
+    @staticmethod
+    def _bind_link_received(graph, link_id: str, link_index: int) -> None:
+        """What arrives on the bulk row leaves on its row port "received" (8-byte tensor handles), and a row port publishes
+        only onto a canvas edge drawn from it. So the canvas carries arrivals to the host itself: an edge from that row port
+        (contact GP_CANVAS_ROW_PORT_CONTACT_BASE + row 1 x stride) to the Input row of the table "link <id> received",
+        whose Output row is the declared output port <id>.received. Lossless (top_k 0): while the host has not pulled,
+        the edge refuses and arrivals wait in the link endpoint. Made once, rebound when the canvas already has it."""
+        lib, label = graph.lib, f"link {link_id} received"
+        index = -1
+        for i in range(max(0, int(lib.nodus_headless_get_module_count(graph._handle)))):
+            desc = CanvasModuleDesc()
+            if lib.nodus_headless_get_module_desc(graph._handle, i, ctypes.byref(desc)) and \
+                    bytes(desc.label).split(b"\0", 1)[0].decode("utf-8", "replace") == label:
+                index = i
+                break
+        if index < 0:
+            index = graph.add_module(label, x=520, y=40).index
+        rows = (_NativeRow * 2)(_NativeRow(0, 0, 1, 0, None), _NativeRow(2, 0, 1, 0, None))       # Input, Output
+        if not lib.nodus_headless_set_module_rows(graph._handle, index, rows, 2):
+            raise RuntimeError(f"the received table of {link_id} could not be placed")
+        if not lib.nodus_headless_set_module_stack_contract(graph._handle, index, 1):
+            raise RuntimeError("the received table's stack contract was refused")
+        fifo = _NativeFifoConfig(8, 16, 0, graph.abstract_tensor_type_id, 2, 16, 0)
+        received = LINK_ROW_PORT_CONTACT_BASE + 1 * LINK_ROW_PORT_STRIDE + 0     # the bulk row (row 1), its port 0
+        have = False
+        for e in range(max(0, int(lib.nodus_headless_get_edge_count(graph._handle)))):
+            desc, type_id = CanvasEdgeDesc(), ctypes.c_int32()
+            if lib.nodus_headless_get_edge(graph._handle, e, ctypes.byref(desc), ctypes.byref(type_id)) and \
+                    (desc.a_module, desc.a_contact_idx, desc.b_module, desc.b_contact_idx) == (link_index, received, index, 0):
+                have = True
+                lib.nodus_headless_configure_edge_fifo(graph._handle, e, ctypes.byref(fifo))
+                break
+        if not have:
+            desc = CanvasEdgeDesc(a_module=link_index, a_contact_idx=received, b_module=index, b_contact_idx=0)
+            edge = int(lib.nodus_headless_add_edge(graph._handle, ctypes.byref(desc), 0))
+            if edge < 0 or not lib.nodus_headless_configure_edge_fifo(graph._handle, edge, ctypes.byref(fifo)):
+                raise RuntimeError(f"the received edge of {link_id} could not be drawn")
+        lib.nodus_headless_declare_output_port_ex(graph._handle, f"{link_id}.received".encode("utf-8"), index, 1,
+                                                  ctypes.byref(fifo), 1)
 
     def _build(self, graph, wanted=frozenset()):
         path = os.path.join(self._tmp, "snapshot.nodus.txt")
