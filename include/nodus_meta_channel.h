@@ -2,13 +2,16 @@
 // How a row reads the meta edges of its canvas (include/table_abi.h "Meta edges listen to their member edges").
 // A row has no graph handle, and a plugin DLL carries its own copy of the canvas statics, so it asks nodus_headless
 // (the module that owns the canvas of this process) through the two process-wide readers of
-// include/nodus_headless_abi.h, found by name in the already-loaded nodus_headless.dll. Inside the image they resolve to
+// include/nodus_headless_abi.h, found by name in the already-loaded nodus_headless (nodus_headless.dll on Windows; the
+// process's global symbols elsewhere, where libnodus_headless.so is loaded). Inside the image they resolve to
 // the image's own functions; with no nodus_headless loaded (a stand-alone test) they report nothing.
 #include <cstdint>
 
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
 
 namespace nodus::meta {
@@ -18,8 +21,10 @@ inline void* headless_symbol(const char* name) {
     HMODULE module = GetModuleHandleA("nodus_headless.dll");
     return module ? reinterpret_cast<void*>(GetProcAddress(module, name)) : nullptr;
 #else
-    (void)name;
-    return nullptr;
+    // Off Windows the headless image is already in the process (it loaded this row), so its exported symbol is found
+    // in the global scope. This used to return nothing, and a row reading meta channels saw no records on Linux
+    // (Oracle A1, 2026-11-21: meta_edge_headless_test's edge_introspect check).
+    return dlsym(RTLD_DEFAULT, name);
 #endif
 }
 

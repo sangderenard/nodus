@@ -159,3 +159,11 @@ for an add on development work we haven't implemented yet".
   read the ROOT module's own table. Both now take the root/container table for the ROOT module.
 - **Not this change:** `meta_edge_headless_test` fails its edge_introspect check on Linux: `nodus_meta_channel.h` finds
   the headless image only on Windows (`GetModuleHandleA`), so a row reading meta channels sees nothing elsewhere.
+- **Two Linux faults diagnosed** (Oracle A1, 2026-11-21):
+  1. `link_metrics_test`'s window checks: a step there costs about 30 us, and five control packets sent after the
+     handshake reached the host only 37 ms later (Nagle holding small frames behind the handshake's delayed ACK). By
+     then 1200 steps had passed and the 64-row window held only idle rows. The link stream now sets TCP_NODELAY, as the
+     wss dialer's socket already did; the packets arrive on the next step and the test passes.
+  2. `nodus_meta_channel.h` returned no symbol off Windows, so rows reading meta channels (edge_introspect, link
+     metrics channel columns) saw nothing. It now finds the headless image's readers in the process's global symbols
+     (dlsym RTLD_DEFAULT); `meta_edge_headless_test` passes on Linux.

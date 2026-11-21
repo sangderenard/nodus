@@ -288,6 +288,10 @@ public:
         : socket_(s), client_(client), max_message_(max_message), out_limit_(out_limit), rx_(std::move(leftover)) {
         if (s == INVALID_SOCKET) throw std::invalid_argument("invalid link socket");
         if (!WireSocket::set_nonblocking(s)) { WireSocket::close_socket(s); throw std::runtime_error("nonblocking socket refused"); }
+        // Small frames go at once, as the wss dialer's socket already does (nodus_link_wss.h): with Nagle on, a control
+        // packet sent after the handshake waited for the handshake's delayed ACK -- about 40 ms on Linux (Oracle A1,
+        // 2026-11-21: five 256-byte packets held 37 ms on loopback).
+        { int on = 1; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&on), sizeof(on)); }
         random_bytes(&mask_state_, sizeof(mask_state_)); mask_state_ |= 1;
     }
     ~WsStream() override { WireSocket::close_socket(socket_); }
