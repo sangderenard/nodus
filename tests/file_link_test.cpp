@@ -3,16 +3,19 @@
 //
 // Tables that end in an Output row are in stack loopback, so a tensor whose edge is full waits instead of being reset.
 //   local:  [file_read | Output] -> [Input | file_write]                     in one canvas
-//   link:   sender canvas   [file_read | Output] -> [Input | <id>.bulk.send]  (stack loopback: a refused send waits)
+//   link:   sender canvas   [file_read | Output] -> [Input | <id>.bulk.send | tensor_returns]  (stack loopback: a
+//           refused send waits); tensor_returns "returns" -> [tensor_mint] "returned": a mint with no size, the trash
 //           receiver canvas [<id>.bulk.receive | Output] -> [Input | file_write]
 // Two "generations" share their file names (000000.rec, 000001.rec, ...), as state_broadcast's do. Every file arrives
-// byte for byte, the source folder ends empty with every file in sent/, and nothing is overwritten.
+// byte for byte, the source folder ends empty with every file in sent/, and nothing is overwritten. Every sent tensor
+// goes back to the mint and is freed: the process ends the run with the tensors it started with.
 //
-//   file_link_test <file_read plugin> <file_write plugin> <work dir>
+//   file_link_test <file_read plugin> <file_write plugin> <tensor_mint plugin> <tensor_returns plugin> <work dir>
 #include "canvas_abi.h"
 #include "nodus_headless_abi.h"
 #include "nodus_link.h"
 #include "plugin_manager.h"
+#include "common/tensors/abstraction/tensor_abi.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -41,6 +44,17 @@ int failures = 0;
     } while (0)
 
 constexpr int32_t kTool = 1, kInput = 0, kOutput = 2, kPlugin = 1;
+constexpr int32_t kRowPortBase = 20000, kRowPortStride = 64;
+
+// Tensor handles alive in the process, by describing every id up to `limit` (ids are small and reused).
+int live_tensors(uint64_t limit = 1u << 16) {
+    int n = 0;
+    for (uint64_t id = 1; id <= limit; ++id) {
+        NodusTensorDesc d{};
+        if (nodus_tensor_describe(id, &d) == NODUS_OK) ++n;
+    }
+    return n;
+}
 
 std::vector<uint8_t> read_file(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
@@ -159,7 +173,7 @@ void local_case(const char* read_id, const char* write_id, const fs::path& dir) 
                 visible_files(src / "sent"));
 }
 
-void link_case(const char* read_id, const char* write_id, const fs::path& dir) {
+void link_case(const char* read_id, const char* write_id, const char* mint_id, const char* returns_id, const fs::path& dir) {
     const fs::path src = dir / "link_src", dst = dir / "link_dst";
     const auto files = make_files(src, 6);
     nodus::link::Key key{};
@@ -176,7 +190,11 @@ void link_case(const char* read_id, const char* write_id, const fs::path& dir) {
     CHECK(nodus_headless_register_link_dialer(sender.g, "files.s", "127.0.0.1", uint16_t(port), "files", ct.data(), bt.data(), 5000, 0));
 
     const int r = sender.table("read", {{kTool, 0, 0, kPlugin, read_id}, {kOutput, 0, 1, 0, nullptr}});
-    const int s = sender.table("send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, "files.s.bulk.send"}});
+    const int live_before = live_tensors();
+    const int s = sender.table("send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, "files.s.bulk.send"},
+                                        {kTool, 0, 0, kPlugin, returns_id}});
+    const int trash = sender.table("trash", {{kTool, 0, 0, kPlugin, mint_id}});
+    CHECK(trash >= 0 && sender.edge(s, kRowPortBase + 2 * kRowPortStride, trash, kRowPortBase) );   // returns -> returned
     CHECK(r >= 0 && s >= 0 && sender.edge(r, 0, s, 0));
     CHECK(nodus_headless_set_module_stack_loopback(sender.g, r, 1));
     CHECK(nodus_headless_set_module_stack_loopback(sender.g, s, 1));                 // a refused send waits on the stack
@@ -211,6 +229,10 @@ void link_case(const char* read_id, const char* write_id, const fs::path& dir) {
     CHECK(same_contents(files, dst));
     // dv: 0 listen_port, 1 account, 2 control_sent, 3 control_received, 4/5 bulk bytes sent/received,
     // 6/7 bulk tensors sent/received, 8 control_refused, 9 bulk_refused, 10 bulk_dropped (nodus_headless_link_report).
+    for (int tick = 0; tick < 60; ++tick) { sender.step(); receiver.step(); }      // the last returns reach the trash
+    const int live_after = live_tensors();
+    CHECK(live_after <= live_before);
+    std::printf("link: tensors alive before %d, after %d\n", live_before, live_after);
     std::printf("link: %zu of %zu files arrived byte for byte; %zu in sent/; sender bulk tensors sent %llu, refused "
                 "(retried) %llu, dropped %llu\n", visible_files(dst), files.size(), visible_files(src / "sent"),
                 (unsigned long long)dv[6], (unsigned long long)dv[9], (unsigned long long)dv[10]);
@@ -219,16 +241,20 @@ void link_case(const char* read_id, const char* write_id, const fs::path& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 4) { std::fprintf(stderr, "usage: file_link_test <file_read plugin> <file_write plugin> <work dir>\n"); return 2; }
-    char read_id[256] = {}, write_id[256] = {};
-    if (!gp_plugin_load_from_path(argv[1], read_id, sizeof(read_id)) || !gp_plugin_load_from_path(argv[2], write_id, sizeof(write_id))) {
+    if (argc < 6) {
+        std::fprintf(stderr, "usage: file_link_test <file_read> <file_write> <tensor_mint> <tensor_returns> <work dir>\n");
+        return 2;
+    }
+    char read_id[256] = {}, write_id[256] = {}, mint_id[256] = {}, returns_id[256] = {};
+    if (!gp_plugin_load_from_path(argv[1], read_id, sizeof(read_id)) || !gp_plugin_load_from_path(argv[2], write_id, sizeof(write_id)) ||
+        !gp_plugin_load_from_path(argv[3], mint_id, sizeof(mint_id)) || !gp_plugin_load_from_path(argv[4], returns_id, sizeof(returns_id))) {
         std::fprintf(stderr, "cannot load the file rows\n");
         return 2;
     }
-    const fs::path dir = fs::path(argv[3]) / ("file_link_test_" + std::to_string(std::time(nullptr)));
+    const fs::path dir = fs::path(argv[5]) / ("file_link_test_" + std::to_string(std::time(nullptr)));
     fs::create_directories(dir);
     local_case(read_id, write_id, dir);
-    link_case(read_id, write_id, dir);
+    link_case(read_id, write_id, mint_id, returns_id, dir);
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("OK\n");
     return 0;

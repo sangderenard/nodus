@@ -167,3 +167,9 @@ for an add on development work we haven't implemented yet".
   2. `nodus_meta_channel.h` returned no symbol off Windows, so rows reading meta channels (edge_introspect, link
      metrics channel columns) saw nothing. It now finds the headless image's readers in the process's global symbols
      (dlsym RTLD_DEFAULT); `meta_edge_headless_test` passes on Linux.
+- **Sent tensors are freed.** A send row is a Borrower: what it sends stays the caller's. Owner, 2026-11-21: "change the
+  mint trash to just trash anything there is no reason to have mints filtered ... there's no point to filter the
+  garbage slot". tensor_mint now keeps returned tensors of its own size and destroys everything else (before, other sizes
+  were pushed back onto its stack for a later mint row); a mint with no size set is a plain trash. A sending table
+  carries a tensor_returns row whose "returns" port feeds a mint's "returned" port. Oracle A1: file_link_test and
+  mesh_replica_test end with the tensors they started with (0 alive before, 0 after; 22 files and 80 snapshots sent).

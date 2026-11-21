@@ -2,18 +2,20 @@
 // Owner, 2026-11-21: "by having the canvas state we should collect also any meta edges supplying traffic metrics".
 //
 //   writer node: [feed Input | Output] -> canvas row (host, publish every 5) "in";  "out" -> the node's canvas port
-//                "result"; "state" -> [Input | <id>.bulk.send]   (the node's own canvas, which only it writes)
+//                "result"; "state" -> [Input | <id>.bulk.send | tensor_returns] (the node's own canvas, which only it
+//                writes); tensor_returns -> [tensor_mint], a mint with no size: every sent snapshot is freed
 //                its canvas: "in" -> pass table -> "out", a meta group listening to both edges
 //   reader node: [<id>.bulk.receive | Output] -> canvas row (replica) "state"     (read only, never stepped)
 // Values run through the writer's canvas while its snapshots cross the link. The replica then holds the writer's canvas
 // (the same canvas ports), and its meta group holds the writer's records: the same group, the same member ropes, the
 // traffic the writer saw. Saved, the reader's canvas carries the replica (ROW_STATE) and it loads again.
 //
-//   mesh_replica_test <canvas_row plugin> <work dir>
+//   mesh_replica_test <canvas_row plugin> <tensor_mint plugin> <tensor_returns plugin> <work dir>
 #include "canvas_abi.h"
 #include "nodus_headless_abi.h"
 #include "nodus_link.h"
 #include "plugin_manager.h"
+#include "common/tensors/abstraction/tensor_abi.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +41,16 @@ constexpr int32_t kTool = 1, kInput = 0, kOutput = 2, kPlugin = 1;
 constexpr int32_t kRowPortBase = 20000, kRowPortStride = 64;
 constexpr int32_t kRecordWords = 16;      // GP_META_RECORD_WORDS
 constexpr int kRopeWord = 5, kWriteDeltaWord = 7;
+
+// Tensor handles alive in the process, by describing every id up to `limit` (ids are small and reused).
+int live_tensors(uint64_t limit = 1u << 16) {
+    int n = 0;
+    for (uint64_t id = 1; id <= limit; ++id) {
+        NodusTensorDesc d{};
+        if (nodus_tensor_describe(id, &d) == NODUS_OK) ++n;
+    }
+    return n;
+}
 
 std::vector<uint8_t> read_file(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
@@ -167,10 +179,11 @@ std::vector<uint8_t> writer_canvas(const fs::path& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: mesh_replica_test <canvas_row plugin> <work dir>\n"); return 2; }
-    char row_id[256] = {};
-    if (!gp_plugin_load_from_path(argv[1], row_id, sizeof(row_id))) { std::fprintf(stderr, "cannot load %s\n", argv[1]); return 2; }
-    const fs::path dir = fs::path(argv[2]) / ("mesh_replica_test_" + std::to_string(std::time(nullptr)));
+    if (argc < 5) { std::fprintf(stderr, "usage: mesh_replica_test <canvas_row> <tensor_mint> <tensor_returns> <work dir>\n"); return 2; }
+    char row_id[256] = {}, mint_id[256] = {}, returns_id[256] = {};
+    if (!gp_plugin_load_from_path(argv[1], row_id, sizeof(row_id)) || !gp_plugin_load_from_path(argv[2], mint_id, sizeof(mint_id)) ||
+        !gp_plugin_load_from_path(argv[3], returns_id, sizeof(returns_id))) { std::fprintf(stderr, "cannot load the rows\n"); return 2; }
+    const fs::path dir = fs::path(argv[4]) / ("mesh_replica_test_" + std::to_string(std::time(nullptr)));
     fs::create_directories(dir);
     const std::vector<uint8_t> child = writer_canvas(dir);
 
@@ -195,7 +208,11 @@ int main(int argc, char** argv) {
     CHECK(nodus_headless_set_row_state(writer.g, node, 0, host_state.data(), host_state.size()));
     const int32_t result = nodus_headless_declare_canvas_port(writer.g, "result", 0, 1);
     const int32_t wroot = nodus_headless_canvas_root_module(writer.g);
-    const int send = writer.table("send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, "mesh.w.bulk.send"}}, 1);
+    const int live_before = live_tensors();
+    const int send = writer.table("send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, "mesh.w.bulk.send"},
+                                           {kTool, 0, 0, kPlugin, returns_id}}, 1);
+    const int trash = writer.table("trash", {{kTool, 0, 0, kPlugin, mint_id}}, 1);
+    CHECK(trash >= 0 && writer.edge(send, kRowPortBase + 2 * kRowPortStride, trash, kRowPortBase, writer.tensor) >= 0);
     CHECK(nodus_headless_set_module_stack_loopback(writer.g, send, 1));
     CHECK(writer.edge(feed, 1, node, kRowPortBase + 0, writer.scalar) >= 0);              // row port 0: "in"
     CHECK(writer.edge(node, kRowPortBase + 1, wroot, result, writer.scalar) >= 0);        // row port 1: "out"
@@ -242,6 +259,11 @@ int main(int argc, char** argv) {
     }
     std::printf("writer: %d of 40 values through its canvas; snapshots sent %llu, received %llu\n", through,
                 (unsigned long long)dv[6], (unsigned long long)hv[7]);
+    for (int tick = 0; tick < 60; ++tick) { nodus_headless_step(writer.g, 1.0 / 60.0); nodus_headless_step(reader.g, 1.0 / 60.0); }
+    const int live_after = live_tensors();
+    std::printf("tensors alive before %d, after %d\n", live_before, live_after);
+    // A few snapshots may be in flight (the writer keeps publishing); a leak would leave every one sent (about 80).
+    CHECK(live_after <= live_before + 4);
     CHECK(through == 40);
     CHECK(dv[6] >= 2 && hv[7] == dv[6]);
 
