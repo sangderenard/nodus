@@ -13,6 +13,71 @@
 #include <chrono>
 #include <ctime>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
+
+// ---------------------------------------------------------------------------
+// Platform region: every OS call in this file lives here.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace plugin_mgr_platform {
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_s(&out, &t); }
+
+inline std::string shared_library_extension() { return ".dll"; }
+
+// If this process has nodus_tensor_core loaded, point `dir` at the folder it was loaded from (when that folder
+// also holds its import library).
+inline void adopt_loaded_core_dir(std::filesystem::path& dir) {
+    HMODULE core = GetModuleHandleA("nodus_tensor_core.dll");
+    wchar_t core_path[MAX_PATH] = {};
+    if (core && GetModuleFileNameW(core, core_path, MAX_PATH) > 0) {
+        const std::filesystem::path loaded_dir = std::filesystem::path(core_path).parent_path();
+        if (std::filesystem::exists(loaded_dir / "nodus_tensor_core.lib")) dir = loaded_dir;
+    }
+}
+}  // namespace plugin_mgr_platform
+#else
+#include <dlfcn.h>
+#include <limits.h>
+
+namespace plugin_mgr_platform {
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_r(&t, &out); }
+
+inline std::string shared_library_extension() {
+#if defined(__APPLE__)
+    return ".dylib";
+#else
+    return ".so";
+#endif
+}
+
+// If this process has libnodus_tensor_core loaded, point `dir` at the folder it was loaded from (when that folder
+// also holds the library to link against).
+inline void adopt_loaded_core_dir(std::filesystem::path& dir) {
+#if defined(__APPLE__)
+    const char* soname = "libnodus_tensor_core.dylib";
+#else
+    const char* soname = "libnodus_tensor_core.so";
+#endif
+    void* core = dlopen(soname, RTLD_NOW | RTLD_NOLOAD);
+    if (!core) return;
+#if !defined(__APPLE__)
+    char origin[PATH_MAX] = {};
+    if (dlinfo(core, RTLD_DI_ORIGIN, origin) == 0 && origin[0] != 0) {
+        const std::filesystem::path loaded_dir(origin);
+        if (std::filesystem::exists(loaded_dir / soname)) dir = loaded_dir;
+    }
+#endif
+    dlclose(core);
+}
+}  // namespace plugin_mgr_platform
+#endif
+// ---------------------------------------------------------------------------
 
 static PluginLoader g_plugin_loader;
 
@@ -64,23 +129,9 @@ static std::string timestamp_string() {
     std::time_t t = system_clock::to_time_t(now);
     char buf[64];
     std::tm tm;
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
+    plugin_mgr_platform::local_time(t, tm);
     std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
     return std::string(buf);
-}
-
-static std::string shared_library_extension() {
-#if defined(_WIN32)
-    return ".dll";
-#elif defined(__APPLE__)
-    return ".dylib";
-#else
-    return ".so";
-#endif
 }
 
 static std::string normalize_source_path_for_registry(const std::string& path) {
@@ -201,7 +252,11 @@ int gp_plugin_build_module_and_load(const char* module_src,
             std::filesystem::path abs_rr = resolve_repo_root(abs_src);
             std::filesystem::path abs_inc = abs_rr / "include";
             cm << "target_include_directories(" << module_name << " PRIVATE \"" << abs_rr.generic_string() << "\" \"" << abs_inc.generic_string() << "\")\n";
+            // The row links the tensor core (and canvas tables) THIS process runs with: the directory of the loaded
+            // nodus_tensor_core module. A row linked against any other copy would hold tensor handles the host
+            // cannot resolve (cmake/auto_sources.cmake). <repo>/build/Release is the fallback when it is unknown.
             std::filesystem::path release_dir = abs_rr / "build" / "Release";
+            plugin_mgr_platform::adopt_loaded_core_dir(release_dir);
             // Generated row tools use the shared tensor transport directly.
             // Linking only canvas_tables is insufficient on Windows because
             // that DLL does not re-export nodus_tensor_core's C ABI.
@@ -221,7 +276,9 @@ int gp_plugin_build_module_and_load(const char* module_src,
                 (release_dir / "canvas_tables.lib").generic_string(),
                 (release_dir / "libcanvas_tables.a").generic_string(),
                 (release_dir / "canvas_tables.so").generic_string(),
-                (release_dir / "canvas_tables.dylib").generic_string()
+                (release_dir / "libcanvas_tables.so").generic_string(),
+                (release_dir / "canvas_tables.dylib").generic_string(),
+                (release_dir / "libcanvas_tables.dylib").generic_string()
             };
             for (const auto& lib_path : candidate_libs) {
                 if (std::filesystem::exists(lib_path)) {
@@ -263,7 +320,7 @@ int gp_plugin_build_module_and_load(const char* module_src,
         if (rc != 0) { fs::remove_all(scratch); return 0; }
 
         // locate built library
-        std::string ext = shared_library_extension();
+        std::string ext = plugin_mgr_platform::shared_library_extension();
         std::vector<fs::path> candidates = {
             builddir / "Release" / (module_name + ext),
             builddir / (module_name + ext),

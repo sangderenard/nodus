@@ -70,6 +70,21 @@ project(canvas_tables LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# Static libraries here (canvas_tables_static) are linked into shared ones (nodus_headless): on ELF platforms that needs
+# position-independent code. MSVC has no such requirement, so Windows builds are unchanged.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Platform libraries (owner, 2026-11-19: Windows work is regionalized; Nodus ships for Linux too). NODUS_NET_LIBS: sockets;
+# NODUS_LINK_LIBS: the Nodus link (nodus_link.h crypto, nodus_link_wss.h TLS WebSocket, nodus_link_udp.h AES-GCM).
+if(WIN32)
+  set(NODUS_NET_LIBS ws2_32)
+  set(NODUS_LINK_LIBS ws2_32 bcrypt winhttp crypt32)
+else()
+  find_package(Threads REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  set(NODUS_NET_LIBS Threads::Threads)
+  set(NODUS_LINK_LIBS OpenSSL::SSL OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
+endif()
 
 ## Dependencies are built in isolation under dev_bundle/deps/*
 ## The main project only consumes already-installed packages.
@@ -108,7 +123,13 @@ set(NODUS_TORCH_PYTHON_INCLUDE_DIRS
   "Torch include dirs from python site-packages (semicolon-separated); leave empty to auto-derive from NODUS_TORCH_ROOT if possible"
 )
 set(NODUS_TORCH_VERSION "v2.9.1" CACHE STRING "Torch version to fetch (tag or branch, e.g. v2.4.1 or main)")
-set(NODUS_CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)")
+# The CUDA toolkit only matters for a CUDA-enabled Torch build; its default is the Windows install, and other platforms
+# name it themselves (it stays empty there, so nothing is checked).
+if(WIN32)
+  set(NODUS_CUDA_TOOLKIT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)")
+else()
+  set(NODUS_CUDA_TOOLKIT_ROOT "" CACHE PATH "CUDA toolkit root (set when using CUDA-enabled Torch)")
+endif()
 set(NODUS_CUDA_BIN_DIR "" CACHE PATH "CUDA bin dir override (optional; defaults to <root>/bin)")
 set(NODUS_CUDA_LIB_DIR "" CACHE PATH "CUDA lib dir override (optional; defaults to <root>/lib/x64 on Windows)")
 set(NODUS_CUDA_INCLUDE_DIR "" CACHE PATH "CUDA include dir override (optional; defaults to <root>/include)")
@@ -253,7 +274,7 @@ endif()
 
 # Optional CUDA toolkit verification (for CUDA-enabled Torch). Only runs when a CUDA path is supplied.
 set(_NODUS_CUDA_WANTS_CHECK FALSE)
-if(NOT NODUS_CUDA_TOOLKIT_ROOT STREQUAL "")
+if(NODUS_ENABLE_TORCH AND NOT NODUS_CUDA_TOOLKIT_ROOT STREQUAL "")   # only CUDA-enabled Torch needs it
   set(_NODUS_CUDA_WANTS_CHECK TRUE)
 endif()
 if(NOT NODUS_CUDA_BIN_DIR STREQUAL "")
@@ -365,12 +386,15 @@ add_library(nodus_tensor_core SHARED
   src/common/tensors/abstraction/tensor_calculator_bridge.cpp
   src/common/thread_pool.cpp
   src/mem_backend_host.cpp
+  src/mem_backend_opengl.cpp
   src/spirv_translation.cpp
   src/kernels/kernel_spirv.cpp
   src/kernels/kernel_ir_text.cpp
   # Device execution for assembled modules -- lives beside the assembler so a
   # host that can produce a kernel can also run it.
   src/kernels/kernel_vulkan.cpp
+  # Borrowed-current-context GL packaging used inside native GPU tool rows.
+  src/kernels/kernel_opengl.cpp
   # CPU execution of the same KernelIR -- the reference the device result is
   # checked against, and the only numeric check available without a device.
   src/kernels/kernel_eigen.cpp
@@ -413,9 +437,15 @@ add_library(canvas_tables SHARED
   # placeholder to keep CMake syntax valid; real sources appended by include(cmake/auto_sources.cmake)
 )
 target_link_libraries(canvas_tables PUBLIC nodus_tensor_core)
+if(CMAKE_DL_LIBS)
+  target_link_libraries(canvas_tables PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 add_library(canvas_tables_static STATIC)
 target_link_libraries(canvas_tables_static PUBLIC nodus_tensor_core)
+if(CMAKE_DL_LIBS)
+  target_link_libraries(canvas_tables_static PUBLIC ${CMAKE_DL_LIBS})
+endif()
 
 add_executable(edge_reader_registry_test
   tests/edge_reader_registry_test.cpp
@@ -558,12 +588,16 @@ target_include_directories(nodus_headless PUBLIC
 # contract ports hold a ContractNegotiator, whose standalone FIFO is the
 # nodus_edge_runtime ABI exported by nodus_runtime.
 target_link_libraries(nodus_headless PRIVATE canvas_tables_static nodus_runtime)
+# contract ports and the link rows: sockets, crypto, TLS (NODUS_LINK_LIBS is the platform's set)
+target_link_libraries(nodus_headless PRIVATE ${NODUS_LINK_LIBS} SDL3::SDL3)
+# The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
+# refers to that object, so from the static library the linker would leave it out; this keeps it in.
 if(WIN32)
-  # contract ports: loopback listener and socket adapters (include/contract_listener.h)
-  target_link_libraries(nodus_headless PRIVATE ws2_32 SDL3::SDL3)
-  # The host-declared exec rows register themselves at image load (src/tools/exec_row_registered.cpp). Nothing
-  # refers to that object, so from the static library the linker would leave it out; this keeps it in.
   target_link_options(nodus_headless PRIVATE "/INCLUDE:nodus_exec_row_source")
+elseif(APPLE)
+  target_link_options(nodus_headless PRIVATE "LINKER:-u,_nodus_exec_row_source")
+else()
+  target_link_options(nodus_headless PRIVATE "LINKER:--undefined=nodus_exec_row_source")
 endif()
 target_compile_features(nodus_headless PUBLIC cxx_std_20)
 
@@ -573,32 +607,39 @@ target_include_directories(modlib_actualize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(modlib_actualize PRIVATE canvas_tables)
 target_compile_features(modlib_actualize PUBLIC cxx_std_17)
 
-# kpath raster tools: same-repo standalone plugin DLLs (raw create_tool/
-# destroy_tool exports, no REGISTER_TOOL/tool_registry.cpp link) proving the
-# plugin-DLL loading pattern repo_package.cpp's ingestion uses for real
-# cross-repo packages, with zero cross-repo risk -- exposes kpath's
-# rasterizer as loadable nodus tools. Deliberately not folded into the
-# canvas_tables/canvas_tables_static amalgam (auto_sources.cmake); these are
-# meant to be discovered via PluginLoader, same as a real ingested package.
-add_library(kpath_raster_kernel_tool SHARED
-  plugins/kpath_raster_tool/kpath_raster_kernel_tool.cpp
-)
-target_include_directories(kpath_raster_kernel_tool PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
-)
-target_link_libraries(kpath_raster_kernel_tool PRIVATE canvas_tables)
-
-add_library(kpath_raster_scatter_tool SHARED
-  plugins/kpath_raster_tool/kpath_raster_scatter_tool.cpp
-)
-target_include_directories(kpath_raster_scatter_tool PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
-)
-target_link_libraries(kpath_raster_scatter_tool PRIVATE canvas_tables)
+# Row tools: every row tool's source is module_library/source/tools/<id>.cpp (case 74fd8157), the place the
+# canvas compiler (module_library_actualizer) and the Menu (canvas_refresh_plugin_tools) read. Each source builds
+# as a plugin DLL named by its id into module_library/bin/<config>, where the Menu finds the compiled artifact and
+# PluginLoader records the source. Generated sources (*_ver_*.cpp) are the actualizer's own output, not rows here.
+set(NODUS_ROW_TOOL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/module_library/source/tools")
+set(NODUS_ROW_TOOL_BIN "${CMAKE_CURRENT_SOURCE_DIR}/module_library/bin")
+file(GLOB NODUS_ROW_TOOL_SOURCES CONFIGURE_DEPENDS "${NODUS_ROW_TOOL_DIR}/*.cpp")
+list(FILTER NODUS_ROW_TOOL_SOURCES EXCLUDE REGEX "_ver_[^/]*\.cpp$")
+# Adopter-generated wrappers for Turing-compiled rows are built by the adopter itself (src/artifact_importer.cpp).
+list(FILTER NODUS_ROW_TOOL_SOURCES EXCLUDE REGEX "/imported_[^/]*\.cpp$")
+list(FILTER NODUS_ROW_TOOL_SOURCES EXCLUDE REGEX "/compiled_table_[^/]*\.cpp$")
+set(NODUS_ROW_TOOL_TARGETS)
+foreach(row_source IN LISTS NODUS_ROW_TOOL_SOURCES)
+  get_filename_component(row_id "${row_source}" NAME_WE)
+  add_library(${row_id} SHARED "${row_source}")
+  target_include_directories(${row_id} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include" "${NODUS_ROW_TOOL_DIR}")
+  # canvas_tables exports only its C ABI (cmake/canvas_tables.def); a row uses Nodus's C++ classes, so it links the
+  # static canvas. The tensor singletons are in the shared nodus_tensor_core, so tensor handles cross into the host.
+  target_link_libraries(${row_id} PRIVATE canvas_tables_static)
+  # Rows that publish onto declared ports (Radio) call the headless ABI; the PCM playback row opens SDL audio.
+  if(TARGET nodus_headless)
+    target_link_libraries(${row_id} PRIVATE nodus_headless)
+  endif()
+  if(TARGET SDL3::SDL3)
+    target_link_libraries(${row_id} PRIVATE SDL3::SDL3)
+  endif()
+  target_compile_definitions(${row_id} PRIVATE NOMINMAX)
+  set_target_properties(${row_id} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${NODUS_ROW_TOOL_BIN}/$<CONFIG>"
+    LIBRARY_OUTPUT_DIRECTORY "${NODUS_ROW_TOOL_BIN}/$<CONFIG>")
+  list(APPEND NODUS_ROW_TOOL_TARGETS ${row_id})
+endforeach()
 
 # (sdlttf_demo removed)
 
@@ -625,12 +666,31 @@ target_include_directories(nodus_headless_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(nodus_headless_demo PRIVATE nodus_headless)
 target_compile_features(nodus_headless_demo PUBLIC cxx_std_20)
 
+# The job-scoped frame sink must publish exact compressed bytes once and
+# refuse a replay of the same generation.
+add_executable(frame_artifact_file_tool_test tests/frame_artifact_file_tool_test.cpp)
+target_include_directories(frame_artifact_file_tool_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(frame_artifact_file_tool_test PRIVATE canvas_tables_static nodus_tensor_core)
+target_compile_features(frame_artifact_file_tool_test PUBLIC cxx_std_20)
+
+add_executable(frame_compression_pipeline_test tests/frame_compression_pipeline_test.cpp)
+target_include_directories(frame_compression_pipeline_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(frame_compression_pipeline_test PRIVATE canvas_tables_static nodus_tensor_core)
+target_compile_features(frame_compression_pipeline_test PUBLIC cxx_std_20)
 # Native Radio: one headless table containing its ordered capture/fftfree and
 # UDP rows, executed by the independent Free table worker.
 add_executable(nodus_radio tools/nodus_radio.cpp)
 target_include_directories(nodus_radio PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(nodus_radio PRIVATE nodus_headless)
 target_compile_features(nodus_radio PRIVATE cxx_std_20)
+
+add_executable(nodus_audio_codec tools/nodus_audio_codec.cpp)
+target_include_directories(nodus_audio_codec PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(nodus_audio_codec PRIVATE canvas_tables_static nodus_tensor_core)
+target_compile_features(nodus_audio_codec PRIVATE cxx_std_20)
 
 add_executable(nodus_pcm_playback tools/nodus_pcm_playback.cpp)
 target_include_directories(nodus_pcm_playback PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -664,7 +724,8 @@ target_compile_features(kpath_raster_tensor_demo PUBLIC cxx_std_20)
 
 find_package(OpenGL REQUIRED)
 
-if(NODUS_ENABLE_TORCH)
+# frontend_shell is built with or without Torch: only its device probe uses Torch (gated on NODUS_ENABLE_TORCH).
+if(TRUE)
   add_executable(frontend_shell tools/frontend_shell.cpp)
   target_include_directories(frontend_shell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   # One image only: the static canvas library carries the tool registry and the
@@ -672,14 +733,16 @@ if(NODUS_ENABLE_TORCH)
   target_link_libraries(frontend_shell PRIVATE
     canvas_tables_static
     nodus_runtime
-    Torch::Torch
     OpenGL::GL
   )
+  if(NODUS_ENABLE_TORCH)
+    target_link_libraries(frontend_shell PRIVATE Torch::Torch)
+  endif()
   if(WIN32)
     # contract ports hosted by the GUI canvas: loopback listener + socket adapters
-    target_link_libraries(frontend_shell PRIVATE ws2_32)
+    target_link_libraries(frontend_shell PRIVATE ${NODUS_NET_LIBS})
   endif()
-  if(TARGET nodus_torch_includes)
+  if(NODUS_ENABLE_TORCH AND TARGET nodus_torch_includes)
     target_link_libraries(frontend_shell PRIVATE nodus_torch_includes)
   endif()
   if(TARGET SDL3::SDL3)
@@ -701,7 +764,7 @@ if(NODUS_ENABLE_TORCH)
     message(FATAL_ERROR "SDL3 runtime target not available to copy DLL. Ensure SDL3 is found/built.")
   endif()
 
-  if(DEFINED Torch_DIR)
+  if(NODUS_ENABLE_TORCH AND DEFINED Torch_DIR)
     get_filename_component(_TorchInstallPrefix "${Torch_DIR}/../../.." ABSOLUTE)
     set(_TorchDllDir "${_TorchInstallPrefix}/lib")
     if(EXISTS "${_TorchDllDir}")
@@ -718,14 +781,12 @@ if(NODUS_ENABLE_TORCH)
       endforeach()
     endif()
   endif()
-else()
-  message(STATUS "frontend_shell skipped because NODUS_ENABLE_TORCH=OFF")
 endif()
 
 find_package(Eigen3 REQUIRED)
 find_package(PNG CONFIG REQUIRED)
 find_package(Freetype REQUIRED)
-find_package(HarfBuzz CONFIG REQUIRED)
+find_package(harfbuzz CONFIG REQUIRED)   # vcpkg installs harfbuzzConfig.cmake: lower case (Windows' case-insensitive files hid it)
         # vcpkg provides a lowercase harfbuzz target; alias the canonical HarfBuzz::HarfBuzz name for compatibility.
         if(TARGET harfbuzz AND NOT TARGET HarfBuzz::HarfBuzz)
           add_library(HarfBuzz::HarfBuzz ALIAS harfbuzz)
@@ -741,9 +802,7 @@ target_include_directories(canvas_tables PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # contract_negotiator_registry.cpp / contract_port_canvas.cpp (src glob) hold a
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables PUBLIC nodus_runtime)
-if(WIN32)
-  target_link_libraries(canvas_tables PUBLIC ws2_32)  # contract_listener.h / contract_socket.h in the src glob
-endif()
+target_link_libraries(canvas_tables PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h, nodus_link.h, nodus_link_wss.h (the platform's set)
 target_link_libraries(canvas_tables PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables PUBLIC Torch::Torch)
@@ -774,9 +833,7 @@ target_include_directories(canvas_tables_static PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 # contract_negotiator_registry.cpp / contract_port_canvas.cpp (src glob) hold a
 # ContractNegotiator whose standalone FIFO is the nodus_edge_runtime ABI.
 target_link_libraries(canvas_tables_static PUBLIC nodus_runtime)
-if(WIN32)
-  target_link_libraries(canvas_tables_static PUBLIC ws2_32)  # contract_listener.h / contract_socket.h in the src glob
-endif()
+target_link_libraries(canvas_tables_static PUBLIC ${NODUS_LINK_LIBS})  # contract_listener.h / contract_socket.h, nodus_link.h, nodus_link_wss.h (the platform's set)
 target_link_libraries(canvas_tables_static PUBLIC Eigen3::Eigen PNG::PNG Freetype::Freetype HarfBuzz::HarfBuzz)
 if(NODUS_ENABLE_TORCH AND TARGET Torch::Torch)
   target_link_libraries(canvas_tables_static PUBLIC Torch::Torch)
@@ -843,8 +900,28 @@ add_library(nodus_contract_service SHARED
 target_compile_definitions(nodus_contract_service PRIVATE NODUS_HEADLESS_BUILD=1)
 target_link_libraries(nodus_contract_service PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(nodus_contract_service PRIVATE ws2_32)
+  target_link_libraries(nodus_contract_service PRIVATE ${NODUS_NET_LIBS})
 endif()
+# The volunteer cycle end to end (case a11b5c9b1be74c9b9fb684790f7fd5a3): its session and its headless graph share
+# one registry image, as the socket graph qualification below does.
+#   test_volunteer_cycle <glslangValidator> <nodus root> <module library root> <work dir>
+add_executable(test_volunteer_cycle tests/volunteer_cycle_test.cpp src/headless/nodus_headless_abi.cpp)
+target_compile_definitions(test_volunteer_cycle PRIVATE NODUS_HEADLESS_BUILD=1 NOMINMAX)
+target_link_libraries(test_volunteer_cycle PRIVATE canvas_tables_static nodus_runtime)
+target_compile_features(test_volunteer_cycle PRIVATE cxx_std_20)
+if(WIN32)
+  target_link_libraries(test_volunteer_cycle PRIVATE ${NODUS_NET_LIBS})
+endif()
+# The cycle across the Nodus link: the library on this host, the work on a volunteer child process.
+#   test_volunteer_cycle_link run <glslangValidator> <nodus root> <module library root> <work dir>
+add_executable(test_volunteer_cycle_link tests/volunteer_cycle_link_test.cpp src/headless/nodus_headless_abi.cpp)
+target_compile_definitions(test_volunteer_cycle_link PRIVATE NODUS_HEADLESS_BUILD=1 NOMINMAX)
+target_link_libraries(test_volunteer_cycle_link PRIVATE canvas_tables_static nodus_runtime)
+target_compile_features(test_volunteer_cycle_link PRIVATE cxx_std_20)
+if(WIN32)
+  target_link_libraries(test_volunteer_cycle_link PRIVATE ${NODUS_LINK_LIBS})
+endif()
+
 # Socket qualification uses the same native registry image as its headless graph.
 add_executable(contract_socket_test tests/contract_socket_graph_test.cpp)
 target_link_libraries(contract_socket_test PRIVATE canvas_tables_static nodus_runtime)
@@ -854,8 +931,8 @@ target_compile_definitions(contract_socket_graph_test PRIVATE
   NODUS_HEADLESS_BUILD=1 CONTRACT_SOCKET_GRAPH_TEST=1)
 target_link_libraries(contract_socket_graph_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(contract_socket_test PRIVATE ws2_32)
-  target_link_libraries(contract_socket_graph_test PRIVATE ws2_32)
+  target_link_libraries(contract_socket_test PRIVATE ${NODUS_NET_LIBS})
+  target_link_libraries(contract_socket_graph_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/contract-loopback-isolated")
 foreach(_contract_target contract_socket_test contract_socket_graph_test)
@@ -875,7 +952,7 @@ set_tests_properties(contract_negotiator_test PROPERTIES TIMEOUT 30)
 add_executable(turing_compile_host_test tests/turing_compile_host_test.cpp)
 target_link_libraries(turing_compile_host_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(turing_compile_host_test PRIVATE ws2_32)
+  target_link_libraries(turing_compile_host_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 add_test(NAME turing_compile_host_test COMMAND turing_compile_host_test)
 set_tests_properties(turing_compile_host_test PROPERTIES TIMEOUT 60)
@@ -888,7 +965,7 @@ target_compile_definitions(turing_compile_host_abi_test PRIVATE NODUS_HEADLESS_B
 target_include_directories(turing_compile_host_abi_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(turing_compile_host_abi_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(turing_compile_host_abi_test PRIVATE ws2_32)
+  target_link_libraries(turing_compile_host_abi_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 add_test(NAME turing_compile_host_abi_test COMMAND turing_compile_host_abi_test)
 set_tests_properties(turing_compile_host_abi_test PROPERTIES TIMEOUT 60)
@@ -911,7 +988,7 @@ set_tests_properties(cron_tool_test PROPERTIES TIMEOUT 30)
 add_executable(contract_engine_socket_test tests/contract_engine_socket_test.cpp)
 target_link_libraries(contract_engine_socket_test PRIVATE canvas_tables_static nodus_runtime)
 if(WIN32)
-  target_link_libraries(contract_engine_socket_test PRIVATE ws2_32)
+  target_link_libraries(contract_engine_socket_test PRIVATE ${NODUS_NET_LIBS})
 endif()
 add_test(NAME contract_engine_socket_test COMMAND contract_engine_socket_test)
 set_tests_properties(contract_engine_socket_test PROPERTIES TIMEOUT 30)
@@ -946,6 +1023,20 @@ add_executable(edge_fifo_concurrent_backpressure_test tests/edge_fifo_concurrent
 target_link_libraries(edge_fifo_concurrent_backpressure_test PRIVATE canvas_tables_static)
 target_compile_features(edge_fifo_concurrent_backpressure_test PRIVATE cxx_std_20)
 add_test(NAME edge_fifo_concurrent_backpressure_test COMMAND edge_fifo_concurrent_backpressure_test)
+add_executable(fftfree_tool_test tests/fftfree_tool_test.cpp)
+target_link_libraries(fftfree_tool_test PRIVATE canvas_tables_static)
+target_compile_features(fftfree_tool_test PRIVATE cxx_std_20)
+set(NODUS_FFTFREE_TEST_DLL "" CACHE FILEPATH "fft_cffi library for the fftfree row test")
+if(NODUS_FFTFREE_TEST_DLL)
+  add_test(NAME fftfree_tool_test COMMAND fftfree_tool_test "${NODUS_FFTFREE_TEST_DLL}")
+endif()
+add_executable(wave_t4_state_tool_test tests/wave_t4_state_tool_test.cpp)
+target_link_libraries(wave_t4_state_tool_test PRIVATE canvas_tables_static)
+target_compile_features(wave_t4_state_tool_test PRIVATE cxx_std_20)
+set(NODUS_WAVE_T4_TEST_DLL "" CACHE FILEPATH "Spectral wave_t4 library for the arena row test")
+if(NODUS_WAVE_T4_TEST_DLL)
+  add_test(NAME wave_t4_state_tool_test COMMAND wave_t4_state_tool_test "${NODUS_WAVE_T4_TEST_DLL}")
+endif()
 set_tests_properties(edge_fifo_concurrent_backpressure_test PROPERTIES TIMEOUT 15)
 set_tests_properties(thread_manager_free_test PROPERTIES TIMEOUT 30 LABELS "cpu;scheduler")
 set_tests_properties(thread_manager_affinity_test PROPERTIES TIMEOUT 30 LABELS "cpu;scheduler")
@@ -967,10 +1058,22 @@ add_executable(nodus_headless_runtime_test
 target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
 if(WIN32)
-  target_link_libraries(nodus_headless_runtime_test PRIVATE ws2_32)
+  target_link_libraries(nodus_headless_runtime_test PRIVATE ${NODUS_LINK_LIBS})  # the link tests sign tickets (nodus_link.h, nodus_link_wss.h)
 endif()
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
+
+# Meta edges listen: a meta group over an edge is fed by the real scheduler, saved and loaded, and heard by edge_introspect.
+add_executable(meta_edge_headless_test tests/meta_edge_headless_test.cpp)
+target_include_directories(meta_edge_headless_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(meta_edge_headless_test PRIVATE nodus_headless canvas_tables)
+if(WIN32)
+  target_link_libraries(meta_edge_headless_test PRIVATE ${NODUS_LINK_LIBS})
+endif()
+target_compile_features(meta_edge_headless_test PUBLIC cxx_std_20)
+target_compile_definitions(meta_edge_headless_test PRIVATE NOMINMAX)
+add_test(NAME meta_edge_headless_test COMMAND meta_edge_headless_test)
+set_tests_properties(meta_edge_headless_test PROPERTIES TIMEOUT 60)
 set_tests_properties(nodus_headless_runtime_test PROPERTIES TIMEOUT 30)
 
 # Python smoke test: exercises nodus_headless via the ctypes bridge
@@ -1223,6 +1326,13 @@ add_executable(test_abstract_tensor_pool_torture
 target_link_libraries(test_abstract_tensor_pool_torture PRIVATE canvas_tables_static)
 add_test(NAME abstract_tensor_pool_torture_test COMMAND test_abstract_tensor_pool_torture)
 
+# The tensor handle dup row refuses failure-atomically (review 924fc2a7, research case 6393486c).
+add_executable(test_tensor_handle_dup tests/tensor_handle_dup_test.cpp)
+target_include_directories(test_tensor_handle_dup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_tensor_handle_dup PRIVATE canvas_tables_static)
+target_compile_definitions(test_tensor_handle_dup PRIVATE NOMINMAX)
+add_test(NAME tensor_handle_dup_test COMMAND test_tensor_handle_dup)
+
 add_executable(test_scatter_indices
   tests/scatter_indices_test.cpp
 )
@@ -1369,17 +1479,148 @@ add_executable(test_spectral_exact_lens_vulkan
   tests/spectral_exact_lens_vulkan_test.cpp)
 target_link_libraries(test_spectral_exact_lens_vulkan PRIVATE canvas_tables_static)
 target_compile_features(test_spectral_exact_lens_vulkan PRIVATE cxx_std_20)
-
 add_executable(test_spectral_wave_vulkan
   tests/spectral_wave_vulkan_test.cpp)
 target_link_libraries(test_spectral_wave_vulkan PRIVATE canvas_tables_static)
 target_compile_features(test_spectral_wave_vulkan PRIVATE cxx_std_20)
+# Nodus link stage 5 (research case 98d49cb8520e44d092c5d134c37c3c32): two Nodus host processes share GPU work over
+# the link; the shader travels as GLSL + its Vulkan SDK (glslang) SPIR-V.
+#   link_gpu_exchange run <turing spring shader dir> <work dir> <glslangValidator>
+if(WIN32)
+  add_executable(link_gpu_exchange tools/link_gpu_exchange/link_gpu_exchange.cpp)
+  target_link_libraries(link_gpu_exchange PRIVATE canvas_tables_static ${NODUS_LINK_LIBS})
+  target_compile_features(link_gpu_exchange PRIVATE cxx_std_20)
+endif()
+add_executable(test_tcp_byte_stream_tool tests/tcp_byte_stream_tool_test.cpp)
+target_link_libraries(test_tcp_byte_stream_tool PRIVATE canvas_tables_static)
+target_compile_features(test_tcp_byte_stream_tool PRIVATE cxx_std_20)
+add_test(NAME tcp_byte_stream_tool_test COMMAND test_tcp_byte_stream_tool)
+set_tests_properties(tcp_byte_stream_tool_test PROPERTIES TIMEOUT 10)
 add_executable(test_spectral_t3_vulkan tests/spectral_t3_vulkan_test.cpp)
 target_link_libraries(test_spectral_t3_vulkan PRIVATE nodus_tensor_core)
 target_compile_features(test_spectral_t3_vulkan PRIVATE cxx_std_20)
 add_executable(test_spectral_t5_vulkan tests/spectral_t5_vulkan_test.cpp)
 target_link_libraries(test_spectral_t5_vulkan PRIVATE canvas_tables_static)
 target_compile_features(test_spectral_t5_vulkan PRIVATE cxx_std_20)
+# Inventory/selection failures are tested with fake Vulkan entry points. These
+# tests never submit or compile shaders and do not depend on a physical GPU.
+if(Vulkan_FOUND)
+  add_executable(test_vulkan_device_query
+    tests/vulkan_device_query_test.cpp
+    src/kernels/kernel_vulkan.cpp
+  )
+  target_include_directories(test_vulkan_device_query PRIVATE include src)
+  target_compile_definitions(test_vulkan_device_query PRIVATE NODUS_HAVE_VULKAN=1)
+  target_link_libraries(test_vulkan_device_query PRIVATE Vulkan::Vulkan)
+  target_compile_features(test_vulkan_device_query PRIVATE cxx_std_20)
+  add_test(NAME vulkan_device_query_test COMMAND test_vulkan_device_query)
+  set_tests_properties(vulkan_device_query_test PROPERTIES LABELS "cpu;vulkan-mock")
+endif()
+
+add_executable(test_vulkan_unavailable
+  tests/vulkan_unavailable_test.cpp
+  src/kernels/kernel_vulkan.cpp
+)
+target_include_directories(test_vulkan_unavailable PRIVATE include src)
+target_compile_features(test_vulkan_unavailable PRIVATE cxx_std_20)
+add_test(NAME vulkan_unavailable_test COMMAND test_vulkan_unavailable)
+set_tests_properties(vulkan_unavailable_test PROPERTIES LABELS "cpu")
+
+# No GL/device calls: injected call recorder + mock Nodus context registry.
+add_executable(test_opengl_compute_package
+  tests/opengl_compute_package_test.cpp
+  src/kernels/kernel_opengl.cpp
+)
+target_include_directories(test_opengl_compute_package PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_opengl_compute_package PRIVATE cxx_std_20)
+target_link_libraries(test_opengl_compute_package PRIVATE nodus_tensor_core)
+add_test(NAME opengl_compute_package_test COMMAND test_opengl_compute_package)
+
+# Actual shared memory registry with CPU-injected OpenGL storage procedures.
+# No context creation, hardware query, shader link, dispatch, or rendering.
+add_executable(test_mem_backend_opengl tests/mem_backend_opengl_test.cpp)
+target_include_directories(test_mem_backend_opengl PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_mem_backend_opengl PRIVATE cxx_std_20)
+target_link_libraries(test_mem_backend_opengl PRIVATE nodus_tensor_core)
+add_test(NAME mem_backend_opengl_test COMMAND test_mem_backend_opengl)
+set_tests_properties(mem_backend_opengl_test PROPERTIES LABELS "cpu")
+
+# Actual native contract FIFO/tool stack with GL entrypoints call-recorded.
+add_executable(test_opengl_gpu_row
+  tests/opengl_gpu_row_test.cpp src/kernels/kernel_opengl.cpp src/tool_registry.cpp)
+target_include_directories(test_opengl_gpu_row PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_opengl_gpu_row PRIVATE cxx_std_20)
+target_link_libraries(test_opengl_gpu_row PRIVATE nodus_runtime nodus_tensor_core)
+add_test(NAME opengl_gpu_row_test COMMAND test_opengl_gpu_row)
+add_executable(test_contract_protected_loan tests/contract_protected_loan_test.cpp)
+target_include_directories(test_contract_protected_loan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(test_contract_protected_loan PRIVATE cxx_std_20)
+target_link_libraries(test_contract_protected_loan PRIVATE nodus_runtime)
+add_test(NAME contract_protected_loan_test COMMAND test_contract_protected_loan)
+
+# Real canonical manager-lane graph and typed FIFO transport; GL is call-recorded.
+add_executable(test_opengl_gpu_threadmanager
+  tests/opengl_gpu_threadmanager_test.cpp src/kernels/kernel_opengl.cpp)
+target_link_libraries(test_opengl_gpu_threadmanager PRIVATE canvas_tables_static)
+target_compile_features(test_opengl_gpu_threadmanager PRIVATE cxx_std_20)
+add_test(NAME opengl_gpu_threadmanager_test COMMAND test_opengl_gpu_threadmanager)
+set_tests_properties(opengl_compute_package_test opengl_gpu_row_test
+  contract_protected_loan_test opengl_gpu_threadmanager_test
+  PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-row")
+
+# Protected native process owner is separate from the service's GL linkage.
+# This CPU test launches only its own no-GL fixture child. The actual worker
+# is built but is never registered as an automatic hardware integration test.
+if(WIN32)
+  add_library(nodus_protected_opengl STATIC
+    src/kernels/opengl_protected_process.cpp
+    src/kernels/opengl_protected_child.cpp)
+  target_include_directories(nodus_protected_opengl PUBLIC include PRIVATE src)
+  target_compile_features(nodus_protected_opengl PUBLIC cxx_std_20)
+  target_link_libraries(nodus_protected_opengl PRIVATE bcrypt)
+  add_executable(nodus_opengl_link_worker
+    src/kernels/opengl_link_worker_main.cpp
+    src/kernels/opengl_protected_wgl.cpp
+    src/kernels/kernel_opengl.cpp)
+  target_include_directories(nodus_opengl_link_worker PRIVATE include src)
+  target_link_libraries(nodus_opengl_link_worker PRIVATE nodus_protected_opengl
+    nodus_tensor_core opengl32 user32 gdi32)
+  # Explicit development entry; never registered as an automatic real-GPU test.
+  add_executable(nodus_opengl_link_once src/opengl_link_once.cpp src/kernels/kernel_opengl.cpp)
+  target_include_directories(nodus_opengl_link_once PRIVATE include src)
+  target_link_libraries(nodus_opengl_link_once PRIVATE nodus_protected_opengl canvas_tables_static)
+  add_executable(test_opengl_protected_process tests/opengl_protected_process_test.cpp
+    src/kernels/opengl_protected_process.cpp src/kernels/opengl_protected_child.cpp)
+  target_include_directories(test_opengl_protected_process PRIVATE include src)
+  target_compile_definitions(test_opengl_protected_process PRIVATE NODUS_PROTECTED_PROCESS_TEST_HOOKS=1)
+  target_link_libraries(test_opengl_protected_process PRIVATE bcrypt)
+  add_test(NAME opengl_protected_process_test COMMAND test_opengl_protected_process)
+  set_tests_properties(opengl_protected_process_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "cpu;gpu-process-containment")
+  add_executable(test_opengl_protected_row_threadmanager
+    tests/opengl_protected_row_threadmanager_test.cpp src/kernels/kernel_opengl.cpp)
+  target_link_libraries(test_opengl_protected_row_threadmanager PRIVATE
+    nodus_protected_opengl canvas_tables_static)
+  target_include_directories(test_opengl_protected_row_threadmanager PRIVATE include src)
+  add_test(NAME opengl_protected_row_threadmanager_test COMMAND test_opengl_protected_row_threadmanager)
+  set_tests_properties(opengl_protected_row_threadmanager_test PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "cpu;gpu-row;gpu-process-containment")
+  # Supplied inventory only: factory/config and contract registration, no query
+  # or GPU work. Uses the same canvas/static registry image as the caller.
+  add_library(nodus_gpu_inventory_rows STATIC src/gpu_inventory_rows.cpp)
+  target_include_directories(nodus_gpu_inventory_rows PUBLIC include)
+  target_link_libraries(nodus_gpu_inventory_rows PUBLIC canvas_tables_static nodus_protected_opengl)
+  target_compile_features(nodus_gpu_inventory_rows PUBLIC cxx_std_20)
+  add_executable(test_gpu_inventory_rows tests/gpu_inventory_rows_test.cpp src/kernels/kernel_opengl.cpp)
+  target_link_libraries(test_gpu_inventory_rows PRIVATE nodus_gpu_inventory_rows)
+  add_test(NAME gpu_inventory_rows_test COMMAND test_gpu_inventory_rows)
+  set_tests_properties(gpu_inventory_rows_test PROPERTIES TIMEOUT 30 LABELS "cpu;gpu-row;registry")
+  add_executable(test_contract_registry_transaction tests/contract_registry_transaction_test.cpp
+    src/contract_negotiator_registry.cpp src/tool_registry.cpp)
+  target_include_directories(test_contract_registry_transaction PRIVATE include)
+  target_link_libraries(test_contract_registry_transaction PRIVATE nodus_runtime nodus_tensor_core)
+  target_compile_features(test_contract_registry_transaction PRIVATE cxx_std_20)
+  add_test(NAME contract_registry_transaction_test COMMAND test_contract_registry_transaction)
+  set_tests_properties(contract_registry_transaction_test PROPERTIES TIMEOUT 30 LABELS "cpu;registry;allocation-faults")
+endif()
 add_executable(test_tensor_state_library tests/tensor_state_library_test.cpp)
 target_link_libraries(test_tensor_state_library PRIVATE nodus_tensor_core)
 target_compile_features(test_tensor_state_library PRIVATE cxx_std_20)
@@ -1461,14 +1702,15 @@ add_executable(test_kpath_raster_tool
   tests/kpath_raster_tool_test.cpp
 )
 target_include_directories(test_kpath_raster_tool PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/plugins/kpath_raster_tool"
+  "${NODUS_ROW_TOOL_DIR}"
 )
 target_link_libraries(test_kpath_raster_tool PRIVATE canvas_tables_static)
 target_compile_definitions(test_kpath_raster_tool PRIVATE
   NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
   NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
+  NODUS_ROW_TOOL_BIN="${NODUS_ROW_TOOL_BIN}"
 )
-add_dependencies(test_kpath_raster_tool kpath_raster_kernel_tool kpath_raster_scatter_tool)
+add_dependencies(test_kpath_raster_tool kpath_raster_kernel kpath_raster_scatter)
 add_test(NAME kpath_raster_tool_test COMMAND test_kpath_raster_tool)
 
 # Many unit tests use assert() for both validation and required side effects

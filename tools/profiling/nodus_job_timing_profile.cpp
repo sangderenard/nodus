@@ -14,77 +14,29 @@
 #include <thread>
 #include <vector>
 
-using Clock = std::chrono::steady_clock;
 using Table = std::unique_ptr<GP_TableContext, decltype(&gp_table_destroy)>;
 
-struct Probe {
-    std::atomic<uint64_t> runs{0};
-    std::atomic<bool> ordered{true};
-};
-
-class Row final : public ITool {
-public:
-    Row(Probe& probe, int work_us, int input_count, bool produce)
-        : probe_(probe), work_us_(work_us), input_count_(input_count), produce_(produce) {}
-    void initialize(const ToolInitContext&) override {}
-    void shutdown() override {}
-    void tick(double, HostAPI&) override {}
-    void render(RenderContext&) override {}
-    void execute_stack(ToolStackContext& ctx) override {
-        const uint64_t ordinal = probe_.runs.fetch_add(1, std::memory_order_relaxed) + 1;
-        for (int i = 0; i < input_count_; ++i) {
-            if (tool_stack_pop(ctx.stack) != static_cast<float>(ordinal))
-                probe_.ordered.store(false, std::memory_order_relaxed);
-        }
-        if (produce_) tool_stack_push(ctx.stack, static_cast<float>(ordinal));
-        if (work_us_ > 0) {
-            const auto until = Clock::now() + std::chrono::microseconds(work_us_);
-            while (Clock::now() < until) std::atomic_signal_fence(std::memory_order_seq_cst);
-        }
-    }
-private:
-    Probe& probe_;
-    int work_us_;
-    int input_count_;
-    bool produce_;
-};
-
-class MathSource final : public ITool {
-public:
-    explicit MathSource(bool chain) : chain_(chain) {}
-    void initialize(const ToolInitContext&) override {}
-    void shutdown() override {}
-    void tick(double, HostAPI&) override {}
-    void render(RenderContext&) override {}
-    void execute_stack(ToolStackContext& ctx) override {
-        if (chain_) {
-            for (int i = 0; i < 65; ++i) tool_stack_push(ctx.stack, 1.0f);
-        } else {
-            tool_stack_push(ctx.stack, 1.25f);
-            tool_stack_push(ctx.stack, 2.5f);
-        }
-    }
-private:
-    bool chain_;
-};
-
-class MathSink final : public ITool {
-public:
-    MathSink(Probe& probe, float expected) : probe_(probe), expected_(expected) {}
-    void initialize(const ToolInitContext&) override {}
-    void shutdown() override {}
-    void tick(double, HostAPI&) override {}
-    void render(RenderContext&) override {}
-    void execute_stack(ToolStackContext& ctx) override {
-        const float result = tool_stack_pop(ctx.stack);
-        if (std::fabs(result - expected_) > 1e-5f)
-            probe_.ordered.store(false, std::memory_order_relaxed);
-        probe_.runs.fetch_add(1, std::memory_order_relaxed);
-    }
-private:
-    Probe& probe_;
-    float expected_;
-};
+// The rows are the plugin sources in module_library/source/tools, compiled into this program the way a composed plugin
+// source is: NODUS_PLUGIN_COMPOSITE with its exports renamed.
+#define NODUS_PLUGIN_COMPOSITE 1
+#define NODUS_PLUGIN_FACTORY_NAME nodus_profile_row_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_profile_row_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_profile_row_source
+#include "../../module_library/source/tools/profile_row.cpp"
+#undef NODUS_PLUGIN_FACTORY_NAME
+#undef NODUS_PLUGIN_DESTROY_NAME
+#undef NODUS_PLUGIN_SOURCE_NAME
+#define NODUS_PLUGIN_FACTORY_NAME nodus_profile_math_source_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_profile_math_source_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_profile_math_source_source
+#include "../../module_library/source/tools/profile_math_source.cpp"
+#undef NODUS_PLUGIN_FACTORY_NAME
+#undef NODUS_PLUGIN_DESTROY_NAME
+#undef NODUS_PLUGIN_SOURCE_NAME
+#define NODUS_PLUGIN_FACTORY_NAME nodus_profile_math_sink_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_profile_math_sink_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_profile_math_sink_source
+#include "../../module_library/source/tools/profile_math_sink.cpp"
 
 static void add_row(GraphRuntime& graph, int module, ModuleRowKind kind, int contact, ITool* tool = nullptr) {
     ModuleIORow row{};

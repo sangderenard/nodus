@@ -3,7 +3,29 @@
 // tick, a number left by an input row that had nothing unread, a tensor handle when a span arrived, one
 // execute_stack per tick, and whatever the row left on top of the stack afterwards.
 // The compressor must compress standard input to standard output with "-c" and decompress with "-d -c".
+#include <chrono>
+#include <thread>
 #include "exec_row.h"
+// ---- platform region: the test's library loading and environment ----
+#if defined(_WIN32)
+static void* test_library_open(const char* path) { return reinterpret_cast<void*>(LoadLibraryA(path)); }
+static void* test_library_symbol(void* lib, const char* name) { return reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(lib), name)); }
+static unsigned long test_last_error() { return test_last_error(); }
+static void test_set_env(const char* name, const char* value) { SetEnvironmentVariableA(name, value); }
+static unsigned long test_process_id() { return GetCurrentProcessId(); }
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdlib>
+static void* test_library_open(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+static void* test_library_symbol(void* lib, const char* name) { return dlsym(lib, name); }
+static unsigned long test_last_error() { return static_cast<unsigned long>(errno); }
+static void test_set_env(const char* name, const char* value) { if (value) setenv(name, value, 1); else unsetenv(name); }
+static unsigned long test_process_id() { return static_cast<unsigned long>(getpid()); }
+#endif
+// ---- end platform region ----
+
 
 #include "common/tensors/abstraction/abstract_tensor_handle.h"
 #include "common/tensors/abstraction/tensor_abi.h"
@@ -12,6 +34,8 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -100,7 +124,7 @@ struct Row {
         const auto deadline = Clock::now() + std::chrono::milliseconds(limit_ms);
         while (Clock::now() < deadline) {
             if (const uint64_t out = tick({})) return out;
-            Sleep(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return 0;
     }
@@ -109,11 +133,12 @@ struct Row {
 int main(int argc, char** argv) {
     if (argc < 4) { std::fprintf(stderr, "usage: exec_row_test <exec_row_tool.dll> <compressor> <scratch-dir> [core-root]\n"); return 2; }
     const std::string dll = argv[1], compressor = argv[2], scratch = argv[3], core = argc > 4 ? argv[4] : "C:/dev/Powershell";
-    HMODULE module = LoadLibraryA(dll.c_str());
-    if (!module) { std::fprintf(stderr, "the row DLL did not load (error %lu)\n", GetLastError()); return 2; }
-    create_tool = reinterpret_cast<CreateToolFn>(GetProcAddress(module, "create_tool"));
-    destroy_tool = reinterpret_cast<void (*)(ITool*)>(GetProcAddress(module, "destroy_tool"));
-    auto plugin_init = reinterpret_cast<int (*)(HostAPI*)>(GetProcAddress(module, "plugin_init"));
+    const std::string ffmpeg = argc > 5 ? argv[5] : "";
+    void* module = test_library_open(dll.c_str());
+    if (!module) { std::fprintf(stderr, "the row DLL did not load (error %lu)\n", test_last_error()); return 2; }
+    create_tool = reinterpret_cast<CreateToolFn>(test_library_symbol(module, "create_tool"));
+    destroy_tool = reinterpret_cast<void (*)(ITool*)>(test_library_symbol(module, "destroy_tool"));
+    auto plugin_init = reinterpret_cast<int (*)(HostAPI*)>(test_library_symbol(module, "plugin_init"));
     if (!create_tool || !destroy_tool || !plugin_init) { std::fprintf(stderr, "the row DLL lacks the plugin exports\n"); return 2; }
     RecordingHost host;
     plugin_init(&host);
@@ -121,7 +146,7 @@ int main(int argc, char** argv) {
     const nodus::exec::RowSettings pack{compressor, {"-c"}, scratch, 2}, unpack{compressor, {"-d", "-c"}, scratch, 2};
 
     // A host that declared no core gets a row that starts nothing.
-    SetEnvironmentVariableA("NODUS_EXEC_CORE_ROOTS", nullptr);
+    test_set_env("NODUS_EXEC_CORE_ROOTS", nullptr);
     {
         Row row(pack, file);
         const uint64_t span = tensor_of("abc");
@@ -131,7 +156,7 @@ int main(int argc, char** argv) {
         check(host.said("declared no core"), "and the host log says why");
         nodus_tensor_destroy(span);
     }
-    SetEnvironmentVariableA("NODUS_EXEC_CORE_ROOTS", ("C:/nowhere-at-all;" + core).c_str());
+    test_set_env("NODUS_EXEC_CORE_ROOTS", ("C:/nowhere-at-all;" + core).c_str());
 
     // Declared port layout.
     {
@@ -193,7 +218,7 @@ int main(int argc, char** argv) {
         note(packer.tick({inputs[5]}));
         for (uint64_t input : inputs) nodus_tensor_destroy(input);
         const auto deadline = Clock::now() + std::chrono::seconds(60);
-        while (packed.size() < sent.size() && Clock::now() < deadline) { note(packer.tick({})); Sleep(1); }
+        while (packed.size() < sent.size() && Clock::now() < deadline) { note(packer.tick({})); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
         check(packed.size() == sent.size(), "six spans in, six out");
         bool in_order = packed.size() == sent.size();
         for (size_t i = 0; in_order && i < packed.size(); ++i) {
@@ -242,7 +267,7 @@ int main(int argc, char** argv) {
         while (!refused_once && Clock::now() < deadline) {
             left_a_span = left_a_span || unpacker.tick({}, &succeeded) != 0;
             refused_once = !succeeded;
-            if (!refused_once) Sleep(1);
+            if (!refused_once) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         check(!left_a_span, "a failed program leaves no span");
         check(refused_once && host.said("exit code"), "the tick that finds the failure is refused and the host log has the exit code");
@@ -265,6 +290,67 @@ int main(int argc, char** argv) {
         nodus::exec::RowSettings read;
         check(nodus::exec::read_settings(in, read) && read.program == compressor && read.arguments == unpack.arguments &&
               read.working_dir == scratch && read.most_at_once == 2, "and they read back the same");
+    }
+    if (!ffmpeg.empty()) {
+        const std::string declaration = scratch + "/ffmpeg_exec_rows.txt";
+        { std::ofstream out(declaration);
+          out << "row exec.radio.hls\nname Radio HLS\nprogram " << ffmpeg << "\n"
+              << "directory " << scratch << "\nmode stream\nqueue_bytes 1048576\n"; }
+        std::vector<nodus::exec::DeclaredRow> declared;
+        std::string why;
+        check(nodus::exec::read_declared_rows(declaration, declared, why) && declared.size() == 1 &&
+              declared[0].settings.stream && declared[0].settings.queue_bytes == 1048576,
+              "declared streaming row parses from the host's row file");
+        // FFmpeg must see multiple PCM tensors on one still-open stdin and publish HLS before shutdown.
+        const std::string stem = "exec_stream_" + std::to_string(test_process_id());
+        const std::string playlist = scratch + "/" + stem + ".m3u8";
+        nodus::exec::RowSettings hls{ffmpeg,
+            {"-hide_banner", "-loglevel", "error", "-probesize", "32", "-analyzeduration", "0",
+             "-f", "s16le", "-ar", "48000", "-ac", "2",
+             "-i", "pipe:0", "-c:a", "aac", "-b:a", "96k", "-f", "hls", "-hls_time", "1",
+             "-hls_list_size", "3", "-hls_segment_filename", scratch + "/" + stem + "_%03d.ts",
+             "-y", playlist}, scratch, 1, true, 1u << 20};
+        Row row(hls, file);
+        check(row.tool->port_count() == 1 && row.tool->port_spec(0).kind == ToolPortKind::Argument,
+              "stream row has an input and no return port");
+        {
+            auto limited = hls;
+            limited.queue_bytes = 1;
+            Row bounded(limited, scratch + "/exec_stream_limited.bin");
+            const uint64_t too_large = tensor_of("too large");
+            bool succeeded = true;
+            check(bounded.tick({too_large}, &succeeded) == too_large && !succeeded,
+                  "a full stream queue refuses input without taking its tensor");
+            nodus_tensor_destroy(too_large);
+        }
+        std::string pcm(192000, '\0'); // One second of 48 kHz, stereo, signed 16-bit PCM.
+        bool accepted = true;
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t span = tensor_of(pcm);
+            bool succeeded = false;
+            row.tick({span}, &succeeded);
+            accepted = accepted && succeeded;
+            nodus_tensor_destroy(span);
+        }
+        check(accepted, "successive PCM tensors enter one open FFmpeg pipe");
+        bool published = false;
+        const auto deadline = Clock::now() + std::chrono::seconds(15);
+        while (!published && Clock::now() < deadline) {
+            bool succeeded = true;
+            row.tick({}, &succeeded);
+            if (!succeeded) break;
+            std::ifstream file_in(playlist);
+            const std::string listing((std::istreambuf_iterator<char>(file_in)), std::istreambuf_iterator<char>());
+            published = listing.find(".ts") != std::string::npos;
+            if (!published) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!published) for (const std::string& line : host.lines) std::printf("     host: %s\n", line.c_str());
+        check(published, "FFmpeg publishes HLS while the row remains open");
+        nodus::exec::RowSettings read;
+        { FileOutputArchive out((scratch + "/exec_stream_saved.bin").c_str()); check(row.tool->serialize(out), "stream settings save"); }
+        { FileInputArchive in((scratch + "/exec_stream_saved.bin").c_str());
+          check(nodus::exec::read_settings(in, read) && read.stream && read.queue_bytes == hls.queue_bytes,
+                "stream mode and queue limit restore"); }
     }
     std::printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;

@@ -1,14 +1,18 @@
-"""tools/run_canvas.py read-only admin console (protocol nodus-console/1)."""
+"""tools/run_canvas.py managed canvas console protocols."""
 
 from __future__ import annotations
 
 import json
+import http.client
+import ctypes
+import os
 import pathlib
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -141,6 +145,71 @@ class ConsoleTest(unittest.TestCase):
         c.close()
         last = self.stop()
         self.assertGreaterEqual(last["ticks"], 300, last)
+
+    def test_v2_ui_action_checks_revision_on_stepping_thread(self) -> None:
+        port, _ = self.start("200")
+        c = Client(port)
+        c.send(f"HELLO nodus-console/2 {TOKEN}")
+        self.assertEqual(c.line(), b"OK console messenger.nodus.txt actions\n")
+        revision, _, _, _ = c.snapshot()
+
+        def action(body):
+            payload = json.dumps(body).encode()
+            c.sock.sendall(b"ACTION %d\n" % len(payload) + payload)
+            header = c.line().split()
+            self.assertEqual(header[:2], [b"JSON", b"ACTION"])
+            return json.loads(c.f.read(int(header[2])))
+
+        changed = action({"op": "viewport", "expected_revision": revision,
+                          "width": 800, "height": 600})
+        self.assertTrue(changed["handled"])
+        clicked = action({"op": "mouse", "expected_revision": changed["revision"],
+                          "kind": "click", "x": 400, "y": 200})
+        self.assertIn("handled", clicked)
+        stale = action({"op": "viewport", "expected_revision": revision + 999,
+                        "width": 800, "height": 600})
+        self.assertEqual(stale["error"], "canvas revision changed")
+        c.close()
+        self.stop()
+
+    @unittest.skipUnless(os.environ.get("CANVAS_TABLES_LIB"), "requires a built Nodus canvas_tables DLL")
+    def test_ui_server_mirrors_full_and_region_frames_read_only(self) -> None:
+        from demo_canvas_tables import CanvasHTTPServer, CanvasRequestHandler, ConsoleMirror
+
+        port, _ = self.start("60")
+        mirror = ConsoleMirror("127.0.0.1", port, self.err_path.parent / "token.txt", 800, 600, 1 / 60, ())
+        backend = mirror.backend_for(mirror.snapshot())
+        ui = CanvasHTTPServer(("127.0.0.1", 0), CanvasRequestHandler, backend, mirror)
+        threading.Thread(target=ui.serve_forever, daemon=True).start()
+        try:
+            ui.backend.apply_tails({"modules": [{"index": 0, "stack_tail": [1.25, 2.5]}]})
+            get_tail = ui.backend.lib.gp_canvas_get_module_stack_tail
+            get_tail.restype = ctypes.c_int
+            get_tail.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_float),
+                                 ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+            values = (ctypes.c_float * 4)()
+            count = ctypes.c_int()
+            self.assertTrue(get_tail(ui.backend.ctx, 0, values, 4, ctypes.byref(count)))
+            self.assertEqual([values[i] for i in range(count.value)], [1.25, 2.5])
+            client = http.client.HTTPConnection("127.0.0.1", ui.server_address[1], timeout=10)
+            for path, size in (("/frame", (800, 600)), ("/frame?x=10&y=12&width=64&height=48", (64, 48))):
+                client.request("GET", path)
+                response = client.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(body[:8], b"\x89PNG\r\n\x1a\n")
+                self.assertEqual(tuple(int.from_bytes(body[i:i + 4], "big") for i in (16, 20)), size)
+            client.request("POST", "/event", body=b"{}")
+            response = client.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+            client.close()
+        finally:
+            ui.shutdown()
+            ui.server_close()
+            ui.backend.shutdown()
+            mirror.close()
+            self.stop()
 
 
 if __name__ == "__main__":

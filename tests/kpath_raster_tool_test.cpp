@@ -141,7 +141,7 @@ int main() {
     return 0;
 #endif
 
-    const fs::path build_dir = fs::path(NODUS_BUILD_DIR);
+    const fs::path build_dir = fs::path(NODUS_ROW_TOOL_BIN);   // module_library/bin: the row tools' DLLs
     const ArmatureProgram program = make_test_program();
 
     MachineControlConfig machine;
@@ -167,16 +167,16 @@ int main() {
         }
 
         PluginLoader loader;
-        auto result = run_tool_via_plugin(loader, host, build_dir, "kpath_raster_kernel_tool", program);
+        auto result = run_tool_via_plugin(loader, host, build_dir, "kpath_raster_kernel", program);
         if (!result) {
-            std::cerr << "kpath_raster_kernel_tool produced no result\n";
+            std::cerr << "kpath_raster_kernel produced no result\n";
             return 1;
         }
         if (!canvases_equal(result->energy, ref_energy) || !canvases_equal(result->temp, ref_temp)) {
-            std::cerr << "kpath_raster_kernel_tool output does not match direct call\n";
+            std::cerr << "kpath_raster_kernel output does not match direct call\n";
             return 1;
         }
-        std::cerr << "kpath_raster_kernel_tool ok (energy_max=" << result->energy.max_value() << ")\n";
+        std::cerr << "kpath_raster_kernel ok (energy_max=" << result->energy.max_value() << ")\n";
     }
 
     // --- scatter path ---
@@ -191,16 +191,16 @@ int main() {
         }
 
         PluginLoader loader;
-        auto result = run_tool_via_plugin(loader, host, build_dir, "kpath_raster_scatter_tool", program);
+        auto result = run_tool_via_plugin(loader, host, build_dir, "kpath_raster_scatter", program);
         if (!result) {
-            std::cerr << "kpath_raster_scatter_tool produced no result\n";
+            std::cerr << "kpath_raster_scatter produced no result\n";
             return 1;
         }
         if (!canvases_equal(result->energy, ref_energy) || !canvases_equal(result->temp, ref_temp)) {
-            std::cerr << "kpath_raster_scatter_tool output does not match direct call\n";
+            std::cerr << "kpath_raster_scatter output does not match direct call\n";
             return 1;
         }
-        std::cerr << "kpath_raster_scatter_tool ok (energy_max=" << result->energy.max_value() << ")\n";
+        std::cerr << "kpath_raster_scatter ok (energy_max=" << result->energy.max_value() << ")\n";
     }
 
     return 0;

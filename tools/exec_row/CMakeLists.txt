@@ -15,7 +15,7 @@ if(NOT EXISTS "${NODUS_TENSOR_CORE_DIR}/nodus_tensor_core.lib")
 endif()
 set(NODUS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
-add_library(exec_row_tool SHARED exec_row_tool.cpp)
+add_library(exec_row_tool SHARED "${NODUS_ROOT}/module_library/source/tools/exec_row.cpp")
 add_executable(exec_row_test exec_row_test.cpp)
 foreach(target exec_row_tool exec_row_test)
   target_include_directories(${target} PRIVATE "${NODUS_ROOT}" "${NODUS_ROOT}/include")
@@ -32,3 +32,7 @@ add_executable(exec_row_registry_test exec_row_registry_test.cpp
 target_include_directories(exec_row_registry_test PRIVATE "${NODUS_ROOT}" "${NODUS_ROOT}/include")
 target_link_libraries(exec_row_registry_test PRIVATE "${NODUS_TENSOR_CORE_DIR}/nodus_tensor_core.lib")
 target_compile_definitions(exec_row_registry_test PRIVATE NOMINMAX)
+
+# Generic bounded child-output regression; no tensor runtime dependency.
+add_executable(exec_pipe_output_test exec_pipe_output_test.cpp)
+target_include_directories(exec_pipe_output_test PRIVATE "${NODUS_ROOT}/include")

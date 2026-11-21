@@ -1,0 +1,2 @@
+# Shell scripts run inside Linux (tools/build_service/build_linux.sh); bash refuses CRLF.
+*.sh text eol=lf

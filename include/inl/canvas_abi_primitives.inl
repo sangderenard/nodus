@@ -414,6 +414,13 @@ const int kModuleExtraLedRows = 4;
 const int kModuleFrameContactBase = 10000;
 constexpr int kModuleFrameRowSend = -100;
 constexpr int kModuleFrameRowReceive = -101;
+// A row's own ports and controls (research case 075069677cb74e3f9794914c9009cec5). Port contacts are a range of their
+// own beside the frame ports: kModuleRowPortContactBase + logical row x kModuleRowPortStride + port. Their hitboxes
+// carry a negative row code, as the frame LEDs do, and the contact in aux0.
+constexpr int kModuleRowPortContactBase = GP_CANVAS_ROW_PORT_CONTACT_BASE;
+constexpr int kModuleRowPortStride = GP_CANVAS_ROW_PORT_STRIDE;
+constexpr int kModuleRowPortRow = -102;
+constexpr int kModuleRowControlRow = -103;
 constexpr int kModuleTopUiHeight =
     kModuleTopPadding * 2 +
     kModuleTitleRowH +

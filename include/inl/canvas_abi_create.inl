@@ -132,6 +132,7 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_output_layout.emplace_back();
     c->module_io_rows.emplace_back();
     c->graph->module_stack_contract.push_back(ModuleStackContract::Opaque);
+    c->graph->module_stack_loopback.resize(c->graph->module_stack_contract.size(), 0);
     c->module_table_rows.emplace_back();
     c->module_frame_leds.push_back(make_module_frame_led_group());
     c->module_frame_links.emplace_back();
@@ -612,6 +613,24 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     printf("  hit[%d]=part=%d row=%d col=%d aux0=%d aux1=%d rect=%d,%d-%d,%d flags=0x%x\n", hi, hbi.part, hbi.row_idx, hbi.col_idx, hbi.aux0, hbi.aux1, hbi.x0, hbi.y0, hbi.x1, hbi.y1, hbi.flags);
                 }
                 if (ok && hits_written > 0) {
+                    // A row's own ports and controls first (the same rectangles the raster drew; research case 075069677cb74e3f9794914c9009cec5).
+                    {
+                        std::vector<CanvasRowSurface> surfaces;
+                        canvas_row_surfaces(c, mi, hits.data(), hits_written, tw, surfaces);
+                        auto inside = [&](const GP_TableHitBox& hb) { return lx >= hb.x0 && lx < hb.x1 && ly_table >= hb.y0 && ly_table < hb.y1; };
+                        for (const auto& s : surfaces) {
+                            for (const auto& hb : s.ports) {
+                                if (!inside(hb)) continue;
+                                GP_TableHitBox adjusted = hb;
+                                adjusted.y0 += layout.table_y;
+                                adjusted.y1 += layout.table_y;
+                                if (canvas_handle_module_led_hit(c, mi, adjusted)) return 1;
+                            }
+                            for (const auto& hb : s.controls) {
+                                if (inside(hb) && canvas_row_control_click(c, mi, hb, lx)) return 1;
+                            }
+                        }
+                    }
                     // find first hit containing local point
                     GP_TableHitBox found{}; bool found_any = false;
                     for (int hi = 0; hi < hits_written; ++hi) {

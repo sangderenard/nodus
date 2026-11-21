@@ -1,3 +1,4 @@
+#include <cstring>
 #include "common/tensors/abstraction/kpath/kpath_fill.h"
 
 #include "common/tensors/abstraction/kpath/kpath_planar_toolpath.h"

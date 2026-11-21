@@ -12,7 +12,14 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
+namespace fs = std::filesystem;
+
+// ===========================================================================
+// PLATFORM REGION (host process): the one place this file calls the OS to load a library. The wrapper sources this
+// file generates carry their own generated platform region (see emit_scalar_loader_region /
+// emit_buffer_loader_region below).
+// ===========================================================================
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -20,9 +27,53 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#endif
 
-namespace fs = std::filesystem;
+namespace importer_platform {
+// Loads `absolute` the way the wrapper will and checks it exports `entry`.
+inline bool probe_entry_symbol(const fs::path& absolute, const std::string& entry, std::string* err) {
+    HMODULE module = LoadLibraryExA(
+        absolute.string().c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!module) {
+        *err = "artifact cannot be loaded (Windows error " +
+               std::to_string(GetLastError()) + "): " + absolute.generic_string();
+        return false;
+    }
+    const bool found = GetProcAddress(module, entry.c_str()) != nullptr;
+    FreeLibrary(module);
+    if (!found) {
+        *err = "artifact does not export declared buffer entry '" + entry + "'";
+        return false;
+    }
+    return true;
+}
+}  // namespace importer_platform
+#else
+#include <dlfcn.h>
+
+namespace importer_platform {
+// Loads `absolute` the way the wrapper will and checks it exports `entry`.
+inline bool probe_entry_symbol(const fs::path& absolute, const std::string& entry, std::string* err) {
+    void* module = dlopen(absolute.string().c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!module) {
+        const char* why = dlerror();
+        *err = std::string("artifact cannot be loaded (") + (why ? why : "dlopen failed") + "): " +
+               absolute.generic_string();
+        return false;
+    }
+    const bool found = dlsym(module, entry.c_str()) != nullptr;
+    dlclose(module);
+    if (!found) {
+        *err = "artifact does not export declared buffer entry '" + entry + "'";
+        return false;
+    }
+    return true;
+}
+}  // namespace importer_platform
+#endif
+// ===========================================================================
+// END PLATFORM REGION (host process)
+// ===========================================================================
 
 namespace {
 
@@ -626,6 +677,178 @@ std::string escape_cpp_string(const std::string& value) {
     return escaped;
 }
 
+// ---------------------------------------------------------------------------
+// GENERATED PLATFORM REGIONS. Each generated wrapper carries exactly one marked platform region that holds every
+// dynamic-library call it makes (open / symbol / close). The wrapper class below the region is platform-free.
+// The Windows half is the loader behavior the wrappers have always had; the POSIX half uses dlopen/dlsym/dlclose.
+// Names carry the wrapper's symbol so several generated wrappers can share one translation unit.
+// ---------------------------------------------------------------------------
+
+// Scalar (turing-compiled-program-api-v1) wrapper: open / symbol / close.
+void emit_scalar_loader_region(std::ostringstream& ss,
+                               const std::string& sym,
+                               const ApiDoc& doc,
+                               const fs::path& artifact_path) {
+    ss << "// ---- PLATFORM REGION BEGIN (generated): every dynamic-library call of this wrapper is in here ----\n";
+    ss << "#if defined(_WIN32)\n";
+    ss << "void* ImportedLib_" << sym << "_open() {\n";
+    // Contract-declared runtime dependencies (E15): register each declared
+    // dependency's DIRECTORY with the loader (AddDllDirectory), which the
+    // artifact load below honors through LOAD_LIBRARY_SEARCH_DEFAULT_DIRS.
+    // Directory registration -- not file preloading -- is the mechanism that
+    // resolves the dependencies' own inter-imports order-independently (a
+    // preloaded libgfortran still needs the loader to find libquadmath for
+    // itself; a registered directory serves every import that lives there).
+    if (!doc.runtime_dependencies.empty()) {
+        std::vector<std::string> dirs;
+        for (const auto& dep : doc.runtime_dependencies) {
+            std::string dir = escape_native_path(fs::path(dep.path).parent_path());
+            if (std::find(dirs.begin(), dirs.end(), dir) == dirs.end()) {
+                dirs.push_back(dir);
+            }
+        }
+        ss << "    static const wchar_t* kRuntimeDepDirs[] = {\n";
+        for (const auto& d : dirs) {
+            ss << "        L\"" << d << "\",\n";
+        }
+        ss << "    };\n";
+        ss << "    for (const wchar_t* dir : kRuntimeDepDirs) {\n";
+        ss << "        if (!AddDllDirectory(dir)) {\n";
+        ss << "            fprintf(stderr, \"[imported:" << sym
+           << "] AddDllDirectory failed (%lu) for a declared dependency dir\\n\",\n";
+        ss << "                    GetLastError());\n";
+        ss << "        }\n";
+        ss << "    }\n";
+    }
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: the artifact's own directory joins the
+    // dependency search, so runtime DLLs placed beside it (or declared in the
+    // contract's runtime_dependencies) resolve. Plain LoadLibraryA searches
+    // the APPLICATION's directory for dependencies, not the artifact's --
+    // which made a missing Fortran runtime fail silently (error register).
+    // Native separators, escaped: the LOAD_LIBRARY_SEARCH_* flags only take
+    // effect for a fully qualified path, and Windows' qualification check
+    // wants backslashes (error register E15).
+    ss << "    HMODULE module = LoadLibraryExA(\"" << escape_native_path(artifact_path) << "\",\n";
+    ss << "        nullptr,\n";
+    ss << "        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);\n";
+    // Loud failure: a tool that cannot reach its engine must say so once,
+    // not no-op forever (silence is the boundary's default failure mode).
+    ss << "    if (!module) {\n";
+    ss << "        fprintf(stderr, \"[imported:" << sym << "] LoadLibrary failed (%lu) for %s\\n\",\n";
+    ss << "                GetLastError(), \"" << artifact_path.generic_string() << "\");\n";
+    ss << "    }\n";
+    ss << "    return module;\n";
+    ss << "}\n";
+    ss << "void* ImportedLib_" << sym << "_symbol(void* module, const char* name) {\n";
+    ss << "    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module), name));\n";
+    ss << "}\n";
+    ss << "void ImportedLib_" << sym << "_close(void* module) { FreeLibrary(static_cast<HMODULE>(module)); }\n";
+    ss << "#else\n";
+    ss << "void* ImportedLib_" << sym << "_open() {\n";
+    // ELF has no per-process equivalent of AddDllDirectory (LD_LIBRARY_PATH is read at process start), so each
+    // declared runtime dependency is loaded by its declared path first, globally: an already-loaded library with the
+    // matching soname satisfies the artifact's own DT_NEEDED entries.
+    for (const auto& dep : doc.runtime_dependencies) {
+        ss << "    if (!dlopen(\"" << escape_cpp_string(fs::path(dep.path).generic_string()) << "\", RTLD_NOW | RTLD_GLOBAL)) {\n";
+        ss << "        const char* why = dlerror();\n";
+        ss << "        fprintf(stderr, \"[imported:" << sym
+           << "] declared dependency not loaded (%s)\\n\", why ? why : \"dlopen failed\");\n";
+        ss << "    }\n";
+    }
+    ss << "    void* module = dlopen(\"" << escape_cpp_string(artifact_path.generic_string())
+       << "\", RTLD_NOW | RTLD_LOCAL);\n";
+    ss << "    if (!module) {\n";
+    ss << "        const char* why = dlerror();\n";
+    ss << "        fprintf(stderr, \"[imported:" << sym << "] dlopen failed (%s) for %s\\n\",\n";
+    ss << "                why ? why : \"unknown\", \"" << escape_cpp_string(artifact_path.generic_string()) << "\");\n";
+    ss << "    }\n";
+    ss << "    return module;\n";
+    ss << "}\n";
+    ss << "void* ImportedLib_" << sym << "_symbol(void* module, const char* name) { return dlsym(module, name); }\n";
+    ss << "void ImportedLib_" << sym << "_close(void* module) { dlclose(module); }\n";
+    ss << "#endif\n";
+    ss << "// ---- PLATFORM REGION END (generated) ----\n\n";
+}
+
+// Buffer-ABI wrapper: open / symbol / close. `library_relative` (when set) is tried first, relative to the directory
+// the wrapper itself was loaded from; the absolute artifact path is the fallback.
+void emit_buffer_loader_region(std::ostringstream& ss,
+                               const std::string& sym,
+                               const BufferAbiDoc& doc,
+                               const fs::path& artifact_path,
+                               const fs::path& library_relative) {
+    (void)doc;
+    ss << "// ---- PLATFORM REGION BEGIN (generated): every dynamic-library call of this wrapper is in here ----\n";
+    ss << "#if defined(_WIN32)\n";
+    if (!library_relative.empty()) {
+        ss << "static void ImportedLib_" << sym << "_anchor() {}\n";
+    }
+    ss << "void* ImportedLib_" << sym << "_open() {\n";
+    ss << "    HMODULE module = nullptr;\n";
+    if (!library_relative.empty()) {
+        ss << "    {\n";
+        ss << "        HMODULE self = nullptr;\n";
+        ss << "        char here[MAX_PATH] = {};\n";
+        ss << "        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,\n";
+        ss << "                reinterpret_cast<LPCSTR>(&ImportedLib_" << sym << "_anchor), &self) &&\n";
+        ss << "            GetModuleFileNameA(self, here, MAX_PATH) > 0) {\n";
+        ss << "            std::string path(here);\n";
+        ss << "            const size_t slash = path.find_last_of(\"\\\\/\");\n";
+        ss << "            if (slash != std::string::npos) {\n";
+        ss << "                path = path.substr(0, slash) + \"\\\\..\\\\\" + \""
+           << escape_native_path(library_relative) << "\";\n";
+        ss << "                module = LoadLibraryExA(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);\n";
+        ss << "            }\n";
+        ss << "        }\n";
+        ss << "    }\n";
+    }
+    ss << "    if (!module) module = LoadLibraryExA(\"" << escape_native_path(artifact_path)
+       << "\", nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);\n";
+    ss << "    if (!module) {\n";
+    ss << "        fprintf(stderr, \"[imported-buffer:" << sym
+       << "] LoadLibrary failed (%lu)\\n\", GetLastError());\n";
+    ss << "    }\n";
+    ss << "    return module;\n";
+    ss << "}\n";
+    ss << "void* ImportedLib_" << sym << "_symbol(void* module, const char* name) {\n";
+    ss << "    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(module), name));\n";
+    ss << "}\n";
+    ss << "void ImportedLib_" << sym << "_close(void* module) { FreeLibrary(static_cast<HMODULE>(module)); }\n";
+    ss << "#else\n";
+    if (!library_relative.empty()) {
+        ss << "static void ImportedLib_" << sym << "_anchor() {}\n";
+    }
+    ss << "void* ImportedLib_" << sym << "_open() {\n";
+    ss << "    void* module = nullptr;\n";
+    if (!library_relative.empty()) {
+        ss << "    {\n";
+        ss << "        Dl_info info{};\n";
+        ss << "        if (dladdr(reinterpret_cast<void*>(&ImportedLib_" << sym << "_anchor), &info) && info.dli_fname) {\n";
+        ss << "            std::string path(info.dli_fname);\n";
+        ss << "            const size_t slash = path.find_last_of('/');\n";
+        ss << "            if (slash != std::string::npos) {\n";
+        ss << "                path = path.substr(0, slash) + \"/../\" + \""
+           << escape_cpp_string(library_relative.generic_string()) << "\";\n";
+        ss << "                module = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);\n";
+        ss << "            }\n";
+        ss << "        }\n";
+        ss << "    }\n";
+    }
+    ss << "    if (!module) module = dlopen(\"" << escape_cpp_string(artifact_path.generic_string())
+       << "\", RTLD_NOW | RTLD_LOCAL);\n";
+    ss << "    if (!module) {\n";
+    ss << "        const char* why = dlerror();\n";
+    ss << "        fprintf(stderr, \"[imported-buffer:" << sym
+       << "] dlopen failed (%s)\\n\", why ? why : \"unknown\");\n";
+    ss << "    }\n";
+    ss << "    return module;\n";
+    ss << "}\n";
+    ss << "void* ImportedLib_" << sym << "_symbol(void* module, const char* name) { return dlsym(module, name); }\n";
+    ss << "void ImportedLib_" << sym << "_close(void* module) { dlclose(module); }\n";
+    ss << "#endif\n";
+    ss << "// ---- PLATFORM REGION END (generated) ----\n\n";
+}
+
 std::string generate_wrapper_source(const ApiDoc& doc,
                                     const ApiEntryPoint& ep,
                                     const std::string& tool_id,
@@ -664,12 +887,15 @@ std::string generate_wrapper_source(const ApiDoc& doc,
     ss << "#include \"common/tensors/abstraction/abstract_tensor_handle.h\"\n";
     ss << "#include \"common/tensors/abstraction/tensor_abi.h\"\n";
     ss << "#include <cstdio>\n";
-    ss << "#ifdef _WIN32\n";
+    ss << "#if defined(_WIN32)\n";
     ss << "#ifndef WIN32_LEAN_AND_MEAN\n#define WIN32_LEAN_AND_MEAN\n#endif\n";
     ss << "#include <windows.h>\n";
+    ss << "#else\n";
+    ss << "#include <dlfcn.h>\n";
     ss << "#endif\n";
     ss << "\n";
     ss << "namespace {\n";
+    emit_scalar_loader_region(ss, sym, doc, artifact_path);
     // Entry signature: value doubles for by-value inputs, double* for
     // by-reference parameters, declared in the YAML's parameter order.
     ss << "using EntryFn = void (*)(";
@@ -689,67 +915,19 @@ std::string generate_wrapper_source(const ApiDoc& doc,
        << doc.module << "\"; }\n";
     ss << "    ToolCaps caps() const override { return static_cast<ToolCaps>(0); }\n";
     ss << "    void initialize(const ToolInitContext&) override {\n";
-    ss << "#ifdef _WIN32\n";
     ss << "        if (!module_) {\n";
-    // Contract-declared runtime dependencies (E15): register each declared
-    // dependency's DIRECTORY with the loader (AddDllDirectory), which the
-    // artifact load below honors through LOAD_LIBRARY_SEARCH_DEFAULT_DIRS.
-    // Directory registration -- not file preloading -- is the mechanism that
-    // resolves the dependencies' own inter-imports order-independently (a
-    // preloaded libgfortran still needs the loader to find libquadmath for
-    // itself; a registered directory serves every import that lives there).
-    if (!doc.runtime_dependencies.empty()) {
-        std::vector<std::string> dirs;
-        for (const auto& dep : doc.runtime_dependencies) {
-            std::string dir = escape_native_path(fs::path(dep.path).parent_path());
-            if (std::find(dirs.begin(), dirs.end(), dir) == dirs.end()) {
-                dirs.push_back(dir);
-            }
-        }
-        ss << "        static const wchar_t* kRuntimeDepDirs[] = {\n";
-        for (const auto& d : dirs) {
-            ss << "            L\"" << d << "\",\n";
-        }
-        ss << "        };\n";
-        ss << "        for (const wchar_t* dir : kRuntimeDepDirs) {\n";
-        ss << "            if (!AddDllDirectory(dir)) {\n";
-        ss << "                fprintf(stderr, \"[imported:" << sym
-           << "] AddDllDirectory failed (%lu) for a declared dependency dir\\n\",\n";
-        ss << "                        GetLastError());\n";
-        ss << "            }\n";
-        ss << "        }\n";
-    }
-    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: the artifact's own directory joins the
-    // dependency search, so runtime DLLs placed beside it (or declared in the
-    // contract's runtime_dependencies) resolve. Plain LoadLibraryA searches
-    // the APPLICATION's directory for dependencies, not the artifact's --
-    // which made a missing Fortran runtime fail silently (error register).
-    // Native separators, escaped: the LOAD_LIBRARY_SEARCH_* flags only take
-    // effect for a fully qualified path, and Windows' qualification check
-    // wants backslashes (error register E15).
-    ss << "            module_ = LoadLibraryExA(\"" << escape_native_path(artifact_path) << "\",\n";
-    ss << "                nullptr,\n";
-    ss << "                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);\n";
-    ss << "            if (!module_) {\n";
-    // Loud failure: a tool that cannot reach its engine must say so once,
-    // not no-op forever (silence is the boundary's default failure mode).
-    ss << "                fprintf(stderr, \"[imported:" << sym << "] LoadLibrary failed (%lu) for %s\\n\",\n";
-    ss << "                        GetLastError(), \"" << artifact_path.generic_string() << "\");\n";
-    ss << "            } else {\n";
-    ss << "                entry_ = reinterpret_cast<EntryFn>(\n";
-    ss << "                    GetProcAddress(static_cast<HMODULE>(module_), \"" << ep.symbol << "\"));\n";
+    ss << "            module_ = ImportedLib_" << sym << "_open();\n";
+    ss << "            if (module_) {\n";
+    ss << "                entry_ = reinterpret_cast<EntryFn>(ImportedLib_" << sym << "_symbol(module_, \"" << ep.symbol << "\"));\n";
     ss << "                if (!entry_) {\n";
     ss << "                    fprintf(stderr, \"[imported:" << sym << "] entry symbol '"
        << ep.symbol << "' not found\\n\");\n";
     ss << "                }\n";
     ss << "            }\n";
     ss << "        }\n";
-    ss << "#endif\n";
     ss << "    }\n";
     ss << "    void shutdown() override {\n";
-    ss << "#ifdef _WIN32\n";
-    ss << "        if (module_) { FreeLibrary(static_cast<HMODULE>(module_)); module_ = nullptr; }\n";
-    ss << "#endif\n";
+    ss << "        if (module_) { ImportedLib_" << sym << "_close(module_); module_ = nullptr; }\n";
     ss << "        entry_ = nullptr;\n";
     ss << "    }\n";
     ss << "    void tick(double, HostAPI&) override {}\n";
@@ -838,8 +1016,13 @@ std::string generate_wrapper_source(const ApiDoc& doc,
     return ss.str();
 }
 
+// `library_relative` is the artifact's path relative to the module library root when the artifact lies under it
+// (module_library/products/<entry>/backend/...). The wrapper is installed in <root>/bin, so at run time it resolves
+// the product as <its own directory>/../<library_relative>: the module library can move with its products. The
+// absolute path stays as the fallback (a wrapper compiled into another image is not in <root>/bin).
 std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
-                                           const fs::path& artifact_path) {
+                                           const fs::path& artifact_path,
+                                           const fs::path& library_relative = {}) {
     std::vector<size_t> input_indices;
     std::vector<size_t> output_indices;
     std::vector<size_t> workspace_indices;
@@ -869,8 +1052,10 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "#include \"common/tensors/abstraction/abstract_tensor_handle.h\"\n";
     ss << "#include \"common/tensors/abstraction/tensor_abi.h\"\n";
     ss << "#include <array>\n#include <cstdint>\n#include <cstdio>\n\n";
-    ss << "#ifdef _WIN32\n#ifndef WIN32_LEAN_AND_MEAN\n#define WIN32_LEAN_AND_MEAN\n#endif\n#include <windows.h>\n#endif\n\n";
+    ss << "#include <string>\n";
+    ss << "#if defined(_WIN32)\n#ifndef WIN32_LEAN_AND_MEAN\n#define WIN32_LEAN_AND_MEAN\n#endif\n#include <windows.h>\n#else\n#include <dlfcn.h>\n#endif\n\n";
     ss << "namespace {\n";
+    emit_buffer_loader_region(ss, sym, doc, artifact_path, library_relative);
     const char* extent_type = doc.extent_dtype == "i32" ? "int32_t" : "int64_t";
     ss << "using Extent = " << extent_type << ";\n";
     ss << "using EntryFn = void (*)(void**, Extent*);\n";
@@ -882,29 +1067,25 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "    const char* name_cstr() const noexcept override { return \""
        << escape_cpp_string(doc.tool_name) << "\"; }\n";
     ss << "    ToolCaps caps() const override { return static_cast<ToolCaps>(0); }\n";
-    ss << "    void initialize(const ToolInitContext&) override {\n#ifdef _WIN32\n";
+    ss << "    void initialize(const ToolInitContext&) override {\n";
     ss << "        if (!module_) {\n";
-    ss << "            module_ = LoadLibraryExA(\"" << escape_native_path(artifact_path)
-       << "\", nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);\n";
-    ss << "            if (!module_) {\n";
-    ss << "                fprintf(stderr, \"[imported-buffer:" << sym
-       << "] LoadLibrary failed (%lu)\\n\", GetLastError());\n";
-    ss << "            } else {\n";
-    ss << "                entry_ = reinterpret_cast<EntryFn>(GetProcAddress(static_cast<HMODULE>(module_), \""
+    ss << "            module_ = ImportedLib_" << sym << "_open();\n";
+    ss << "            if (module_) {\n";
+    ss << "                entry_ = reinterpret_cast<EntryFn>(ImportedLib_" << sym << "_symbol(module_, \""
        << escape_cpp_string(doc.entry) << "\"));\n";
     ss << "                if (!entry_) fprintf(stderr, \"[imported-buffer:" << sym
        << "] entry symbol not found: " << escape_cpp_string(doc.entry) << "\\n\");\n";
-    ss << "                validation_reset_ = reinterpret_cast<ValidationResetFn>(GetProcAddress(static_cast<HMODULE>(module_), \"turing_validation_error_reset\"));\n";
-    ss << "                validation_take_ = reinterpret_cast<ValidationTakeFn>(GetProcAddress(static_cast<HMODULE>(module_), \"turing_validation_error_take\"));\n";
+    ss << "                validation_reset_ = reinterpret_cast<ValidationResetFn>(ImportedLib_" << sym << "_symbol(module_, \"turing_validation_error_reset\"));\n";
+    ss << "                validation_take_ = reinterpret_cast<ValidationTakeFn>(ImportedLib_" << sym << "_symbol(module_, \"turing_validation_error_take\"));\n";
     ss << "                if ((validation_reset_ == nullptr) != (validation_take_ == nullptr)) {\n"
           "                    fprintf(stderr, \"[imported-buffer:" << sym
        << "] incomplete validation-error ABI; disabling it\\n\");\n"
           "                    validation_reset_ = nullptr; validation_take_ = nullptr;\n"
           "                }\n";
-    ss << "            }\n        }\n#endif\n    }\n";
-    ss << "    void shutdown() override {\n#ifdef _WIN32\n"
-          "        if (module_) { FreeLibrary(static_cast<HMODULE>(module_)); module_ = nullptr; }\n"
-          "#endif\n        entry_ = nullptr; validation_reset_ = nullptr; validation_take_ = nullptr;\n    }\n";
+    ss << "            }\n        }\n    }\n";
+    ss << "    void shutdown() override {\n"
+          "        if (module_) { ImportedLib_" << sym << "_close(module_); module_ = nullptr; }\n"
+          "        entry_ = nullptr; validation_reset_ = nullptr; validation_take_ = nullptr;\n    }\n";
     ss << "    void tick(double, HostAPI&) override {}\n";
     ss << "    void render(RenderContext&) override {}\n";
     ss << "    int32_t port_count() const override { return 2; }\n";
@@ -912,6 +1093,19 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     ss << "        if (idx == 0) return ToolPortSpec{ToolPortKind::Argument, " << input_indices.size() << "};\n";
     ss << "        if (idx == 1) return ToolPortSpec{ToolPortKind::Return, " << output_indices.size() << "};\n";
     ss << "        return ToolPortSpec{};\n    }\n";
+    // The mint table (research case 6393486c): a compiled row only reads its inputs, so the host may return them to the
+    // mint once no stack entry names them; each output is taken from the row's own port "blank" (blank1, ... for
+    // further outputs) when the mint has lent one of the right size, and created here otherwise.
+    ss << "    ToolTensorRole tensor_role() const override { return ToolTensorRole::Borrower; }\n";
+    ss << "    int32_t row_port_count() const override { return " << output_indices.size() << "; }\n";
+    ss << "    ToolRowPort row_port(int32_t idx) const override {\n";
+    for (size_t k = 0; k < output_indices.size(); ++k) {
+        const std::string name = k == 0 ? "blank" : "blank" + std::to_string(k);
+        const float y = output_indices.size() == 1 ? 0.5f : (static_cast<float>(k) + 0.5f) / static_cast<float>(output_indices.size());
+        ss << "        if (idx == " << k << ") return ToolRowPort{ToolPortKind::Argument, 0.0f, " << y << "f, \"" << name
+           << "\", 8};\n";
+    }
+    ss << "        return ToolRowPort{};\n    }\n";
     ss << "    void execute_stack(ToolStackContext& ctx) override {\n";
     // A compiled row succeeds only after every output is published. Missing
     // entry/input previously inherited success=true and advanced an idle row.
@@ -992,24 +1186,38 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     for (size_t i = 0; i < doc.values.size(); ++i) {
         const auto& value = doc.values[i];
         if (value.role != BufferValue::Role::Input) {
-            if (value.shape.empty()) {
-                ss << "        handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype << ", 0, nullptr);\n";
-            } else {
-                ss << "        { const std::array<uint64_t, " << value.shape.size() << "> shape = {";
-                for (size_t axis = 0; axis < value.shape.size(); ++axis) {
-                    if (axis) ss << ", ";
-                    if (value.dynamic_shape[axis]) {
-                        const size_t source_index = buffer_value_index(
-                            doc, value.shape_source[axis]);
-                        ss << "descs[" << source_index << "].shape["
-                           << value.shape_source_axis[axis] << "]";
-                    } else {
-                        ss << value.shape[axis] << "ull";
-                    }
+            const auto out_pos = std::find(output_indices.begin(), output_indices.end(), i);
+            const bool lent = out_pos != output_indices.end();
+            const size_t rank = value.shape.size();
+            ss << "        { const std::array<uint64_t, " << std::max<size_t>(rank, 1) << "> shape = {";
+            if (rank == 0) ss << "0ull";
+            for (size_t axis = 0; axis < rank; ++axis) {
+                if (axis) ss << ", ";
+                if (value.dynamic_shape[axis]) {
+                    const size_t source_index = buffer_value_index(
+                        doc, value.shape_source[axis]);
+                    ss << "descs[" << source_index << "].shape["
+                       << value.shape_source_axis[axis] << "]";
+                } else {
+                    ss << value.shape[axis] << "ull";
                 }
-                ss << "}; handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype << ", "
-                   << value.shape.size() << ", shape.data()); }\n";
             }
+            ss << "};\n";
+            if (lent) {
+                // A blank the mint lent on this output's port, if it is exactly this output's dtype and shape.
+                ss << "          if (ctx.row_ports && ctx.row_ports->consume) { uint64_t blank = 0; size_t got = 0;\n"
+                      "            if (ctx.row_ports->consume(ctx.row_ports->host, "
+                   << (out_pos - output_indices.begin()) << ", &blank, sizeof(blank), &got) && got == sizeof(blank) && blank) {\n"
+                      "              NodusTensorDesc bd{}; bool fits = nodus_tensor_describe(blank, &bd) == NODUS_OK && bd.dtype == "
+                   << value.nodus_dtype << " && bd.rank == " << rank << "u;\n"
+                      "              for (uint32_t a = 0; fits && a < " << rank << "u; ++a) fits = bd.shape[a] == shape[a];\n"
+                      "              if (fits) handles[" << i << "].id = blank;\n"
+                      "              else { fprintf(stderr, \"[imported-buffer:" << sym
+                   << "] lent blank does not fit output " << i << "; destroyed\\n\"); nodus_tensor_destroy(blank); }\n"
+                      "            } }\n";
+            }
+            ss << "          if (!handles[" << i << "].id) handles[" << i << "].id = nodus_tensor_create(" << value.nodus_dtype
+               << ", " << rank << ", " << (rank == 0 ? "nullptr" : "shape.data()") << "); }\n";
             ss << "        if (!handles[" << i << "].id) { fail(); return; }\n";
             ss << "        if (nodus_tensor_describe(handles[" << i << "].id, &descs[" << i
                << "]) != NODUS_OK) { fail(); return; }\n";
@@ -1104,29 +1312,7 @@ bool validate_buffer_entry_symbol(const fs::path& artifact_path,
         *err = "artifact is not a regular file: " + artifact_path.generic_string();
         return false;
     }
-#ifdef _WIN32
-    const fs::path absolute = fs::absolute(artifact_path);
-    HMODULE module = LoadLibraryExA(
-        absolute.string().c_str(), nullptr,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!module) {
-        *err = "artifact cannot be loaded (Windows error " +
-               std::to_string(GetLastError()) + "): " + absolute.generic_string();
-        return false;
-    }
-    const bool found = GetProcAddress(module, entry.c_str()) != nullptr;
-    FreeLibrary(module);
-    if (!found) {
-        *err = "artifact does not export declared buffer entry '" + entry + "'";
-        return false;
-    }
-#else
-    // Buffer row wrappers are currently a Windows loading surface. Keep the
-    // descriptor validation portable without pretending to preflight a
-    // loader that the generated non-Windows wrapper does not yet implement.
-    (void)entry;
-#endif
-    return true;
+    return importer_platform::probe_entry_symbol(fs::absolute(artifact_path), entry, err);
 }
 
 } // namespace
@@ -1234,7 +1420,16 @@ extern "C" int gp_artifact_import_buffer_abi(const char* descriptor_path,
     const fs::path root = output_root;
     const std::string stem = backend_qualified_stem(doc.tool_id, doc.backend);
     const fs::path wrapper_path = root / "source" / "tools" / (stem + ".cpp");
-    if (!write_file(wrapper_path, generate_buffer_wrapper_source(doc, fs::absolute(artifact_path)), &err)) {
+    // Relative to the module library when the product lives in it (module_library/products/<entry>/...).
+    fs::path library_relative;
+    {
+        std::error_code ec;
+        const fs::path abs_root = fs::weakly_canonical(fs::absolute(root), ec);
+        const fs::path abs_artifact = fs::weakly_canonical(fs::absolute(artifact_path), ec);
+        const fs::path rel = abs_artifact.lexically_relative(abs_root);
+        if (!rel.empty() && *rel.begin() != "..") library_relative = rel;
+    }
+    if (!write_file(wrapper_path, generate_buffer_wrapper_source(doc, fs::absolute(artifact_path), library_relative), &err)) {
         std::cerr << "artifact_importer: " << err << "\n";
         if (report) *report = local;
         return 0;

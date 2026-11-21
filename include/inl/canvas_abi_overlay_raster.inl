@@ -1738,6 +1738,74 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     module_hitboxes[mi].push_back(adjusted);
                 }
             }
+            // A row's own surface (research case 075069677cb74e3f9794914c9009cec5): the row draws its picture with its paint
+            // half (render_table), then the canvas draws the controls and port LEDs the row declares, where it declares
+            // them, and adds their hitboxes: the port LEDs are contacts ropes attach to, the controls are click routes.
+            if (hits_written > 0) {
+                std::vector<CanvasRowSurface> surfaces;
+                canvas_row_surfaces(ctx, mi, hits.data(), hits_written, tw, surfaces);
+                uint8_t* buf = module_tables[mi].data();
+                const int pitch_px = tw * 4;
+                auto blit_text = [&](const std::string& text, int x0, int y0, int x1, int y1) {
+                    if (text.empty()) return;
+                    auto tb = render_text_to_rgba(text, 1.0f, {230, 230, 230, 255});
+                    if (tb.pixels.empty()) return;
+                    const int tx = x0 + std::max(0, ((x1 - x0) - tb.width) / 2);
+                    const int ty = y0 + std::max(0, ((y1 - y0) - tb.height) / 2);
+                    for (int yy = 0; yy < tb.height; ++yy) {
+                        const int dy = ty + yy; if (dy < y0 || dy >= y1 || dy < 0 || dy >= th) continue;
+                        for (int xx = 0; xx < tb.width; ++xx) {
+                            const int dx = tx + xx; if (dx < x0 || dx >= x1 || dx < 0 || dx >= tw) continue;
+                            const unsigned char* src = &tb.pixels[static_cast<size_t>(yy * tb.width + xx) * 4];
+                            if (src[3] == 0) continue;
+                            uint8_t* dst = buf + static_cast<size_t>(dy) * pitch_px + static_cast<size_t>(dx) * 4;
+                            const float a = src[3] / 255.0f;
+                            for (int cc = 0; cc < 3; ++cc) dst[cc] = static_cast<uint8_t>(std::lround(src[cc] * a + dst[cc] * (1.0f - a)));
+                            dst[3] = 255;
+                        }
+                    }
+                };
+                for (auto& s : surfaces) {
+                    if (!is_stage && s.y0 >= table_clip_h) continue;
+                    const int ry0 = s.y0 + table_offset_y, ry1 = std::min(s.y1 + table_offset_y, th);
+                    if ((static_cast<uint32_t>(s.tool->caps()) & static_cast<uint32_t>(ToolCaps::Table)) != 0u && ry1 > ry0) {
+                        TableRenderArgs args{};
+                        args.rows = 1; args.cols = 1;
+                        args.cell_w = static_cast<float>(s.x1 - s.x0);
+                        args.cell_h = static_cast<float>(ry1 - ry0);
+                        args.frame_buffer = buf + static_cast<size_t>(ry0) * pitch_px + static_cast<size_t>(s.x0) * 4;
+                        args.pitch = pitch_px;
+                        try { s.tool->render_table(args); } catch (...) {}
+                    }
+                    for (const auto& hb : s.controls) {
+                        const ToolRowControl c = s.tool->row_control(hb.aux1);
+                        const int x0 = hb.x0, x1 = hb.x1, y0 = hb.y0 + table_offset_y, y1 = hb.y1 + table_offset_y;
+                        if (c.kind != ToolRowControlKind::Text) memset_rect(buf, tw, th, pitch_px, x0, y0, x1 - x0, y1 - y0, Color{52, 56, 70, 255});
+                        std::string text = c.label ? c.label : "";
+                        if (c.kind == ToolRowControlKind::Toggle && c.value != 0.0f)
+                            memset_rect(buf, tw, th, pitch_px, x0, y0, x1 - x0, y1 - y0, Color{70, 110, 80, 255});
+                        if (c.kind == ToolRowControlKind::Slider && c.max > c.min) {
+                            const float f = std::clamp((c.value - c.min) / (c.max - c.min), 0.0f, 1.0f);
+                            memset_rect(buf, tw, th, pitch_px, x0, y0, static_cast<int>(std::lround(f * (x1 - x0))), y1 - y0, Color{70, 90, 130, 255});
+                        }
+                        if (c.kind == ToolRowControlKind::Stepper || c.kind == ToolRowControlKind::Slider || c.kind == ToolRowControlKind::Choice) {
+                            char v[48]; std::snprintf(v, sizeof(v), "%s%s%g", text.c_str(), text.empty() ? "" : " ", c.value);
+                            text = (c.kind == ToolRowControlKind::Stepper) ? std::string("- ") + v + " +" : std::string(v);
+                        }
+                        blit_text(text, x0, y0, x1, y1);
+                        GP_TableHitBox adjusted = hb; adjusted.y0 += table_offset_y; adjusted.y1 += table_offset_y;
+                        module_hitboxes[mi].push_back(adjusted);
+                    }
+                    for (const auto& hb : s.ports) {
+                        const bool out_port = (hb.col_idx == kModuleColRightLed);
+                        const int cx = (hb.x0 + hb.x1) / 2, cy = (hb.y0 + hb.y1) / 2 + table_offset_y;
+                        draw_blob_blend(buf, tw, th, pitch_px, cx, cy, 6, Color{20, 22, 28, 255});
+                        draw_blob_blend(buf, tw, th, pitch_px, cx, cy, 4, out_port ? Color{255, 170, 60, 255} : Color{90, 200, 255, 255});
+                        GP_TableHitBox adjusted = hb; adjusted.y0 += table_offset_y; adjusted.y1 += table_offset_y;
+                        module_hitboxes[mi].push_back(adjusted);
+                    }
+                }
+            }
             auto &light_map = module_contact_lights[mi];
             light_map.clear();
             Color led_on{st.led_on_rgba[0], st.led_on_rgba[1], st.led_on_rgba[2], st.led_on_rgba[3]};

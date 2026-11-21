@@ -248,6 +248,9 @@ struct GP_CanvasContextImpl {
     double autosave_accum_s = 0.0;
     // In-memory last serialized save signature buffer (double-buffered) to avoid unnecessary disk writes.
     std::array<std::string, 2> last_save_buf{};
+    // The file each signature was written to: an unchanged canvas is skipped only for that same file (a save to any
+    // other path, such as a console snapshot, must not make the next save of the canvas's own file a no-op).
+    std::array<std::string, 2> last_save_path_buf{};
     std::atomic<int> last_save_idx{0}; // index of the currently active signature
     // Action-driven autosave controls
     std::vector<int> autosave_action_whitelist; // actions that may trigger autosave when policy==ACTION
@@ -333,7 +336,15 @@ struct GP_CanvasContextImpl {
     int container_table_owned = 0;
     int root_actions_installed = 0;
     int root_module_idx = -1; // synthetic module that mirrors the canvas root table
-    
+    // Canvas ports (canvas_abi.h GP_CANVAS_PORT_*): named contacts on the ROOT module, in declaration order.
+    struct CanvasPortDecl {
+        std::string name;
+        int direction = 0;   // GP_CANVAS_PORT_OUT / _IN
+        int up = 0;          // carried to the upper layer (stage 2)
+        int contact = 0;     // GP_CANVAS_PORT_CONTACT_BASE + index
+    };
+    std::vector<CanvasPortDecl> canvas_ports;
+
     bool thread_mgr_paused = true;
     int thread_mgr_delay_ms = 0;
     double thread_mgr_delay_accum_s = 0.0;

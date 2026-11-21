@@ -5,6 +5,7 @@
 // Text is carried through the API (label + per-cell text) but this minimal raster
 // does not render text; callers can overlay text separately using their text system.
 
+#include <stddef.h>
 #include <stdint.h>
 // Forward-declare LassoConfig (defined in lasso_config.h). We avoid including
 // the header here to keep this file friendly to C/C++ consumers and
@@ -704,7 +705,52 @@ int32_t gp_table_meta_set_ring_mode(GP_TableContext* ctx, GP_MetaGroup* mg, int3
 // top_k, write_seq, writer_low, last_write_seq, last_read_seq,
 // write_friction, read_friction, last_write_region, last_read_region,
 // write_phase, read_phase, friction_regions, configured(0/1), shape_len, shape[...]
+// After those, the members block (this is what makes the snapshot report the member edges, with 64-bit
+// sequences split in two floats): member_count, group_records_hi, group_records_lo, then per member (9 floats)
+// edge_idx, occupancy, slots, write_seq_hi, write_seq_lo, write_delta, read_delta, refused_delta, bytes_delta.
+// Floats cannot carry 64 bits: gp_table_meta_snapshot_u64 is the exact reader.
 int32_t gp_table_meta_get_fifo_snapshot(GP_TableContext* ctx, GP_MetaGroup* mg, float* out_buf, int32_t out_len);
+
+// ---- Meta edges listen to their member edges (include/inl/table_abi_meta_feed.inl) --------------------------------
+// Once per scheduler tick the group FIFO receives one record of GP_META_RECORD_WORDS uint64 words per member edge.
+// A record observes the member's FIFO header; it is never a copy of what passed and never changes the member.
+enum GP_MetaRecordWord {
+    GP_META_REC_TICK = 0,          // scheduler tick id
+    GP_META_REC_TIME_NS = 1,       // steady-clock nanoseconds when the record was taken
+    GP_META_REC_DT_NS = 2,         // nanoseconds since this group's previous feed (0 on the first)
+    GP_META_REC_ORDINAL = 3,       // member ordinal within the group
+    GP_META_REC_EDGE_IDX = 4,      // table edge index (all ones when the edge no longer exists)
+    GP_META_REC_ROPE_ID = 5,       // persistent rope id (the member's identity)
+    GP_META_REC_WRITE_SEQ = 6,     // member FIFO write sequence (64-bit, next to write)
+    GP_META_REC_WRITE_DELTA = 7,   // writes since the previous record (0 on a member's first record)
+    GP_META_REC_READ_SEQ = 8,      // slowest reader sequence (= write sequence when nobody reads)
+    GP_META_REC_READ_DELTA = 9,    // slowest reader's advance since the previous record
+    GP_META_REC_OCCUPANCY = 10,    // slots in use: write sequence - slowest reader, at most slots
+    GP_META_REC_SLOTS = 11,        // member FIFO capacity in slots
+    GP_META_REC_REFUSED_TOTAL = 12,// writes the member FIFO has refused because it was full (cumulative)
+    GP_META_REC_REFUSED_DELTA = 13,// refusals since the previous record
+    GP_META_REC_BYTES_DELTA = 14,  // WRITE_DELTA * token bytes
+    GP_META_REC_FLAGS = 15,        // bits 0..7 GP_MetaRecordFlag; bits 8..63 drop-oldest events since the previous record
+    GP_META_RECORD_WORDS = 16
+};
+enum GP_MetaRecordFlag { GP_META_FLAG_FULL = 1, GP_META_FLAG_CONFIGURED = 2, GP_META_FLAG_READERS = 4, GP_META_FLAG_LOST = 8 };
+enum GP_MetaSnapshotWord {
+    GP_META_SNAP_ID = 0, GP_META_SNAP_CHANNEL = 1, GP_META_SNAP_VERTICES = 2, GP_META_SNAP_MEMBERS = 3,
+    GP_META_SNAP_RECORDS = 4,      // records ever appended to the group FIFO (its write sequence)
+    GP_META_SNAP_FEED_REFUSED = 5, GP_META_SNAP_SLOTS = 6, GP_META_SNAP_RECORD_WORDS = 7,
+    GP_META_SNAPSHOT_HEADER_WORDS = 8   // then one record (GP_META_RECORD_WORDS words) per member
+};
+// A listening group over table edges (membership only: nothing is registered with the rope simulator).
+GP_MetaGroup* gp_table_meta_create_over_edges(GP_TableContext* ctx, const int32_t* edge_indices, int32_t count, int32_t channel_group);
+int32_t gp_table_meta_get_member_count(GP_TableContext* ctx, GP_MetaGroup* mg);
+int32_t gp_table_meta_get_member(GP_TableContext* ctx, GP_MetaGroup* mg, int32_t ordinal, int32_t* out_edge_idx, uint64_t* out_rope_id);
+// The feed: called by the scheduler once per tick on the manager thread. Returns the groups fed.
+int32_t gp_table_meta_feed_tick(GP_TableContext* ctx, uint64_t tick_id);
+// Each member's most recent record, member order; returns records written.
+int32_t gp_table_meta_get_latest_records(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t* out_words, int32_t max_records);
+// Records from the group FIFO with sequence >= from_seq that are still in the ring, oldest first; *out_write_seq = next sequence.
+int32_t gp_table_meta_read_records(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t from_seq, uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq);
+int32_t gp_table_meta_snapshot_u64(GP_TableContext* ctx, GP_MetaGroup* mg, uint64_t* out_words, int32_t capacity);
 // Enable/disable edge-springs for a meta-group. Springs connect consecutive
 // vertices in the group's member list and will reduce their rest length
 // over time until `min_rest` at the given `reduce_rate` (units per second).

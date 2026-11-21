@@ -1,17 +1,26 @@
 # Radio as one independent Nodus table
 
-Radio currently has two registered native tool rows in one headless Nodus
-table, in this order:
+Radio's live path uses four native tool rows in one headless Nodus table, in
+this order:
 
-1. `radio.system_output` reads new default-speaker loopback frames and uses
-   SpeakToMe's existing native WASAPI/fftfree scope to produce spectral bands.
-2. `radio.udp_broadcast` sends that frame over a nonblocking UDP socket.
+1. `radio.system_output` reads default-speaker loopback PCM through the
+   SpeakToMe capture-only scope ring. File playback uses `radio.file_output`.
+2. `nodus.fftfree` transforms both channel windows as one batched state-library
+   job. The source advances the window by FFT size / overlap (256 frames by
+   default); the two packed channel windows use a full-window hop inside this
+   single transform call.
+3. `radio.fft_bands` projects the transform magnitude into the configured
+   logarithmic or linear-Hz Radio bands and keeps the original NRAD packet layout.
+4. `radio.udp_broadcast` sends that frame over a nonblocking UDP socket, or
+   writes the same NRAD record to a bounded file in offline analysis mode.
 
-The table has `ExecMode::Free` and an `Opaque` row-stack contract. Its rows
-exchange one typed frame pointer only within the same ordered table iteration;
-no Nodus edge or cross-thread handoff intervenes. The WASAPI library retains
-its own hardware capture thread. Nodus's persistent Free worker owns analysis,
-row ordering, and UDP delivery after **one** initial `nodus_headless_step`.
+The table has `ExecMode::Free` and an `Opaque` row-stack contract. Its source,
+FFT and projection rows exchange typed work/receipt tokens in order, without
+a cross-thread handoff. The WASAPI library retains its own hardware capture
+thread and exposes a frame cursor and explicit ring-overrun count. It does not
+load fftfree or create an FFT plan in this capture-only mode. Nodus's persistent
+Free worker owns analysis, row ordering, and UDP delivery after **one** initial
+`nodus_headless_step`.
 The canvas needs no further ticks. A graph save/load records the module's Free
 execution mode and stack contract in a `MODULE_POLICY` trailer; callers must
 register/configure the Radio rows before loading such a graph.
@@ -25,11 +34,13 @@ nodus_radio.exe <openrgb_audio_scope.dll> <fft_cffi.dll> 127.0.0.1 23999 0 5 102
 ```
 
 Duration 0 runs until Ctrl+C. Default bands = 5 and FFT size = 1024; the
-overlap is 4, and analyzed frequencies span 40–18000 Hz on the existing
-scope's logarithmic scale. The CLI prints the UDP endpoint and once-per-second
-capture rate, frame count, sent count, and drop count. The scope DLL must
-include `openrgb_audio_scope_frame_count`, which distinguishes a fresh audio
-window from its cached FFT snapshot.
+overlap is 4, and analyzed frequencies span 40–18000 Hz. Logarithmic bands are
+the default; append `linear` after the optional HLS argument to use equal-Hz
+bands (the intervening optional arguments can be `0`). The CLI prints the UDP
+endpoint and once-per-second
+capture rate, frame count, sent count, drop count, and PCM overrun frames. The
+scope DLL must include `openrgb_audio_scope_create_capture`,
+`openrgb_audio_scope_read_stereo`, and `openrgb_audio_scope_frame_count`.
 
 UDP packet v1 is little-endian, 28 + 4 × bands bytes:
 
@@ -41,7 +52,7 @@ UDP packet v1 is little-endian, 28 + 4 × bands bytes:
 | 12 | u32 | sample rate |
 | 16 | u64 | captured stereo-frame index; strictly increasing |
 | 24 | f32 | full-window RMS |
-| 28 | f32[band count] | logarithmic spectral power, normalized 0–1 by the scope |
+| 28 | f32[band count] | configured spectral band powers, normalized 0–1 by the Nodus band row |
 
 The output socket is nonblocking. If a datagram cannot be sent, Radio counts
 it as dropped and continues with the next live frame. There is no inbound
@@ -49,16 +60,28 @@ socket and no manager handoff between rows. UDP itself has no delivery or
 authentication guarantee; use a local destination unless the surrounding
 network supplies the needed controls.
 
-On this machine (Windows, 48 kHz loopback, five bands), a five-second local
+For ingestion analysis, the caller passes a finite file source with looping,
+PCM, HLS, and gated start disabled, sets `NODUS_RADIO_DECODER` to the declared
+FFmpeg executable, then supplies the final optional `analysis-file` argument.
+The CLI calls `nodus_headless_radio_analysis_file` before launching the same
+Free table. The file source streams decoded float32 stereo to the scope ring
+without opening an SDL speaker or pacing to device playback. The last row
+writes NRAD v1 records with `CREATE_NEW`, flushes at shutdown, and refuses to
+exceed 16 MiB. An existing output file is never replaced. The CLI returns
+failure if any record is dropped or none is written and prints final captured
+frame, record, and drop counts for ingestion validation. The consuming service
+owns track identity, publication, and aggregate storage limits.
+
+Before the fftfree row split, on this machine (Windows, 48 kHz loopback, five bands), a five-second local
 receiver run with FFT size 1024 received 293 packets. Median interpacket gap
 was 15.7 ms, 95th percentile 31.6 ms, maximum 32.7 ms, with no reported
 send drops. A separate four-second run verified 149 packets with strictly
 increasing frame indices, valid band payloads, and 50 ms shutdown. These are
 measurements of the current host, not hard real-time guarantees.
 
-Media-file playback, linear-band mapping, and REST/MCP subscription management
-are separate Radio source/control additions. This path supplies the default
-system-output source and fftfree analysis through a real Nodus Free table.
+REST/MCP subscription management remains a separate service addition. This
+path supplies default system-output and WAV playback sources with central
+fftfree analysis through a real Nodus Free table.
 
 ## Dedicated WAV source (no system-output capture)
 
@@ -70,7 +93,8 @@ nodus_radio.exe <scope.dll> <fft_cffi.dll> 127.0.0.1 <relay-port> 0 5 1024 <appr
 
 This selects `radio.file_output` in the same Free table. SDL3 decodes the WAV,
 converts it to stereo float32, and plays it through an SDL audio stream. Only
-that stream's submitted samples feed the existing scope ring/fftfree analysis;
+that stream's submitted samples feed the capture-only scope ring; the Nodus
+fftfree row performs analysis;
 WASAPI capture is never started. NRAD v1 remains spectral telemetry, not an
 audio stream. The browser cannot reconstruct or listen to music from NRAD v1.
 
@@ -88,8 +112,8 @@ CLI. API callers select `nodus_headless_radio_file_source` after configure and
 before constructing or launching the table; configuration is not a live switch.
 
 The scope DLL must additionally export `openrgb_audio_scope_feed_stereo`.
-Its external-feed and WASAPI modes are mutually exclusive. This reuses the
-same analyzer, not a second FFT implementation.
+Its external-feed and WASAPI modes are mutually exclusive. Neither capture
+mode performs an FFT; both feed the same Nodus fftfree row.
 
 ### Verification, 2026-11-12
 
@@ -110,6 +134,11 @@ assets, not this repository. Its generator docstring says PCM16, but its actual
 writer emits float32; SDL's WAV conversion supports the real emitted format.
 
 ## Opt-in PCM backend output
+
+The later stack-connected FFmpeg/HLS exit is documented in
+`docs/FFMPEG_EXEC_STREAM_2026-11-13.md`. Its `radio.pcm_s16le` row converts the
+source's PCM stack value to a byte tensor for the declared exec row while the
+existing RTP row continues to use the canonical FIFO.
 
 A final CLI argument selects a **separate private PCM destination**:
 
@@ -179,9 +208,9 @@ Looping sources have no natural EOF; forced process termination is not a
 clean finite-source ending.
 
 ThreadManager correctly stops subsequent rows when a source refuses a step.
-Therefore a terminal internal RadioFrame control value now lets the PCM row
-drain the final FIFO and send EOF; the spectrum row consumes that control
-without emitting invented/repeated NRAD measurements. No router changes.
+The independent PCM RTP row is ordered first in the Free table, so it can
+drain the final FIFO and send EOF even after the source stops. No invented
+or repeated NRAD measurement is emitted. No router changes.
 
 Turing's matching receiver handles 1..256-frame L16 blocks, accepts this exact
 terminal compound from its pinned endpoint/SSRC, and stops readback at the
@@ -250,3 +279,66 @@ Silent full-frame gated source proof passed:48007frames/188packets, exact final
 seven-frame block, verified RTCP EOF, zero loss/late/rejected/resync. Two successive
 streams then fed one existing native PA sink through Turing's bounded readback tap:
 96014frames accepted. SDL dummy explicitly selected; real speakers untested.
+
+## Bounded decoder-output prerequisite (2026-11-14)
+
+`nodus::exec::Child::start` now accepts an optional fourth `output_limit`
+argument. Zero retains the existing span behavior; a positive byte count
+backpressures the child's stdout instead of accumulating the complete output.
+`take(out, maximum)` consumes bounded pieces without blocking the caller.
+`output_drained()` distinguishes stdout EOF plus consumed buffered bytes from
+process completion. Consumers must keep taking output while the child runs;
+waiting for exit before consuming bounded output can deadlock by design.
+Cancellation wakes the backpressured reader and terminates the owned child job.
+The OS pipe and one 64KiB reader buffer are additional fixed storage, not part
+of the application queue limit.
+
+`tools/exec_row/exec_pipe_output_test.cpp` verifies byte continuity with partial
+reads, a tiny limit, cancellation, restart and unchanged legacy span behavior.
+Built with MSVC C++20 and passed on Windows. An optional invocation with
+`<ffmpeg.exe> <180-second stereo 48kHz WAV>` also decoded 69,120,000 float32
+bytes through a 65,536-byte queue, crossing the old radio allocation limit
+without holding the whole decoded song. Test input was generated silence;
+there was no audio device, network sender or service restart.
+
+This is the existing execution primitive needed for a streaming decoder.
+**The radio file source still uses SDL_LoadWAV and its old 64MiB limits.**
+Connecting the decoder to its paced SDL/scope/canonical PCM FIFO, declaring
+the trusted executable through service configuration, and verifying real
+radio EOF/loop/error handling remain separate integration work. This receipt
+does not claim that long songs now play on the live station.
+
+### Native file-source decoder integration
+
+Setting the operator-only `NODUS_RADIO_DECODER` to one absolute trusted FFmpeg
+executable opts `radio.file_output` into bounded decoding. Leave it unset to
+retain SDL's existing bounded whole-WAV loader. The input must be a local
+regular file. FFmpeg is invoked with fixed local file/pipe protocols and fixed
+48kHz stereo float32 output; songs cannot supply executable arguments.
+The child uses the existing exec Program core/work-root policy and inherits
+the source's working directory, so the operator should launch in an approved
+user scratch directory rather than a repository directory.
+
+Decoded output is capped at65,536 bytes, then consumed in one existing FFT hop
+at a time. The same samples go to SDL device pacing, fftfree analysis, the
+canonical `radio.pcm` FIFO, and the existing HLS stack conversion. There is no
+new transport, queue scheduler, FFT or parallel media engine. The terminal
+partial hop is retained; only a successful, frame-aligned decoder EOF emits the
+normal end token. Looping restarts the decoder without resetting the sample
+clock; empty streams do not spin forever. Shutdown cancels the owned decoder.
+
+The prior prerequisite receipt above described the source before this
+integration. `tools/test_radio_decoder.py` now exercises the actual native
+source silently with generated local WAV/MP3 files, isolated UDP sockets,
+monotonic RTP and stereo samples, partial EOF/BYE, looping and bounded-duration
+cancellation of a180-second file. This does not configure a live station or
+claim a provider-account integration.
+
+Verification on final native build: WAV and MP3 each delivered exactly14,400
+stereo frames, including a64-frame final packet and compound RTCP BYE. The
+0.3-second WAV loop ran continuously for3seconds with monotonic sequence and
+sample timestamps; a180-second WAV streamed for3seconds before clean bounded
+shutdown. Native counters reported zero PCM drops; observed shutdown times
+were72-101ms. Invalid audio failed without hanging. The original SDL WAV/NRAD
+regression also remains applicable with the decoder option unset. This is not
+a full180-second real-time radio soak or a browser HLS playback test.

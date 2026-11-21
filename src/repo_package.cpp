@@ -2,13 +2,6 @@
 #include "plugin_manager.h"
 #include "tool_api.h"
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
-
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -18,6 +11,45 @@
 #include <iostream>
 #include <sstream>
 
+// ---------------------------------------------------------------------------
+// Platform region: every OS call in this file (dynamic libraries, local time, library naming) lives here.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+namespace repo_platform {
+using LibHandle = HMODULE;
+
+inline LibHandle lib_open(const char* path) { return LoadLibraryA(path); }
+inline void* lib_symbol(LibHandle h, const char* name) { return reinterpret_cast<void*>(GetProcAddress(h, name)); }
+inline void lib_close(LibHandle h) { FreeLibrary(h); }
+inline const char* shared_library_prefix() { return ""; }
+inline const char* shared_library_suffix() { return ".dll"; }
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_s(&out, &t); }
+}  // namespace repo_platform
+#else
+#include <dlfcn.h>
+
+namespace repo_platform {
+using LibHandle = void*;
+
+inline LibHandle lib_open(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+inline void* lib_symbol(LibHandle h, const char* name) { return dlsym(h, name); }
+inline void lib_close(LibHandle h) { dlclose(h); }
+inline const char* shared_library_prefix() { return "lib"; }
+#if defined(__APPLE__)
+inline const char* shared_library_suffix() { return ".dylib"; }
+#else
+inline const char* shared_library_suffix() { return ".so"; }
+#endif
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_r(&t, &out); }
+}  // namespace repo_platform
+#endif
+// ---------------------------------------------------------------------------
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -26,9 +58,7 @@ struct LoadedRepoPackage {
     std::string owner;
     std::string version;
     std::vector<std::string> tool_ids; // pass to gp_plugin_unload
-#ifdef _WIN32
-    std::vector<HMODULE> contract_handles; // pass to FreeLibrary
-#endif
+    std::vector<repo_platform::LibHandle> contract_handles; // pass to repo_platform::lib_close
 };
 
 std::vector<LoadedRepoPackage> g_loaded_packages;
@@ -64,16 +94,11 @@ std::string timestamp_tag() {
     std::time_t t = system_clock::to_time_t(now);
     char buf[64];
     std::tm tm;
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
+    repo_platform::local_time(t, tm);
     std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
     return std::string(buf);
 }
 
-#ifdef _WIN32
 // Build `src` as a standalone shared library and return the built DLL path
 // (empty on failure). Used for register_types()-only contract sources,
 // which have no create_tool export and so can't go through
@@ -117,6 +142,8 @@ fs::path build_contract_dll(const fs::path& src, const fs::path& package_root) {
     const std::vector<std::string> candidate_libs = {
         (release_dir / "canvas_tables.lib").generic_string(),
         (release_dir / "libcanvas_tables.a").generic_string(),
+        (release_dir / "libcanvas_tables.so").generic_string(),
+        (release_dir / "libcanvas_tables.dylib").generic_string(),
     };
     for (const auto& lib : candidate_libs) {
         if (fs::exists(lib)) {
@@ -149,15 +176,16 @@ fs::path build_contract_dll(const fs::path& src, const fs::path& package_root) {
     if (std::system(build_cmd.c_str()) != 0) return {};
 
     const std::vector<fs::path> candidates = {
-        build_dir / "Release" / (name + ".dll"),
-        build_dir / (name + ".dll"),
+        build_dir / "Release" / (name + repo_platform::shared_library_suffix()),
+        build_dir / (name + repo_platform::shared_library_suffix()),
+        build_dir / "Release" / (repo_platform::shared_library_prefix() + name + repo_platform::shared_library_suffix()),
+        build_dir / (repo_platform::shared_library_prefix() + name + repo_platform::shared_library_suffix()),
     };
     for (const auto& c : candidates) {
         if (fs::exists(c)) return c;
     }
     return {};
 }
-#endif
 
 } // namespace
 
@@ -230,12 +258,9 @@ int gp_repo_package_ingest(const GP_RepoPackage& package, void* host) {
 
     auto rollback = [&]() {
         for (const auto& id : loaded.tool_ids) gp_plugin_unload(id.c_str());
-#ifdef _WIN32
-        for (HMODULE h : loaded.contract_handles) FreeLibrary(h);
-#endif
+        for (repo_platform::LibHandle h : loaded.contract_handles) repo_platform::lib_close(h);
     };
 
-#ifdef _WIN32
     for (const auto& contract : package.contracts) {
         fs::path src = resolve_path(package.root_dir, contract.source_path);
         fs::path dll = build_contract_dll(src, fs::path(package.root_dir));
@@ -244,16 +269,16 @@ int gp_repo_package_ingest(const GP_RepoPackage& package, void* host) {
             rollback();
             return 0;
         }
-        HMODULE h = LoadLibraryA(dll.string().c_str());
+        repo_platform::LibHandle h = repo_platform::lib_open(dll.string().c_str());
         if (!h) {
             std::cerr << "repo_package: failed to load contract dll '" << dll.string() << "'\n";
             rollback();
             return 0;
         }
-        auto register_types_fn = reinterpret_cast<RegisterTypesFn>(GetProcAddress(h, "register_types"));
+        auto register_types_fn = reinterpret_cast<RegisterTypesFn>(repo_platform::lib_symbol(h, "register_types"));
         if (!register_types_fn) {
             std::cerr << "repo_package: contract '" << contract.source_path << "' has no register_types export\n";
-            FreeLibrary(h);
+            repo_platform::lib_close(h);
             rollback();
             return 0;
         }
@@ -265,24 +290,18 @@ int gp_repo_package_ingest(const GP_RepoPackage& package, void* host) {
             register_types_fn();
         } catch (...) {
             std::cerr << "repo_package: register_types threw in '" << contract.source_path << "'\n";
-            FreeLibrary(h);
+            repo_platform::lib_close(h);
             rollback();
             return 0;
         }
         loaded.contract_handles.push_back(h);
     }
-#else
-    if (!package.contracts.empty()) {
-        std::cerr << "repo_package: contracts only supported on Windows in this prototype\n";
-        return 0;
-    }
-#endif
 
     for (const auto& tool : package.tools) {
         fs::path src_or_dll = resolve_path(package.root_dir, tool.source_or_dll_path);
         char id_buf[256] = {0};
         bool ok = false;
-        if (src_or_dll.extension() == ".dll") {
+        if (src_or_dll.extension() == repo_platform::shared_library_suffix()) {
             ok = gp_plugin_load_from_path_with_host(src_or_dll.string().c_str(), host, id_buf, sizeof(id_buf)) != 0;
         } else {
             ok = gp_plugin_build_module_and_load(src_or_dll.string().c_str(), package.root_dir.c_str(), nullptr,
@@ -310,9 +329,7 @@ int gp_repo_package_unload(const std::string& owner) {
     for (auto it = g_loaded_packages.begin(); it != g_loaded_packages.end(); ++it) {
         if (it->owner != owner) continue;
         for (const auto& id : it->tool_ids) gp_plugin_unload(id.c_str());
-#ifdef _WIN32
-        for (HMODULE h : it->contract_handles) FreeLibrary(h);
-#endif
+        for (repo_platform::LibHandle h : it->contract_handles) repo_platform::lib_close(h);
         g_loaded_packages.erase(it);
         return 1;
     }

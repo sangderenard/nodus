@@ -550,7 +550,14 @@ def _buffer_abi(
     root: str,
 ) -> tuple[dict[str, Any], str]:
     function = _root_function(module, root)
-    argument_ids = [_value_id(value) for value in tuple(getattr(function, "args", ()) or ())]
+    # The program's inputs are the root formals that are not the compiler's frame workspace (Turing's
+    # compiled_program_api.is_frame_workspace). Program: ``a.to_dtype('int64')``; the literal 'int64' left two frame
+    # formals (its length and capacity cells), counted as inputs: "column count does not match root argument count:
+    # 1 != 3" (2026-11-18, case 6393486c). The backend owns those frames; they are not in buffer_order.
+    argument_ids = [
+        _value_id(value) for value in tuple(getattr(function, "args", ()) or ())
+        if _TURING_IS_FRAME_WORKSPACE is None or not _TURING_IS_FRAME_WORKSPACE(value)
+    ]
     output_ids = [_value_id(value) for value in _published_outputs(outputs, root)]
     overlap = set(argument_ids) & set(output_ids)
     if overlap:
@@ -586,7 +593,10 @@ def _buffer_abi(
         for index, value_id in enumerate(argument_ids)
     }
     order = tuple(int(item) for item in getattr(artifact, "buffer_order", ()) or ())
-    dtypes = tuple(getattr(artifact, "buffer_dtypes", ()) or ())
+    # The element dtype is the value's identity; the backend's buffer_dtypes are its storage spelling (LLVM's i64
+    # carries no sign, so a uint64 column would read back as i64). Use the element dtypes when the backend has them.
+    element_dtypes = tuple(getattr(artifact, "buffer_element_dtypes", ()) or ())
+    dtypes = element_dtypes or tuple(getattr(artifact, "buffer_dtypes", ()) or ())
     shapes = tuple(getattr(artifact, "buffer_shapes", ()) or ())
     if len(dtypes) not in {0, len(order)} or len(shapes) not in {0, len(order)}:
         raise ProductError("backend buffer metadata does not match buffer_order")
@@ -836,6 +846,9 @@ def _compiler_head(root: Path) -> str:
         return "unknown"
 
 
+_TURING_IS_FRAME_WORKSPACE: Any = None   # set by TuringBoundary from Turing's compiled_program_api
+
+
 class TuringBoundary:
     """Late imports keep Turing external to Nodus and easy to test."""
 
@@ -856,9 +869,25 @@ class TuringBoundary:
                 emit_ssa_function_to_llvm,
             )
             from src.compiler.fortran_c_shell import compile_fortran_module_c_shell
+            # The authored tensor kernels: every other Turing caller (native_package, external_functions,
+            # vehicle_python_compilation) lowers tensor calls against this reference. Without it a tensor op
+            # such as matmul, stack, cat, gather or full_like reached the LLVM emitter un-lowered and was refused
+            # "operation has no repository LLVM emission" (2026-11-18, case 6393486c).
+            from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+                c_backend_repository_ssa_reference,
+            )
+            from src.common.tensors.abstraction import AbstractTensor
+            # Turing's own classification of a root formal the compiler gave the entry frame (a sequence's length and
+            # capacity cells, a linked call's or returned record's storage): role "workspace" in its compiled program
+            # API, never an input column.
+            from src.compiler.compiled_program_api import is_frame_workspace
         finally:
             sys.path.pop(0)
+        global _TURING_IS_FRAME_WORKSPACE
+        _TURING_IS_FRAME_WORKSPACE = is_frame_workspace
         self._lower = lower_ast_source_to_ssa
+        self._tensor_reference = c_backend_repository_ssa_reference
+        self._abstract_tensor = AbstractTensor
         self._emit_c = emit_ssa_module_to_c
         self._emit_llvm = emit_ssa_function_to_llvm
         self._compile_llvm = compile_artifact
@@ -868,7 +897,10 @@ class TuringBoundary:
         self.toolchain = compiler_toolchain_fingerprint()
 
     def lower(self, source: str, entrypoint: str, **kwargs: Any) -> tuple[Any, Any, Any]:
-        return self._lower(source, entrypoint, **kwargs)
+        kwargs.setdefault("tensor_ssa_reference", self._tensor_reference())
+        bindings = dict(kwargs.pop("python_bindings", None) or {})
+        bindings.setdefault("AbstractTensor", self._abstract_tensor)
+        return self._lower(source, entrypoint, python_bindings=bindings, **kwargs)
 
     def emit_c(self, module: Any, root: str, *, entry_name: str) -> Any:
         return self._emit_c(module, root, entry_name=entry_name)

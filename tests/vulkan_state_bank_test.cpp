@@ -67,5 +67,20 @@ int main() {
         warm_stats.resident_bytes != 2 * bytes) return 16;
     std::cout << "warm_resident=" << warm_stats.resident_bytes
               << " warm_evictions=" << warm_stats.evicted << '\n';
+    nodus::gpu::VulkanStateBank pinned(context.get(), bytes);
+    if (!pinned.add(3001, bytes, home_a.get()) ||
+        !pinned.add(3002, bytes, home_b.get()) ||
+        !pinned.set_pin(3001, true)) return 17;
+    if (pinned.stats().pinned_bytes != bytes || pinned.lease(3002)) return 18;
+    if (pinned.stats().evicted != 0) return 19;
+    {
+        auto loan = pinned.lease(3001);
+        if (!loan || pinned.set_pin(3001, false)) return 20;
+    }
+    if (!pinned.set_pin(3001, false) || pinned.stats().pinned_bytes) return 21;
+    {
+        auto loan = pinned.lease(3002);
+        if (!loan || pinned.stats().evicted != 1) return 22;
+    }
     return 0;
 }

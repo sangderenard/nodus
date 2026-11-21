@@ -12,12 +12,16 @@
 #include <cstdlib>
 #include <vector>
 #include <memory>
+// ---- platform region: OS headers (the OS calls are in the platform region below the arena globals) ----
 #if defined(_WIN32) || defined(_WIN64)
 #define NODUS_OS_WINDOWS 1
 #ifndef NOMINMAX
 #define NOMINMAX 1
 #endif
 #include <windows.h>
+#if WIN32
+#include <malloc.h>
+#endif
 #elif defined(__APPLE__)
 #define NODUS_OS_APPLE 1
 #include <sys/sysctl.h>
@@ -27,9 +31,7 @@
 #include <sys/mman.h>
 #include <fstream>
 #endif
-#if WIN32
-#include <malloc.h>
-#endif
+// ---- end platform region ----
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -188,6 +190,7 @@ static uint64_t align_up_u64(uint64_t v, uint64_t alignment) {
     return (v + alignment - 1) & ~(alignment - 1);
 }
 
+// ---- platform region: system memory, page release, virtual reservation (every OS call in this file) ----
 static uint64_t get_system_free_bytes() {
 #if NODUS_OS_WINDOWS
     MEMORYSTATUSEX status{};
@@ -238,6 +241,52 @@ static void os_release_pages(void* base, uint64_t offset, uint64_t size) {
 #endif
 }
 
+// Arena backing. Windows reserves address space with VirtualAlloc and commits on demand when the backing policy is
+// VirtualOnly; everywhere else the arena is a malloc block (uses_virtual is always false).
+#if NODUS_OS_WINDOWS
+static bool os_arena_wants_virtual_backing() {
+    return g_arena_backing_policy.load(std::memory_order_acquire) == InMemoryBackend::ArenaBackingPolicy::VirtualOnly;
+}
+static void* os_virtual_reserve(uint64_t bytes) {
+    return VirtualAlloc(nullptr, static_cast<SIZE_T>(bytes), MEM_RESERVE, PAGE_READWRITE);
+}
+static bool os_virtual_commit(void* at, uint64_t bytes) {
+    return VirtualAlloc(at, static_cast<SIZE_T>(bytes), MEM_COMMIT, PAGE_READWRITE) != nullptr;
+}
+static void os_virtual_release(void* base) {
+    VirtualFree(base, 0, MEM_RELEASE);
+}
+// Grow the malloc block in place (CRT _expand); nullptr when it cannot.
+static void* os_expand_block(void* block, size_t bytes) {
+#if WIN32
+    return _expand(block, bytes);
+#else
+    (void)block;
+    (void)bytes;
+    return nullptr;
+#endif
+}
+// Free spans of a malloc-backed arena are left alone; only virtual backing is decommitted.
+static bool os_trims_malloc_backed_arena() { return false; }
+#else
+static bool os_arena_wants_virtual_backing() { return false; }
+static void* os_virtual_reserve(uint64_t) { return nullptr; }
+static bool os_virtual_commit(void*, uint64_t) { return true; }
+static void os_virtual_release(void*) {}
+static void* os_expand_block(void*, size_t) { return nullptr; }
+// Free spans of a malloc-backed arena are returned to the OS with madvise.
+static bool os_trims_malloc_backed_arena() { return true; }
+#endif
+// Release an arena's backing block: virtual reservation or malloc block.
+static void os_free_arena_backing(void* base, bool uses_virtual) {
+    if (uses_virtual) {
+        os_virtual_release(base);
+    } else {
+        std::free(base);
+    }
+}
+// ---- end platform region ----
+
 static bool arena_init_book(Arena* arena, uint64_t reserve, uint64_t span_nodes) {
     if (!arena) return false;
     if (span_nodes == 0 || span_nodes > 50'000'000ull) return false;
@@ -245,10 +294,8 @@ static bool arena_init_book(Arena* arena, uint64_t reserve, uint64_t span_nodes)
 
     const uint64_t alloc_bytes = reserve + static_cast<uint64_t>(kPageAlignment);
     void* raw = nullptr;
-#if NODUS_OS_WINDOWS
-    const auto policy = g_arena_backing_policy.load(std::memory_order_acquire);
-    if (policy == InMemoryBackend::ArenaBackingPolicy::VirtualOnly) {
-        raw = VirtualAlloc(nullptr, static_cast<SIZE_T>(alloc_bytes), MEM_RESERVE, PAGE_READWRITE);
+    if (os_arena_wants_virtual_backing()) {
+        raw = os_virtual_reserve(alloc_bytes);
         if (!raw) return false;
         arena->uses_virtual = true;
     } else {
@@ -256,11 +303,6 @@ static bool arena_init_book(Arena* arena, uint64_t reserve, uint64_t span_nodes)
         if (!raw) return false;
         arena->uses_virtual = false;
     }
-#else
-    raw = std::malloc(static_cast<size_t>(alloc_bytes));
-    if (!raw) return false;
-    arena->uses_virtual = false;
-#endif
 
     arena->malloc_base = raw;
     arena->malloc_bytes = static_cast<size_t>(alloc_bytes);
@@ -275,13 +317,8 @@ static bool arena_init_book(Arena* arena, uint64_t reserve, uint64_t span_nodes)
 
     arena->nodes = static_cast<ArenaSpanNode*>(std::calloc(static_cast<size_t>(span_nodes), sizeof(ArenaSpanNode)));
     if (!arena->nodes) {
-#if NODUS_OS_WINDOWS
-        if (arena->uses_virtual && arena->malloc_base) {
-            VirtualFree(arena->malloc_base, 0, MEM_RELEASE);
-        } else
-#endif
         if (arena->malloc_base) {
-            std::free(arena->malloc_base);
+            os_free_arena_backing(arena->malloc_base, arena->uses_virtual);
         }
         arena->malloc_base = nullptr;
         arena->base = nullptr;
@@ -373,26 +410,20 @@ static bool arena_init_book(Arena* arena, uint64_t reserve, uint64_t span_nodes)
     const uint64_t min_bytes_cfg = g_arena_min_commit_bytes.load(std::memory_order_acquire);
     const uint64_t min_bytes = std::min<uint64_t>(reserve, min_bytes_cfg);
     if (min_bytes < reserve) {
-#if NODUS_OS_WINDOWS
         if (arena->uses_virtual) {
             const uint64_t commit_bytes = align_up_u64(min_bytes, kPageAlignment);
             if (commit_bytes > 0) {
-                void* res = VirtualAlloc(arena->base, static_cast<SIZE_T>(commit_bytes), MEM_COMMIT, PAGE_READWRITE);
-                if (!res) return false;
+                if (!os_virtual_commit(arena->base, commit_bytes)) return false;
             }
             arena->committed_bytes = commit_bytes;
+        } else if (os_trims_malloc_backed_arena()) {
+            os_release_pages(arena->base, min_bytes, reserve - min_bytes);
         }
-#else
-        os_release_pages(arena->base, min_bytes, reserve - min_bytes);
-#endif
     } else {
-#if NODUS_OS_WINDOWS
         if (arena->uses_virtual) {
-            void* res = VirtualAlloc(arena->base, static_cast<SIZE_T>(reserve), MEM_COMMIT, PAGE_READWRITE);
-            if (!res) return false;
+            if (!os_virtual_commit(arena->base, reserve)) return false;
             arena->committed_bytes = reserve;
         }
-#endif
     }
     return true;
 }
@@ -491,8 +522,7 @@ static bool arena_try_expand_locked(uint64_t min_reserve) {
         return true;
     }
 
-#if WIN32
-    void* expanded = _expand(g_arena.malloc_base, static_cast<size_t>(target_bytes));
+    void* expanded = os_expand_block(g_arena.malloc_base, static_cast<size_t>(target_bytes));
     if (!expanded || expanded != g_arena.malloc_base) {
         return false;
     }
@@ -503,10 +533,6 @@ static bool arena_try_expand_locked(uint64_t min_reserve) {
         arena_insert_clean_span(old_reserve, g_arena.reserve_bytes - old_reserve);
     }
     return true;
-#else
-    (void)target_bytes;
-    return false;
-#endif
 }
 
 
@@ -517,22 +543,16 @@ static void arena_push_node(int32_t idx);
 static bool arena_ensure_committed(uint64_t end_offset) {
     if (!arena_ensure_initialized()) return false;
     if (end_offset > g_arena.reserve_bytes) return false;
-#if NODUS_OS_WINDOWS
     if (g_arena.uses_virtual) {
         const uint64_t page = kPageAlignment;
         uint64_t want = align_up_u64(end_offset, page);
         if (want > g_arena.reserve_bytes) want = g_arena.reserve_bytes;
         if (want > g_arena.committed_bytes) {
             uint64_t delta = want - g_arena.committed_bytes;
-            void* res = VirtualAlloc(g_arena.base + g_arena.committed_bytes,
-                                     static_cast<SIZE_T>(delta),
-                                     MEM_COMMIT,
-                                     PAGE_READWRITE);
-            if (!res) return false;
+            if (!os_virtual_commit(g_arena.base + g_arena.committed_bytes, delta)) return false;
             g_arena.committed_bytes = want;
         }
     }
-#endif
     return true;
 }
 
@@ -1434,13 +1454,9 @@ static void arena_trim_retired_locked(Arena* arena) {
             uint64_t end = off + sz;
 
             if (end <= trim_low || off >= trim_high) {
-#if NODUS_OS_WINDOWS
-                if (arena->uses_virtual) {
+                if (arena->uses_virtual || os_trims_malloc_backed_arena()) {
                     os_release_pages(arena->base, off, sz);
                 }
-#else
-                os_release_pages(arena->base, off, sz);
-#endif
                 if (prev < 0) {
                     head = next;
                 } else {
@@ -1475,9 +1491,7 @@ static void arena_trim_retired_locked(Arena* arena) {
 static void arena_release_free_spans_locked(Arena* arena) {
     if (!arena || !arena->base || !arena->nodes) return;
     if (!arena->retired) return;
-#if NODUS_OS_WINDOWS
-    if (!arena->uses_virtual) return;
-#endif
+    if (!arena->uses_virtual && !os_trims_malloc_backed_arena()) return;
     auto release_list = [&](int32_t head) {
         for (int32_t cur = head; cur >= 0; cur = arena->nodes[cur].next) {
             const uint64_t off = arena->nodes[cur].offset;
@@ -1502,14 +1516,7 @@ static bool arena_exodus_locked(uint64_t min_need) {
                 old_arena->nodes = nullptr;
             }
             if (old_arena->malloc_base) {
-#if NODUS_OS_WINDOWS
-                if (old_arena->uses_virtual) {
-                    VirtualFree(old_arena->malloc_base, 0, MEM_RELEASE);
-                } else
-#endif
-                {
-                    std::free(old_arena->malloc_base);
-                }
+                os_free_arena_backing(old_arena->malloc_base, old_arena->uses_virtual);
                 old_arena->malloc_base = nullptr;
             }
             old_arena->base = nullptr;
@@ -1663,11 +1670,9 @@ static bool arena_exodus_locked(uint64_t min_need) {
         uint64_t half = align_up_u64(planned / 2u, page);
         if (half < planned) {
             os_release_pages(new_arena->base, half, planned - half);
-#if NODUS_OS_WINDOWS
             if (new_arena->uses_virtual) {
                 new_arena->committed_bytes = half;
             }
-#endif
         }
     }
 
@@ -1829,14 +1834,7 @@ static void maybe_free_owner_lease(uint64_t owner_id) {
             std::free(owner_arena->nodes);
             owner_arena->nodes = nullptr;
             if (owner_arena->malloc_base) {
-#if NODUS_OS_WINDOWS
-                if (owner_arena->uses_virtual) {
-                    VirtualFree(owner_arena->malloc_base, 0, MEM_RELEASE);
-                } else
-#endif
-                {
-                    std::free(owner_arena->malloc_base);
-                }
+                os_free_arena_backing(owner_arena->malloc_base, owner_arena->uses_virtual);
             }
             owner_arena->malloc_base = nullptr;
             owner_arena->base = nullptr;
@@ -2362,14 +2360,7 @@ void InMemoryBackend::reset_arena_for_testing() {
             arena->nodes = nullptr;
         }
         if (arena->malloc_base) {
-#if NODUS_OS_WINDOWS
-            if (arena->uses_virtual) {
-                VirtualFree(arena->malloc_base, 0, MEM_RELEASE);
-            } else
-#endif
-            {
-                std::free(arena->malloc_base);
-            }
+            os_free_arena_backing(arena->malloc_base, arena->uses_virtual);
             arena->malloc_base = nullptr;
         }
         arena->base = nullptr;

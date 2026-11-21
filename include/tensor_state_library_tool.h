@@ -1,10 +1,12 @@
 #pragma once
+// The row's source: module_library/source/tools/tensor_state_library.cpp.
 #include "tensor_state_library.h"
 #include "tool_api.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -24,11 +26,20 @@ class TensorStateLibraryTool final : public ITool {
 public:
     explicit TensorStateLibraryTool(
         std::uint64_t ram_budget_bytes=1024ull*1024*1024,
-        std::vector<std::uint64_t> device_budget_bytes={})
+        std::vector<std::uint64_t> device_budget_bytes={},
+        bool include_gpu=true)
         :ram_budget_(ram_budget_bytes),
-         device_budget_bytes_(std::move(device_budget_bytes)){}
+         device_budget_bytes_(std::move(device_budget_bytes)),
+         include_gpu_(include_gpu){}
+    // No-argument construction is the defaults above (a row made with no saved settings); configure() or the saved
+    // state (serialize/deserialize) gives it its budgets before initialize() opens the library.
+    void configure(std::uint64_t ram_budget_bytes,
+                   std::vector<std::uint64_t> device_budget_bytes,bool include_gpu);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     enum class Operation : std::uint64_t {
-        Card=1, Put=2, Remove=3, Status=4, ChooseResident=5
+        Card=1, Put=2, Remove=3, Status=4, ChooseResident=5,
+        Pin=6, Unpin=7
     };
     enum class Result : std::uint64_t {
         Ok=0, Invalid=1, CardUnknown=2, Quota=3, StateConflict=4,
@@ -40,7 +51,8 @@ public:
     // Argument port as an ordinary typed tensor. ChooseResident takes U64[N,2]
     // candidate rows {base_address, field_count}, device in request[5], and
     // selects the warmest admissible candidate; equal scores keep FIFO order.
-    // Other operations ignore the payload.
+    // Pin and Unpin use address in request[3], device in request[5], and
+    // reserve/release that card's GPU quota. Other operations ignore payload.
     const char* id_cstr() const noexcept override {return "nodus.tensor.state.library";}
     const char* name_cstr() const noexcept override {return "Tensor state library";}
     ToolCaps caps() const override {return ToolCaps::None;}
@@ -55,6 +67,27 @@ public:
     void tick(double,HostAPI&) override {}
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext&) override;
+
+    // The volunteer cycle (case a11b5c9b1be74c9b9fb684790f7fd5a3): "the state library on a table that outputs work
+    // and inputs state returns from the work". Besides its U64[12] requests the row takes, on its table's Input row:
+    //   U64[7] work packet {card, base, invocations, work id, Y invocations, target, program}: queued (rule 3);
+    //   U64[6] (no program word) is program 0, any job on the target device;
+    //   U64[N,10] batch (gpu_work_row_tool.h VolunteerSlots): each receipt slot finishes its work, or re-queues it
+    //   when it failed (rule 2: retry, no re-checking); each null slot is filled with queued work, its target kept
+    //   when set ahead of time and otherwise chosen by the library's metrics (rule 1).
+    // Empty batches come from the tensor mint on the row's own port "blank"; a batch with nothing left to carry goes
+    // back on "spent". At most one batch leaves per step, on the table's Output row, to the work table.
+    int32_t row_port_count() const override {return 2;}
+    ToolRowPort row_port(int32_t index) const override {
+        if(index==0)return ToolRowPort{ToolPortKind::Argument,0.0f,0.5f,"blank",8};
+        if(index==1)return ToolRowPort{ToolPortKind::Return,1.0f,0.5f,"spent",8};
+        return ToolRowPort{};
+    }
+    struct CycleCounts {
+        std::uint64_t queued=0,outstanding=0,completed=0,retried=0,batches_in_hand=0;
+        std::array<std::uint64_t,4> completed_by_device{};  // by the receipt's device word (first four devices)
+    };
+    CycleCounts cycle_counts() const;
 
     class GpuLoan {
     public:
@@ -102,7 +135,11 @@ public:
     // The library card limits simultaneously leased bytes for that client on each GPU.
     GpuLoan borrow_gpu(std::uint64_t card,std::uint64_t address,
                        std::size_t device,bool writable);
+    bool pin_gpu(std::uint64_t card,std::uint64_t address,
+                 std::size_t device,bool pinned);
     CpuLoan borrow_cpu(std::uint64_t card,std::uint64_t address,bool writable);
+    std::optional<TensorStateLibrary::Spec> describe_state(
+        std::uint64_t card,std::uint64_t address) const;
     struct Candidate { std::uint64_t base=0, fields=0; };
     static_assert(sizeof(Candidate)==2*sizeof(std::uint64_t));
     struct ResidencyChoice {
@@ -143,7 +180,7 @@ public:
 private:
     struct Card {
         std::uint64_t process=0,ram_quota=0,ram_used=0;
-        std::vector<std::uint64_t> gpu_quota,gpu_leased;
+        std::vector<std::uint64_t> gpu_quota,gpu_leased,gpu_pinned;
     };
     void release_gpu_loan(std::uint64_t card,std::size_t device,
                           std::uint64_t bytes,
@@ -151,6 +188,8 @@ private:
     Result handle(const std::array<std::uint64_t,kRequestWords>&,
                   std::uint64_t payload,
                   std::array<std::uint64_t,kReceiptWords>& receipt);
+    Result set_gpu_pin_locked(std::uint64_t card,std::uint64_t address,
+                              std::size_t device,bool pinned);
     std::optional<ResidencyChoice> choose_resident_locked(
         std::uint64_t card,std::size_t device,
         std::span<const Candidate> candidates) const;
@@ -158,9 +197,11 @@ private:
     std::vector<std::unique_ptr<void,decltype(&gp_mem_backend_release)>> contexts_;
     std::unique_ptr<TensorStateLibrary> library_;
     std::unordered_map<std::uint64_t,Card> cards_;
+    std::map<std::pair<std::uint64_t,std::size_t>,std::uint64_t> pins_;
     std::unordered_map<std::uint64_t,std::uint64_t> address_card_,address_bytes_;
     std::uint64_t ram_budget_;
     std::vector<std::uint64_t> device_budget_bytes_;
+    bool include_gpu_ = true;
     std::uint64_t inflight_gpu_loans_=0;
     struct CompletionWindow {
         std::array<std::uint64_t,8> lease{},dispatch{},total{};
@@ -170,6 +211,19 @@ private:
     std::vector<CompletionWindow> completion_windows_;
     using WorkKey=std::tuple<ExecutionApi,std::size_t,std::uint64_t,std::uint64_t>;
     std::map<WorkKey,CompletionWindow> work_windows_;
+
+    // The volunteer cycle's state, under its own lock (device_performance takes mutex_).
+    using WorkPacket=std::array<std::uint64_t,7>;
+    bool cycle_step(ToolStackContext& context);
+    std::uint64_t choose_target_locked(std::uint64_t program,std::uint64_t lanes);
+    void fill_and_settle_locked(std::vector<std::uint64_t>& words);
+    mutable std::mutex cycle_mutex_;
+    std::deque<WorkPacket> work_queue_;
+    std::unordered_map<std::uint64_t,WorkPacket> outstanding_;  // work id -> the packet as queued
+    std::vector<std::uint64_t> inflight_by_device_;
+    std::deque<std::uint64_t> batches_;                          // batches in hand, oldest first
+    std::uint64_t completed_=0,retried_=0;
+    std::array<std::uint64_t,4> completed_by_device_{};
 };
 
 } // namespace nodus::gpu

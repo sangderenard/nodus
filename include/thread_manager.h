@@ -147,6 +147,7 @@ public:
             int32_t exec_skip_count = 0; // number of frames to skip between executions (0 = every frame)
             ExecMode exec_mode = ExecMode::Pooled;
             ModuleStackContract stack_contract = ModuleStackContract::Opaque;
+            uint8_t stack_loopback = 0;  // 1 = the table keeps its stack from tick to tick (GraphRuntime)
         };
 
     struct EdgeContract {
@@ -191,6 +192,8 @@ public:
     Mode mode() const;
     void set_persistent_workers(bool enabled);
     bool persistent_workers() const;
+    void set_parallel_worker_limit(size_t count);
+    size_t parallel_worker_limit() const;
     void set_module_tool_stack_default_type(ValueTypeId tid);
     ValueTypeId module_tool_stack_default_type() const;
 
@@ -353,6 +356,7 @@ private:
 
     std::atomic<Mode> mode_{Mode::Scheduled};
     std::atomic<bool> persistent_workers_{true};
+    std::atomic<size_t> parallel_worker_limit_{0}; // 0 selects the existing automatic limit.
     std::atomic<bool> running_{false};
     std::thread worker_;
     std::vector<std::thread> free_workers_;

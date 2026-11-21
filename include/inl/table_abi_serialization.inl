@@ -679,6 +679,14 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
                 continue;
             }
             if (!ctx->rope_sim) {
+                // No simulator (a headless table): the persistent rope id names the table edge directly. A listening
+                // meta group only needs membership, so add it without simulator registration.
+                int by_id = -1;
+                for (size_t ri = 0; ri < ctx->rope_ids.size(); ++ri) if (ctx->rope_ids[ri] == want_uid) { by_id = static_cast<int>(ri); break; }
+                if (by_id >= 0) {
+                    gp_table_meta_add_vertex_with_id_internal(ctx, mg, want_uid, by_id, vp.second, false);
+                    continue;
+                }
                 SERIALIZE_DEBUGF("gp_table_deserialize: deferring meta vertex rope_id=%llu (no RopeSim attached yet)\n", (unsigned long long)want_uid);
                 gp_table_queue_pending_meta_vertex(ctx, mg, want_uid, vp.second);
                 continue;

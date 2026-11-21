@@ -15,7 +15,12 @@ namespace nodus::contracts {
 struct Contract { uint64_t id=0, engine=0, revision=0, payload=0; };
 struct Loan { Contract work{}; uint64_t generation=0, host=0, deadline=0; };
 struct Result { Loan loan{}; uint64_t payload=0; };
-struct Exchange { uint64_t accepted_generation=0; bool has_result=false; Result result{}; };
+struct Exchange {
+    uint64_t accepted_generation=0; bool has_result=false; Result result{};
+    // Native opt-in ownership while awaiting explicit operation approval.
+    // This holds the exact accepted generation; it does not authorize work.
+    bool hold_accepted_loan=false;
+};
 // An exchange first returns the host's previous completed result, and may
 // accept the new offer. Rejected offers leave the contract unaccepted.
 struct Peer {
@@ -34,7 +39,13 @@ struct Producer {
 class ContractNegotiator {
 public:
     enum class State { Unaccepted, Loaned, Returned, Committed };
-    struct Entry { Contract work; State state=State::Unaccepted; Loan loan{}; uint64_t registration=0; };
+    struct Entry {
+        Contract work; State state=State::Unaccepted; Loan loan{}; uint64_t registration=0;
+        // Set by the exact native owner immediately before non-replayable work.
+        // Authoritative across host/Offer replacement for this negotiator's
+        // lifetime. It is not persisted across destruction/process restart.
+        bool replay_protected=false;
+    };
     // Operator chooses an unaccepted index from the retained stack. SIZE_MAX
     // means no offer. Pricing/pressure is policy, not guessed by transport.
     using Offer = std::function<size_t(const Peer&, const std::vector<Entry>&)>;
@@ -115,6 +126,16 @@ public:
         if(in_turn_){ if(!has_host(id))return false; deferred_.push_back({true,id}); return true; }
         return apply_remove_host(id);
     }
+    // An explicit boundary for work whose outcome must not be retried after
+    // lease expiry, host replacement or rejection. Protect before the native
+    // submission, while the current loan is still valid. Completion must still
+    // match the exact loan; only its original deadline ceases to cause replay.
+    bool protect_loan(uint64_t id,uint64_t generation,uint64_t host){
+        auto* e=find(id);
+        if(!e || e->state!=State::Loaned || e->loan.generation!=generation ||
+           e->loan.host!=host || (!e->replay_protected && turn_>=e->loan.deadline))return false;
+        e->replay_protected=true;return true;
+    }
     bool settle_engine(uint64_t id){
         if(in_turn_||!pending_||pending_result_.loan.work.engine!=id)return false;
         auto* entry=find(pending_result_.loan.work.id);
@@ -141,7 +162,7 @@ public:
     // Owner rejects a validated-but-uncommitted result; release FIFO head and reoffer.
     bool reject_pending(uint64_t id,uint64_t generation){
         if(!pending_ || pending_result_.loan.work.id!=id || pending_result_.loan.generation!=generation)return false;
-        auto* e=find(id);if(!e || e->state!=State::Returned)return false;
+        auto* e=find(id);if(!e || e->state!=State::Returned || e->replay_protected)return false;
         e->state=State::Unaccepted;pending_=false;return true;
     }
     bool retire(uint64_t id){
@@ -157,7 +178,7 @@ public:
     void market_turn(){
         TurnGuard guard(*this);
         ++turn_;
-        for(auto& e:entries_) if(e.state==State::Loaned && turn_>=e.loan.deadline)
+        for(auto& e:entries_) if(e.state==State::Loaned && !e.replay_protected && turn_>=e.loan.deadline)
             e.state=State::Unaccepted;
         // Work of a removed engine whose loan expired has nowhere to go.
         entries_.erase(std::remove_if(entries_.begin(),entries_.end(),[&](const Entry& e){
@@ -193,6 +214,7 @@ public:
         if(offered.generation && reply.accepted_generation==offered.generation &&
            candidate && candidate->state==State::Unaccepted && turn_<offered.deadline){
             candidate->loan=offered;candidate->state=State::Loaned;retained={};
+            candidate->replay_protected=reply.hold_accepted_loan;
         }
         if(reply.has_result){
             bool received=reply.result.loan.host==host.id && accept_result(reply.result);
@@ -222,7 +244,10 @@ public:
             }
             if(!routed_to_known){ // engine removed while its work was in flight
                 const uint64_t id=pending_result_.loan.work.id;
-                for(auto it=entries_.begin();it!=entries_.end();++it)if(it->work.id==id){entries_.erase(it);break;}
+                for(auto it=entries_.begin();it!=entries_.end();++it)if(it->work.id==id){
+                    if(!it->replay_protected)entries_.erase(it);
+                    break;
+                }
                 pending_=false;++discarded_results_;
             }
         }
@@ -254,19 +279,19 @@ private:
                 auto* e=find(pending_result_.loan.work.id);
                 if(e && e->registration==reg){
                     const uint64_t dead=e->work.id;
-                    entries_.erase(std::remove_if(entries_.begin(),entries_.end(),[&](const Entry& x){return x.work.id==dead;}),entries_.end());
+                    entries_.erase(std::remove_if(entries_.begin(),entries_.end(),[&](const Entry& x){return x.work.id==dead && !x.replay_protected;}),entries_.end());
                     pending_=false;++discarded_results_;
                 }
             }
             entries_.erase(std::remove_if(entries_.begin(),entries_.end(),[&](const Entry& e){
-                return e.registration==reg && (e.state==State::Unaccepted || e.state==State::Committed);}),entries_.end());
+                return e.registration==reg && (e.state==State::Committed || (e.state==State::Unaccepted && !e.replay_protected));}),entries_.end());
             return true;
         } return false;
     }
     bool apply_remove_host(uint64_t id){
         for(size_t i=0;i<hosts_.size();++i) if(hosts_[i].id==id){
             hosts_.erase(hosts_.begin()+i); offers_.erase(offers_.begin()+i);
-            for(auto& e:entries_) if(e.state==State::Loaned && e.loan.host==id){
+            for(auto& e:entries_) if(e.state==State::Loaned && e.loan.host==id && !e.replay_protected){
                 e.state=State::Unaccepted; e.loan={}; ++reoffered_loans_;
             }
             return true;
@@ -279,7 +304,7 @@ private:
         const auto& a=e->loan; const auto& b=result.loan;
         if(a.generation!=b.generation || a.host!=b.host || a.deadline!=b.deadline ||
            a.work.engine!=b.work.engine || a.work.revision!=b.work.revision ||
-           a.work.payload!=b.work.payload || turn_>=a.deadline) return false;
+           a.work.payload!=b.work.payload || (!e->replay_protected && turn_>=a.deadline)) return false;
         int32_t dropped=0;
         if(publish_){if(!publish_(result)) return false;}
         else if(!nodus_edge_runtime_publish(fifo_,1,&result,sizeof(result),&dropped)) return false;

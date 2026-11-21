@@ -4,6 +4,8 @@ EXPORTS
     gp_canvas_actualize_to_root
     gp_canvas_add_edge
     gp_canvas_add_edge_with_type
+    gp_canvas_apply_port_pair
+    gp_canvas_resolve_port_pair
     gp_canvas_add_module
     gp_canvas_attach_rope_to_overlay
     gp_canvas_attach_rope_to_overlay_with_module
@@ -43,6 +45,7 @@ EXPORTS
     gp_canvas_get_module_frame_ptr
     gp_canvas_get_module_frame_ptr_for_contact
     gp_canvas_get_module_node_id
+    gp_canvas_get_module_stack_tail
     gp_canvas_get_module_uuid
     gp_canvas_get_offset
     gp_canvas_get_overlay_port_uuids
@@ -108,6 +111,7 @@ EXPORTS
     gp_canvas_set_overlay_button_callback
     gp_canvas_set_overlay_meta
     gp_canvas_set_size
+    gp_canvas_set_module_stack_tail
     gp_canvas_set_subgroup_toolbar_rgba
     gp_canvas_set_subgroup_toolbar_rgba_at
     gp_canvas_set_table_tool_number
@@ -347,6 +351,13 @@ EXPORTS
     gp_table_meta_get_dangling_rope_info
     gp_table_meta_get_dangling_widget_id
     gp_table_meta_get_fifo_snapshot
+    gp_table_meta_create_over_edges
+    gp_table_meta_get_member_count
+    gp_table_meta_get_member
+    gp_table_meta_feed_tick
+    gp_table_meta_get_latest_records
+    gp_table_meta_read_records
+    gp_table_meta_snapshot_u64
     gp_table_meta_get_id
     gp_table_meta_get_lasso_config
     gp_table_meta_get_lasso_fields

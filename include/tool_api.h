@@ -107,6 +107,57 @@ struct ToolStackFrame {
 // table/edge code that must carry arbitrary typed payloads. The typed
 // raw stack helpers allow single-op memcpy push/pop and are stride-aware.
 
+// ---- A row's own surface (research case 075069677cb74e3f9794914c9009cec5) ------------------------------------------
+// Table ports move the stack: N items on the stack with N output ports go out together. A port declared ON a row is
+// the row's own channel: the row reads and writes it itself during its tick (ToolStackContext::row_ports). A row also
+// declares where its ports sit and which controls it shows; its picture is the ITool paint half (render_table, with
+// ToolCaps::Table). The canvas draws and routes exactly what the row declares: rectangles are also the click routes.
+struct ToolRowPort {
+    ToolPortKind kind = ToolPortKind::Return;  // Argument = into the row, Return = out of the row
+    float x = 1.0f, y = 0.5f;                   // the port's LED centre, as fractions of the row's rectangle
+    const char* name = "";                      // stable name; a port pair may name it (table.row:name)
+    uint32_t token_bytes = 0;                   // bytes per token on its edge (0 = whatever the edge is configured to)
+};
+
+// The control kinds are the Pluck knob kinds (button, toggle, stepper, slider, choice) plus text.
+enum class ToolRowControlKind : uint8_t { Text = 0, Button = 1, Toggle = 2, Stepper = 3, Slider = 4, Choice = 5 };
+struct ToolRowControl {
+    ToolRowControlKind kind = ToolRowControlKind::Text;
+    int32_t id = 0;                             // handed back in on_row_control
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;  // fractions of the row's rectangle
+    const char* label = "";
+    float value = 0.0f, min = 0.0f, max = 1.0f;    // toggle: 0/1; stepper, slider: in [min, max]; choice: index
+    int32_t choices = 0;                        // choice: how many
+};
+enum class ToolRowControlEventKind : uint8_t { Press = 1, Set = 2, Step = 3 };
+struct ToolRowControlEvent {
+    ToolRowControlEventKind kind = ToolRowControlEventKind::Press;
+    float value = 0.0f;                         // Set: the new value; Step: +1 or -1
+};
+
+// The row's authority over its own ports during execute_stack. Port indices are the row's declared ports.
+struct ToolRowPortAccess {
+    void* host = nullptr;
+    // One token onto the edge at this (output) port: 1 accepted; 0 no edge there, the edge is full, or wrong size.
+    int32_t (*publish)(void* host, int32_t port, const void* bytes, size_t len) = nullptr;
+    // One token from the edge at this (input) port: 1 read into out (*written bytes); 0 nothing waiting or no edge.
+    int32_t (*consume)(void* host, int32_t port, void* out, size_t capacity, size_t* written) = nullptr;
+    // 1 when the edge at this (output) port can take `count` more tokens without dropping; 0 otherwise or no edge.
+    // Trailing: hosts that do not fill it leave it null.
+    int32_t (*can_publish)(void* host, int32_t port, int32_t count) = nullptr;
+};
+
+enum class ToolTensorRole : uint8_t { Owner = 0, Borrower = 1, Returns = 2 };
+
+// The table's used-up AbstractTensor handles, oldest first, offered to a Returns row (ITool::tensor_role). Every use
+// of a duplicated handle (tensor_handle_dup) is a stack entry, so a handle appears here only once no entry names it.
+// The row sets `taken` to how many it handed on, from the front; the host keeps the rest for the next tick.
+struct ToolReturnedTensors {
+    const uint64_t* ids = nullptr;
+    size_t count = 0;
+    size_t taken = 0;
+};
+
 struct ToolStackContext {
     ToolStackFrame stack{};
     const ToolInputState* input = nullptr;
@@ -116,6 +167,11 @@ struct ToolStackContext {
     // Kept as a trailing, default-true field so existing tools retain their
     // successful void execute_stack contract until they opt into refusal.
     bool succeeded = true;
+    // The row's own ports (row_port_count() > 0), bound by the host for this execution; null otherwise. Trailing, as
+    // `succeeded` is, so rows that declare no ports are unaffected.
+    const ToolRowPortAccess* row_ports = nullptr;
+    // For a Returns row (ITool::tensor_role): the table's used-up handles; null for every other row. Trailing.
+    ToolReturnedTensors* returns = nullptr;
 };
 
 inline float tool_stack_pop(ToolStackFrame& frame) {
@@ -284,6 +340,24 @@ struct ITool {
 
     virtual bool serialize(OutputArchive& /*out*/) const { return false; }
     virtual bool deserialize(InputArchive& /*in*/) { return false; }
+
+    // A row's own surface (see ToolRowPort above). Appended after the existing virtuals so their order is unchanged.
+    // The row's picture is render_table (ToolCaps::Table): the host calls it with rows = cols = 1, cell_w/cell_h = the
+    // row's pixel size and frame_buffer/pitch at the row's rectangle, then draws the declared ports and controls on it.
+    virtual int32_t row_height_px() const { return 0; }                 // 0 = the host's tool row height
+    virtual int32_t row_port_count() const { return 0; }
+    virtual ToolRowPort row_port(int32_t /*idx*/) const { return ToolRowPort{}; }
+    virtual int32_t row_control_count() const { return 0; }
+    virtual ToolRowControl row_control(int32_t /*idx*/) const { return ToolRowControl{}; }
+    virtual void on_row_control(int32_t /*id*/, const ToolRowControlEvent& /*event*/) {}
+
+    // What a row does with the AbstractTensor handles it pops (research case 6393486c, the mint table). Appended after
+    // the row-surface virtuals so their order is unchanged.
+    //   Owner    : the row may keep what it pops (state libraries, negotiators); the host never returns it. Default.
+    //   Borrower : the row only reads what it pops and never keeps or destroys it (compiled rows, tensor_handle_dup).
+    //              A handle a Borrower row pops that no stack entry still names is used up: the host records it.
+    //   Returns  : the row hands the table's used-up handles on (ToolStackContext::returns) to the mint table.
+    virtual ToolTensorRole tensor_role() const { return ToolTensorRole::Owner; }
 };
 
 #if defined(_WIN32)

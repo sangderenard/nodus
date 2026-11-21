@@ -152,6 +152,15 @@ def _contract_from_native(value: int) -> ExecutionContract:
 
 def _load(lib_path: Optional[str] = None):
     lib = load_headless_lib(lib_path)
+    if hasattr(lib, "nodus_headless_ui_mouse"):
+        lib.nodus_headless_ui_viewport.restype = ctypes.c_int32
+        lib.nodus_headless_ui_viewport.argtypes = (ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32)
+        lib.nodus_headless_ui_mouse.restype = ctypes.c_int32
+        lib.nodus_headless_ui_mouse.argtypes = (ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int32, ctypes.c_float)
+        lib.nodus_headless_ui_key.restype = ctypes.c_int32
+        lib.nodus_headless_ui_key.argtypes = (ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_int32, ctypes.c_int32)
     lib.nodus_headless_get_module_count.restype = ctypes.c_int32
     lib.nodus_headless_get_module_count.argtypes = (ctypes.c_void_p,)
     lib.nodus_headless_get_module_desc.restype = ctypes.c_int32
@@ -263,6 +272,25 @@ def _load(lib_path: Optional[str] = None):
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32,
         ctypes.POINTER(_NativeFifoConfig), ctypes.c_int32,
     )
+    # Canvas ports (canvas_abi.h GP_CANVAS_PORT_*). A library built before them lacks the symbols; Graph methods say so.
+    if hasattr(lib, "nodus_headless_declare_canvas_port"):
+        lib.nodus_headless_declare_canvas_port.restype = ctypes.c_int32
+        lib.nodus_headless_declare_canvas_port.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32)
+        lib.nodus_headless_canvas_root_module.restype = ctypes.c_int32
+        lib.nodus_headless_canvas_root_module.argtypes = (ctypes.c_void_p,)
+        lib.nodus_headless_canvas_port_count.restype = ctypes.c_int32
+        lib.nodus_headless_canvas_port_count.argtypes = (ctypes.c_void_p,)
+        lib.nodus_headless_canvas_port_at.restype = ctypes.c_int32
+        lib.nodus_headless_canvas_port_at.argtypes = (
+            ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
+        )
+        lib.nodus_headless_canvas_port_consume.restype = ctypes.c_int32
+        lib.nodus_headless_canvas_port_consume.argtypes = (
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+        )
+        lib.nodus_headless_canvas_port_publish.restype = ctypes.c_int32
+        lib.nodus_headless_canvas_port_publish.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t)
     lib.nodus_headless_set_module_uuid.restype = ctypes.c_int32
     lib.nodus_headless_set_module_uuid.argtypes = (ctypes.c_void_p, ctypes.c_int32, ctypes.c_uint64)
     lib.nodus_headless_get_module_uuid.restype = ctypes.c_uint64
@@ -616,6 +644,27 @@ class Graph:
         edge = Edge(self, index, source, target, fifo, type_id)
         self.edges.append(edge)
         return edge
+
+    def apply_port_pair(self, pair: str, *, fifo: Optional[FifoConfig] = None) -> int:
+        """Apply a port pair as the move: ``"<table>.<row>:<port> > <table>.<row>:<port>"``, producer first.
+
+        ``<table>`` is a module label or ``#<index>``, ``<row>`` the row's index in its module and ``<port>`` a port the
+        row itself declares (its name or index). The edge is the one the GUI's connect move makes between those two
+        LEDs, and the canvas lays its rope there (research case 075069677cb74e3f9794914c9009cec5). Returns the native
+        edge index; ``fifo`` configures its FIFO.
+        """
+        fn = self.lib.nodus_headless_apply_port_pair
+        fn.restype = ctypes.c_int32
+        fn.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32)
+        error = ctypes.create_string_buffer(512)
+        index = int(fn(self._handle, pair.encode("utf-8"), error, len(error)))
+        if index < 0:
+            raise ValueError(f"port pair {pair!r} refused: {error.value.decode('utf-8', 'replace')}")
+        if fifo is not None:
+            native_fifo = _fifo(fifo)
+            if not self.lib.nodus_headless_configure_edge_fifo(self._handle, index, ctypes.byref(native_fifo)):
+                raise RuntimeError("native edge FIFO configuration failed")
+        return index
 
     def attach_edge(self, source: Contact, target: Contact, *,
                     fifo: Optional[FifoConfig] = FifoConfig.scalar_f32()) -> Edge:
@@ -1026,6 +1075,24 @@ class Graph:
             raise RuntimeError(f"native plugin build/load failed: {source_path}")
         return tool_id.value.decode()
 
+    def import_buffer_abi(
+        self, descriptor_path: Union[str, pathlib.Path], artifact_path: Union[str, pathlib.Path], *,
+        module_library_root: Union[str, pathlib.Path],
+    ) -> pathlib.Path:
+        """Write the row wrapper for a NODUS BUFFER ABI descriptor and its library; returns the wrapper's path.
+
+        The artifact importer's own generation (the Turing product adopter's call). Build and load the wrapper with
+        ``build_plugin_source``. A compiled table (research case 6393486c) is adopted this way.
+        """
+        fn = self.lib.nodus_headless_import_buffer_abi
+        fn.restype = ctypes.c_int32
+        fn.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32)
+        wrapper = ctypes.create_string_buffer(4096)
+        if not fn(str(descriptor_path).encode(), str(artifact_path).encode(), str(module_library_root).encode(),
+                  wrapper, len(wrapper)):
+            raise RuntimeError(f"buffer ABI import failed: {descriptor_path}")
+        return pathlib.Path(wrapper.value.decode())
+
     def compile_turing_row(
         self, request_json: Union[str, pathlib.Path], *,
         python_executable: Union[str, pathlib.Path],
@@ -1119,6 +1186,50 @@ class Graph:
     def push_f32(self, name: str, value: float) -> None:
         self.push_bytes(name, struct.pack("f", value))
 
+    # ---- canvas ports: the canvas's own boundary, contacts of its ROOT module (canvas_abi.h GP_CANVAS_PORT_*) ----
+    def _canvas_ports_lib(self):
+        if not hasattr(self.lib, "nodus_headless_declare_canvas_port"):
+            raise RuntimeError("this nodus_headless library predates canvas ports")
+        return self.lib
+
+    def declare_canvas_port(self, name: str, direction: str = "out", up: bool = False) -> int:
+        """Declare a canvas port; returns its ROOT contact. "out": an edge inside the canvas ends there and
+        canvas_port_pull reads it; "in": canvas_port_push writes it and an edge inside starts there."""
+        if direction not in ("out", "in"):
+            raise ValueError("direction is 'out' or 'in'")
+        contact = int(self._canvas_ports_lib().nodus_headless_declare_canvas_port(
+            self._handle, name.encode(), 0 if direction == "out" else 1, int(bool(up))))
+        if contact < 0:
+            raise ValueError(f"canvas port {name!r} refused (name 1-63 bytes without whitespace; direction fixed)")
+        return contact
+
+    def canvas_root_module(self) -> int:
+        return int(self._canvas_ports_lib().nodus_headless_canvas_root_module(self._handle))
+
+    def canvas_ports(self) -> list:
+        lib = self._canvas_ports_lib()
+        out = []
+        for ordinal in range(max(0, int(lib.nodus_headless_canvas_port_count(self._handle)))):
+            name = ctypes.create_string_buffer(64)
+            direction, contact, up = ctypes.c_int32(), ctypes.c_int32(), ctypes.c_int32()
+            if lib.nodus_headless_canvas_port_at(self._handle, ordinal, name, len(name), ctypes.byref(direction),
+                                                 ctypes.byref(contact), ctypes.byref(up)):
+                out.append({"name": name.value.decode(), "direction": "out" if direction.value == 0 else "in",
+                            "contact": contact.value, "up": bool(up.value)})
+        return out
+
+    def canvas_port_pull(self, name: str, capacity: int) -> Optional[bytes]:
+        buf = ctypes.create_string_buffer(capacity)
+        written = ctypes.c_size_t()
+        if not self._canvas_ports_lib().nodus_headless_canvas_port_consume(
+                self._handle, name.encode(), buf, capacity, ctypes.byref(written)):
+            return None
+        return buf.raw[:written.value]
+
+    def canvas_port_push(self, name: str, data: bytes) -> bool:
+        return bool(self._canvas_ports_lib().nodus_headless_canvas_port_publish(
+            self._handle, name.encode(), data, len(data)))
+
     def pull_bytes(self, name: str, capacity: int) -> Optional[bytes]:
         self._ensure_scalar_execution()
         if capacity <= 0:
@@ -1191,6 +1302,36 @@ class Graph:
         self._ensure_scalar_execution()
         if not self.lib.nodus_headless_step(self._handle, dt):
             raise RuntimeError("native graph step failed")
+
+    def ui_viewport(self, width: int, height: int) -> None:
+        if not hasattr(self.lib, "nodus_headless_ui_viewport"):
+            raise UnsupportedNativeContract("this Nodus build lacks canvas UI actions")
+        if not self.lib.nodus_headless_ui_viewport(self._handle, width, height):
+            raise ValueError("canvas viewport must be 64..4096 pixels on each axis")
+
+    def ui_mouse(self, kind: str, x: float, y: float, *, dx: float = 0.0, dy: float = 0.0,
+                 button: int = 0, scroll: float = 0.0) -> bool:
+        if not hasattr(self.lib, "nodus_headless_ui_mouse"):
+            raise UnsupportedNativeContract("this Nodus build lacks canvas UI actions")
+        kinds = {"click": 0, "down": 1, "up": 2, "move": 3, "scroll": 4}
+        if kind not in kinds:
+            raise ValueError("unknown canvas mouse action")
+        handled = self.lib.nodus_headless_ui_mouse(self._handle, kinds[kind], x, y, dx, dy, button, scroll)
+        if handled < 0:
+            raise RuntimeError("native canvas UI action could not synchronize edges")
+        self.edges.clear()  # native UI owns current edge bindings; definition queries them directly
+        self._loaded_unattached_edges.clear()
+        return bool(handled)
+
+    def ui_key(self, key: int, scancode: int = 0, action: int = 1, mods: int = 0) -> bool:
+        if not hasattr(self.lib, "nodus_headless_ui_key"):
+            raise UnsupportedNativeContract("this Nodus build lacks canvas UI actions")
+        handled = self.lib.nodus_headless_ui_key(self._handle, key, scancode, action, mods)
+        if handled < 0:
+            raise RuntimeError("native canvas UI key could not synchronize edges")
+        self.edges.clear()
+        self._loaded_unattached_edges.clear()
+        return bool(handled)
 
     def save(self, path: Union[str, pathlib.Path]) -> None:
         if not self.lib.nodus_headless_save_file(self._handle, str(path).encode()):
@@ -1269,8 +1410,219 @@ class Graph:
             lib.nodus_headless_detach_cron.argtypes = (ctypes.c_char_p, ctypes.c_uint64)
             lib.nodus_headless_cron_stats.restype = ctypes.c_int32
             lib.nodus_headless_cron_stats.argtypes = (ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64))
+        # The Nodus link rows (research case 98d49cb8520e44d092c5d134c37c3c32) arrived after the cron tool; an older library
+        # still serves everything else and refuses only register_link_host/register_link_dialer/link_report, by name.
+        lib._link_abi = hasattr(lib, "nodus_headless_register_link_host")
+        if lib._link_abi:
+            lib.nodus_headless_register_link_host.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_host.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p, ctypes.c_uint64)
+            lib.nodus_headless_register_link_dialer.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_dialer.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p,
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_uint64)
+            lib.nodus_headless_link_report.restype = ctypes.c_int32
+        lib._link_udp_abi = lib._link_abi and hasattr(lib, "nodus_headless_register_link_udp_dialer")
+        if lib._link_udp_abi:
+            lib.nodus_headless_register_link_udp_dialer.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_udp_dialer.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p, ctypes.c_int32,
+                ctypes.c_char_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_int32, ctypes.c_uint64)
+        lib._link_wss_abi = lib._link_abi and hasattr(lib, "nodus_headless_register_link_wss_dialer")
+        if lib._link_wss_abi:
+            lib.nodus_headless_register_link_wss_dialer.restype = ctypes.c_int32
+            lib.nodus_headless_register_link_wss_dialer.argtypes = (
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16, ctypes.c_char_p, ctypes.c_char_p,
+                ctypes.c_int32, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_uint64)
+        if lib._link_abi:
+            lib.nodus_headless_link_report.argtypes = (
+                ctypes.c_char_p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_uint64))
         lib._contract_port_abi = True
         return lib
+
+    _LINK_STATES = ("waiting", "linked", "closed", "failed")
+    _LINK_COUNTERS = ("listen_port", "account", "control_sent", "control_received", "bulk_bytes_sent", "bulk_bytes_received",
+                      "bulk_tensors_sent", "bulk_tensors_received", "control_refused", "bulk_refused", "bulk_dropped",
+                      "peers_refused", "control_read_stalls", "bulk_read_stalls", "protocol_violations", "refused_full")
+
+    def _link_lib(self):
+        lib = self._contract_abi()
+        if not lib._link_abi:
+            raise RuntimeError("this nodus_headless library has no link rows (nodus_headless_register_link_host)")
+        return lib
+
+    def register_link_host(self, tool_id: str, prefix: str, key: bytes, port: int = 0, maximum_bulk_bytes: int = 0) -> int:
+        """Admit <tool_id>.control and <tool_id>.bulk over a 127.0.0.1 link listener; returns the bound port.
+
+        `key` is the 32-byte ticket key (meowdoku link_tickets.KEY_FILE); place the two rows as PluginTool rows."""
+        if len(key) != 32:
+            raise ValueError("the link key is 32 bytes")
+        bound = int(self._link_lib().nodus_headless_register_link_host(
+            self._handle, tool_id.encode("utf-8"), prefix.encode("utf-8"), int(port), bytes(key), int(maximum_bulk_bytes)))
+        if bound <= 0:
+            raise RuntimeError(f"native link host registration refused: {tool_id}")
+        return bound
+
+    def register_link_dialer(self, tool_id: str, host: str, port: int, prefix: str, control_ticket: bytes, bulk_ticket: bytes,
+                             timeout_ms: int = 5000, maximum_bulk_bytes: int = 0) -> None:
+        """Admit <tool_id>.control and <tool_id>.bulk over one dial to host:port with the issued tickets (128 bytes each)."""
+        if len(control_ticket) != 128 or len(bulk_ticket) != 128:
+            raise ValueError("each link ticket is 128 bytes")
+        if not self._link_lib().nodus_headless_register_link_dialer(
+                self._handle, tool_id.encode("utf-8"), host.encode("utf-8"), int(port), prefix.encode("utf-8"),
+                bytes(control_ticket), bytes(bulk_ticket), int(timeout_ms), int(maximum_bulk_bytes)):
+            raise RuntimeError(f"native link dialer registration refused: {tool_id}")
+
+    def register_link_wss_dialer(self, tool_id: str, host: str, port: int, prefix: str, control_ticket: bytes,
+                                 bulk_ticket: bytes, *, secure: bool = True, pin_sha256: Optional[bytes] = None,
+                                 path_base: str = "/ws/link/", timeout_ms: int = 10000, maximum_bulk_bytes: int = 0) -> None:
+        """Admit <tool_id>.control and <tool_id>.bulk over one WinHTTP dial: wss://host:port<path_base><prefix>/....
+
+        `pin_sha256` (32 bytes, SHA-256 of the server certificate DER) replaces CA validation with that one certificate."""
+        lib = self._link_lib()
+        if not lib._link_wss_abi:
+            raise RuntimeError("this nodus_headless library has no wss link dialer (nodus_headless_register_link_wss_dialer)")
+        if len(control_ticket) != 128 or len(bulk_ticket) != 128 or (pin_sha256 is not None and len(pin_sha256) != 32):
+            raise ValueError("tickets are 128 bytes and a pin is 32")
+        if not lib.nodus_headless_register_link_wss_dialer(
+                self._handle, tool_id.encode("utf-8"), host.encode("utf-8"), int(port), path_base.encode("utf-8"),
+                prefix.encode("utf-8"), 1 if secure else 0, None if pin_sha256 is None else bytes(pin_sha256),
+                bytes(control_ticket), bytes(bulk_ticket), int(timeout_ms), int(maximum_bulk_bytes)):
+            raise RuntimeError(f"native wss link dialer registration refused: {tool_id}")
+
+    def register_link_udp_dialer(self, tool_id: str, broker_host: str, broker_port: int, prefix: str, role: int,
+                                 link_id: bytes, expires_at: int, key: bytes, *, account: int = 0, timeout_ms: int = 15000,
+                                 maximum_bulk_bytes: int = 0) -> None:
+        """Admit <tool_id>.control and <tool_id>.bulk over a link that meets its peer at the UDP broker, then runs directly
+        over UDP. `role` 1 host / 2 dialer, `link_id` (16 bytes), `expires_at` and `key` (32 bytes) are the rendezvous's."""
+        lib = self._link_lib()
+        if not lib._link_udp_abi:
+            raise RuntimeError("this nodus_headless library has no UDP link (nodus_headless_register_link_udp_dialer)")
+        if role not in (1, 2) or len(link_id) != 16 or len(key) != 32:
+            raise ValueError("role is 1 or 2, the link id 16 bytes and the key 32")
+        if not lib.nodus_headless_register_link_udp_dialer(
+                self._handle, tool_id.encode("utf-8"), broker_host.encode("utf-8"), int(broker_port), prefix.encode("utf-8"),
+                int(role), bytes(link_id), int(expires_at), bytes(key), int(account), int(timeout_ms), int(maximum_bulk_bytes)):
+            raise RuntimeError(f"native UDP link registration refused: {tool_id}")
+
+    # ---- Meta edges: listening groups over edges (include/nodus_headless_abi.h "Meta edges") -------------------------
+    # A meta group is made over edges with a channel group. Every scheduler tick it appends one observation record per
+    # member edge to its own FIFO; it observes and never changes a member. Groups are saved and loaded with the graph.
+    META_RECORD_WORDS = 16
+    META_SNAPSHOT_HEADER_WORDS = 8
+    _META_RECORD_FIELDS = ("tick", "time_ns", "dt_ns", "ordinal", "edge_idx", "rope_id", "write_seq", "write_delta",
+                           "read_seq", "read_delta", "occupancy", "slots", "refused_total", "refused_delta", "bytes_delta", "flags")
+
+    def _meta_lib(self):
+        lib = self.lib
+        if getattr(lib, "_meta_abi_declared", False):
+            return lib
+        if not hasattr(lib, "nodus_headless_meta_create"):
+            raise RuntimeError("this nodus_headless library has no meta edges (nodus_headless_meta_create)")
+        u64, i32, vp = ctypes.c_uint64, ctypes.c_int32, ctypes.c_void_p
+        lib.nodus_headless_meta_create.restype = u64
+        lib.nodus_headless_meta_create.argtypes = (vp, ctypes.POINTER(i32), i32, i32)
+        lib.nodus_headless_meta_count.restype = i32
+        lib.nodus_headless_meta_count.argtypes = (vp,)
+        lib.nodus_headless_meta_id_at.restype = u64
+        lib.nodus_headless_meta_id_at.argtypes = (vp, i32)
+        lib.nodus_headless_meta_set_channel_group.restype = i32
+        lib.nodus_headless_meta_set_channel_group.argtypes = (vp, u64, i32)
+        lib.nodus_headless_meta_get_channel_group.restype = i32
+        lib.nodus_headless_meta_get_channel_group.argtypes = (vp, u64, ctypes.POINTER(i32))
+        lib.nodus_headless_meta_destroy.restype = i32
+        lib.nodus_headless_meta_destroy.argtypes = (vp, u64)
+        lib.nodus_headless_meta_member_count.restype = i32
+        lib.nodus_headless_meta_member_count.argtypes = (vp, u64)
+        lib.nodus_headless_meta_member.restype = i32
+        lib.nodus_headless_meta_member.argtypes = (vp, u64, i32, ctypes.POINTER(i32), ctypes.POINTER(i32), ctypes.POINTER(u64))
+        lib.nodus_headless_meta_snapshot.restype = i32
+        lib.nodus_headless_meta_snapshot.argtypes = (vp, u64, ctypes.POINTER(u64), i32)
+        lib.nodus_headless_meta_read_records.restype = i32
+        lib.nodus_headless_meta_read_records.argtypes = (vp, u64, u64, ctypes.POINTER(u64), i32, ctypes.POINTER(u64))
+        lib._meta_abi_declared = True
+        return lib
+
+    def meta_create(self, edges, channel_group: int = 0) -> int:
+        """A meta group over `edges` (Edge objects or canvas edge indices); returns its id (stable, non-zero)."""
+        lib = self._meta_lib()
+        indices = [int(e.native_index) if hasattr(e, "native_index") else int(e) for e in edges]
+        if not indices:
+            raise ValueError("a meta group needs at least one edge")
+        array = (ctypes.c_int32 * len(indices))(*indices)
+        group = int(lib.nodus_headless_meta_create(self._handle, array, len(indices), int(channel_group)))
+        if not group:
+            raise RuntimeError(f"native meta group refused over edges {indices}")
+        return group
+
+    def meta_group_ids(self) -> list:
+        lib = self._meta_lib()
+        return [int(lib.nodus_headless_meta_id_at(self._handle, i)) for i in range(int(lib.nodus_headless_meta_count(self._handle)))]
+
+    def meta_set_channel_group(self, group_id: int, channel_group: int) -> None:
+        if not self._meta_lib().nodus_headless_meta_set_channel_group(self._handle, int(group_id), int(channel_group)):
+            raise RuntimeError(f"no meta group {group_id}")
+
+    def meta_destroy(self, group_id: int) -> None:
+        if not self._meta_lib().nodus_headless_meta_destroy(self._handle, int(group_id)):
+            raise RuntimeError(f"no meta group {group_id}")
+
+    def meta_group(self, group_id: int) -> Optional[dict]:
+        """{"id", "channel_group", "vertices", "records", "feed_refused", "slots", "members": [record dict ...]} or None.
+
+        Each member is its latest observation record (META record fields: tick, time_ns, dt_ns, ordinal, edge_idx,
+        rope_id, write_seq, write_delta, read_seq, read_delta, occupancy, slots, refused_total, refused_delta,
+        bytes_delta, flags); flags bits 0..7 are 1 full, 2 configured, 4 has readers, 8 edge lost; bits 8.. count drops."""
+        lib = self._meta_lib()
+        count = int(lib.nodus_headless_meta_member_count(self._handle, int(group_id)))
+        capacity = self.META_SNAPSHOT_HEADER_WORDS + max(count, 1) * self.META_RECORD_WORDS
+        out = (ctypes.c_uint64 * capacity)()
+        if not lib.nodus_headless_meta_snapshot(self._handle, int(group_id), out, capacity):
+            return None
+        signed_channel = out[1] - (1 << 64) if out[1] >= (1 << 63) else out[1]
+        members = []
+        for m in range(int(out[3])):
+            base = self.META_SNAPSHOT_HEADER_WORDS + m * self.META_RECORD_WORDS
+            record = {name: int(out[base + i]) for i, name in enumerate(self._META_RECORD_FIELDS)}
+            canvas, table, rope = ctypes.c_int32(-1), ctypes.c_int32(-1), ctypes.c_uint64(0)
+            if lib.nodus_headless_meta_member(self._handle, int(group_id), m, ctypes.byref(canvas), ctypes.byref(table), ctypes.byref(rope)):
+                record["canvas_edge_idx"] = canvas.value
+            members.append(record)
+        return {"id": int(out[0]), "channel_group": int(signed_channel), "vertices": int(out[2]), "records": int(out[4]),
+                "feed_refused": int(out[5]), "slots": int(out[6]), "members": members}
+
+    def meta_records(self, group_id: int, from_seq: int = 0, limit: int = 64) -> tuple:
+        """(records, next_seq): the observation records still in the group FIFO from `from_seq`, oldest first."""
+        lib = self._meta_lib()
+        out = (ctypes.c_uint64 * (self.META_RECORD_WORDS * max(1, limit)))()
+        nxt = ctypes.c_uint64(0)
+        n = int(lib.nodus_headless_meta_read_records(self._handle, int(group_id), int(from_seq), out, int(limit), ctypes.byref(nxt)))
+        records = [{name: int(out[r * self.META_RECORD_WORDS + i]) for i, name in enumerate(self._META_RECORD_FIELDS)} for r in range(n)]
+        return records, int(nxt.value)
+
+    def set_link_metrics_channel(self, tool_id: str, channel_group: int) -> None:
+        """The meta channel the next "<tool_id>.metrics" row of that link starts with (0 = none)."""
+        lib = self._link_lib()
+        lib.nodus_headless_set_link_metrics_channel.restype = ctypes.c_int32
+        lib.nodus_headless_set_link_metrics_channel.argtypes = (ctypes.c_char_p, ctypes.c_int32)
+        if not lib.nodus_headless_set_link_metrics_channel(tool_id.encode("utf-8"), int(channel_group)):
+            raise RuntimeError(f"no registered link {tool_id}")
+
+    def link_report(self, tool_id: str) -> Optional[dict]:
+        """{"state": waiting|linked|closed|failed, counters...} of a registered link endpoint, or None."""
+        lib = self._link_lib()
+        state, out = ctypes.c_int32(), (ctypes.c_uint64 * 16)()
+        if not lib.nodus_headless_link_report(tool_id.encode("utf-8"), ctypes.byref(state), out):
+            return None
+        report = {name: int(value) for name, value in zip(self._LINK_COUNTERS, out)}
+        report["state"] = self._LINK_STATES[state.value] if 0 <= state.value < 4 else str(state.value)
+        if hasattr(lib, "nodus_headless_link_reason"):
+            buf = ctypes.create_string_buffer(512)
+            lib.nodus_headless_link_reason.restype = ctypes.c_int32
+            lib.nodus_headless_link_reason.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32)
+            if lib.nodus_headless_link_reason(tool_id.encode("utf-8"), buf, len(buf)) > 0:
+                report["reason"] = buf.value.decode("utf-8", "replace")
+        return report
 
     def acquire_contract_pair(self, prefix: str, capacity: int, loan_ticks: Optional[int] = None) -> None:
         """Create the process-owned `<prefix>.market` / `<prefix>.worker` plugin rows.

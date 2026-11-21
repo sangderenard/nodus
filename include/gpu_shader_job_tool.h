@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/gpu_shader_job.cpp.
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
 
@@ -36,6 +37,10 @@ class GpuShaderJobTool final : public ITool {
 public:
     GpuShaderJobTool(TensorStateLibraryTool& library,std::size_t device,
                      GpuShaderJobContract contract);
+    GpuShaderJobTool();                       // no library: the row refuses until a host gives it one; settings from configure()/saved state
+    void configure(std::size_t device,GpuShaderJobContract contract);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     const char* id_cstr() const noexcept override {return id_.c_str();}
     const char* name_cstr() const noexcept override {return "GPU shader job";}
     ToolCaps caps() const override {return ToolCaps::None;}
@@ -45,14 +50,14 @@ public:
         if(index==1)return {ToolPortKind::Return,1};
         return {};
     }
-    void initialize(const ToolInitContext&) override {}
+    void initialize(const ToolInitContext&) override;
     void shutdown() override {}
     void tick(double,HostAPI&) override {}
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext&) override;
 private:
-    TensorStateLibraryTool& library_;
-    std::size_t device_;
+    TensorStateLibraryTool* library_=nullptr;
+    std::size_t device_=0;
     GpuShaderJobContract contract_;
     std::string id_;
 };

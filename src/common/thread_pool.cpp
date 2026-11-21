@@ -25,6 +25,8 @@ void JobBatch::finish_one() {
     }
 }
 
+ThreadPool::ThreadPool() : ThreadPool(Options{}) {}
+
 ThreadPool::ThreadPool(const Options& options) {
     thread_count_ = options.thread_count;
     if (thread_count_ == 0) {

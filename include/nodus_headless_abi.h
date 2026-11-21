@@ -115,6 +115,53 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_desc(
     NodusHeadlessGraph* g, int32_t module_idx, const GP_CanvasModuleDesc* desc);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_builtin_tool(NodusHeadlessGraph* g, int32_t module_idx, int32_t tool_kind);
 NODUS_HEADLESS_API int32_t nodus_headless_bind_plugin_tool(NodusHeadlessGraph* g, int32_t module_idx, const char* plugin_id);
+// Admit one native TCP byte-stream row into this graph's registry. The host
+// then binds its id with nodus_headless_bind_plugin_tool and connects its
+// Argument/Return contacts to ordinary typed FIFOs. The port is explicit so
+// a saved graph and its host contract can name the same loopback endpoint.
+// The row is unregistered after graph destruction.
+NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_byte_stream(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t pending_frames);
+// One-input, best-effort fan-out. Slow readers lose stale queued frames;
+// the independent table never waits for a reader or replays an old frame.
+NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_broadcast(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t max_readers);
+// Nodus link (include/nodus_link_rows.h; research case 98d49cb8520e44d092c5d134c37c3c32): admits two rows,
+// <tool_id>.control and <tool_id>.bulk, sharing one endpoint; bind them with nodus_headless_bind_plugin_tool.
+// Host: a 127.0.0.1 listener on `port` (0 = ephemeral) for /ws/link/<prefix>/{control,bulk}; tickets are checked
+// with the 32-byte key. Returns the bound port, 0 on refusal. maximum_bulk_bytes 0 = 256 MiB.
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_host(
+    NodusHeadlessGraph* g, const char* tool_id, const char* prefix, uint16_t port,
+    const uint8_t* key32, uint64_t maximum_bulk_bytes);
+// Dialer: numeric IPv4 `host`:`port`, the two 128-byte tickets the issuing service gave. 1 on success.
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* prefix,
+    const uint8_t* control_ticket128, const uint8_t* bulk_ticket128, int32_t timeout_ms,
+    uint64_t maximum_bulk_bytes);
+// Dialer through WinHTTP (stage 4): `host` is a name or an address, `path_base` the public path before the prefix
+// (null = "/ws/link/"), secure 1 = wss:// (0 = ws://). pin32: SHA-256 of the server certificate's DER, or null for
+// Windows certificate validation. Nothing blocks; the rows advance the dial. 1 on success.
+// A link that meets its peer at a UDP broker (rendezvous from POST /api/link/rendezvous/<prefix>) and then runs directly
+// over UDP (include/nodus_link_udp.h). role 1 host, 2 dialer; link_id16 and key32 are the rendezvous's.
+// Why a link endpoint failed (empty while it has not); the reason's length, or -1 for an unknown id.
+NODUS_HEADLESS_API int32_t nodus_headless_link_reason(const char* tool_id, char* out, int32_t capacity);
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_udp_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* broker_host, uint16_t broker_port, const char* prefix,
+    int32_t role, const uint8_t* link_id16, uint64_t expires_at, const uint8_t* key32, uint64_t account,
+    int32_t timeout_ms, uint64_t maximum_bulk_bytes);
+NODUS_HEADLESS_API int32_t nodus_headless_register_link_wss_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* path_base,
+    const char* prefix, int32_t secure, const uint8_t* pin32, const uint8_t* control_ticket128,
+    const uint8_t* bulk_ticket128, int32_t timeout_ms, uint64_t maximum_bulk_bytes);
+// State (0 waiting, 1 linked, 2 closed, 3 failed) and 16 counters, in this order: listen_port, account,
+// control_sent, control_received, bulk_bytes_sent, bulk_bytes_received, bulk_tensors_sent, bulk_tensors_received,
+// control_refused, bulk_refused, bulk_dropped, peers_refused, control_read_stalls, bulk_read_stalls,
+// protocol_violations, refused_full (control + bulk). 1 when the endpoint is registered.
+// The meta-edge channel group the next "<tool_id>.metrics" row of that link starts with (0 = none); see nodus_link_rows.h.
+NODUS_HEADLESS_API int32_t nodus_headless_set_link_metrics_channel(const char* tool_id, int32_t channel);
+NODUS_HEADLESS_API int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_rows(
     NodusHeadlessGraph* g, int32_t module_idx,
     const GP_CanvasModuleRowDesc* rows, int32_t row_count);
@@ -128,6 +175,11 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t contract);
 NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_contract(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_contract);
+// Stack loopback (1) or the per-tick stack reset (0, the default); saved with the canvas (MODULE_STACK_LOOPBACK).
+NODUS_HEADLESS_API int32_t nodus_headless_set_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t on);
+NODUS_HEADLESS_API int32_t nodus_headless_get_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_on);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_exec_mode(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t mode);
 NODUS_HEADLESS_API int32_t nodus_headless_get_module_exec_mode(
@@ -141,6 +193,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_radio_configure(
     const char* destination_host, uint16_t destination_port,
     uint32_t fft_size, uint32_t overlap, uint32_t band_count,
     float min_hz, float max_hz);
+  // Configure band edges before capture starts: 0 logarithmic (default), 1 linear Hz.
+  NODUS_HEADLESS_API int32_t nodus_headless_radio_band_scale(int32_t linear);
 typedef struct NodusRadioStatus {
     uint64_t captured_frames;
     uint64_t emitted_packets;
@@ -150,6 +204,10 @@ typedef struct NodusRadioStatus {
 } NodusRadioStatus;
 // Select WAV playback before constructing/launching the Radio table. No loopback capture.
 NODUS_HEADLESS_API int32_t nodus_headless_radio_file_source(const wchar_t* wav_path, int32_t loop);
+// Record finite-file NRAD levels through the same fftfree/Radio rows without
+// SDL playback pacing. The output path must not exist. Requires the declared
+// NODUS_RADIO_DECODER, a non-looping file, and no PCM/HLS rows.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_analysis_file(const wchar_t* path);
 // Opt-in private PCM RTP sender; configure before binding rows, then bind its
 // canonical canvas output FIFO before launching. Requires file source, hop 256.
 // Hold source advancement until a trusted receiver has pinned the announced stream.
@@ -157,8 +215,24 @@ NODUS_HEADLESS_API int32_t nodus_headless_radio_hold(int32_t held);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_configure(uint16_t loopback_port);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_status(uint64_t* emitted, uint64_t* dropped);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind(NodusHeadlessGraph* graph, int32_t module_idx);
+// Same canonical PCM output FIFO, attached to the RTP row's actual index when
+// a stack conversion row is inserted before the spectrum/RTP exits.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_pcm_bind_at(
+    NodusHeadlessGraph* graph, int32_t module_idx, int32_t row_idx);
 NODUS_HEADLESS_API int32_t nodus_headless_radio_status(NodusRadioStatus* out_status);
+// Absolute PCM frames lost when the live capture ring outruns Radio's cursor.
+NODUS_HEADLESS_API int32_t nodus_headless_radio_capture_overruns(uint64_t* lost_frames);
 NODUS_HEADLESS_API int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_CanvasEdgeDesc* desc, int32_t type_id);
+// A port pair "<table>.<row>:<port> > <table>.<row>:<port>" (gp_canvas_resolve_port_pair), applied as the move: the
+// edge between two ports the rows declare, bound as nodus_headless_add_edge binds it. Edge index, or -1 (error says why).
+NODUS_HEADLESS_API int32_t nodus_headless_apply_port_pair(NodusHeadlessGraph* g, const char* pair, char* error, int32_t error_capacity);
+// Drive the same canvas UI handlers used by the GUI, on the graph's owning
+// thread. Mouse kinds: 0 click, 1 down, 2 up, 3 move, 4 scroll.
+NODUS_HEADLESS_API int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height);
+NODUS_HEADLESS_API int32_t nodus_headless_ui_mouse(NodusHeadlessGraph* g, int32_t kind,
+    float x, float y, float dx, float dy, int32_t button, float scroll);
+NODUS_HEADLESS_API int32_t nodus_headless_ui_key(NodusHeadlessGraph* g,
+    int32_t key, int32_t scancode, int32_t action, int32_t mods);
 // Configured edge FIFOs and named ports are persisted by
 // nodus_headless_save_file as EDGE_FIFO / PORT trailer records appended after
 // the CANVAS V4 body, and restored by nodus_headless_load_file (load returns 0
@@ -186,6 +260,33 @@ NODUS_HEADLESS_API int32_t nodus_headless_publish_edge_token(
 NODUS_HEADLESS_API int32_t nodus_headless_consume_edge_token(
     NodusHeadlessGraph* g, int32_t edge_idx, void* bytes, size_t capacity,
     size_t* written);
+// ---- Meta edges: listening groups over edges (table_abi.h "Meta edges listen to their member edges") --------------
+// A meta group is made over canvas edges (the indices nodus_headless_add_edge returns) with a channel group. Every
+// scheduler tick it appends one fixed-size observation record per member edge to its own FIFO (GP_MetaRecordWord); it
+// observes, never copies tokens, never changes a member. Groups live in the table blob, so nodus_headless_save_file and
+// nodus_headless_load_file carry them (ids, members, channel group); live observations are not saved. Group ids are
+// stable and non-zero. Call these between steps, as nodus_headless_publish_edge_token.
+NODUS_HEADLESS_API uint64_t nodus_headless_meta_create(NodusHeadlessGraph* g, const int32_t* canvas_edge_idx, int32_t count, int32_t channel_group);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API uint64_t nodus_headless_meta_id_at(NodusHeadlessGraph* g, int32_t ordinal);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_set_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t channel_group);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_get_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t* out_channel_group);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_destroy(NodusHeadlessGraph* g, uint64_t group_id);
+NODUS_HEADLESS_API int32_t nodus_headless_meta_member_count(NodusHeadlessGraph* g, uint64_t group_id);
+// Member `ordinal`: its canvas edge index (-1 when it is not a canvas edge of this graph), table edge index (-1 when gone), rope id.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_member(NodusHeadlessGraph* g, uint64_t group_id, int32_t ordinal,
+    int32_t* out_canvas_edge_idx, int32_t* out_table_edge_idx, uint64_t* out_rope_id);
+// The group snapshot as uint64 words: GP_META_SNAPSHOT_HEADER_WORDS then a GP_META_RECORD_WORDS record per member.
+// Returns words written, 0 on error.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_snapshot(NodusHeadlessGraph* g, uint64_t group_id, uint64_t* out_words, int32_t capacity_words);
+// Records still in the group FIFO with sequence >= from_seq, oldest first; *out_write_seq is the next sequence.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint64_t group_id, uint64_t from_seq,
+    uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq);
+// Process-wide readers for rows (a row has no graph handle; they read the canvas of this process): the latest record of
+// every member of every group whose channel group is `channel`, groups then members in order. Returns words written.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words);
+// The edge_introspect float snapshot (gp_table_meta_get_fifo_snapshot) of the `ordinal`-th group of `channel`; 0 when none.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_channel_floats(int32_t channel, int32_t ordinal, float* out, int32_t capacity);
 NODUS_HEADLESS_API int32_t nodus_headless_get_edge_unread(
     NodusHeadlessGraph* g, int32_t canvas_edge_idx, int32_t* out_unread);
 NODUS_HEADLESS_API int32_t nodus_headless_set_module_uuid(
@@ -202,6 +303,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_set_persistent_workers(
     NodusHeadlessGraph* g, int32_t enabled);
 NODUS_HEADLESS_API int32_t nodus_headless_get_persistent_workers(
     NodusHeadlessGraph* g, int32_t* out_enabled);
+NODUS_HEADLESS_API int32_t nodus_headless_set_parallel_worker_limit(
+    NodusHeadlessGraph* g, int32_t limit);
 
 // Compiler/tool and tensor services exposed by this same runtime image. This
 // keeps plugin registration and ValueType ids in the registry instance used
@@ -226,6 +329,14 @@ NODUS_HEADLESS_API int32_t nodus_headless_build_plugin_source(
     const char* source_path, const char* nodus_root,
     const char* module_library_root,
     char* out_tool_id, int32_t out_tool_id_cap);
+// Generate the ordinary row wrapper for a NODUS BUFFER ABI descriptor and its native library (the artifact importer's
+// gp_artifact_import_buffer_abi, the same call the Turing product adopter makes). The wrapper is written to
+// <module_library_root>/source/tools/<stem>.cpp and its path returned; nodus_headless_build_plugin_source then builds
+// and loads it. A compiled table (its rows' LLVM joined into one library, research case 6393486c) is adopted this way.
+NODUS_HEADLESS_API int32_t nodus_headless_import_buffer_abi(
+    const char* descriptor_path, const char* artifact_path,
+    const char* module_library_root,
+    char* out_wrapper_path, int32_t out_wrapper_path_cap);
 NODUS_HEADLESS_API int32_t nodus_headless_compile_turing_row(
     const char* python_executable, const char* request_json,
     const char* turing_root, const char* product_dir,
@@ -277,6 +388,20 @@ NODUS_HEADLESS_API int32_t nodus_headless_publish_output_token(
     NodusHeadlessGraph* g, const char* port_name, const void* bytes, size_t len,
     NodusHeadlessPublishResult* out_result);
 NODUS_HEADLESS_API int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* port_name, void* out_bytes, size_t cap, size_t* out_written);
+// Canvas ports (canvas_abi.h GP_CANVAS_PORT_*): the canvas's own boundary, contacts of its ROOT module, saved with the
+// canvas. declare returns the port's ROOT contact (draw an edge to or from (root module, contact)), or -1.
+// direction 0 = OUT (an inside edge ends there; consume reads it), 1 = IN (publish writes it; an inside edge starts there).
+NODUS_HEADLESS_API int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph* g, const char* name, int32_t direction,
+                                                               int32_t up);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_count(NodusHeadlessGraph* g);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_at(NodusHeadlessGraph* g, int32_t ordinal, char* out_name,
+                                                          int32_t out_name_capacity, int32_t* out_direction,
+                                                          int32_t* out_contact, int32_t* out_up);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, const char* name, void* out_bytes,
+                                                               size_t cap, size_t* out_written);
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
+                                                               size_t len);
 NODUS_HEADLESS_API int32_t nodus_headless_get_port_fifo_config(
     NodusHeadlessGraph* g, const char* port_name, int32_t is_output,
     NodusHeadlessFifoConfig* out_config);

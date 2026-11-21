@@ -12,10 +12,12 @@ bool ToolRegistry::register_tool(Entry entry) {
     bool inserted = result.second;
     if (inserted) {
         const auto& e = result.first->second;
-        std::cerr << "DEBUG: ToolRegistry registered tool id='" << e.id << "'" << " name='" << e.name << "'"
-                  << " auto_mouse_ports=" << e.auto_mouse_ports << " auto_keyboard_ports=" << e.auto_keyboard_ports << "\n";
+        // Diagnostics must not turn a completed insertion into an exception or
+        // prevent rollback/removal under allocation pressure.
+        try {std::cerr << "DEBUG: ToolRegistry registered tool id='" << e.id << "'" << " name='" << e.name << "'"
+                  << " auto_mouse_ports=" << e.auto_mouse_ports << " auto_keyboard_ports=" << e.auto_keyboard_ports << "\n";}catch(...){}
     } else {
-        std::cerr << "DEBUG: ToolRegistry failed to register tool id='" << entry.id << "' (already exists?)\n";
+        try {std::cerr << "DEBUG: ToolRegistry failed to register tool id='" << entry.id << "' (already exists?)\n";}catch(...){}
     }
     return inserted;
 }
@@ -23,15 +25,15 @@ bool ToolRegistry::register_tool(Entry entry) {
 bool ToolRegistry::unregister_tool(const std::string& id) {
     auto it = entries_.find(id);
     if (it == entries_.end()) return false;
-    std::cerr << "DEBUG: ToolRegistry unregistering tool id='" << id << "'\n";
+    try {std::cerr << "DEBUG: ToolRegistry unregistering tool id='" << id << "'\n";}catch(...){}
     entries_.erase(it);
     // Drop every alias that pointed at the removed entry -- a dangling alias
     // would resolve to nothing and read as a silent hole later (register E2's
     // lesson: never leave a name that quietly stops meaning anything).
     for (auto ait = aliases_.begin(); ait != aliases_.end();) {
         if (ait->second == id) {
-            std::cerr << "DEBUG: ToolRegistry dropping alias '" << ait->first
-                      << "' (target unregistered)\n";
+            try {std::cerr << "DEBUG: ToolRegistry dropping alias '" << ait->first
+                      << "' (target unregistered)\n";}catch(...){}
             ait = aliases_.erase(ait);
         } else {
             ++ait;

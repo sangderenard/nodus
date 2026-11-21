@@ -57,6 +57,13 @@ struct VulkanDeviceInfo {
     std::uint32_t queue_family = UINT32_MAX;
     std::uint32_t available_compute_queues = 0;
     std::uint32_t max_storage_buffers = 0, max_storage_buffer_bytes = 0;
+    // Compiler settings a shader build depends on (volunteer case a11b5c9b1be74c9b9fb684790f7fd5a3, stage 2):
+    // VkPhysicalDeviceFeatures::shaderFloat64, the compute work-group limits, and the subgroup size (Vulkan 1.1+;
+    // 0 when unknown).
+    bool shader_float64 = false;
+    std::uint32_t max_compute_invocations = 0;
+    std::array<std::uint32_t, 3> max_compute_size{};
+    std::uint32_t subgroup_size = 0;
 };
 
 struct VulkanMemoryHeapStatus {

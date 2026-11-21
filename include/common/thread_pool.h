@@ -57,7 +57,8 @@ public:
         bool start_immediately = true;
     };
 
-    explicit ThreadPool(const Options& options = Options{});
+    ThreadPool();
+    explicit ThreadPool(const Options& options);
     ~ThreadPool();
 
     ThreadPool(const ThreadPool&) = delete;

@@ -5,7 +5,26 @@
 //     NODUS_EXEC_WORK_ROOTS=<core-root>/srv/state/content/users in the environment, so the rows were
 //     registered when this image loaded; finds them in the real tool registry, makes them the way a canvas does
 //     (by id, with an empty init context), and passes a span through both.
+#include <chrono>
+#include <thread>
 #include "exec_row.h"
+// ---- platform region: the test's library loading and environment ----
+#if defined(_WIN32)
+static void* test_library_open(const char* path) { return reinterpret_cast<void*>(LoadLibraryA(path)); }
+static void* test_library_symbol(void* lib, const char* name) { return reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(lib), name)); }
+static unsigned long test_last_error() { return test_last_error(); }
+static void test_set_env(const char* name, const char* value) { SetEnvironmentVariableA(name, value); }
+#else
+#include <dlfcn.h>
+#include <cerrno>
+#include <cstdlib>
+static void* test_library_open(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+static void* test_library_symbol(void* lib, const char* name) { return dlsym(lib, name); }
+static unsigned long test_last_error() { return static_cast<unsigned long>(errno); }
+static void test_set_env(const char* name, const char* value) { if (value) setenv(name, value, 1); else unsetenv(name); }
+#endif
+// ---- end platform region ----
+
 #include "exec_row_registry.h"
 
 #include "common/tensors/abstraction/abstract_tensor_handle.h"
@@ -58,7 +77,7 @@ static uint64_t through(ITool& tool, uint64_t span) {
         tool.execute_stack(context);
         Handle top{};
         if (raw_stack_pop_abstract_tensor(frame, top) && top.id != span) out = top.id;
-        if (!out) Sleep(1);
+        if (!out) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     raw_stack_free_mask(frame);
     return out;
@@ -140,11 +159,11 @@ int main(int argc, char** argv) {
           "and a file that is not there");
 
     // The same declarations with no declared core: nothing is registered.
-    SetEnvironmentVariableA("NODUS_EXEC_CORE_ROOTS", nullptr);
+    test_set_env("NODUS_EXEC_CORE_ROOTS", nullptr);
     report.clear();
     check(nodus::exec::register_declared_rows(file, local, report) == 0 && report.find("declared no core") != std::string::npos,
           "with no declared core no row is registered");
-    SetEnvironmentVariableA("NODUS_EXEC_CORE_ROOTS", core.c_str());
+    test_set_env("NODUS_EXEC_CORE_ROOTS", core.c_str());
     report.clear();
     check(nodus::exec::register_declared_rows(file, local, report) == 3 && local.find("exec.zstd.pack") && !local.find("exec.git"),
           "with the core declared the three good rows are, into any registry");

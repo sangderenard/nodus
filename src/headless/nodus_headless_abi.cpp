@@ -3,6 +3,8 @@
 #include "contract_negotiator_registry.h"
 #include "turing_compile_host_tool.h"
 #include "cron_tool.h"
+#include "tcp_byte_stream_tool.h"
+#include "nodus_link_rows.h"
 #include "nodus_headless_abi.h"
 
 #include "common/tensors/abstraction/abstract_tensor_graph_ir.h"
@@ -11,6 +13,7 @@
 #include "table_abi.h"
 #include "value_types.h"
 #include "plugin_manager.h"
+#include "artifact_importer.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -61,6 +64,8 @@ struct NodusHeadlessGraph {
     std::unordered_map<std::string, PortBinding> input_ports;
     std::unordered_map<std::string, PortBinding> output_ports;
     std::vector<EdgeBinding> edges;
+    std::vector<std::string> registered_tcp_stream_rows;
+    std::vector<std::string> registered_links;  // nodus::link endpoints (two rows each)
     gp_mem_backend_handle_t vulkan_backend = nullptr;
 
     std::mutex events_mu;
@@ -347,6 +352,21 @@ extern "C" int32_t nodus_headless_build_plugin_source(
         out_tool_id, out_tool_id_cap);
 }
 
+extern "C" int32_t nodus_headless_import_buffer_abi(
+    const char* descriptor_path, const char* artifact_path,
+    const char* module_library_root,
+    char* out_wrapper_path, int32_t out_wrapper_path_cap) {
+    if (!descriptor_path || !artifact_path || !module_library_root ||
+        !out_wrapper_path || out_wrapper_path_cap <= 0) return 0;
+    GP_ArtifactImportReport report{};
+    char package_path[4096] = {};
+    if (!gp_artifact_import_buffer_abi(descriptor_path, artifact_path, module_library_root, &report,
+                                       out_wrapper_path, out_wrapper_path_cap,
+                                       package_path, static_cast<int32_t>(sizeof(package_path))))
+        return 0;
+    return report.wrappers_written == 1 ? 1 : 0;
+}
+
 extern "C" int32_t nodus_headless_compile_turing_row(
     const char* python_executable, const char* request_json,
     const char* turing_root, const char* product_dir,
@@ -392,8 +412,157 @@ extern "C" void nodus_headless_destroy(NodusHeadlessGraph* g) {
     // process-owned and are deliberately NOT released here.
     g->contract_ports.clear();
     if (g->ctx) gp_canvas_destroy(g->ctx);
+    for (const auto& id : g->registered_tcp_stream_rows)
+        tool_registry_global().unregister_tool(id);
+    for (const auto& id : g->registered_links)
+        nodus::link::unregister_link(tool_registry_global(), id);
     if (g->vulkan_backend) gp_mem_backend_release(g->vulkan_backend);
     delete g;
+}
+
+extern "C" int32_t nodus_headless_register_tcp_byte_stream(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t pending_frames) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !port ||
+        maximum_frame_bytes == 0 || maximum_frame_bytes > 64ull*1024*1024 ||
+        pending_frames == 0 || pending_frames > 1024) return 0;
+    nodus::net::TcpByteStreamConfig config;
+    config.id=tool_id;config.port=port;
+    config.maximum_frame_bytes=static_cast<std::size_t>(maximum_frame_bytes);
+    config.pending_frames=pending_frames;
+    if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
+        return 0;
+    g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_register_tcp_broadcast(
+    NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
+    uint64_t maximum_frame_bytes, uint32_t max_readers) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !port ||
+        maximum_frame_bytes == 0 || maximum_frame_bytes > 64ull*1024*1024 ||
+        max_readers == 0 || max_readers > 64) return 0;
+    nodus::net::TcpByteStreamConfig config;
+    config.id=tool_id;config.port=port;
+    config.maximum_frame_bytes=static_cast<std::size_t>(maximum_frame_bytes);
+    config.pending_frames=1;config.broadcast_readers=max_readers;
+    if (!nodus::net::register_tcp_byte_stream(tool_registry_global(),std::move(config)))
+        return 0;
+    g->registered_tcp_stream_rows.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_register_link_host(
+    NodusHeadlessGraph* g, const char* tool_id, const char* prefix, uint16_t port,
+    const uint8_t* key32, uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !prefix || !*prefix || !key32) return 0;
+    nodus::link::LinkHostConfig config;
+    config.id = tool_id; config.prefix = prefix; config.port = port;
+    std::memcpy(config.key.data(), key32, config.key.size());
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    uint16_t bound = 0; std::string error;
+    if (!nodus::link::register_link_host(tool_registry_global(), std::move(config), &bound, &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_host: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return bound;
+}
+
+extern "C" int32_t nodus_headless_register_link_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* prefix,
+    const uint8_t* control_ticket128, const uint8_t* bulk_ticket128, int32_t timeout_ms,
+    uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !host || !prefix || !*prefix || !port ||
+        !control_ticket128 || !bulk_ticket128) return 0;
+    nodus::link::LinkDialConfig config;
+    config.id = tool_id; config.target.host = host; config.target.port = port; config.target.prefix = prefix;
+    if (timeout_ms > 0) config.target.timeout_ms = timeout_ms;
+    std::memcpy(config.control_ticket.data(), control_ticket128, config.control_ticket.size());
+    std::memcpy(config.bulk_ticket.data(), bulk_ticket128, config.bulk_ticket.size());
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    std::string error;
+    if (!nodus::link::register_link_dialer(tool_registry_global(), std::move(config), &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_dialer: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_register_link_wss_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* host, uint16_t port, const char* path_base,
+    const char* prefix, int32_t secure, const uint8_t* pin32, const uint8_t* control_ticket128,
+    const uint8_t* bulk_ticket128, int32_t timeout_ms, uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !host || !*host || !prefix || !*prefix || !port ||
+        !control_ticket128 || !bulk_ticket128) return 0;
+    nodus::link::LinkDialConfig config;
+    config.id = tool_id; config.wss = true;
+    config.wss_target.host = host; config.wss_target.port = port; config.wss_target.prefix = prefix;
+    if (path_base && *path_base) config.wss_target.path_base = path_base;
+    config.wss_target.secure = secure != 0;
+    if (pin32) { config.wss_target.pinned = true; std::memcpy(config.wss_target.pin.data(), pin32, 32); }
+    if (timeout_ms > 0) config.wss_target.timeout_ms = timeout_ms;
+    std::memcpy(config.control_ticket.data(), control_ticket128, config.control_ticket.size());
+    std::memcpy(config.bulk_ticket.data(), bulk_ticket128, config.bulk_ticket.size());
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    std::string error;
+    if (!nodus::link::register_link_dialer(tool_registry_global(), std::move(config), &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_wss_dialer: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_register_link_udp_dialer(
+    NodusHeadlessGraph* g, const char* tool_id, const char* broker_host, uint16_t broker_port, const char* prefix,
+    int32_t role, const uint8_t* link_id16, uint64_t expires_at, const uint8_t* key32, uint64_t account,
+    int32_t timeout_ms, uint64_t maximum_bulk_bytes) {
+    if (!g || !g->ctx || !tool_id || !*tool_id || !broker_host || !*broker_host || !broker_port || !prefix || !*prefix ||
+        (role != 1 && role != 2) || !link_id16 || !key32) return 0;
+    nodus::link::LinkDialConfig config;
+    config.id = tool_id; config.udp = true;
+    auto& t = config.udp_target;
+    t.broker_host = broker_host; t.broker_port = broker_port; t.prefix = prefix;
+    t.role = static_cast<nodus::link::Role>(role); t.expires_at = expires_at; t.account = account;
+    std::memcpy(t.link_id.data(), link_id16, 16); std::memcpy(t.key.data(), key32, 32);
+    if (timeout_ms > 0) t.timeout_ms = timeout_ms;
+    if (maximum_bulk_bytes) config.maximum_bulk_bytes = maximum_bulk_bytes;
+    std::string error;
+    if (!nodus::link::register_link_dialer(tool_registry_global(), std::move(config), &error)) {
+        std::fprintf(stderr, "nodus_headless_register_link_udp_dialer: %s: %s\n", tool_id, error.c_str());
+        return 0;
+    }
+    g->registered_links.emplace_back(tool_id);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_link_reason(const char* tool_id, char* out, int32_t capacity) {
+    nodus::link::EndpointReport r;
+    if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return -1;
+    if (out && capacity > 0) {
+        const size_t n = std::min(r.reason.size(), size_t(capacity - 1));
+        std::memcpy(out, r.reason.data(), n); out[n] = 0;
+    }
+    return int32_t(r.reason.size());
+}
+
+extern "C" int32_t nodus_headless_set_link_metrics_channel(const char* tool_id, int32_t channel) {
+    nodus::link::EndpointReport r;
+    if (!tool_id || channel < 0 || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;
+    nodus::link::set_link_metrics_channel(tool_id, channel);
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_link_report(const char* tool_id, int32_t* state, uint64_t* out16) {
+    nodus::link::EndpointReport r;
+    if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return 0;
+    if (state) *state = static_cast<int32_t>(r.state);
+    if (out16) {
+        nodus::link::link_report_counters(r, out16);
+    }
+    return 1;
 }
 
 namespace {
@@ -467,6 +636,7 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
     std::vector<TrailerPort> trailer_ports;
     struct ModulePolicy { int32_t module; int32_t exec; int32_t stack; };
     std::vector<ModulePolicy> trailer_policies;
+    std::vector<std::pair<int32_t, int32_t>> trailer_loopbacks;  // MODULE_STACK_LOOPBACK module on
     std::vector<nodus::contracts::CanvasContractPorts::Record> trailer_contract_ports;
     {
         std::ifstream ifs(path);
@@ -504,6 +674,13 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
                     return 0;
                 }
                 trailer_policies.push_back(policy);
+            } else if (tag == "MODULE_STACK_LOOPBACK") {
+                int32_t module = -1, on = 0;
+                if (!(ss >> module >> on) || module < 0 || (on != 0 && on != 1)) {
+                    std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                    return 0;
+                }
+                trailer_loopbacks.emplace_back(module, on);
             }
         }
     }
@@ -512,6 +689,12 @@ extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* p
         if (!nodus_headless_set_module_exec_mode(g, policy.module, policy.exec) ||
             !nodus_headless_set_module_stack_contract(g, policy.module, policy.stack)) {
             std::fprintf(stderr, "nodus_headless_load_file: cannot restore MODULE_POLICY %d\n", policy.module);
+            return 0;
+        }
+    }
+    for (const auto& lb : trailer_loopbacks) {
+        if (!nodus_headless_set_module_stack_loopback(g, lb.first, lb.second)) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot restore MODULE_STACK_LOOPBACK %d\n", lb.first);
             return 0;
         }
     }
@@ -599,6 +782,9 @@ extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* p
         if (!nodus_headless_get_module_exec_mode(g, module, &exec) ||
             !nodus_headless_get_module_stack_contract(g, module, &stack)) return 0;
         trailer << "MODULE_POLICY " << module << " " << exec << " " << stack << "\n";
+        int32_t loopback = 0;
+        if (!nodus_headless_get_module_stack_loopback(g, module, &loopback)) return 0;
+        if (loopback) trailer << "MODULE_STACK_LOOPBACK " << module << " 1\n";
     }
     for (const auto& e : g->edges) {
         if (!e.configured) continue;
@@ -719,6 +905,18 @@ extern "C" int32_t nodus_headless_get_module_stack_contract(
     return gp_canvas_get_module_stack_contract(g->ctx, module_idx, out_contract);
 }
 
+extern "C" int32_t nodus_headless_set_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t on) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_set_module_stack_loopback(g->ctx, module_idx, on);
+}
+
+extern "C" int32_t nodus_headless_get_module_stack_loopback(
+    NodusHeadlessGraph* g, int32_t module_idx, int32_t* out_on) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_get_module_stack_loopback(g->ctx, module_idx, out_on);
+}
+
 extern "C" int32_t nodus_headless_set_module_exec_mode(
     NodusHeadlessGraph* g, int32_t module_idx, int32_t mode) {
     return g && g->ctx ? gp_canvas_set_module_exec_mode(g->ctx, module_idx, mode) : 0;
@@ -734,6 +932,79 @@ extern "C" int32_t nodus_headless_add_edge(NodusHeadlessGraph* g, const GP_Canva
     int32_t canvas_edge_idx = gp_canvas_add_edge_with_type(g->ctx, desc, type_id);
     if (canvas_edge_idx < 0) return -1;
     return attach_edge_binding(g, *desc, canvas_edge_idx);
+}
+
+// A port pair applied as the move (gp_canvas_resolve_port_pair), then added and bound as nodus_headless_add_edge is.
+extern "C" int32_t nodus_headless_apply_port_pair(NodusHeadlessGraph* g, const char* pair, char* error, int32_t error_capacity) {
+    if (!g || !g->ctx || !pair) return -1;
+    GP_CanvasEdgeDesc desc{};
+    if (!gp_canvas_resolve_port_pair(g->ctx, pair, &desc, error, error_capacity)) return -1;
+    return nodus_headless_add_edge(g, &desc, 0);
+}
+
+static int32_t sync_ui_edges(NodusHeadlessGraph* g) {
+    if (!g || !g->ctx || !g->table) return 0;
+    gp_table_apply_pending_ops(g->table);
+    const auto previous = g->edges;
+    const int32_t count = gp_canvas_get_edge_count(g->ctx);
+    if (count < 0) return 0;
+    std::vector<EdgeBinding> current(static_cast<size_t>(count));
+    for (int32_t i = 0; i < count; ++i) {
+        GP_CanvasEdgeDesc desc{};
+        int32_t type_id = 0;
+        if (!gp_canvas_get_edge(g->ctx, i, &desc, &type_id)) return 0;
+        const uint64_t a = (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_module)) << 32) |
+                           (static_cast<uint64_t>(static_cast<uint32_t>(desc.a_contact_idx)) << 16);
+        const uint64_t b = (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_module)) << 32) |
+                           (static_cast<uint64_t>(static_cast<uint32_t>(desc.b_contact_idx)) << 16);
+        int32_t table_index = -1;
+        if (!gp_table_edge_index_for_pair(g->table, a, b, &table_index) || table_index < 0) return 0;
+        const auto prior = std::find_if(previous.begin(), previous.end(), [&](const EdgeBinding& edge) {
+            return edge.desc.a_module == desc.a_module && edge.desc.a_contact_idx == desc.a_contact_idx &&
+                   edge.desc.b_module == desc.b_module && edge.desc.b_contact_idx == desc.b_contact_idx;
+        });
+        current[static_cast<size_t>(i)] = EdgeBinding{desc, table_index,
+            prior == previous.end() ? 0 : prior->configured};
+    }
+    g->edges = std::move(current);
+    for (int32_t i = 0; i < count; ++i) {
+        if (g->edges[static_cast<size_t>(i)].configured) continue;
+        NodusHeadlessFifoConfig config{};
+        if (read_table_edge_config(g->table, g->edges[static_cast<size_t>(i)].table_edge_idx, &config)) {
+            const auto& edge = g->edges[static_cast<size_t>(i)];
+            if (!gp_table_edge_subscribe_ex(g->table, edge.table_edge_idx,
+                scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx), 1)) return 0;
+            g->edges[static_cast<size_t>(i)].configured = 1;
+        } else return 0;
+    }
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height) {
+    return g && g->ctx && width >= 64 && height >= 64 && width <= 4096 && height <= 4096
+        ? gp_canvas_set_size(g->ctx, width, height) : 0;
+}
+
+extern "C" int32_t nodus_headless_ui_mouse(NodusHeadlessGraph* g, int32_t kind,
+    float x, float y, float dx, float dy, int32_t button, float scroll) {
+    if (!g || !g->ctx) return -1;
+    int32_t handled = 0;
+    switch (kind) {
+        case 0: handled = gp_canvas_on_click(g->ctx, static_cast<int>(x), static_cast<int>(y)); break;
+        case 1: handled = gp_canvas_on_mouse_down(g->ctx, x, y, dx, dy, button); break;
+        case 2: handled = gp_canvas_on_mouse_up(g->ctx, x, y, dx, dy, button); break;
+        case 3: handled = gp_canvas_on_mouse_move(g->ctx, x, y, dx, dy); break;
+        case 4: handled = gp_canvas_on_mouse_scroll(g->ctx, x, y, dx, dy, scroll); break;
+        default: return -1;
+    }
+    return sync_ui_edges(g) ? handled : -1;
+}
+
+extern "C" int32_t nodus_headless_ui_key(NodusHeadlessGraph* g,
+    int32_t key, int32_t scancode, int32_t action, int32_t mods) {
+    if (!g || !g->ctx) return -1;
+    const int32_t handled = gp_canvas_on_key(g->ctx, key, scancode, action, mods);
+    return sync_ui_edges(g) ? handled : -1;
 }
 
 extern "C" int32_t nodus_headless_get_edge_count(NodusHeadlessGraph* g) {
@@ -829,6 +1100,111 @@ extern "C" int32_t nodus_headless_get_edge_unread(
         scalar_reader_key(edge.desc.b_module, edge.desc.b_contact_idx), out_unread);
 }
 
+namespace {
+GP_MetaGroup* find_meta_group(GP_TableContext* table, uint64_t id) {
+    if (!table || !id) return nullptr;
+    const int32_t n = gp_table_get_meta_group_count(table);
+    for (int32_t i = 0; i < n; ++i) {
+        GP_MetaGroup* mg = gp_table_get_meta_group(table, i);
+        unsigned long long mid = 0;
+        if (mg && gp_table_meta_get_id(table, mg, &mid) && mid == id) return mg;
+    }
+    return nullptr;
+}
+GP_TableContext* process_container_table() {
+    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    return cvs ? gp_canvas_get_container_table(cvs) : nullptr;
+}
+}  // namespace
+
+extern "C" uint64_t nodus_headless_meta_create(NodusHeadlessGraph* g, const int32_t* canvas_edge_idx, int32_t count, int32_t channel_group) {
+    if (!g || !g->table || !canvas_edge_idx || count <= 0) return 0;
+    std::vector<int32_t> table_edges;
+    for (int32_t i = 0; i < count; ++i) {
+        const int32_t c = canvas_edge_idx[i];
+        if (c < 0 || static_cast<size_t>(c) >= g->edges.size() || g->edges[static_cast<size_t>(c)].table_edge_idx < 0) return 0;
+        table_edges.push_back(g->edges[static_cast<size_t>(c)].table_edge_idx);
+    }
+    GP_MetaGroup* mg = gp_table_meta_create_over_edges(g->table, table_edges.data(), count, channel_group);
+    unsigned long long id = 0;
+    if (!mg || !gp_table_meta_get_id(g->table, mg, &id)) return 0;
+    return id;
+}
+extern "C" int32_t nodus_headless_meta_count(NodusHeadlessGraph* g) { return g && g->table ? gp_table_get_meta_group_count(g->table) : 0; }
+extern "C" uint64_t nodus_headless_meta_id_at(NodusHeadlessGraph* g, int32_t ordinal) {
+    if (!g || !g->table) return 0;
+    GP_MetaGroup* mg = gp_table_get_meta_group(g->table, ordinal);
+    unsigned long long id = 0;
+    return mg && gp_table_meta_get_id(g->table, mg, &id) ? id : 0;
+}
+extern "C" int32_t nodus_headless_meta_set_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t channel_group) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_set_channel_group(g->table, mg, channel_group) : 0;
+}
+extern "C" int32_t nodus_headless_meta_get_channel_group(NodusHeadlessGraph* g, uint64_t group_id, int32_t* out_channel_group) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg && out_channel_group ? gp_table_meta_get_channel_group(g->table, mg, out_channel_group) : 0;
+}
+extern "C" int32_t nodus_headless_meta_destroy(NodusHeadlessGraph* g, uint64_t group_id) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_destroy(g->table, mg) : 0;
+}
+extern "C" int32_t nodus_headless_meta_member_count(NodusHeadlessGraph* g, uint64_t group_id) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_get_member_count(g->table, mg) : 0;
+}
+extern "C" int32_t nodus_headless_meta_member(NodusHeadlessGraph* g, uint64_t group_id, int32_t ordinal,
+    int32_t* out_canvas_edge_idx, int32_t* out_table_edge_idx, uint64_t* out_rope_id) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    int32_t table_edge = -1; uint64_t rope = 0;
+    if (!mg || !gp_table_meta_get_member(g->table, mg, ordinal, &table_edge, &rope)) return 0;
+    if (out_table_edge_idx) *out_table_edge_idx = table_edge;
+    if (out_rope_id) *out_rope_id = rope;
+    if (out_canvas_edge_idx) {
+        *out_canvas_edge_idx = -1;
+        for (size_t i = 0; i < g->edges.size(); ++i)
+            if (g->edges[i].table_edge_idx == table_edge) { *out_canvas_edge_idx = static_cast<int32_t>(i); break; }
+    }
+    return 1;
+}
+extern "C" int32_t nodus_headless_meta_snapshot(NodusHeadlessGraph* g, uint64_t group_id, uint64_t* out_words, int32_t capacity_words) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_snapshot_u64(g->table, mg, out_words, capacity_words) : 0;
+}
+extern "C" int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint64_t group_id, uint64_t from_seq,
+    uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_read_records(g->table, mg, from_seq, out_words, max_records, out_write_seq) : 0;
+}
+extern "C" int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words) {
+    GP_TableContext* table = process_container_table();
+    if (!table || !out_words || capacity_words < GP_META_RECORD_WORDS) return 0;
+    int32_t words = 0;
+    const int32_t n = gp_table_get_meta_group_count(table);
+    for (int32_t i = 0; i < n; ++i) {
+        GP_MetaGroup* mg = gp_table_get_meta_group(table, i);
+        int32_t ch = 0;
+        if (!mg || !gp_table_meta_get_channel_group(table, mg, &ch) || ch != channel) continue;
+        const int32_t room = (capacity_words - words) / GP_META_RECORD_WORDS;
+        if (room <= 0) break;
+        words += gp_table_meta_get_latest_records(table, mg, out_words + words, room) * GP_META_RECORD_WORDS;
+    }
+    return words;
+}
+extern "C" int32_t nodus_headless_meta_channel_floats(int32_t channel, int32_t ordinal, float* out, int32_t capacity) {
+    GP_TableContext* table = process_container_table();
+    if (!table || !out || capacity <= 0 || ordinal < 0) return 0;
+    const int32_t n = gp_table_get_meta_group_count(table);
+    int32_t seen = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        GP_MetaGroup* mg = gp_table_get_meta_group(table, i);
+        int32_t ch = 0;
+        if (!mg || !gp_table_meta_get_channel_group(table, mg, &ch) || ch != channel) continue;
+        if (seen++ == ordinal) return gp_table_meta_get_fifo_snapshot(table, mg, out, capacity);
+    }
+    return 0;
+}
+
 extern "C" int32_t nodus_headless_set_module_uuid(
     NodusHeadlessGraph* g, int32_t module_idx, uint64_t module_uuid) {
     if (!g || !g->ctx || module_uuid == 0) return 0;
@@ -869,6 +1245,12 @@ extern "C" int32_t nodus_headless_get_persistent_workers(
     NodusHeadlessGraph* g, int32_t* out_enabled) {
     if (!g || !g->ctx) return 0;
     return gp_canvas_get_persistent_workers(g->ctx, out_enabled);
+}
+
+extern "C" int32_t nodus_headless_set_parallel_worker_limit(
+    NodusHeadlessGraph* g, int32_t limit) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_set_parallel_worker_limit(g->ctx, limit);
 }
 
 extern "C" int32_t nodus_headless_declare_input_port(NodusHeadlessGraph* g, const char* name, int32_t module_idx, int32_t row_idx, int32_t token_bytes) {
@@ -946,6 +1328,49 @@ extern "C" int32_t nodus_headless_pull_token(NodusHeadlessGraph* g, const char* 
     int32_t ok = gp_table_edge_consume(g->table, it->second.edge_idx, kHostKey, out_bytes, static_cast<int32_t>(cap), &written);
     if (out_written) *out_written = static_cast<size_t>(written);
     return ok;
+}
+
+// ---- canvas ports: the canvas's own boundary (canvas_abi.h GP_CANVAS_PORT_*) --------------------------------------
+extern "C" int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph* g, const char* name, int32_t direction,
+                                                      int32_t up) {
+    if (!g || !g->ctx) return -1;
+    return gp_canvas_declare_port(g->ctx, name, direction, up);
+}
+
+extern "C" int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g) {
+    return (g && g->ctx) ? gp_canvas_root_module_of(g->ctx) : -1;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_count(NodusHeadlessGraph* g) {
+    return (g && g->ctx) ? gp_canvas_port_count(g->ctx) : -1;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_at(NodusHeadlessGraph* g, int32_t ordinal, char* out_name,
+                                                 int32_t out_name_capacity, int32_t* out_direction,
+                                                 int32_t* out_contact, int32_t* out_up) {
+    if (!g || !g->ctx) return 0;
+    int direction = 0, contact = 0, up = 0;
+    const int ok = gp_canvas_port_at(g->ctx, ordinal, out_name, out_name_capacity, &direction, &contact, &up);
+    if (out_direction) *out_direction = direction;
+    if (out_contact) *out_contact = contact;
+    if (out_up) *out_up = up;
+    return ok;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, const char* name, void* out_bytes,
+                                                      size_t cap, size_t* out_written) {
+    if (out_written) *out_written = 0;
+    if (!g || !g->ctx) return 0;
+    int written = 0;
+    const int ok = gp_canvas_port_consume(g->ctx, name, out_bytes, static_cast<int>(cap), &written);
+    if (out_written) *out_written = static_cast<size_t>(written);
+    return ok;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
+                                                      size_t len) {
+    if (!g || !g->ctx) return 0;
+    return gp_canvas_port_publish(g->ctx, name, bytes, static_cast<int>(len));
 }
 
 extern "C" int32_t nodus_headless_get_port_fifo_config(

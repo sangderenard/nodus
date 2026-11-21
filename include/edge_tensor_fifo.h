@@ -56,6 +56,10 @@ struct EdgeTensorFifo {
         std::atomic<float> write_phase{0.0f};
         std::atomic<float> read_phase{0.0f};
         std::atomic<int32_t> friction_regions{8};
+        // Observability counters (meta edges read them; nothing in the FIFO's own behavior depends on them):
+        // writes refused because the ring was full, and writes that made room by dropping the oldest unread slots.
+        std::atomic<uint64_t> refused_pushes{0};
+        std::atomic<uint64_t> dropped_pushes{0};
         std::mutex cv_mu;
         std::condition_variable cv;
         bool configured = false;
@@ -822,19 +826,21 @@ public:
         uint64_t min_seq = min_reader_seq(head);
         uint64_t used = (seq >= min_seq) ? (seq - min_seq) : 0;
         if (used < static_cast<uint64_t>(impl->slots)) return true;
-        if (impl->top_k == 0) return false;
+        if (impl->top_k == 0) { impl->refused_pushes.fetch_add(1, std::memory_order_relaxed); return false; }
         uint64_t window = std::min<uint64_t>(static_cast<uint64_t>(impl->top_k), static_cast<uint64_t>(impl->slots));
         uint64_t target_min = (window > 0 && seq >= (window - 1)) ? (seq - (window - 1)) : 0;
-        if (target_min <= min_seq) return false;
+        if (target_min <= min_seq) { impl->refused_pushes.fetch_add(1, std::memory_order_relaxed); return false; }
         for (size_t i = 0; i < kMaxReaders; ++i) {
             if (impl->readers[i].key.load(std::memory_order_relaxed) == 0) continue;
             uint64_t s = impl->readers[i].seq.load(std::memory_order_relaxed);
             if (s < target_min) impl->readers[i].seq.store(target_min, std::memory_order_relaxed);
         }
         if (out_dropped) *out_dropped = true;
+        impl->dropped_pushes.fetch_add(1, std::memory_order_relaxed);
         min_seq = min_reader_seq(head);
         used = (seq >= min_seq) ? (seq - min_seq) : 0;
-        return used < static_cast<uint64_t>(impl->slots);
+        if (used >= static_cast<uint64_t>(impl->slots)) { impl->refused_pushes.fetch_add(1, std::memory_order_relaxed); return false; }
+        return true;
     }
 
     bool push(uint64_t edge_id, uint64_t writer_id, const void* sample_bytes, size_t sample_len_bytes, bool* out_dropped) {

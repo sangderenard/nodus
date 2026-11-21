@@ -21,6 +21,7 @@ public:
     struct Stats {
         std::uint64_t resident_bytes = 0, budget_bytes = 0;
         std::uint64_t reused = 0, evicted = 0, restored = 0, saved = 0;
+        std::uint64_t pinned_bytes = 0;
     };
     class Lease {
     public:
@@ -138,6 +139,21 @@ public:
         return Lease(this, address, entry.buffer.get(), entry.bytes, writable);
     }
 
+    // A pin is a hard cache reservation. It warms the state first, then
+    // prevents LRU eviction until explicitly released. Coherence invalidation
+    // may still discard a stale copy; the next lease restores it.
+    bool set_pin(std::uint64_t address, bool pinned) {
+        auto it = entries_.find(address);
+        if (it == entries_.end() || it->second.leased) return false;
+        if (pinned && !it->second.buffer) {
+            auto loan = lease(address);
+            if (!loan) return false;
+            loan.reset();
+        }
+        it->second.pinned = pinned;
+        return true;
+    }
+
     // Dirty state without backing cannot be evicted. A source-only scratch
     // address can be removed explicitly when its consumer is complete.
     bool remove(std::uint64_t address) {
@@ -168,7 +184,10 @@ public:
         return true;
     }
     Stats stats() const noexcept {
-        return {resident_bytes_, budget_bytes_, reused_, evicted_, restored_, saved_};
+        std::uint64_t pinned = 0;
+        for (const auto& [_, entry] : entries_)
+            if (entry.pinned && entry.buffer) pinned += entry.bytes;
+        return {resident_bytes_, budget_bytes_, reused_, evicted_, restored_, saved_, pinned};
     }
     std::size_t resident_bytes(std::uint64_t address) const noexcept {
         const auto it = entries_.find(address);
@@ -180,7 +199,7 @@ private:
         std::size_t bytes;
         gp_mem_backend_handle_t backing;
         Buffer buffer{nullptr, &gp_mem_backend_release};
-        bool leased = false, dirty = false;
+        bool leased = false, dirty = false, pinned = false;
         std::uint64_t last_use = 0;
         Entry(std::size_t size, gp_mem_backend_handle_t home)
             : bytes(size), backing(home) {}
@@ -234,7 +253,7 @@ private:
     bool evict_one() {
         auto victim = entries_.end();
         for (auto it = entries_.begin(); it != entries_.end(); ++it)
-            if (it->second.buffer && !it->second.leased &&
+            if (it->second.buffer && !it->second.leased && !it->second.pinned &&
                 (!it->second.dirty || it->second.backing) &&
                 (victim == entries_.end() ||
                  it->second.last_use < victim->second.last_use)) victim = it;

@@ -3,19 +3,59 @@
 #include "tool_api.h"
 #include "module_library.h"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
-
 #include <iostream>
 #include <sstream>
 #include <filesystem>
+#include <ctime>
+
+// ---------------------------------------------------------------------------
+// Platform region: every dynamic-library and time OS call in this file lives here.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+namespace plugin_platform {
+using LibHandle = HMODULE;
+
+inline LibHandle lib_open(const char* path, std::string& error) {
+    LibHandle h = LoadLibraryA(path);
+    if (!h) error = std::to_string(GetLastError());
+    return h;
+}
+inline void* lib_symbol(LibHandle h, const char* name) {
+    return reinterpret_cast<void*>(GetProcAddress(h, name));
+}
+inline void lib_close(LibHandle h) { FreeLibrary(h); }
+inline const char* lib_open_failure_label() { return "LoadLibrary failed: "; }
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_s(&out, &t); }
+}  // namespace plugin_platform
+#else
+#include <dlfcn.h>
+
+namespace plugin_platform {
+using LibHandle = void*;
+
+inline LibHandle lib_open(const char* path, std::string& error) {
+    LibHandle h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char* why = dlerror();
+        error = why ? why : "unknown dlopen failure";
+    }
+    return h;
+}
+inline void* lib_symbol(LibHandle h, const char* name) { return dlsym(h, name); }
+inline void lib_close(LibHandle h) { dlclose(h); }
+inline const char* lib_open_failure_label() { return "dlopen failed: "; }
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_r(&t, &out); }
+}  // namespace plugin_platform
+#endif
+// ---------------------------------------------------------------------------
 
 struct LoadedModuleInfo {
-#ifdef _WIN32
-    HMODULE handle = nullptr;
-#endif
+    plugin_platform::LibHandle handle = nullptr;
     std::string path;
     std::string base_id;
     std::string unique_id;
@@ -50,11 +90,7 @@ static std::string make_version_tag() {
     std::time_t t = system_clock::to_time_t(now);
     char buf[64];
     std::tm tm;
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
+    plugin_platform::local_time(t, tm);
     std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
     // append a short random hex to avoid collisions within same second
     std::random_device rd;
@@ -88,9 +124,9 @@ static std::string normalize_source_path(const std::string& path) {
     }
 }
 
-static std::string find_plugin_source_path(const std::string& dll_path, HMODULE module) {
+static std::string find_plugin_source_path(const std::string& dll_path, plugin_platform::LibHandle module) {
     using source_path_fn_t = const char* (*)();
-    source_path_fn_t src_fn = (source_path_fn_t)GetProcAddress(module, "plugin_source_path");
+    source_path_fn_t src_fn = reinterpret_cast<source_path_fn_t>(plugin_platform::lib_symbol(module, "plugin_source_path"));
     if (src_fn) {
         const char* p = src_fn();
         if (p && p[0] != '\0') return normalize_source_path(p);
@@ -113,15 +149,15 @@ static std::string find_plugin_source_path(const std::string& dll_path, HMODULE 
 }
 
 std::string PluginLoader::load_module(const std::string& path, void* host) {
-#ifdef _WIN32
-    HMODULE h = LoadLibraryA(path.c_str());
+    std::string open_error;
+    plugin_platform::LibHandle h = plugin_platform::lib_open(path.c_str(), open_error);
     if (!h) {
-        std::cerr << "LoadLibrary failed: " << GetLastError() << "\n";
+        std::cerr << plugin_platform::lib_open_failure_label() << open_error << "\n";
         return {};
     }
 
     using create_fn_t = ITool* (*)();
-    create_fn_t create_fn = (create_fn_t)GetProcAddress(h, "create_tool");
+    create_fn_t create_fn = reinterpret_cast<create_fn_t>(plugin_platform::lib_symbol(h, "create_tool"));
     std::cerr << "DEBUG: plugin_loader: create_tool fn at " << reinterpret_cast<void*>(create_fn) << " for " << path << "\n";
     LoadedModuleInfo* info = new LoadedModuleInfo();
     info->handle = h;
@@ -129,18 +165,18 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
 
     if (!create_fn) {
         std::cerr << "create_tool not found in " << path << "\n";
-        FreeLibrary(h);
+        plugin_platform::lib_close(h);
         delete info;
         return {};
     }
 
-    info->destroy_fn = (LoadedModuleInfo::destroy_fn_t)GetProcAddress(h, "destroy_tool");
-    info->plugin_init = (LoadedModuleInfo::plugin_init_fn_t)GetProcAddress(h, "plugin_init");
-    info->plugin_shutdown = (LoadedModuleInfo::plugin_shutdown_fn_t)GetProcAddress(h, "plugin_shutdown");
+    info->destroy_fn = reinterpret_cast<LoadedModuleInfo::destroy_fn_t>(plugin_platform::lib_symbol(h, "destroy_tool"));
+    info->plugin_init = reinterpret_cast<LoadedModuleInfo::plugin_init_fn_t>(plugin_platform::lib_symbol(h, "plugin_init"));
+    info->plugin_shutdown = reinterpret_cast<LoadedModuleInfo::plugin_shutdown_fn_t>(plugin_platform::lib_symbol(h, "plugin_shutdown"));
 
     // Optional: register any new ValueType structs this DLL's tools need,
     // once, before any tool instance is created. Absent in most plugins.
-    if (auto register_types_fn = reinterpret_cast<RegisterTypesFn>(GetProcAddress(h, "register_types"))) {
+    if (auto register_types_fn = reinterpret_cast<RegisterTypesFn>(plugin_platform::lib_symbol(h, "register_types"))) {
         try { register_types_fn(); } catch (...) {
             std::cerr << "register_types threw in " << path << "\n";
         }
@@ -198,17 +234,15 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
     entry.caps = caps;
     entry.source_path = find_plugin_source_path(path, h);
     // Optional autobind exports
-#ifdef _WIN32
-    if (h) {
+    {
         using autobind_fn = int (*)();
-        if (auto fn = reinterpret_cast<autobind_fn>(GetProcAddress(h, "nodus_autobind_mouse_ports"))) {
+        if (auto fn = reinterpret_cast<autobind_fn>(plugin_platform::lib_symbol(h, "nodus_autobind_mouse_ports"))) {
             info->auto_mouse_ports = fn();
         }
-        if (auto fn = reinterpret_cast<autobind_fn>(GetProcAddress(h, "nodus_autobind_keyboard_ports"))) {
+        if (auto fn = reinterpret_cast<autobind_fn>(plugin_platform::lib_symbol(h, "nodus_autobind_keyboard_ports"))) {
             info->auto_keyboard_ports = fn();
         }
     }
-#endif
     entry.auto_mouse_ports = info->auto_mouse_ports;
     entry.auto_keyboard_ports = info->auto_keyboard_ports;
     if (create_fn) {
@@ -228,7 +262,7 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
 
     if (!tool_registry_global().register_tool(std::move(entry))) {
         std::cerr << "failed to register tool " << unique_id << "\n";
-        FreeLibrary(h);
+        plugin_platform::lib_close(h);
         delete info;
         return {};
     }
@@ -250,7 +284,7 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
         if (!r) {
             std::cerr << "plugin_init failed for " << unique_id << "\n";
             tool_registry_global().unregister_tool(unique_id);
-            FreeLibrary(h);
+            plugin_platform::lib_close(h);
             delete info;
             return {};
         }
@@ -260,11 +294,6 @@ std::string PluginLoader::load_module(const std::string& path, void* host) {
     modules_.emplace(unique_id, std::unique_ptr<LoadedModuleInfo>(info));
     std::cerr << "DEBUG: plugin_loader: loaded module unique_id='" << unique_id << "' path='" << path << "'\n";
     return unique_id;
-#else
-    (void)path;
-    std::cerr << "PluginLoader only implemented on Windows in this prototype.\n";
-    return {};
-#endif
 }
 
 bool PluginLoader::unload_module(const std::string& tool_id) {
@@ -277,12 +306,10 @@ bool PluginLoader::unload_module(const std::string& tool_id) {
     // unregister from registry
     bool ok = tool_registry_global().unregister_tool(tool_id);
 
-#ifdef _WIN32
     if (it->second->handle) {
-        FreeLibrary(it->second->handle);
+        plugin_platform::lib_close(it->second->handle);
         it->second->handle = nullptr;
     }
-#endif
     modules_.erase(it);
     return ok;
 }

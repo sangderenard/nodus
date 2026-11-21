@@ -373,6 +373,26 @@ inline int raw_stack_pop_known_type(RawStackFrame& frame, void* out,
     return 0; // no host heap storage without backend
 }
 
+// Read the top element into out without consuming it: the checks and copy of raw_stack_pop_known_type (with the mask
+// validated), and no change to the frame. Returns 1 on success, 0 otherwise.
+inline int raw_stack_peek_known_type(const RawStackFrame& frame, void* out, ValueTypeId type_id, size_t needed) {
+    if (!frame.types_per_byte || !out || !frame.backend) return 0;
+    if (needed == 0 || frame.byte_count > frame.byte_capacity || frame.byte_count < needed) return 0;
+    const size_t start = frame.byte_count - needed;
+    for (size_t i = 0; i < needed; ++i) {
+        if (frame.types_per_byte[start + i] != type_id) return 0;
+    }
+    const gp_mem_backend_vtable_t* bvt = gp_mem_backend_get_vtable(frame.backend);
+    if (bvt && bvt->copy_from_backend) {
+        return bvt->copy_from_backend(frame.backend, start, out, needed) ? 1 : 0;
+    }
+    void* m = gp_mem_backend_map_or_null(frame.backend);
+    if (!m) return 0;
+    std::memcpy(out, reinterpret_cast<uint8_t*>(m) + start, needed);
+    gp_mem_backend_unmap(frame.backend);
+    return 1;
+}
+
 // Pop a single typed element from the raw stack into out. Returns 1 on success, 0 otherwise.
 inline int raw_stack_pop_typed(RawStackFrame& frame, void* out, ValueTypeId type_id) {
     const ValueType* vt = ValueTypeRegistry::global().get(type_id);
@@ -469,6 +489,13 @@ inline int raw_stack_pop_torch(RawStackFrame& frame, torch::Tensor*& out) {
 inline int raw_stack_push_abstract_tensor(RawStackFrame& frame, nodus::tensors::AbstractTensorHandle handle) {
     const ValueTypeId tid = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
     return raw_stack_push_typed(frame, &handle, tid);
+}
+
+// Read the AbstractTensorHandle on top of the raw stack without consuming it.
+inline int raw_stack_peek_abstract_tensor(const RawStackFrame& frame, nodus::tensors::AbstractTensorHandle& out) {
+    const ValueTypeId tid = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+    const ValueType* vt = ValueTypeRegistry::global().get(tid);
+    return vt ? raw_stack_peek_known_type(frame, &out, tid, vt->size) : 0;
 }
 
 // Pop a single AbstractTensorHandle from the raw stack.

@@ -2533,7 +2533,8 @@ struct FrontendOptions {
     int width = kDefaultCanvasWidth;
     int height = kDefaultCanvasHeight;
     std::string workspace_path;
-    std::vector<std::pair<std::string, size_t>> acquire_pairs;  // --acquire=PREFIX:CAPACITY
+    std::vector<std::pair<std::string, size_t>> acquire_pairs;  // --acquire=PREFIX:CAPACITY[:LOAN_TICKS]
+    std::vector<uint64_t> acquire_loan_ticks;                    // per pair; 0 = unspecified (as run_canvas.py)
     std::string attach_target;        // --attach=127.0.0.1:<port> (read-only console viewer)
     std::string console_token_file;   // --console-token-file=<path>
     // timing overrides: negative => not set
@@ -2561,7 +2562,7 @@ static void print_usage(const char* progname) {
     std::cout << "  --width=<pixels>       Initial canvas width (default: 1000)\n";
     std::cout << "  --height=<pixels>      Initial canvas height (default: 720)\n";
     std::cout << "  --workspace=<path>     Path for primary canvas workspace file\n";
-    std::cout << "  --acquire=PREFIX:CAPACITY  Acquire a contract negotiator pair (repeatable) so a\n";
+    std::cout << "  --acquire=PREFIX:CAPACITY[:LOAN_TICKS]  Acquire a contract negotiator pair (repeatable) so a\n";
     std::cout << "                         saved canvas's <PREFIX>.market/.worker rows resolve\n";
     std::cout << "  --attach=127.0.0.1:<port>  Read-only viewer of a running headless graph's console port\n";
     std::cout << "                         (hosts no canvas of its own; excludes --workspace/--acquire)\n";
@@ -2607,16 +2608,22 @@ FrontendOptions parse_frontend_options(int argc, char** argv) {
             opts.console_token_file = arg.substr(token_file_prefix.size());
         } else if (arg.rfind(acquire_prefix, 0) == 0) {
             const std::string v = arg.substr(acquire_prefix.size());
-            const size_t colon = v.rfind(':');
+            // PREFIX:CAPACITY[:LOAN_TICKS], the form tools/run_canvas.py --acquire takes; a prefix has no ':'.
+            const size_t colon = v.find(':');
             if (colon == std::string::npos || colon == 0) {
-                std::cerr << "--acquire expects PREFIX:CAPACITY, got: " << v << "\n";
+                std::cerr << "--acquire expects PREFIX:CAPACITY[:LOAN_TICKS], got: " << v << "\n";
             } else {
                 try {
-                    const long cap = std::stol(v.substr(colon + 1));
+                    const std::string rest = v.substr(colon + 1);
+                    const size_t second = rest.find(':');
+                    const long cap = std::stol(rest.substr(0, second));
                     if (cap <= 0) throw std::out_of_range("capacity");
+                    const unsigned long long loan = second == std::string::npos ? 0ull : std::stoull(rest.substr(second + 1));
+                    if (second != std::string::npos && loan == 0) throw std::out_of_range("loan_ticks");
                     opts.acquire_pairs.emplace_back(v.substr(0, colon), static_cast<size_t>(cap));
+                    opts.acquire_loan_ticks.push_back(static_cast<uint64_t>(loan));
                 } catch (...) {
-                    std::cerr << "--acquire has an invalid capacity: " << v << "\n";
+                    std::cerr << "--acquire has an invalid capacity or loan length: " << v << "\n";
                 }
             }
         } else if (arg.rfind(device_prefix, 0) == 0) {
@@ -2919,7 +2926,11 @@ void prepare_torch(FrontendResources& resources, const FrontendOptions& opts) {
     // runs inside mem_backend_torch.cpp (the sole translation unit that
     // includes <torch/torch.h>); this file only ever sees a plain int/string.
     std::string dev = to_lower(opts.device);
+#if NODUS_ENABLE_TORCH
     bool cuda_available = gp_mem_backend_torch_cuda_available() != 0;
+#else
+    bool cuda_available = false;   // a Torch-free image has no Torch device; the probe lives in mem_backend_torch.cpp
+#endif
     if (dev == "cpu") {
         resources.torch_device_name = "cpu";
     } else if (dev == "cuda") {
@@ -3034,9 +3045,10 @@ int main(int argc, char** argv) {
     }
 
     // Pairs must exist before the canvas loads so saved <prefix>.market/.worker rows resolve.
-    for (const auto& pair : options.acquire_pairs) {
+    for (size_t i = 0; i < options.acquire_pairs.size(); ++i) {
+        const auto& pair = options.acquire_pairs[i];
         try {
-            nodus::contracts::acquire(pair.first, pair.second);
+            nodus::contracts::acquire(pair.first, pair.second, options.acquire_loan_ticks[i]);
         } catch (const std::exception& e) {
             std::cerr << "--acquire " << pair.first << ":" << pair.second << " failed: " << e.what() << "\n";
             cleanup(resources);

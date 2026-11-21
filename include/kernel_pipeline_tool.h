@@ -1,4 +1,5 @@
 #pragma once
+// The row's source: module_library/source/tools/kernel_pipeline.cpp.
 #include "tensor_state_library_tool.h"
 #include "tool_registry.h"
 
@@ -28,6 +29,10 @@ class KernelPipelineTool final : public ITool {
 public:
     KernelPipelineTool(std::string id,std::vector<KernelPipelineComponent> components,
                        ToolRegistry& registry);
+    KernelPipelineTool();                     // no registry: the row refuses until a host gives it one; settings from configure()/saved state
+    void configure(std::string id,std::vector<KernelPipelineComponent> components);
+    bool serialize(OutputArchive& out) const override;
+    bool deserialize(InputArchive& in) override;
     const char* id_cstr() const noexcept override {return id_.c_str();}
     const char* name_cstr() const noexcept override {return "Kernel pipeline";}
     ToolCaps caps() const override {return ToolCaps::None;}
@@ -46,7 +51,9 @@ private:
     using ToolPtr=std::unique_ptr<ITool,std::function<void(ITool*)>>;
     std::string id_;
     std::vector<KernelPipelineComponent> components_;
+    ToolRegistry* registry_=nullptr;
     std::vector<ToolPtr> tools_;
+    void build_tools();
 };
 
 bool register_kernel_pipeline(ToolRegistry& registry,std::string id,

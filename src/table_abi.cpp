@@ -48,6 +48,7 @@ typedef struct LassoConfig {
 #include "inl/table_abi_pending_ops.inl"
 #include "inl/table_abi_rope_draw.inl"
 #include "inl/table_abi_edge_io.inl"
+#include "inl/table_abi_meta_feed.inl"
 #include "inl/table_abi_serialization.inl"
 #include "inl/table_abi_relax_prospective.inl"
 #include "inl/table_abi_cpp_helpers.inl"

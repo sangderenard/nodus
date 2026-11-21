@@ -187,6 +187,79 @@ static uint64_t canvas_contact_key(int module_idx, int contact_idx) {
     return trid;
 }
 
+// A row's authority over its own ports during its tick (research case 075069677cb74e3f9794914c9009cec5). The row's port
+// p is the contact GP_CANVAS_ROW_PORT_CONTACT_BASE + row x GP_CANVAS_ROW_PORT_STRIDE + p; its edge is found and keyed
+// exactly as an Output row (writer) or Input row (reader) finds and keys the edge at its contact.
+struct RowPortBinding {
+    const ThreadManager::TickRequest* req = nullptr;
+    GP_TableContext* fifo_table = nullptr;
+    int mod_idx = -1;
+    int row = -1;
+};
+static int row_port_contact(int row, int port) {
+    return GP_CANVAS_ROW_PORT_CONTACT_BASE + row * GP_CANVAS_ROW_PORT_STRIDE + port;
+}
+static int32_t row_port_publish(void* host, int32_t port, const void* bytes, size_t len) {
+    auto* b = static_cast<RowPortBinding*>(host);
+    if (!b || !b->req || !b->fifo_table || !bytes || port < 0 || port >= GP_CANVAS_ROW_PORT_STRIDE) return 0;
+    const int contact = row_port_contact(b->row, port);
+    for (const auto& e : b->req->edges) {
+        if (e.a_module != b->mod_idx || e.a_contact_idx != contact) continue;
+        int32_t dropped = 0;
+        return gp_table_edge_publish(b->fifo_table, e.edge_idx, canvas_contact_key(b->mod_idx, contact), bytes,
+                                     static_cast<int32_t>(len), &dropped) ? 1 : 0;
+    }
+    return 0;
+}
+static int32_t row_port_can_publish(void* host, int32_t port, int32_t count) {
+    auto* b = static_cast<RowPortBinding*>(host);
+    if (!b || !b->req || !b->fifo_table || port < 0 || port >= GP_CANVAS_ROW_PORT_STRIDE || count < 0) return 0;
+    const int contact = row_port_contact(b->row, port);
+    for (const auto& e : b->req->edges) {
+        if (e.a_module != b->mod_idx || e.a_contact_idx != contact) continue;
+        return gp_table_edge_can_publish(b->fifo_table, e.edge_idx, count) ? 1 : 0;
+    }
+    return 0;
+}
+static int32_t row_port_consume(void* host, int32_t port, void* out, size_t capacity, size_t* written) {
+    auto* b = static_cast<RowPortBinding*>(host);
+    if (written) *written = 0;
+    if (!b || !b->req || !b->fifo_table || !out || port < 0 || port >= GP_CANVAS_ROW_PORT_STRIDE) return 0;
+    const int contact = row_port_contact(b->row, port);
+    for (const auto& e : b->req->edges) {
+        if (e.b_module != b->mod_idx || e.b_contact_idx != contact) continue;
+        const uint64_t reader = canvas_contact_key(b->mod_idx, contact);
+        gp_table_edge_subscribe_ex(b->fifo_table, e.edge_idx, reader, /*start_at_head=*/1);
+        int32_t got = 0;
+        if (!gp_table_edge_consume(b->fifo_table, e.edge_idx, reader, out, static_cast<int32_t>(capacity), &got) || got <= 0) return 0;
+        if (written) *written = static_cast<size_t>(got);
+        return 1;
+    }
+    return 0;
+}
+
+
+// Every AbstractTensor handle a stack entry names, bottom to top (research case 6393486c, the mint table). The walk is
+// the StackDisplay walk: each entry's size is its registered type's size.
+static void stack_tensor_ids(const RawStackFrame* frame, std::vector<uint64_t>& out) {
+    out.clear();
+    if (!frame || !frame->types_per_byte || !frame->backend) return;
+    const ValueTypeId tensor_tid = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+    const gp_mem_backend_vtable_t* bvt = gp_mem_backend_get_vtable(frame->backend);
+    if (!bvt || !bvt->copy_from_backend) return;
+    size_t idx = 0;
+    while (idx < frame->byte_count) {
+        const ValueTypeId tid = frame->types_per_byte[idx];
+        const ValueType* vt = ValueTypeRegistry::global().get(tid);
+        if (!vt || vt->size == 0) break;
+        if (tid == tensor_tid && vt->size == sizeof(nodus::tensors::AbstractTensorHandle)) {
+            nodus::tensors::AbstractTensorHandle h{};
+            if (bvt->copy_from_backend(frame->backend, idx, &h, sizeof(h)) && h.id) out.push_back(h.id);
+        }
+        idx += vt->size;
+    }
+}
+
 static float raw_stack_value_as_float(const uint8_t* bytes, size_t size) {
     if (!bytes || size == 0) return 0.0f;
     if (size == sizeof(float)) {
@@ -364,6 +437,14 @@ void ThreadManager::set_persistent_workers(bool enabled) {
 
 bool ThreadManager::persistent_workers() const {
     return persistent_workers_.load(std::memory_order_relaxed);
+}
+
+void ThreadManager::set_parallel_worker_limit(size_t count) {
+    parallel_worker_limit_.store(count, std::memory_order_relaxed);
+}
+
+size_t ThreadManager::parallel_worker_limit() const {
+    return parallel_worker_limit_.load(std::memory_order_relaxed);
 }
 
 void ThreadManager::ensure_pool_workers(size_t count) {
@@ -607,6 +688,9 @@ void ThreadManager::run_loop() {
         TickRequest scheduled = req;
         for (auto& mod : scheduled.modules) if (mod.exec_mode == ExecMode::Free) mod.module_skip = 1;
         run_scheduled_tick(scheduled, preserve_free);
+        // Meta edges listen to their members: one observation record per member edge per tick, taken here on the
+        // manager thread after the tick's rows ran. One branch when the root table has no meta groups.
+        if (req.root_table) gp_table_meta_feed_tick(req.root_table, req.tick_id);
         if (!preserve_free) start_free_workers(req);
 
         {
@@ -774,7 +858,8 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         const ValueType* stack_type_info = scalar_stack ? nullptr : ValueTypeRegistry::global().get(stack_default_type);
         size_t stack_elem_size = scalar_stack ? sizeof(double) :
             (stack_type_info && stack_type_info->size > 0 ? stack_type_info->size : sizeof(double));
-        reset_module_tool_stack(*module_stack);
+        // A table set in stack loopback keeps its stack: what a row refused is still on it this tick.
+        if (!mod.stack_loopback) reset_module_tool_stack(*module_stack);
         std::vector<float> stack_snapshot;
         auto push_value = [&](float value) {
             double dv = static_cast<double>(value);
@@ -864,6 +949,20 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         if (_tm_enabled) {
             _tm_start = std::chrono::high_resolution_clock::now();
         }
+        // The mint table's return path (research case 6393486c): only a module with a Returns row records the handles
+        // its Borrower rows use up; they wait in the module's pending list until that row hands them on.
+        std::vector<uint64_t>* pending_returns = nullptr;
+        if (graph_runtime_ && mod_idx >= 0 &&
+            mod_idx < static_cast<int>(graph_runtime_->module_plugin_instances.size())) {
+            for (const auto& row_inst : graph_runtime_->module_plugin_instances[static_cast<size_t>(mod_idx)]) {
+                if (row_inst && row_inst->tensor_role() == ToolTensorRole::Returns) {
+                    std::lock_guard<std::mutex> lk(graph_runtime_->module_returns_mu);
+                    pending_returns = &graph_runtime_->module_pending_returns[mod_idx];
+                    break;
+                }
+            }
+        }
+        std::vector<uint64_t> tensors_before, tensors_after;
         for (int row = 0; row < row_count; ++row) {
             ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None, 0};
             if (meta.kind == ModuleRowKind::Input) {
@@ -990,6 +1089,20 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         frame.default_type = stack_default_type;
                         ToolStackContext tctx;
                         tctx.stack = frame;
+                        // The row's own ports, if it declares any: it reads and writes them itself during this tick.
+                        RowPortBinding row_port_binding;
+                        ToolRowPortAccess row_port_access;
+                        if (inst->row_port_count() > 0) {
+                            row_port_binding.req = &req;
+                            row_port_binding.fifo_table = req.root_table ? req.root_table : mod.table;
+                            row_port_binding.mod_idx = mod_idx;
+                            row_port_binding.row = row;
+                            row_port_access.host = &row_port_binding;
+                            row_port_access.publish = &row_port_publish;
+                            row_port_access.consume = &row_port_consume;
+                            row_port_access.can_publish = &row_port_can_publish;
+                            tctx.row_ports = &row_port_access;
+                        }
                         ToolInputState tinp;
                         if (load_input_state()) {
                             tinp.mouse_x = input_state.mouse_x;
@@ -1009,17 +1122,37 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         } else {
                             tctx.input = nullptr;
                         }
+                        const ToolTensorRole tensor_role = inst->tensor_role();
+                        const bool track_used = pending_returns && tensor_role == ToolTensorRole::Borrower;
+                        if (track_used) stack_tensor_ids(module_stack, tensors_before);
+                        ToolReturnedTensors returns_view;
+                        if (pending_returns && tensor_role == ToolTensorRole::Returns) {
+                            returns_view.ids = pending_returns->data();
+                            returns_view.count = pending_returns->size();
+                            tctx.returns = &returns_view;
+                        }
                         try {
                             inst->execute_stack(tctx);
                         } catch (...) {
                             tctx.succeeded = false;
                         }
-                        if (!tctx.succeeded) {
-                            // Refusing tools restore their inputs by contract.
-                            // Do not let following output rows reinterpret that
-                            // rolled-back stack tail as successful return values.
-                            break;
+                        if (tctx.returns) {
+                            const size_t taken = std::min(returns_view.taken, pending_returns->size());
+                            pending_returns->erase(pending_returns->begin(), pending_returns->begin() + static_cast<std::ptrdiff_t>(taken));
                         }
+                        if (track_used && tctx.succeeded) {
+                            // A popped handle that no stack entry names any more is used up: every use of a duplicated
+                            // handle is its own entry, so this is the last one.
+                            stack_tensor_ids(module_stack, tensors_after);
+                            for (uint64_t id : tensors_before) {
+                                if (std::find(tensors_after.begin(), tensors_after.end(), id) != tensors_after.end()) continue;
+                                if (std::find(pending_returns->begin(), pending_returns->end(), id) != pending_returns->end()) continue;
+                                pending_returns->push_back(id);
+                            }
+                        }
+                        // A refusing row restores its input to the stack by contract, and the table goes on: the rows
+                        // after it run, so a refused tensor stays on the stack for them (owner, 2026-11-19: a table
+                        // never stops at a refusal; the filter send and governed intake rows loop it back up).
                         continue; // plugin handled this row
                     }
                 }
@@ -1580,6 +1713,11 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req, bool preserve_fre
                     if (e.b_module == root_mod) contact_idx = e.b_contact_idx;
                     else if (e.a_module == root_mod) contact_idx = e.a_contact_idx;
                     else continue;
+                    // Canvas ports (canvas_abi.h GP_CANVAS_PORT_*) are the canvas's boundary: whoever is above reads or
+                    // writes them (gp_canvas_port_consume / _publish). This block must neither take their samples as
+                    // toolbar colours nor hold a never-draining reader on their lossless edges.
+                    if (contact_idx >= GP_CANVAS_PORT_CONTACT_BASE &&
+                        contact_idx < GP_CANVAS_PORT_CONTACT_BASE + GP_CANVAS_PORT_MAX) continue;
                     uint64_t reader_key = canvas_contact_key(root_mod, contact_idx);
                     if (reader_key == 0) reader_key = 0x8000000000000000ull;
                     gp_table_edge_subscribe_ex(req.root_table, edge_idx, reader_key, /*start_at_head=*/1);
@@ -1776,6 +1914,8 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req, bool preserve_fre
         int hw = static_cast<int>(std::thread::hardware_concurrency());
         if (hw <= 0) hw = 1;
         int thread_count = std::min(hw, std::max(1, static_cast<int>(order.size())));
+        const auto limit = parallel_worker_limit();
+        if (limit) thread_count = std::min(thread_count, static_cast<int>(std::min<size_t>(limit, std::numeric_limits<int>::max())));
         std::mutex ready_mu;
         std::condition_variable ready_cv;
         std::atomic<int> remaining(static_cast<int>(order.size()));

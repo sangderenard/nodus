@@ -11,12 +11,45 @@
 #include <vector>
 
 #include "tool_api.h"
-#ifdef _WIN32
+#include <chrono>
+#include <ctime>
+
+// ---------------------------------------------------------------------------
+// Platform region: every OS call in this file (atomic file replace, local time) lives here.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+namespace actualizer_platform {
+// Move `from` over `to`, replacing an existing file atomically. On failure sets `err` and returns false.
+inline bool replace_file(const std::filesystem::path& from, const std::filesystem::path& to, std::string& err) {
+    if (!MoveFileExW(from.wstring().c_str(), to.wstring().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        err = "MoveFileExW failed: " + std::to_string(GetLastError());
+        return false;
+    }
+    return true;
+}
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_s(&out, &t); }
+}  // namespace actualizer_platform
+#else
+namespace actualizer_platform {
+// Move `from` over `to`, replacing an existing file atomically (rename(2)). On failure sets `err` and returns false.
+inline bool replace_file(const std::filesystem::path& from, const std::filesystem::path& to, std::string& err) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (ec) {
+        err = "rename failed: " + ec.message();
+        return false;
+    }
+    return true;
+}
+inline void local_time(const std::time_t& t, std::tm& out) { localtime_r(&t, &out); }
+}  // namespace actualizer_platform
 #endif
+// ---------------------------------------------------------------------------
 
 namespace {
 bool ensure_parent_dir(const std::filesystem::path& path, std::string& err) {
@@ -53,16 +86,11 @@ bool atomic_write_file(const std::filesystem::path& target, const std::string& c
         ofs.flush();
         ofs.close();
 
-        // Move/rename into place. On Windows use MoveFileEx to replace existing atomically.
-#ifdef _WIN32
-        if (!MoveFileExW(tmp.wstring().c_str(), target.wstring().c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            err = "MoveFileExW failed: " + std::to_string(GetLastError());
+        // Move/rename into place, replacing any existing file atomically.
+        if (!actualizer_platform::replace_file(tmp, target, err)) {
             std::filesystem::remove(tmp);
             return false;
         }
-#else
-        std::filesystem::rename(tmp, target);
-#endif
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -697,11 +725,7 @@ int gp_module_library_actualize_sources(const GP_ModuleLibrary& library, const c
                 auto now = std::chrono::system_clock::now();
                 std::time_t t = std::chrono::system_clock::to_time_t(now);
                 char buf[64];
-#ifdef _WIN32
-                std::tm tm; localtime_s(&tm, &t);
-#else
-                std::tm tm; localtime_r(&t, &tm);
-#endif
+                std::tm tm; actualizer_platform::local_time(t, tm);
                 std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
                 std::string ts(buf);
                 std::filesystem::path dir = tool_path.parent_path();

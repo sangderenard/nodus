@@ -205,8 +205,9 @@ def compile_row_product_graph(
     python_executable: str | pathlib.Path, turing_root: str | pathlib.Path,
     product_dir: str | pathlib.Path, nodus_root: str | pathlib.Path,
     module_library_root: str | pathlib.Path,
+    install_definition: bool = True,
 ) -> tuple[GraphDefinition, dict[str, object]]:
-    """Compile an explicit Turing row request and install its derived graph."""
+    """Compile an explicit Turing row request; optionally install its graph."""
 
     loaded_id, report = graph.compile_turing_row(
         request_json, python_executable=python_executable,
@@ -226,7 +227,8 @@ def compile_row_product_graph(
         raise RuntimeError(
             f"loaded tool {loaded_id!r} disagrees with product ABI {product_tool!r}"
         )
-    graph.apply_definition(definition)
+    if install_definition:
+        graph.apply_definition(definition)
     return definition, report
 
 
