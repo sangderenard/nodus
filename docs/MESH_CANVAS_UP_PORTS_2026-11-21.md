@@ -54,3 +54,26 @@ Ticket `e12fd0f545c44f868591bbe7ef505cc1` (follows `e2f19532`, regional state br
 3. Canvas rows: a table row that holds a canvas and exposes its ports; in the mesh layer one per node (own node writable,
    remote nodes read replicas fed over the link); single writer per table.
 4. Read privacy: per-canvas reader lists; sealed delivery; the non-readers' view.
+
+## Findings for stage 1 (read-only map, 2026-11-21)
+
+- **Contact spaces per module** (all canvas edges are FIFOs in the root table, keyed `(module<<32)|(contact<<16)`, so a
+  contact must stay below 65536): Input/Output attachments from 0; module frame LEDs 10000-10063
+  (`kModuleFrameContactBase`, 16 x 4); toolbar 10064-10079 (render time only, ROOT only); row ports 20000 + row x 64;
+  ROOT contacts 0/1 are the overlay anchors. A canvas-port range fits between 10080 and 20000.
+- **A headless canvas has no ROOT module**: headless setup clears the workspace and sets `root_module_idx = -1`
+  (rope_map.inl 856-862, nodus_headless_abi.cpp 289-295); save writes `ROOT_MODULE` only when one exists.
+- **The scheduler swallows every edge touching ROOT**: `run_scheduled_tick` (thread_manager.cpp 1701-1840) subscribes
+  and consumes any edge with `a_module` or `b_module` == root and treats it as a toolbar colour sample; non-toolbar
+  contacts are consumed and dropped, and its reader shares the composed key a host reader would use. Port edges need that
+  block narrowed to the toolbar range.
+- **Root-table IO keys cannot be ports**: unnamed type hints, not saved, never read by the scheduler.
+- **Second canvas contexts** (upper layers, canvas rows) build and get their own ThreadManager, but their ticks read and
+  write the primary through `g_canvas_context_singleton`, `gp_canvas_get_root_module_idx()` (no ctx),
+  `ThreadManager::global()`, the primary's `module_binding_id_map`, input/stack vectors, rope map and overlays, and the
+  global sim tick. Each touchpoint needs a ctx before stage 2/3 nesting is safe.
+- **Stepping**: plugin rows run through `execute_stack`; `ITool::tick` is never called by the scheduler. A row can step a
+  child synchronously (separate manager thread), once the singleton touchpoints are per ctx.
+- **Save/load**: CANVAS V4 text; the loader skips unknown tags; a new core record goes beside `ROOT_MODULE`, restored
+  after the edge rebuild, and must enter `gp_canvas_compute_signature`. Headless trailers (`PORT`, `EDGE_FIFO`, ...)
+  are parsed strictly, so a new tag must not reuse their names. A child canvas needs its own `module_library_root`.
