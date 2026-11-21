@@ -76,6 +76,19 @@ CONSOLE_MAX_CLIENTS = 8
 CONSOLE_IDLE_SECONDS = 60.0
 CONSOLE_COALESCE_SECONDS = 0.1
 CONSOLE_STEP_WAIT_SECONDS = 5.0
+# A row's own port p is the contact BASE + row x STRIDE + p (canvas_abi.h GP_CANVAS_ROW_PORT_CONTACT_BASE / _STRIDE).
+LINK_ROW_PORT_CONTACT_BASE = 20000
+LINK_ROW_PORT_STRIDE = 64
+# link_send_file: one file is one U8 bulk tensor; the link endpoint refuses more than its maximum (256 MiB by default).
+LINK_FILE_MAX_BYTES = 256 << 20
+
+
+class _TensorDesc(ctypes.Structure):
+    """tensor_abi.h NodusTensorDesc (NODUS_TENSOR_MAX_RANK 8)."""
+    _fields_ = [("dtype", ctypes.c_uint8), ("layout", ctypes.c_uint8), ("is_readonly", ctypes.c_uint8),
+                ("is_buffer", ctypes.c_uint8), ("rank", ctypes.c_uint32), ("shape", ctypes.c_uint64 * 8),
+                ("strides", ctypes.c_uint64 * 8), ("element_count", ctypes.c_uint64), ("element_bytes", ctypes.c_uint32),
+                ("reserved", ctypes.c_uint32), ("total_bytes", ctypes.c_uint64)]
 
 
 def _on_signal(signum, frame) -> None:
@@ -199,12 +212,14 @@ class ConsoleServer:
             if any(type(v) is not int or abs(v) > 65535 for v in values):
                 raise ValueError("invalid canvas key action")
             handled = graph.ui_key(*values)
-        elif op in ("link_host", "link_dial", "link_udp", "link_send", "link_report"):
+        elif op in ("link_host", "link_dial", "link_udp", "link_send", "link_report", "link_send_file", "link_receive"):
             handled, report = self._apply_link(graph, request)
             if op in ("link_host", "link_dial", "link_udp") and request["id"] not in self._link_ids:
                 self._link_ids.append(request["id"])
             if op == "link_report":
                 return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, "link": report}
+            if op in ("link_send_file", "link_receive"):
+                return {"handled": True, "revision": self._revision, "canvas": self._canvas_name, op: report}
         elif op in ("meta_group", "meta_report", "meta_destroy"):
             meta = self._apply_meta(graph, request)
             if op == "meta_report":
@@ -301,11 +316,63 @@ class ConsoleServer:
             if core.nodus_tensor_write(handle, 0, data, size) != size:
                 core.nodus_tensor_destroy(handle)
                 raise RuntimeError("the tensor could not be written")
-            result = graph.try_push_bytes(f"{link_id}.send", struct.pack("<Q", handle))
-            if not result.accepted:
+            if not self._link_push(graph, link_id, handle):
                 core.nodus_tensor_destroy(handle)
                 raise RuntimeError(f"{link_id}.send is full")
             return True, {"handle": handle, "bytes": size}
+        if op == "link_send_file":
+            if set(request) != {"op", "expected_revision", "id", "path"} or not isinstance(request["path"], str):
+                raise ValueError("link_send_file takes op, expected_revision, id, path")
+            path = pathlib.Path(request["path"])
+            size = path.stat().st_size if path.is_file() else -1
+            if not 0 < size <= LINK_FILE_MAX_BYTES:
+                raise ValueError(f"link_send_file: a file of 1..{LINK_FILE_MAX_BYTES} bytes")
+            data = path.read_bytes()
+            core = self._tensor_core(graph)
+            handle = int(core.nodus_tensor_create(7, 1, (ctypes.c_uint64 * 1)(len(data))))      # NODUS_DTYPE_U8
+            if not handle:
+                raise RuntimeError("the tensor core refused the tensor")
+            if core.nodus_tensor_write(handle, 0, data, len(data)) != len(data):
+                core.nodus_tensor_destroy(handle)
+                raise RuntimeError("the tensor could not be written")
+            if not self._link_push(graph, link_id, handle):
+                core.nodus_tensor_destroy(handle)
+                return True, {"sent": False, "why": f"{link_id}.send is full; send it again"}
+            return True, {"sent": True, "bytes": len(data)}
+        if op == "link_receive":
+            if not {"op", "expected_revision", "id", "spool"} <= set(request) <= {"op", "expected_revision", "id", "spool", "max"}:
+                raise ValueError("link_receive takes op, expected_revision, id, spool[, max]")
+            if not hasattr(graph.lib, "nodus_headless_declare_canvas_port"):
+                raise RuntimeError("link_receive needs a nodus_headless library with canvas ports")
+            spool, most = pathlib.Path(request["spool"]), request.get("max", 16)
+            if type(most) is not int or not 0 < most <= 256:
+                raise ValueError("link_receive: max 1..256")
+            spool.mkdir(parents=True, exist_ok=True)
+            core = self._tensor_core(graph)
+            arrived = []
+            while len(arrived) < most:
+                # Read at the canvas port only when asked: an unread arrival waits in the link endpoint (the row port
+                # publishes only while the port's lossless edge can take it), so nothing is queued here.
+                token = graph.canvas_port_pull(f"{link_id}.received", 8)
+                if not token or len(token) != 8:
+                    break
+                (handle,) = struct.unpack("<Q", token)
+                if not handle:
+                    continue
+                desc = _TensorDesc()
+                try:
+                    # The tensor's own length (total_bytes), not its arena slot, which rounds up.
+                    if core.nodus_tensor_describe(handle, ctypes.byref(desc)) != 0:
+                        raise RuntimeError(f"an arrival on {link_id} could not be described")
+                    buffer = ctypes.create_string_buffer(int(desc.total_bytes))
+                    if core.nodus_tensor_read(handle, 0, buffer, desc.total_bytes) != desc.total_bytes:
+                        raise RuntimeError(f"an arrival on {link_id} could not be read")
+                    data = buffer.raw
+                finally:
+                    core.nodus_tensor_destroy(handle)            # an arrival belongs to whoever pops it
+                name = self._spool_file(spool, data)
+                arrived.append({"file": str(name), "bytes": len(data)})
+            return True, {"arrived": arrived}
         if op == "link_udp":
             keys = {"op", "expected_revision", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"}
             if not set(request) >= keys or not set(request) <= keys | {"account", "metrics", "metrics_channel"}:
@@ -381,7 +448,44 @@ class ConsoleServer:
         lib.nodus_tensor_write.argtypes = (ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64)
         lib.nodus_tensor_destroy.restype = None
         lib.nodus_tensor_destroy.argtypes = (ctypes.c_uint64,)
+        lib.nodus_tensor_describe.restype = ctypes.c_int32
+        lib.nodus_tensor_describe.argtypes = (ctypes.c_uint64, ctypes.POINTER(_TensorDesc))
+        lib.nodus_tensor_read.restype = ctypes.c_int64
+        lib.nodus_tensor_read.argtypes = (ctypes.c_uint64, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_uint64)
         return lib
+
+    @staticmethod
+    def _link_push(graph, link_id: str, handle: int) -> bool:
+        """One tensor handle onto the link: through the canvas port <id>.send, or (a library from before canvas ports)
+        the declared host port of the same name. False when full; the caller still owns the tensor."""
+        token = struct.pack("<Q", handle)
+        if hasattr(graph.lib, "nodus_headless_declare_canvas_port"):
+            return graph.canvas_port_push(f"{link_id}.send", token)
+        return bool(graph.try_push_bytes(f"{link_id}.send", token).accepted)
+
+    @staticmethod
+    def _spool_file(spool: pathlib.Path, data: bytes) -> pathlib.Path:
+        """Write one arrival as the next <n>.arrival, created exclusively: a name already present (an earlier run's
+        arrival) is never overwritten; the number moves on instead. Written under a hidden name, then renamed, so a
+        reader never sees a half-written arrival."""
+        numbers = [int(p.stem) for p in spool.glob("*.arrival") if p.stem.isdigit()]
+        n = max(numbers, default=0) + 1
+        while True:
+            name = spool / f"{n:08d}.arrival"
+            partial = spool / f".{n:08d}.partial"
+            try:
+                fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                n += 1
+                continue
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            if name.exists():
+                os.remove(partial)
+                n += 1
+                continue
+            os.replace(partial, name)
+            return name
 
     @staticmethod
     def _bind_link_table(graph, link_id: str, metrics: bool = False) -> None:
@@ -408,7 +512,40 @@ class ConsoleServer:
         if not lib.nodus_headless_set_module_stack_contract(graph._handle, index, 1):
             raise RuntimeError("the link table's stack contract was refused")
         fifo = _NativeFifoConfig(8, 4, 0, graph.abstract_tensor_type_id, 2, 16, 0)     # one tensor handle a token, lossless
-        lib.nodus_headless_declare_input_port_ex(graph._handle, f"{link_id}.send".encode("utf-8"), index, 0, ctypes.byref(fifo))
+        if not hasattr(lib, "nodus_headless_declare_canvas_port"):
+            # A library from before canvas ports: the host feeds the Input row through a declared port, as before.
+            lib.nodus_headless_declare_input_port_ex(graph._handle, f"{link_id}.send".encode("utf-8"), index, 0,
+                                                     ctypes.byref(fifo))
+            return
+        # The link's two ends are canvas ports (docs/MESH_CANVAS_UP_PORTS_2026-11-21.md): the canvas's boundary in the
+        # top tools area, marked up for the mesh. <id>.send (IN) feeds the table's Input row; the bulk row's row port
+        # "received" (contact 20000 + row 1 x 64) feeds <id>.received (OUT). Both edges are lossless and a row port
+        # publishes only while its edge can take it, so an unread arrival waits in the link endpoint.
+        # Stack loopback keeps what the bulk row refuses (out queue full, not yet linked) for its next tick instead of
+        # the per-tick reset dropping it -- the loss of the first live generation (63 of 271 records, 2026-11-21).
+        if not lib.nodus_headless_set_module_stack_loopback(graph._handle, index, 1):
+            raise RuntimeError("the link table's stack loopback was refused")
+        root_and = ConsoleServer._canvas_port_edge
+        root_and(graph, f"{link_id}.send", "in", index, 0, fifo)
+        root_and(graph, f"{link_id}.received", "out", index, LINK_ROW_PORT_CONTACT_BASE + 1 * LINK_ROW_PORT_STRIDE, fifo)
+
+    @staticmethod
+    def _canvas_port_edge(graph, name: str, direction: str, module: int, contact: int, fifo) -> None:
+        """Declare canvas port `name` (up, for the mesh) and draw its edge to or from (module, contact), once."""
+        lib = graph.lib
+        port = graph.declare_canvas_port(name, direction, up=True)
+        root = graph.canvas_root_module()
+        a, b = ((root, port), (module, contact)) if direction == "in" else ((module, contact), (root, port))
+        for e in range(max(0, int(lib.nodus_headless_get_edge_count(graph._handle)))):
+            desc, type_id = CanvasEdgeDesc(), ctypes.c_int32()
+            if lib.nodus_headless_get_edge(graph._handle, e, ctypes.byref(desc), ctypes.byref(type_id)) and \
+                    (desc.a_module, desc.a_contact_idx, desc.b_module, desc.b_contact_idx) == (*a, *b):
+                lib.nodus_headless_configure_edge_fifo(graph._handle, e, ctypes.byref(fifo))
+                return
+        desc = CanvasEdgeDesc(a_module=a[0], a_contact_idx=a[1], b_module=b[0], b_contact_idx=b[1])
+        edge = int(lib.nodus_headless_add_edge(graph._handle, ctypes.byref(desc), 0))
+        if edge < 0 or not lib.nodus_headless_configure_edge_fifo(graph._handle, edge, ctypes.byref(fifo)):
+            raise RuntimeError(f"the edge of canvas port {name} could not be drawn")
 
     def _build(self, graph, wanted=frozenset()):
         path = os.path.join(self._tmp, "snapshot.nodus.txt")

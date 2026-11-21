@@ -58,13 +58,33 @@ void LinkRow::execute_stack(ToolStackContext& context) {
     auto& stack = *context.stack.raw;
     bool accepted = false;
     nodus::tensors::AbstractTensorHandle input{};
-    if (raw_stack_pop_abstract_tensor(stack, input)) {
-        if (!input.id) {
-            // The Input row's pad for an empty edge (in a tensor table, the null handle): nothing to send this tick.
+    // An Input row with an empty edge pads the stack with one value of the stack's default type (a scalar, not a
+    // tensor) or a null handle; either means nothing to send. With stack loopback a refused input stays on the stack
+    // across ticks -- under the next tick's pad, where a tensor pop fails on the scalar and the input is never seen
+    // again: on the Oracle A1 host (2026-11-21) 6 of 20 refused 8 MiB inputs sat under pads for minutes while the link
+    // stood idle. Drop every pad, so a waiting input is retried.
+    const ValueTypeId tensor_type = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+    bool popped = false;
+    ValueTypeId top = kInvalidValueTypeId;
+    while (raw_stack_peek_type(stack, top)) {
+        if (top == tensor_type) {
+            if (!raw_stack_pop_abstract_tensor(stack, input)) break;
+            popped = true;
+            if (input.id) break;
             accepted = true;
-        } else if (!(bulk_ ? accept_bulk(input.id) : accept_control(input.id))) {
+            continue;
+        }
+        const ValueType* pad = ValueTypeRegistry::global().get(top);
+        if (!pad || !pad->size) break;
+        std::vector<uint8_t> discard(pad->size);
+        if (!raw_stack_pop_typed(stack, discard.data(), top)) break;
+        accepted = true;
+    }
+    if (popped && input.id) {
+        if (!(bulk_ ? accept_bulk(input.id) : accept_control(input.id))) {
             ++(bulk_ ? ep_->report().bulk_refused : ep_->report().control_refused);
             raw_stack_push_abstract_tensor(stack, input);  // refused: it stays on the stack for the rows below
+            accepted = false;
         } else {
             accepted = true; ep_->poll();
         }
