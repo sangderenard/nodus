@@ -632,29 +632,34 @@ static RopeSim* canvas_require_root_sim(GP_CanvasContextImpl* ctx);
 // (e.g. sync_module_table_io_layout), which still needs to read tool
 // bindings to lay out pixels.
 
-bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state) {
-    if (!g_canvas_context_singleton || !out_state) return false;
-    if (module_idx < 0 || module_idx >= static_cast<int>(g_canvas_context_singleton->module_input_state.size())) return false;
-    *out_state = g_canvas_context_singleton->module_input_state[module_idx];
+// The module input/stack helpers the scheduler calls during a tick act on that tick's canvas (ThreadManager::
+// TickRequest::canvas), so a canvas nested in a table row keeps its own input state and stack snapshots.
+bool canvas_get_module_input_state(GP_CanvasContext* canvas_, int module_idx, ModuleInputState* out_state) {
+    GP_CanvasContextImpl* const owner = reinterpret_cast<GP_CanvasContextImpl*>(canvas_);
+    if (!owner || !out_state) return false;
+    if (module_idx < 0 || module_idx >= static_cast<int>(owner->module_input_state.size())) return false;
+    *out_state = owner->module_input_state[module_idx];
     return true;
 }
 
-void canvas_clear_module_input_pulses(int module_idx) {
-    if (!g_canvas_context_singleton) return;
-    if (module_idx < 0 || module_idx >= static_cast<int>(g_canvas_context_singleton->module_input_state.size())) return;
-    auto &state = g_canvas_context_singleton->module_input_state[module_idx];
+void canvas_clear_module_input_pulses(GP_CanvasContext* canvas_, int module_idx) {
+    GP_CanvasContextImpl* const owner = reinterpret_cast<GP_CanvasContextImpl*>(canvas_);
+    if (!owner) return;
+    if (module_idx < 0 || module_idx >= static_cast<int>(owner->module_input_state.size())) return;
+    auto &state = owner->module_input_state[module_idx];
     state.mouse_down = 0;
     state.mouse_up = 0;
     state.key_event = 0;
 }
 
-void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count) {
-    if (!g_canvas_context_singleton) return;
+void canvas_set_module_stack_snapshot(GP_CanvasContext* canvas_, int module_idx, int row_idx, const float* values, int count) {
+    GP_CanvasContextImpl* const owner = reinterpret_cast<GP_CanvasContextImpl*>(canvas_);
+    if (!owner) return;
     if (module_idx < 0) return;
-    if (module_idx >= static_cast<int>(g_canvas_context_singleton->module_stack_snapshots.size())) {
-        g_canvas_context_singleton->module_stack_snapshots.resize(module_idx + 1);
+    if (module_idx >= static_cast<int>(owner->module_stack_snapshots.size())) {
+        owner->module_stack_snapshots.resize(module_idx + 1);
     }
-    auto &snapshots = g_canvas_context_singleton->module_stack_snapshots[module_idx];
+    auto &snapshots = owner->module_stack_snapshots[module_idx];
     std::vector<float> data;
     if (values && count > 0) {
         data.assign(values, values + count);
@@ -662,13 +667,14 @@ void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* 
     snapshots[row_idx] = std::move(data);
 }
 
-void canvas_set_module_stack_snapshot_meta(int module_idx, int row_idx, const int* types, const int* counts, int count) {
-    if (!g_canvas_context_singleton) return;
+void canvas_set_module_stack_snapshot_meta(GP_CanvasContext* canvas_, int module_idx, int row_idx, const int* types, const int* counts, int count) {
+    GP_CanvasContextImpl* const owner = reinterpret_cast<GP_CanvasContextImpl*>(canvas_);
+    if (!owner) return;
     if (module_idx < 0) return;
-    if (module_idx >= static_cast<int>(g_canvas_context_singleton->module_stack_snapshot_meta.size())) {
-        g_canvas_context_singleton->module_stack_snapshot_meta.resize(module_idx + 1);
+    if (module_idx >= static_cast<int>(owner->module_stack_snapshot_meta.size())) {
+        owner->module_stack_snapshot_meta.resize(module_idx + 1);
     }
-    auto &meta_map = g_canvas_context_singleton->module_stack_snapshot_meta[module_idx];
+    auto &meta_map = owner->module_stack_snapshot_meta[module_idx];
     std::vector<std::pair<int,int>> data;
     if (types && counts && count > 0) {
         data.reserve(static_cast<size_t>(count));
@@ -677,9 +683,10 @@ void canvas_set_module_stack_snapshot_meta(int module_idx, int row_idx, const in
     meta_map[row_idx] = std::move(data);
 }
 
-void canvas_set_module_stack_tail(int module_idx, const float* values, int count) {
-    if (!g_canvas_context_singleton) return;
-    module_stack_tail_write(g_canvas_context_singleton, module_idx, values, count);
+void canvas_set_module_stack_tail(GP_CanvasContext* canvas_, int module_idx, const float* values, int count) {
+    GP_CanvasContextImpl* const owner = reinterpret_cast<GP_CanvasContextImpl*>(canvas_);
+    if (!owner) return;
+    module_stack_tail_write(owner, module_idx, values, count);
 }
 
 static bool module_has_tool(const GP_CanvasContextImpl* ctx, int module_idx, ModuleToolKind tool) {
@@ -4347,7 +4354,7 @@ static void canvas_install_key_recorder_table(GP_CanvasContextImpl* ctx, int mod
     if (!ctx) return;
     if (module_idx < 0 || module_idx >= static_cast<int>(ctx->modules.size())) return;
     // create table
-    GP_TableContext* t = gp_table_create(nullptr);
+    GP_TableContext* t = canvas_own_table(ctx, gp_table_create(nullptr));
     if (!t) return;
     // style
     GP_TableStyle st{};
@@ -4946,7 +4953,7 @@ static void canvas_install_root_actions(GP_CanvasContextImpl* ctx, GP_TableConte
 static GP_TableContext* canvas_ensure_root_table(GP_CanvasContextImpl* ctx) {
     if (!ctx) return nullptr;
     if (!ctx->container_table) {
-        ctx->container_table = gp_table_create(nullptr);
+        ctx->container_table = canvas_own_table(ctx, gp_table_create(nullptr));
         ctx->container_table_owned = 1;
         ctx->root_actions_installed = 0;
         gp_table_set_debug_flags(ctx->container_table, ctx->debug_flags);
@@ -5376,7 +5383,7 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     // If there's no attached table but the UI has non-zero IO counts, create
     // a canvas-owned table so the user sees the LED cells immediately.
     if (!t && (in_count > 0 || (module_idx < static_cast<int>(ctx->module_io_out_count.size()) && ctx->module_io_out_count[module_idx] > 0))) {
-        GP_TableContext* nt = gp_table_create(nullptr);
+        GP_TableContext* nt = canvas_own_table(ctx, gp_table_create(nullptr));
         gp_table_set_prospective_mode(nt, 1);
         gp_table_prospective_set_params(nt, 8, 4.0f, 0.0f);
         t = nt;

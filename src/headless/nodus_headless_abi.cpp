@@ -271,9 +271,10 @@ extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
     std::call_once(abstract_tensor_vocabulary_once, [] {
         nodus::tensors::register_abstract_tensor_tool_ir(tool_registry_global());
     });
-    // The native canvas still owns process-global contact and table helpers.
-    // Refuse coexistence instead of perturbing an already-running UI/bridge.
-    if (gp_canvas_get_singleton() != nullptr) return nullptr;
+    // Graphs coexist: each canvas runs on its own scheduler with its own tables, tick state and sim frame count
+    // (ThreadManager::TickRequest::canvas, GP_TableContext::owner_canvas), so a graph made while another canvas exists
+    // -- a canvas a table row holds (canvas_row) -- is a compartment of its own. gp_canvas_create keeps the first canvas
+    // as the process's primary; a later one never loads or autosaves the workspace file.
     auto* g = new NodusHeadlessGraph();
     g->ctx = gp_canvas_create(1, 1);
     if (!g->ctx) {
@@ -1335,6 +1336,22 @@ extern "C" int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph* g, con
                                                       int32_t up) {
     if (!g || !g->ctx) return -1;
     return gp_canvas_declare_port(g->ctx, name, direction, up);
+}
+
+extern "C" int32_t nodus_headless_get_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row, uint8_t* out,
+                                               size_t capacity, size_t* out_size) {
+    if (out_size) *out_size = 0;
+    if (!g || !g->ctx || capacity > static_cast<size_t>(INT32_MAX)) return 0;
+    int size = 0;
+    const int ok = gp_canvas_row_state_get(g->ctx, module_idx, row, out, static_cast<int>(capacity), &size);
+    if (out_size) *out_size = static_cast<size_t>(size);
+    return ok;
+}
+
+extern "C" int32_t nodus_headless_set_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row,
+                                               const uint8_t* bytes, size_t size) {
+    if (!g || !g->ctx || size > static_cast<size_t>(INT32_MAX)) return 0;
+    return gp_canvas_row_state_set(g->ctx, module_idx, row, bytes, static_cast<int>(size));
 }
 
 extern "C" int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g) {

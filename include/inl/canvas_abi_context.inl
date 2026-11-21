@@ -155,6 +155,7 @@ struct GP_CanvasContextImpl {
     // global rope-sim frame-skip count (0 => step every frame).
     // The count is the number of frames to skip between steps (step every count+1 frames).
     int sim_frame_skip_count = 0;
+    uint64_t sim_frame_tick = 0;  // this canvas's frame count (canvas_abi_nesting.inl)
     int sim_root_paused = 0; // toolbar-level pause for the root/global rope sim
     uint32_t debug_flags = GP_CANVAS_DEBUG_NORENDER_MODE; // debug render/sim overrides (see GP_CanvasDebugFlags)
     // tool selection state: separate groups (exclusive within group)

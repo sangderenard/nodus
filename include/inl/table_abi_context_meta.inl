@@ -11,6 +11,10 @@
 #include <memory>
 
 struct GP_TableContext {
+    // The canvas this table belongs to (gp_table_set_owner_canvas). Its edges, ids, scheduler mirror and sim tick come
+    // from that canvas, so a canvas nested in a table row is a compartment of its own. A table no canvas has claimed
+    // keeps the process's primary canvas, as before.
+    GP_CanvasContext* owner_canvas = nullptr;
     GP_TableStyle style_raw{};
     Style st{};
     std::vector<GP_TableRow> rows;
@@ -159,13 +163,32 @@ struct GP_TableContext {
 static int g_global_sim_frame_skip_count = 0; // number of frames to skip between steps (0 = every frame)
 static uint64_t g_global_sim_frame_tick = 0; // incremented once per canvas frame
 
+// The canvas a table answers to, and that canvas's scheduler.
+static inline GP_CanvasContext* table_canvas(const GP_TableContext* ctx) {
+    return (ctx && ctx->owner_canvas) ? ctx->owner_canvas : gp_canvas_get_singleton();
+}
+static inline ThreadManager* table_thread_manager(const GP_TableContext* ctx) {
+    return (ctx && ctx->owner_canvas) ? canvas_thread_manager(ctx->owner_canvas) : ThreadManager::global();
+}
+
+void gp_table_set_owner_canvas(GP_TableContext* ctx, GP_CanvasContext* canvas) {
+    if (ctx) ctx->owner_canvas = canvas;
+}
+GP_CanvasContext* gp_table_get_owner_canvas(const GP_TableContext* ctx) {
+    return ctx ? ctx->owner_canvas : nullptr;
+}
+
 static inline bool table_should_step_sim(GP_TableContext* ctx) {
     if (!ctx) return false;
     if (!ctx->sim_enabled) return false;
+    // An owned table follows its own canvas's frame count and skip setting; an unowned one the process-wide pair.
     int count = std::max(0, g_global_sim_frame_skip_count);
+    uint64_t tick = g_global_sim_frame_tick;
+    if (ctx->owner_canvas) canvas_sim_frame_state(ctx->owner_canvas, &count, &tick);
+    count = std::max(0, count);
     if (count <= 0) return true;
     // step once every (count+1) frames
-    return (g_global_sim_frame_tick % static_cast<uint64_t>(count + 1)) == 0ull;
+    return (tick % static_cast<uint64_t>(count + 1)) == 0ull;
 }
 
 int32_t gp_table_set_global_sim_frame_skip_count(int32_t count) {
@@ -325,7 +348,7 @@ static uint64_t gp_table_ensure_rope_id_for_index(GP_TableContext* ctx, int rope
     if (!ctx || rope_idx < 0) return 0ull;
     uint64_t rid = gp_table_lookup_rope_id_for_index(ctx, rope_idx);
     if (rid != 0ull) return rid;
-    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    GP_CanvasContext* cvs = table_canvas(ctx);
     rid = gp_canvas_generate_id(cvs, 0ull);
     if (rid != 0ull && rope_idx >= 0 && ctx) {
         ctx->rope_id_to_sim_idx[rid] = rope_idx;
@@ -410,7 +433,7 @@ static void gp_table_apply_pending_meta_vertices(GP_TableContext* ctx) {
         if (ctx->pending_meta_vertices.empty()) return;
         pending.swap(ctx->pending_meta_vertices);
     }
-    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    GP_CanvasContext* cvs = table_canvas(ctx);
     for (const auto &entry : pending) {
         if (!entry.mg || entry.rope_id == 0ull) continue;
         int resolved = -1;
@@ -616,7 +639,7 @@ extern "C" int32_t gp_table_create_ring(GP_TableContext* ctx, int32_t rope_idx, 
 // canvas mapping then table-local fallback, and call gp_table_create_ring.
 extern "C" int32_t gp_table_create_ring_by_id(GP_TableContext* ctx, uint64_t rope_id, float u) {
     if (!ctx || rope_id == 0ull) return -1;
-    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    GP_CanvasContext* cvs = table_canvas(ctx);
     int resolved = -1;
     if (cvs) resolved = gp_canvas_resolve_rope_id_to_index(cvs, ctx, rope_id);
     if (resolved < 0) {
@@ -1024,13 +1047,13 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
             if (existing_id != 0ull) {
                 rid = existing_id;
             } else {
-                rid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+                rid = gp_canvas_generate_id(table_canvas(ctx), 0ull);
             }
             ctx->rope_ids[ei] = rid;
             ctx->rope_id_to_sim_idx[rid] = idx;
             printf("gp_table_attach_rope_sim: ctx=%p backfilled rope idx=%d id=%llu\n", (void*)ctx, idx, (unsigned long long)rid);
             {
-                GP_CanvasContext* cvs2 = gp_canvas_get_singleton();
+                GP_CanvasContext* cvs2 = table_canvas(ctx);
                 if (cvs2) {
                     uint64_t tmp2 = rid;
                     gp_canvas_register_table_rope_ids_from_array(cvs2, ctx, &tmp2, 1);
@@ -1038,7 +1061,7 @@ int32_t gp_table_attach_rope_sim(GP_TableContext* ctx, RopeSim* sim, int32_t tak
             }
         }
     }
-    if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+    if (GP_CanvasContext* cvs = table_canvas(ctx)) {
         gp_canvas_mark_rope_map_dirty(cvs);
     }
     gp_table_apply_pending_meta_vertices(ctx);

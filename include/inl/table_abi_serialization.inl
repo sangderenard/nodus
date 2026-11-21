@@ -267,7 +267,7 @@ int32_t gp_table_serialize(GP_TableContext* ctx, char* out_buf, int32_t out_len)
         memcpy(p, &okb, 8); p += 8;
         // persist overlay per-port UUIDs so restore can re-establish exact port identities
         uint64_t pu_a = 0ull, pu_b = 0ull;
-        GP_CanvasContext* cvs = gp_canvas_get_singleton();
+        GP_CanvasContext* cvs = table_canvas(ctx);
         if (cvs && (oka || okb)) {
             gp_canvas_get_overlay_port_uuids(cvs, oka, okb, &pu_a, &pu_b);
         }
@@ -300,13 +300,13 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
         atlas.push_back(u);
     }
     SERIALIZE_DEBUGF("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
-    SERIALIZE_DEBUGF("gp_table_deserialize: canvas singleton=%p\n", (void*)gp_canvas_get_singleton());
+    SERIALIZE_DEBUGF("gp_table_deserialize: canvas singleton=%p\n", (void*)table_canvas(ctx));
     SERIALIZE_DEBUGF("gp_table_deserialize: read UUID atlas count=%d\n", atlas_count);
     // trace: report deserialize invocation
     SERIALIZE_DEBUGF("gp_table_deserialize: ctx=%p len=%d version=%u\n", (void*)ctx, in_len, (unsigned)version);
     // Canvas singleton (may be null). Declare early so deserialization can
     // register persisted rope/module UUIDs with the canvas if available.
-    GP_CanvasContext* cvs = gp_canvas_get_singleton();
+    GP_CanvasContext* cvs = table_canvas(ctx);
     const uint32_t expected_version = 4u;
     if (version != expected_version) {
         // No backward-compatibility: if save version mismatches current
@@ -465,7 +465,7 @@ int32_t gp_table_deserialize(GP_TableContext* ctx, const char* in_buf, int32_t i
     gp_table_clear_edges(ctx);
     auto add_edge_without_rope = [&](uint64_t a, uint64_t b) {
         ctx->edges.emplace_back(a, b);
-        uint64_t uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+        uint64_t uid = gp_canvas_generate_id(table_canvas(ctx), 0ull);
         ctx->edge_ids.push_back(uid);
         ctx->relax_value.push_back(0.0f);
         ctx->relax_vel.push_back(0.0f);

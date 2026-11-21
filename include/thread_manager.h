@@ -17,6 +17,11 @@
 #include "value_types.h"
 
 struct GP_TableContext;
+struct GP_CanvasContext;
+class ThreadManager;
+// A canvas's own scheduler, and its sim frame skip setting and frame count (canvas_abi_nesting.inl).
+ThreadManager* canvas_thread_manager(GP_CanvasContext* canvas);
+void canvas_sim_frame_state(GP_CanvasContext* canvas, int* out_skip_count, uint64_t* out_tick);
 class GraphRuntime;
 
 enum class ModuleRowKind : int8_t {
@@ -177,6 +182,10 @@ public:
         std::vector<EdgeContract> edges;
         std::vector<StageContract> stages;
         GP_TableContext* root_table = nullptr;
+        // The canvas this tick belongs to. A canvas nested in a table row has its own; everything on the tick path
+        // reads it from here, never from the process's primary canvas. A request with none (standalone tools that
+        // drive a manager without a canvas) falls back to the primary canvas, as before.
+        GP_CanvasContext* canvas = nullptr;
     };
 
     ThreadManager();

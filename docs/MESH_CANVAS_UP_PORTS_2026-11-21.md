@@ -77,3 +77,34 @@ Ticket `e12fd0f545c44f868591bbe7ef505cc1` (follows `e2f19532`, regional state br
 - **Save/load**: CANVAS V4 text; the loader skips unknown tags; a new core record goes beside `ROOT_MODULE`, restored
   after the edge rebuild, and must enter `gp_canvas_compute_signature`. Headless trailers (`PORT`, `EDGE_FIFO`, ...)
   are parsed strictly, so a new tag must not reuse their names. A child canvas needs its own `module_library_root`.
+
+## Stage 3: the canvas row (2026-11-21)
+
+Owner, 2026-11-21: "we need the canvas in a table and going up from the canvas into a table"; "compartmentalize the
+canvas in a table, don't use mandated global namespace just nest it"; "eliminate the use of python for nodus unless it's
+for an add on development work we haven't implemented yet".
+
+- **A canvas is a compartment.** Every tick request names its canvas (`ThreadManager::TickRequest::canvas`); the
+  scheduler's contact keys, module input state, stack snapshots, frame pointers and ROOT lookup read it from there.
+  Every table records the canvas that owns it (`GP_TableContext::owner_canvas`, stamped as a canvas creates or is given
+  a table); its edge ids, scheduler mirror and sim frame count come from that canvas. Each canvas keeps its own sim
+  frame count; only the primary also advances the process-wide pair for tables no canvas owns. Only the primary canvas
+  loads or autosaves the workspace file. `nodus_headless_create` no longer refuses a second graph.
+- **Rows keep their settings.** `ITool::serialize` / `deserialize` existed but no canvas called them. A canvas file now
+  carries `ROW_STATE <module> <row> <hex>` for every row whose serialize answers, handed back on load once the canvas
+  exists; `nodus_headless_get_row_state` / `set_row_state` read and set the same bytes.
+- **canvas_row** (`module_library/source/tools/canvas_row.cpp`, built as its own plugin like every row): its state is a
+  whole canvas, so the table holds the canvas. The canvas's IN ports are the row's Argument ports and its OUT ports the
+  row's Return ports, in declaration order. Each execution moves waiting tokens in, steps the canvas once on its own
+  scheduler, and moves arrivals out while the edge takes them; a refused token is held by the row, never dropped.
+- **Going up.** A canvas's up ports reach the layer above as the ports of the row that holds it: the layer above is a
+  table, and the link's ends belong on that table's edges, not in a host.
+- **Proof.** `tests/canvas_row_test.cpp` (native, Oracle A1, 2026-11-21): two canvases in one process; 12 of 12 values
+  through the nested canvas in order; the parent saved with its ROW_STATE and loaded into a third graph carries 12 of 12
+  again.
+- **Python removed from this lane.** The link ends that lived in `tools/run_canvas.py`, the canvas-port wrappers in
+  `nodus_graph/native.py` and their Python tests are gone; the link's ends move into tables (next).
+- **Still process-wide, by design or not yet:** the tool registry (a catalogue), `ThreadManager::global()` for tables
+  no canvas owns, the meta-channel readers (`nodus_headless_meta_channel_*` read the primary canvas), and a nested
+  canvas's module library root (unset: serialized tables fall back to the cwd default). The canvas signature does not
+  include ROW_STATE yet.

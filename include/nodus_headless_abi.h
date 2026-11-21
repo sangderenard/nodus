@@ -395,6 +395,13 @@ NODUS_HEADLESS_API int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph
                                                                int32_t up);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_count(NodusHeadlessGraph* g);
+// A row's saved state (ITool::serialize / deserialize; the canvas file's ROW_STATE record), at a quiescent boundary. A
+// canvas row's (module_library/source/tools/canvas_row.cpp) is the canvas it holds. get reports the size in *out_size
+// and returns 0 when `capacity` is too small.
+NODUS_HEADLESS_API int32_t nodus_headless_get_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row,
+                                                        uint8_t* out, size_t capacity, size_t* out_size);
+NODUS_HEADLESS_API int32_t nodus_headless_set_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row,
+                                                        const uint8_t* bytes, size_t size);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_at(NodusHeadlessGraph* g, int32_t ordinal, char* out_name,
                                                           int32_t out_name_capacity, int32_t* out_direction,
                                                           int32_t* out_contact, int32_t* out_up);

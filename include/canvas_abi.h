@@ -388,6 +388,10 @@ int gp_canvas_port_at(GP_CanvasContext* ctx, int ordinal, char* out_name, int ou
                       int* out_contact, int* out_up);
 // This canvas's ROOT module index (the context-taking form of gp_canvas_get_root_module_idx), or -1.
 int gp_canvas_root_module_of(GP_CanvasContext* ctx);
+// A row's saved state (ITool::serialize / deserialize), the bytes a ROW_STATE record carries; set it at a quiescent
+// boundary. get reports the size in *out_size and returns 0 when `capacity` is too small. 1 on success.
+int gp_canvas_row_state_get(GP_CanvasContext* ctx, int module_idx, int row, uint8_t* out, int capacity, int* out_size);
+int gp_canvas_row_state_set(GP_CanvasContext* ctx, int module_idx, int row, const uint8_t* bytes, int size);
 // OUT port: take the next sample of the edge that ends at it. 1 and *out_written > 0 when one was taken.
 int gp_canvas_port_consume(GP_CanvasContext* ctx, const char* name, void* out_bytes, int capacity, int* out_written);
 // IN port: write one sample onto the edge that starts at it. 1 when accepted; 0 when full or unconnected.

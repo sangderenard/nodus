@@ -191,6 +191,7 @@ typedef struct GP_TableRenderState {
 // Opaque stateful table context. Holds style/columns/rows so callers can update incrementally
 // and render repeatedly without repassing everything.
 typedef struct GP_TableContext GP_TableContext;
+typedef struct GP_CanvasContext GP_CanvasContext;
 typedef struct GP_MetaGroup GP_MetaGroup;
 
 // Ring topology selection for meta-groups
@@ -452,6 +453,10 @@ int32_t gp_table_set_global_sim_frame_skip_count(int32_t count);
 int32_t gp_table_get_global_sim_frame_skip_count(int32_t* out_count);
 // Advance the global sim frame tick (called once per canvas frame).
 void gp_table_advance_global_sim_tick();
+// The canvas a table belongs to. A canvas stamps every table it creates or is given; a table it owns takes its edge
+// ids, scheduler mirror and sim frame count from that canvas, so canvases nested in table rows stay separate.
+void gp_table_set_owner_canvas(GP_TableContext* ctx, GP_CanvasContext* canvas);
+GP_CanvasContext* gp_table_get_owner_canvas(const GP_TableContext* ctx);
 // Query whether the table's rope sim should step this frame (honors per-table
 // `sim_enabled` and the global sim frame-skip count). Returns 1 if should step, 0 otherwise.
 int32_t gp_table_should_step_sim(GP_TableContext* ctx);

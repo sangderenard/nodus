@@ -18,7 +18,7 @@ extern "C" int gp_canvas_create_table(GP_CanvasContext* ctx_, int module_idx) {
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return 0;
     if (c->module_tables[module_idx]) return 0; // already has a table
-    GP_TableContext* t = gp_table_create(nullptr);
+    GP_TableContext* t = canvas_own_table(c, gp_table_create(nullptr));
     if (!t) return 0;
     c->module_tables[module_idx] = t;
     c->module_table_owned[module_idx] = 1;
@@ -202,8 +202,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
         GP_TableContext* root_tbl = canvas_ensure_root_table(c);
         // publish global skip count and advance global tick so tables make a
         // consistent decision within this frame
-        gp_table_set_global_sim_frame_skip_count(c->sim_frame_skip_count);
-        gp_table_advance_global_sim_tick();
+        canvas_advance_sim_frame(c);
         // Only step the root rope sim if the table-level sim is enabled and
         // the global sim-skip cadence allows stepping this frame.
         uint32_t dbg = c->debug_flags;
@@ -286,6 +285,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
         }
         if (should_submit) {
             ThreadManager::TickRequest req;
+            req.canvas = reinterpret_cast<GP_CanvasContext*>(c);
             req.dt = static_cast<double>(dt);
             req.root_table = canvas_ensure_root_table(c);
             req.modules.reserve(c->modules.size());
@@ -325,9 +325,8 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
             }
             // Update global sim frame-skip count so table stepping decisions
             // use the current canvas-level setting.
-            gp_table_set_global_sim_frame_skip_count(c->sim_frame_skip_count);
-            // Advance the global sim tick once per canvas frame.
-            gp_table_advance_global_sim_tick();
+            // Advance this canvas's sim frame once per canvas frame.
+            canvas_advance_sim_frame(c);
             req.edges.reserve(c->edges.size());
             GP_TableContext* root_tbl = req.root_table;
             for (size_t ei = 0; ei < c->edges.size(); ++ei) {
@@ -828,7 +827,7 @@ extern "C" int gp_canvas_attach_table(GP_CanvasContext* ctx_, int module_idx, GP
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (module_idx >= static_cast<int>(c->modules.size())) return 0;
     // set table pointer and ownership
-    c->module_tables[module_idx] = table;
+    c->module_tables[module_idx] = canvas_own_table(c, table);
     c->module_table_owned[module_idx] = take_ownership ? 1 : 0;
     // ensure module has a backing node in graph
     if (module_idx >= static_cast<int>(c->module_node_id.size())) c->module_node_id.resize(module_idx + 1, -1);

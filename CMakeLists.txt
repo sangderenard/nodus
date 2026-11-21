@@ -674,6 +674,18 @@ target_include_directories(frame_artifact_file_tool_test PRIVATE
 target_link_libraries(frame_artifact_file_tool_test PRIVATE canvas_tables_static nodus_tensor_core)
 target_compile_features(frame_artifact_file_tool_test PUBLIC cxx_std_20)
 
+# A canvas nested in a table row (module_library/source/tools/canvas_row.cpp): two canvases in one process, each on its
+# own scheduler, values carried through, and the row's canvas saved and restored with the canvas that holds it. Run it
+# with the canvas_row plugin's path.
+add_executable(canvas_row_test tests/canvas_row_test.cpp)
+target_include_directories(canvas_row_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(canvas_row_test PRIVATE nodus_headless)
+target_compile_features(canvas_row_test PUBLIC cxx_std_20)
+if(TARGET canvas_row)
+  add_dependencies(canvas_row_test canvas_row)
+endif()
+
 add_executable(frame_compression_pipeline_test tests/frame_compression_pipeline_test.cpp)
 target_include_directories(frame_compression_pipeline_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)

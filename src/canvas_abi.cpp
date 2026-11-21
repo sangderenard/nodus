@@ -44,6 +44,7 @@
 // Segmented implementation pieces (see .inl files for details).
 #include "inl/canvas_abi_primitives.inl"
 #include "inl/canvas_abi_context.inl"
+#include "inl/canvas_abi_nesting.inl"
 #include "inl/canvas_abi_rope_map.inl"
 #include "inl/canvas_abi_create.inl"
 #include "inl/canvas_abi_table_step.inl"

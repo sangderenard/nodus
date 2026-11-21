@@ -547,7 +547,7 @@ int32_t gp_table_render_rgba_with_state(
         uint32_t c_idx = static_cast<uint32_t>((key >> 16) & 0xFFFFu);
         uint32_t led = static_cast<uint32_t>(key & 0xFFFFu);
         // First: allow canonical root keys mapped to overlays to resolve to overlay coords
-        GP_CanvasContext* canvas = gp_canvas_get_singleton();
+        GP_CanvasContext* canvas = table_canvas(ctx);
         if (canvas) {
             int ox = -1, oy = -1;
             if (gp_canvas_resolve_canonical_key(canvas, key, &ox, &oy)) {
@@ -814,7 +814,7 @@ int32_t gp_table_render_rgba_with_state(
                 int new_idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
                 if (uid == 0ull) {
                         // assign persistent id for this rope if not already present
-                        uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+                        uid = gp_canvas_generate_id(table_canvas(ctx), 0ull);
                         if (ei < ctx->rope_ids.size()) ctx->rope_ids[ei] = uid;
                         else ctx->rope_ids.push_back(uid);
                     }
