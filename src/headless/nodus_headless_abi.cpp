@@ -1389,6 +1389,10 @@ extern "C" int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, con
     return ok;
 }
 
+extern "C" int32_t nodus_headless_canvas_port_carries_tensors(NodusHeadlessGraph* g, const char* name) {
+    return (g && g->ctx) ? gp_canvas_port_carries_tensors(g->ctx, name) : -1;
+}
+
 extern "C" int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
                                                       size_t len) {
     if (!g || !g->ctx) return 0;

@@ -23,7 +23,7 @@ namespace {
 // reader kids (32 bytes each), writer kid length (u32, 0 or 32) and kid, last generation taken (u64), snapshot byte
 // count (u64), the snapshot (CanvasRow::snapshot). Read only: version 2 (role, interval, snapshot) and version 1 (a
 // bare canvas file, a host).
-constexpr uint32_t kCanvasRowMagic = 0x3152434E, kCanvasRowVersion = 3;
+constexpr uint32_t kCanvasRowMagic = 0x3152434E, kCanvasRowVersion = 4;   // v4: v3, then the held tokens
 constexpr size_t kKidBytes = 32;
 constexpr uint32_t kMaxReaders = 4096;
 constexpr uint32_t kSnapshotMagic = 0x3153434E, kSnapshotVersion = 2;
@@ -81,6 +81,10 @@ CanvasRow::~CanvasRow() { release(); }
 void CanvasRow::release() {
     if (canvas_) nodus_headless_destroy(canvas_);
     canvas_ = nullptr;
+    for (const Port& p : ports_) {          // a held tensor is the row's: freed with it
+        uint64_t h = 0;
+        if (p.tensor && p.held.size() == sizeof(h)) { std::memcpy(&h, p.held.data(), sizeof(h)); if (h) nodus_tensor_destroy(h); }
+    }
     ports_.clear();
     if (held_state_) nodus_tensor_destroy(held_state_);
     held_state_ = 0;
@@ -210,6 +214,7 @@ bool CanvasRow::adopt(const std::vector<uint8_t>& snap) {
             Port p;
             p.name = name;
             p.into_canvas = direction == 1;     // GP_CANVAS_PORT_IN
+            p.tensor = nodus_headless_canvas_port_carries_tensors(graph, name) == 1;
             ports.push_back(std::move(p));
         }
         if (ports.size() > 63) { nodus_headless_destroy(graph); return false; }   // GP_CANVAS_ROW_PORT_STRIDE, less "state"
@@ -233,7 +238,11 @@ bool CanvasRow::serialize(OutputArchive& out) const {
     return out.write(head, sizeof(head)) && out.write(mesh, sizeof(mesh)) && out.write(readers_.data(), readers_.size()) &&
            out.write(&writer_size, sizeof(writer_size)) && out.write(writer_.data(), writer_.size()) &&
            out.write(&last_generation_, sizeof(last_generation_)) && out.write(&size, sizeof(size)) &&
-           out.write(snap.data(), snap.size());
+           out.write(snap.data(), snap.size()) && [&] {
+               std::vector<uint8_t> held;
+               write_held(held);
+               return out.write(held.data(), held.size());
+           }();
 }
 
 bool CanvasRow::deserialize(InputArchive& in) {
@@ -272,6 +281,42 @@ bool CanvasRow::deserialize(InputArchive& in) {
     }
     std::vector<uint8_t> bytes(static_cast<size_t>(size));
     if (!in.read(bytes.data(), bytes.size())) return false;
+    std::vector<uint8_t> held;              // v4: the tokens in custody, read whole and parsed after the adopt
+    if (head[1] >= 4) {
+        uint32_t ports = 0;
+        if (!in.read(&ports, sizeof(ports)) || ports > 64) return false;
+        put(held, ports);
+        for (uint32_t i = 0; i < ports; ++i) {
+            uint8_t kind = 0;
+            if (!in.read(&kind, 1) || kind > 2) return false;
+            held.push_back(kind);
+            if (kind == 1) {
+                uint32_t n = 0;
+                if (!in.read(&n, sizeof(n)) || n > 4096) return false;
+                put(held, n);
+                const size_t at = held.size();
+                held.resize(at + n);
+                if (!in.read(held.data() + at, n)) return false;
+            } else if (kind == 2) {
+                int32_t dtype = 0;
+                uint32_t rank = 0;
+                if (!in.read(&dtype, sizeof(dtype)) || !in.read(&rank, sizeof(rank)) || rank > 8) return false;
+                put(held, dtype);
+                put(held, rank);
+                for (uint32_t r = 0; r < rank; ++r) {
+                    uint64_t d = 0;
+                    if (!in.read(&d, sizeof(d))) return false;
+                    put(held, d);
+                }
+                uint64_t n = 0;
+                if (!in.read(&n, sizeof(n)) || n > kCanvasRowMaxBytes) return false;
+                put(held, n);
+                const size_t at = held.size();
+                held.resize(at + static_cast<size_t>(n));
+                if (!in.read(held.data() + at, static_cast<size_t>(n))) return false;
+            }
+        }
+    }
     if (head[1] == 1) {                     // a bare canvas file: a host snapshot with no records
         std::vector<uint8_t> snap;
         put(snap, kSnapshotMagic);
@@ -292,11 +337,73 @@ bool CanvasRow::deserialize(InputArchive& in) {
         writer_ = std::move(writer);
         last_generation_ = last_generation;
         readable_ = role_ == CanvasRowRole::Replica;
+        if (!held.empty() && !restore_held(held)) return false;
         return true;
     }
     role_ = previous_role;
     publish_every_ = previous_every;
     return false;
+}
+
+void CanvasRow::write_held(std::vector<uint8_t>& out) const {
+    put(out, static_cast<uint32_t>(ports_.size()));
+    for (const Port& p : ports_) {
+        uint64_t h = 0;
+        NodusTensorDesc d{};
+        if (p.held.empty()) { out.push_back(0); continue; }
+        if (p.tensor && p.held.size() == sizeof(h) && (std::memcpy(&h, p.held.data(), sizeof(h)), h) &&
+            nodus_tensor_describe(h, &d) == NODUS_OK) {
+            out.push_back(2);
+            put(out, static_cast<int32_t>(d.dtype));
+            put(out, static_cast<uint32_t>(d.rank));
+            for (uint32_t r = 0; r < d.rank; ++r) put(out, static_cast<uint64_t>(d.shape[r]));
+            put(out, static_cast<uint64_t>(d.total_bytes));
+            const size_t at = out.size();
+            out.resize(at + static_cast<size_t>(d.total_bytes));
+            if (d.total_bytes && nodus_tensor_read(h, 0, out.data() + at, static_cast<size_t>(d.total_bytes)) !=
+                                     static_cast<int64_t>(d.total_bytes))
+                std::memset(out.data() + at, 0, static_cast<size_t>(d.total_bytes));
+            continue;
+        }
+        out.push_back(1);
+        put(out, static_cast<uint32_t>(p.held.size()));
+        out.insert(out.end(), p.held.begin(), p.held.end());
+    }
+}
+
+bool CanvasRow::restore_held(const std::vector<uint8_t>& held) {
+    Reader r{held};
+    uint32_t ports = 0;
+    if (!r.get(ports)) return false;
+    for (uint32_t i = 0; i < ports; ++i) {
+        uint8_t kind = 0;
+        if (!r.get(kind)) return false;
+        Port* p = i < ports_.size() ? &ports_[i] : nullptr;   // a port the canvas no longer has: its token is dropped
+        if (kind == 1) {
+            uint32_t n = 0;
+            const uint8_t* b = nullptr;
+            if (!r.get(n) || !r.take(n, b)) return false;
+            if (p) p->held.assign(b, b + n);
+        } else if (kind == 2) {
+            int32_t dtype = 0;
+            uint32_t rank = 0;
+            if (!r.get(dtype) || !r.get(rank) || rank > 8) return false;
+            uint64_t shape[8] = {};
+            for (uint32_t k = 0; k < rank; ++k) if (!r.get(shape[k])) return false;
+            uint64_t n = 0;
+            const uint8_t* b = nullptr;
+            if (!r.get(n) || !r.take(static_cast<size_t>(n), b)) return false;
+            if (!p) continue;
+            const uint64_t t = nodus_tensor_create(dtype, rank, shape);
+            if (!t || (n && nodus_tensor_write(t, 0, b, static_cast<size_t>(n)) != static_cast<int64_t>(n))) {
+                if (t) nodus_tensor_destroy(t);
+                return false;
+            }
+            p->held.resize(sizeof(t));
+            std::memcpy(p->held.data(), &t, sizeof(t));
+        }
+    }
+    return true;
 }
 
 int32_t CanvasRow::row_port_count() const {

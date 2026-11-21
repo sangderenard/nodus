@@ -10,13 +10,14 @@
 // (the same canvas ports), and its meta group holds the writer's records: the same group, the same member ropes, the
 // traffic the writer saw. Saved, the reader's canvas carries the replica (ROW_STATE) and it loads again.
 //
-//   mesh_replica_test <canvas_row plugin> <tensor_mint plugin> <tensor_returns plugin> <work dir>
+//   mesh_replica_test <work dir>   (its rows are built from module_library/source/tools in the headless runtime)
 #include "canvas_abi.h"
 #include "nodus_headless_abi.h"
 #include "nodus_link.h"
-#include "plugin_manager.h"
+#include "headless_rows.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -108,7 +109,8 @@ bool snapshot_of_row(NodusHeadlessGraph* g, int32_t module, int32_t row, Snapsho
     if (size < 24) return false;
     std::vector<uint8_t> st(size);
     if (!nodus_headless_get_row_state(g, module, row, st.data(), st.size(), &size)) return false;
-    // NCR1 v3: head 16 | mesh 4 | reader count 4 | readers | writer size 4 | writer | last generation 8 | size 8 | snapshot
+    // NCR1 v4: head 16 | mesh 4 | reader count 4 | readers | writer size 4 | writer | last generation 8 | size 8 | snapshot |
+    // held tokens
     size_t at = 16 + 4;
     uint32_t readers = 0, writer = 0;
     if (st.size() < at + 4) return false;
@@ -116,9 +118,14 @@ bool snapshot_of_row(NodusHeadlessGraph* g, int32_t module, int32_t row, Snapsho
     at += 4 + static_cast<size_t>(readers) * 32;
     if (st.size() < at + 4) return false;
     std::memcpy(&writer, st.data() + at, 4);
-    at += 4 + writer + 8 + 8;
-    if (st.size() < at) return false;
-    return parse_snapshot(std::vector<uint8_t>(st.begin() + static_cast<std::ptrdiff_t>(at), st.end()), out);
+    at += 4 + writer + 8;
+    uint64_t snap = 0;
+    if (st.size() < at + 8) return false;
+    std::memcpy(&snap, st.data() + at, 8);
+    at += 8;
+    if (st.size() < at + snap) return false;                   // v4: the held tokens follow the snapshot
+    return parse_snapshot(std::vector<uint8_t>(st.begin() + static_cast<std::ptrdiff_t>(at),
+                                               st.begin() + static_cast<std::ptrdiff_t>(at + snap)), out);
 }
 
 struct Canvas {
@@ -189,11 +196,13 @@ std::vector<uint8_t> writer_canvas(const fs::path& dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 5) { std::fprintf(stderr, "usage: mesh_replica_test <canvas_row> <tensor_mint> <tensor_returns> <work dir>\n"); return 2; }
-    char row_id[256] = {}, mint_id[256] = {}, returns_id[256] = {};
-    if (!gp_plugin_load_from_path(argv[1], row_id, sizeof(row_id)) || !gp_plugin_load_from_path(argv[2], mint_id, sizeof(mint_id)) ||
-        !gp_plugin_load_from_path(argv[3], returns_id, sizeof(returns_id))) { std::fprintf(stderr, "cannot load the rows\n"); return 2; }
-    const fs::path dir = fs::path(argv[4]) / ("mesh_replica_test_" + std::to_string(std::time(nullptr)));
+    if (argc < 2) { std::fprintf(stderr, "usage: mesh_replica_test <work dir>\n"); return 2; }
+    const fs::path lib = fs::path(argv[1]) / ("mesh_replica_test_rows_" + std::to_string(std::time(nullptr)));
+    const std::string row_s = headless_rows::build_named("canvas_row", lib), mint_s = headless_rows::build_named("tensor_mint", lib),
+                      returns_s = headless_rows::build_named("tensor_returns", lib);
+    if (row_s.empty() || mint_s.empty() || returns_s.empty()) return 2;
+    const char *row_id = row_s.c_str(), *mint_id = mint_s.c_str(), *returns_id = returns_s.c_str();
+    const fs::path dir = fs::path(argv[1]) / ("mesh_replica_test_" + std::to_string(std::time(nullptr)));
     fs::create_directories(dir);
     const std::vector<uint8_t> child = writer_canvas(dir);
 
@@ -299,8 +308,11 @@ int main(int argc, char** argv) {
                     (unsigned long long)rg.id, rn, wn, (unsigned long long)r_writes, (unsigned long long)w_writes,
                     (unsigned long long)(rn ? rg.words[kRopeWord] : 0));
     }
-    CHECK(r.canvas.find("CANVAS_PORT ") != std::string::npos && r.canvas.find(" in\n") != std::string::npos &&
-          r.canvas.find(" out\n") != std::string::npos);
+    // The canvas ports' records, whatever line ends the platform wrote (CRLF on Windows: review f1a3eb8f).
+    std::string lines = r.canvas;
+    lines.erase(std::remove(lines.begin(), lines.end(), '\r'), lines.end());
+    CHECK(lines.find("CANVAS_PORT ") != std::string::npos && lines.find(" in\n") != std::string::npos &&
+          lines.find(" out\n") != std::string::npos);
 
     // Saved, the reader's canvas carries its replica; loaded into another graph, the replica is there with its records.
     const auto saved = dir / "reader.nodus.txt";

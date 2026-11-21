@@ -298,6 +298,20 @@ int gp_plugin_build_module_and_load(const char* module_src,
                     break;
                 }
             }
+            // Rows that call the headless ABI (a canvas row holds a nested graph; rows that publish onto declared
+            // ports) link the headless image this process runs, as the build-time row loop in CMakeLists.txt does.
+            // On Windows an unresolved import is a link error; on Linux it resolved at load only by accident.
+            const std::vector<std::string> headless_libs = {
+                (release_dir / "nodus_headless.lib").generic_string(),
+                (release_dir / "libnodus_headless.so").generic_string(),
+                (release_dir / "libnodus_headless.dylib").generic_string()
+            };
+            for (const auto& lib_path : headless_libs) {
+                if (std::filesystem::exists(lib_path)) {
+                    cm << "target_link_libraries(" << module_name << " PRIVATE \"" << lib_path << "\")\n";
+                    break;
+                }
+            }
         }
         cm << "set_target_properties(" << module_name << " PROPERTIES CXX_STANDARD 17)\n";
 

@@ -680,8 +680,9 @@ target_compile_features(frame_artifact_file_tool_test PUBLIC cxx_std_20)
 add_executable(canvas_row_test tests/canvas_row_test.cpp)
 target_include_directories(canvas_row_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(canvas_row_test PRIVATE nodus_headless)
+target_link_libraries(canvas_row_test PRIVATE nodus_headless nodus_tensor_core)  # the custody case compiles the row in
 target_compile_features(canvas_row_test PUBLIC cxx_std_20)
+target_compile_definitions(canvas_row_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")  # its rows are built from module_library sources
 if(TARGET canvas_row)
   add_dependencies(canvas_row_test canvas_row)
 endif()
@@ -707,6 +708,7 @@ target_include_directories(mesh_replica_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(mesh_replica_test PRIVATE nodus_headless nodus_tensor_core ${NODUS_LINK_LIBS})  # counts live tensors
 target_compile_features(mesh_replica_test PUBLIC cxx_std_20)
+target_compile_definitions(mesh_replica_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")  # its rows are built from module_library sources
 foreach(row canvas_row tensor_mint tensor_returns)
   if(TARGET ${row})
     add_dependencies(mesh_replica_test ${row})
@@ -720,6 +722,7 @@ target_include_directories(file_link_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(file_link_test PRIVATE nodus_headless nodus_tensor_core ${NODUS_LINK_LIBS})  # counts live tensors
 target_compile_features(file_link_test PUBLIC cxx_std_20)
+target_compile_definitions(file_link_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")  # its rows are built from module_library sources
 foreach(row file_read file_write tensor_mint tensor_returns)
   if(TARGET ${row})
     add_dependencies(file_link_test ${row})

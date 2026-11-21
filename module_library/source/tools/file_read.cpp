@@ -25,9 +25,14 @@ namespace nodus::file_rows {
 
 namespace fs = std::filesystem;
 
-// UTF-8 text of a path and back (C++20 paths speak char8_t).
+// UTF-8 text of a path and back. C++20 paths speak char8_t; the runtime plugin builder compiles rows as C++17.
+#if defined(__cpp_char8_t)
 inline std::string utf8_of(const fs::path& p) { const auto u = p.u8string(); return std::string(u.begin(), u.end()); }
 inline fs::path path_of_utf8(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
+#else
+inline std::string utf8_of(const fs::path& p) { return p.u8string(); }
+inline fs::path path_of_utf8(const std::string& s) { return fs::u8path(s); }
+#endif
 
 class FileRead final : public ITool {
 public:

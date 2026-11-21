@@ -396,6 +396,8 @@ int gp_canvas_row_state_set(GP_CanvasContext* ctx, int module_idx, int row, cons
 int gp_canvas_port_consume(GP_CanvasContext* ctx, const char* name, void* out_bytes, int capacity, int* out_written);
 // IN port: write one sample onto the edge that starts at it. 1 when accepted; 0 when full or unconnected.
 int gp_canvas_port_publish(GP_CanvasContext* ctx, const char* name, const void* bytes, int len);
+// 1 when the port's edge carries AbstractTensor handles, 0 raw tokens, -1 no such port or edge.
+int gp_canvas_port_carries_tensors(GP_CanvasContext* ctx, const char* name);
 int gp_canvas_resolve_port_pair(GP_CanvasContext* ctx, const char* pair, GP_CanvasEdgeDesc* out_desc, char* error, int error_capacity);
 int gp_canvas_apply_port_pair(GP_CanvasContext* ctx, const char* pair, char* error, int error_capacity);
 

@@ -29,8 +29,10 @@
 // replica with no writer named takes plain snapshots, unsigned (the unsecured mesh of mesh_replica_test).
 //
 // The row's saved state (serialize/deserialize, the canvas file's ROW_STATE record) is its role, its publish interval,
-// its mesh settings (readers, or the writer and the last generation taken) and the snapshot it holds, so a table's
-// canvas rows are saved inside the canvas that holds the table.
+// its mesh settings (readers, or the writer and the last generation taken), the snapshot it holds and every token in
+// its custody (review f1a3eb8f: a token taken from one side and not yet handed to the other survives a save and reload,
+// exactly once), so a table's canvas rows are saved inside the canvas that holds the table. Tokens still in an edge's
+// FIFO are the edge's, and a canvas save does not keep FIFO contents.
 // The source is module_library/source/tools/canvas_row.cpp.
 #pragma once
 
@@ -72,8 +74,14 @@ private:
     struct Port {
         std::string name;
         bool into_canvas = false;           // canvas IN port: the row's Argument port
-        std::vector<uint8_t> held;          // a token the canvas refused, offered again next execution
+        bool tensor = false;                // its edge carries AbstractTensor handles (the token is a handle)
+        std::vector<uint8_t> held;          // a token in the row's custody: taken from one side, not yet given to the
+                                            // other (offered again next execution); saved with the row
     };
+    // The held tokens, saved: per port a kind (0 none, 1 raw bytes, 2 tensor) and the token -- a tensor as its dtype,
+    // shape and bytes, since a handle means nothing in another process. Restored after the canvas is adopted.
+    void write_held(std::vector<uint8_t>& out) const;
+    bool restore_held(const std::vector<uint8_t>& held);
     // Snapshot: magic "NCS1", version 2, canvas byte count (u64), the canvas file's bytes; the files a save writes beside
     // it in <file>.modules/ (count u32; each: relative name length u32, name, byte count u64, bytes); meta group count
     // (u32), then per group its id (u64), its record count (u32) and those records (GP_META_RECORD_WORDS u64 each),

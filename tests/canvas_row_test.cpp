@@ -11,11 +11,19 @@
 //   canvas_row_test <path to the canvas_row plugin library>
 #include "canvas_abi.h"
 #include "nodus_headless_abi.h"
-#include "plugin_manager.h"
+#include "headless_rows.h"
+// The canvas row itself, compiled in for the custody case (its exports renamed, as the image composes a plugin source).
+#define NODUS_PLUGIN_COMPOSITE 1
+#define NODUS_PLUGIN_FACTORY_NAME canvas_row_test_create
+#define NODUS_PLUGIN_DESTROY_NAME canvas_row_test_destroy
+#define NODUS_PLUGIN_SOURCE_NAME canvas_row_test_source
+#include "../module_library/source/tools/canvas_row.cpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -52,10 +60,11 @@ int32_t pass_table(NodusHeadlessGraph* g, const char* label) {
     return m;
 }
 
-bool edge(NodusHeadlessGraph* g, int32_t a, int32_t ac, int32_t b, int32_t bc) {
+bool edge(NodusHeadlessGraph* g, int32_t a, int32_t ac, int32_t b, int32_t bc, int32_t slots = 8) {
     GP_CanvasEdgeDesc d{a, ac, b, bc};
     const int32_t e = nodus_headless_add_edge(g, &d, 0);
-    const NodusHeadlessFifoConfig fifo = float_fifo();
+    NodusHeadlessFifoConfig fifo = float_fifo();
+    fifo.slots = slots;
     return e >= 0 && nodus_headless_configure_edge_fifo(g, e, &fifo);
 }
 
@@ -67,7 +76,7 @@ std::vector<uint8_t> read_file(const std::filesystem::path& p) {
 // The child: canvas port "in" -> pass table -> canvas port "out". Saved, its bytes are a canvas row's state. The pass
 // table's exec mode is the child's own choice: -1 steps on the tick the canvas row gives it, 3 (Free) free-runs on its
 // own worker; the choice is saved with the child (MODULE_POLICY).
-std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir, int32_t exec_mode) {
+std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir, int32_t exec_mode, int32_t slots = 8) {
     NodusHeadlessGraph* child = nodus_headless_create();
     CHECK(child != nullptr);
     if (!child) return {};
@@ -76,10 +85,10 @@ std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir, int32_
     const int32_t root = nodus_headless_canvas_root_module(child);
     const int32_t pass = pass_table(child, "pass");
     CHECK(in >= 0 && out >= 0 && root >= 0 && pass >= 0);
-    CHECK(edge(child, root, in, pass, 0));
-    CHECK(edge(child, pass, 1, root, out));
+    CHECK(edge(child, root, in, pass, 0, slots));
+    CHECK(edge(child, pass, 1, root, out, slots));
     CHECK(nodus_headless_set_module_exec_mode(child, pass, exec_mode));
-    const auto path = dir / ("child_" + std::to_string(exec_mode + 1) + ".nodus.txt");
+    const auto path = dir / ("child_" + std::to_string(exec_mode + 1) + "_" + std::to_string(slots) + ".nodus.txt");
     CHECK(nodus_headless_save_file(child, path.string().c_str()));
     nodus_headless_destroy(child);
     std::vector<uint8_t> canvas = read_file(path);
@@ -181,19 +190,123 @@ void run_case(const char* tool_id, const std::filesystem::path& dir, int32_t exe
 
 }
 
+// Exactly once across a save (review f1a3eb8f). A canvas row takes a token from one side only when the other side has
+// room, so a token is in its custody only when the far side then refuses: the canvas's IN edge filling, or a publish
+// failing after the edge said it had room. Those moments are driven here directly, with the row's ports played by
+// the test (as link_rows_test plays a link row's): the feed always offers the next value, and the output edge says it
+// has room but refuses every publish. The row then holds a token on each side. It is saved, restored into a new row,
+// and drained with the output accepting: each held value comes out exactly once, and nothing comes out twice. Values
+// that were in the nested canvas's own FIFOs at the save are that canvas's, and a canvas save keeps no FIFO contents.
+struct PlayedPorts {
+    std::deque<float> feed;                 // what the Argument port "in" offers, in order
+    std::vector<float> published;           // what the Return port "out" accepted
+    bool refuse = true;                     // the output says it has room, then refuses
+    static int32_t consume(void* h, int32_t port, void* out, size_t cap, size_t* written) {
+        auto* p = static_cast<PlayedPorts*>(h);
+        if (written) *written = 0;
+        if (port != 0 || p->feed.empty() || cap < sizeof(float)) return 0;
+        std::memcpy(out, &p->feed.front(), sizeof(float));
+        p->feed.pop_front();
+        if (written) *written = sizeof(float);
+        return 1;
+    }
+    static int32_t publish(void* h, int32_t port, const void* bytes, size_t len) {
+        auto* p = static_cast<PlayedPorts*>(h);
+        if (port != 1 || len != sizeof(float) || p->refuse) return 0;
+        float v = 0.0f;
+        std::memcpy(&v, bytes, sizeof(v));
+        p->published.push_back(v);
+        return 1;
+    }
+    static int32_t can_publish(void*, int32_t port, int32_t) { return port == 1 ? 1 : 0; }
+    ToolRowPortAccess access() {
+        ToolRowPortAccess a{};
+        a.host = this; a.consume = &consume; a.publish = &publish; a.can_publish = &can_publish;
+        return a;
+    }
+};
+
+void execute(nodus::canvas_row::CanvasRow& row, PlayedPorts& ports) {
+    RawStackFrame frame{};
+    raw_stack_init_frame(frame, 1 << 12);
+    const ToolRowPortAccess access = ports.access();
+    ToolStackContext c{};
+    c.stack.raw = &frame;
+    c.row_ports = &access;
+    c.dt = 1.0 / 60.0;
+    row.execute_stack(c);
+    raw_stack_free_mask(frame);
+}
+
+void custody_case(const std::filesystem::path& dir) {
+    const std::vector<uint8_t> child = child_canvas_state(dir, -1, 1);   // one-slot edges inside the canvas
+    PlayedPorts ports;
+    for (int v = 1; v <= 40; ++v) ports.feed.push_back(static_cast<float>(v));
+    std::vector<uint8_t> saved;
+    {
+        nodus::canvas_row::CanvasRow row;
+        MemoryInputArchive in(child);
+        CHECK(row.deserialize(in));
+        for (int i = 0; i < 6; ++i) execute(row, ports);              // the output refuses: tokens pile up in custody
+        MemoryOutputArchive out;
+        CHECK(row.serialize(out));
+        saved = out.bytes;
+    }                                                                 // the row is gone; only its saved state remains
+    // Its held tokens, from the saved state (NCR1 v4): after the snapshot, per port a kind and the token.
+    std::vector<float> held;
+    {
+        size_t at = 16 + 4;
+        uint32_t n = 0, ws = 0, nports = 0;
+        uint64_t snap = 0;
+        std::memcpy(&n, saved.data() + at, 4); at += 4 + n * 32;
+        std::memcpy(&ws, saved.data() + at, 4); at += 4 + ws + 8;
+        std::memcpy(&snap, saved.data() + at, 8); at += 8 + static_cast<size_t>(snap);
+        std::memcpy(&nports, saved.data() + at, 4); at += 4;
+        for (uint32_t i = 0; i < nports; ++i) {
+            const uint8_t kind = saved[at++];
+            float v = 0.0f;
+            if (kind == 1) {
+                uint32_t len = 0;
+                std::memcpy(&len, saved.data() + at, 4); at += 4;
+                if (len == sizeof(v)) std::memcpy(&v, saved.data() + at, sizeof(v));
+                at += len;
+            }
+            held.push_back(v);
+        }
+    }
+    std::printf("custody: held at the save: in %g, out %g (nothing published while the output refused: %zu)\n",
+                held.size() > 0 ? held[0] : -1.0, held.size() > 1 ? held[1] : -1.0, ports.published.size());
+    CHECK(held.size() == 2 && held[0] != 0.0f && held[1] != 0.0f && ports.published.empty());
+    {
+        nodus::canvas_row::CanvasRow row;
+        MemoryInputArchive in(saved);
+        CHECK(row.deserialize(in));
+        ports.refuse = false;
+        for (int i = 0; i < 120; ++i) execute(row, ports);
+    }
+    std::vector<float> got;
+    for (float v : ports.published) if (v != 0.0f) got.push_back(v);
+    auto count = [&](float v) { return std::count(got.begin(), got.end(), v); };
+    bool unique = true;
+    for (float v : got) unique = unique && count(v) == 1;
+    std::printf("custody: after the restore %zu values came out; the held ones %ld and %ld times\n", got.size(),
+                held.size() > 0 ? static_cast<long>(count(held[0])) : -1L, held.size() > 1 ? static_cast<long>(count(held[1])) : -1L);
+    CHECK(held.size() == 2 && count(held[0]) == 1 && count(held[1]) == 1);
+    CHECK(unique);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: canvas_row_test <canvas_row plugin library>\n"); return 2; }
-    char tool_id[256] = {};
-    if (!gp_plugin_load_from_path(argv[1], tool_id, sizeof(tool_id))) {
-        std::fprintf(stderr, "cannot load %s\n", argv[1]);
-        return 2;
-    }
-    const auto dir = std::filesystem::temp_directory_path() / ("canvas_row_test_" + std::to_string(::time(nullptr)));
+    if (argc < 2) { std::fprintf(stderr, "usage: canvas_row_test <work dir>\n"); return 2; }
+    const auto dir = std::filesystem::path(argv[1]) / ("canvas_row_test_" + std::to_string(::time(nullptr)));
     std::filesystem::create_directories(dir);
+    const std::string row_id = headless_rows::build_named("canvas_row", dir / "module_library");
+    if (row_id.empty()) return 2;
+    const char* tool_id = row_id.c_str();
     run_case(tool_id, dir, -1, "respects the tick:");
     run_case(tool_id, dir, 3, "free-runs:");
+    custody_case(dir);
 
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("OK\n");

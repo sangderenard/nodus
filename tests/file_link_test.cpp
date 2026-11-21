@@ -10,11 +10,11 @@
 // byte for byte, the source folder ends empty with every file in sent/, and nothing is overwritten. Every sent tensor
 // goes back to the mint and is freed: the process ends the run with the tensors it started with.
 //
-//   file_link_test <file_read plugin> <file_write plugin> <tensor_mint plugin> <tensor_returns plugin> <work dir>
+//   file_link_test <work dir>   (its rows are built from module_library/source/tools in the headless runtime)
 #include "canvas_abi.h"
 #include "nodus_headless_abi.h"
 #include "nodus_link.h"
-#include "plugin_manager.h"
+#include "headless_rows.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
 #include <algorithm>
@@ -241,17 +241,19 @@ void link_case(const char* read_id, const char* write_id, const char* mint_id, c
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 6) {
-        std::fprintf(stderr, "usage: file_link_test <file_read> <file_write> <tensor_mint> <tensor_returns> <work dir>\n");
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: file_link_test <work dir>\n");
         return 2;
     }
-    char read_id[256] = {}, write_id[256] = {}, mint_id[256] = {}, returns_id[256] = {};
-    if (!gp_plugin_load_from_path(argv[1], read_id, sizeof(read_id)) || !gp_plugin_load_from_path(argv[2], write_id, sizeof(write_id)) ||
-        !gp_plugin_load_from_path(argv[3], mint_id, sizeof(mint_id)) || !gp_plugin_load_from_path(argv[4], returns_id, sizeof(returns_id))) {
+    const fs::path lib = fs::path(argv[1]) / ("file_link_test_rows_" + std::to_string(std::time(nullptr)));
+    const std::string read_s = headless_rows::build_named("file_read", lib), write_s = headless_rows::build_named("file_write", lib),
+                      mint_s = headless_rows::build_named("tensor_mint", lib), returns_s = headless_rows::build_named("tensor_returns", lib);
+    const char *read_id = read_s.c_str(), *write_id = write_s.c_str(), *mint_id = mint_s.c_str(), *returns_id = returns_s.c_str();
+    if (read_s.empty() || write_s.empty() || mint_s.empty() || returns_s.empty()) {
         std::fprintf(stderr, "cannot load the file rows\n");
         return 2;
     }
-    const fs::path dir = fs::path(argv[5]) / ("file_link_test_" + std::to_string(std::time(nullptr)));
+    const fs::path dir = fs::path(argv[1]) / ("file_link_test_" + std::to_string(std::time(nullptr)));
     fs::create_directories(dir);
     local_case(read_id, write_id, dir);
     link_case(read_id, write_id, mint_id, returns_id, dir);

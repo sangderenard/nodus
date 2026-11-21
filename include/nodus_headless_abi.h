@@ -412,6 +412,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_at(NodusHeadlessGraph* g, 
                                                           int32_t* out_contact, int32_t* out_up);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, const char* name, void* out_bytes,
                                                                size_t cap, size_t* out_written);
+// 1 when the canvas port's edge carries AbstractTensor handles, 0 raw tokens (scalars), -1 no such port or edge.
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_carries_tensors(NodusHeadlessGraph* g, const char* name);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
                                                                size_t len);
 NODUS_HEADLESS_API int32_t nodus_headless_get_port_fifo_config(

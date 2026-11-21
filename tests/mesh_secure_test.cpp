@@ -14,12 +14,14 @@
 //   B, writer A after the site root force-revokes A's current key (section 5): nothing more is adopted from it
 // Keys are hybrid (Ed25519 + ML-DSA-65 signatures, X25519 + ML-KEM-768 sealing), made by mesh_crypto.py keygen.
 //
-//   mesh_secure_test <python> <python site-packages> <canvas_row> <tensor_mint> <tensor_returns> <work dir>
+//   mesh_secure_test <python> <python site-packages> <work dir>
+// Every node process builds its own rows inside its own headless runtime (headless_rows.h, nodus_headless_build_plugin
+// _source): the module library rows by name, the mesh_crypto rows from the wrappers the orchestrator generates.
 #include "canvas_abi.h"
 #include "exec_pipe.h"
 #include "nodus_headless_abi.h"
 #include "nodus_link.h"
-#include "plugin_manager.h"
+#include "headless_rows.h"
 #include "python_row_tool.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
@@ -137,17 +139,20 @@ std::vector<uint8_t> small_canvas(const fs::path& dir) {
     return snap;
 }
 
-bool load(const char* path, std::string& id) {
-    char out[512] = {};
-    if (!gp_plugin_load_from_path(path, out, sizeof(out))) { std::fprintf(stderr, "cannot load %s\n", path); return false; }
-    id = out;
-    return true;
+fs::path g_rows;   // this process's own module library root: a loaded plugin is never rebuilt in place
+
+// A row by module library name, or a generated wrapper source (.cpp), built and loaded in this process's runtime.
+bool load(const char* spec, std::string& id) {
+    const std::string s(spec);
+    id = s.size() > 4 && s.compare(s.size() - 4, 4, ".cpp") == 0 ? headless_rows::build(s, g_rows) : headless_rows::build_named(spec, g_rows);
+    return !id.empty();
 }
 
 // ---------------------------------------------------------------------------------------------------- the writer
 // writer <work> <port> <control ticket> <bulk ticket> <reader kid hex | -> <canvas_row> <mint> <returns> <seal> <sign>
 int writer(char** argv) {
     const fs::path work = argv[2];
+    g_rows = work / ("rows_writer_" + std::string(argv[3]));
     std::string row, mint, returns, seal, sign;
     if (!load(argv[7], row) || !load(argv[8], mint) || !load(argv[9], returns) || !load(argv[10], seal) || !load(argv[11], sign))
         return 2;
@@ -177,6 +182,7 @@ int writer(char** argv) {
 // ---------------------------------------------------------------------------------------------------- the reader
 // reader <port> <link key hex> <writer kid hex> <seconds> <canvas_row> <mint> <returns> <verify> <open>
 int reader(char** argv) {
+    g_rows = fs::path(argv[9]).parent_path().parent_path() / ("rows_reader_" + std::string(argv[2]));
     std::string row, mint, returns, verify, open;
     if (!load(argv[6], row) || !load(argv[7], mint) || !load(argv[8], returns) || !load(argv[9], verify) || !load(argv[10], open))
         return 2;
@@ -192,12 +198,19 @@ int reader(char** argv) {
         !c.edge(receive, 0, replica, kRowPortBase) || !c.trash(receive, 3, mint.c_str())) return 4;
     std::printf("[reader] up\n");
     std::fflush(stdout);
+    int32_t hs = -1;
+    uint64_t hv[16] = {};
+    // The writer builds its rows too before it dials: wait for the link, then watch for the window.
+    for (auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(240);
+         hs != 1 && std::chrono::steady_clock::now() < give_up;) {
+        nodus_headless_step(c.g, 1.0 / 60.0);
+        nodus_headless_link_report("mesh.r", &hs, hv);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(std::stoi(argv[5]));
     uint64_t first = 0, last = 0;
     uint32_t readable_seen = 0;
     size_t snap_bytes = 0;
-    int32_t hs = -1;
-    uint64_t hv[16] = {};
     while (std::chrono::steady_clock::now() < until) {
         nodus_headless_step(c.g, 1.0 / 60.0);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -244,8 +257,8 @@ bool run(const nodus::exec::Program& p, std::string& out, int seconds) {
     return !child.running() && child.exit_code() == 0;
 }
 
-// The plugin of one mesh_crypto row: its descriptor and generated wrapper, built and loaded the ordinary way.
-std::string build_row(const char* name, const fs::path& source, const fs::path& library, const fs::path& nodus_root) {
+// One mesh_crypto row's generated wrapper source (each node process builds it in its own runtime).
+std::string build_row(const char* name, const fs::path& source, const fs::path& library, const fs::path&) {
     nodus::python_row::Descriptor d;
     d.tool_id = std::string("nodus.mesh.") + name;
     d.tool_name = std::string("Mesh ") + name;
@@ -258,14 +271,7 @@ std::string build_row(const char* name, const fs::path& source, const fs::path& 
     fs::create_directories(wrapper.parent_path());
     std::string error;
     if (!nodus::python_row::write_plugin_source(d, wrapper.string(), &error)) { std::fprintf(stderr, "%s\n", error.c_str()); return {}; }
-    char id[512] = {};
-    if (!nodus_headless_build_plugin_source(wrapper.string().c_str(), nodus_root.string().c_str(), library.string().c_str(), id, sizeof(id)))
-        return {};
-    for (const auto& e : fs::recursive_directory_iterator(library / "bin"))
-        if (e.is_regular_file() && e.path().filename().string().find(std::string("mesh_") + name) != std::string::npos &&
-            (e.path().extension() == ".so" || e.path().extension() == ".dll"))
-            return e.path().string();
-    return {};
+    return wrapper.string();
 }
 
 }  // namespace
@@ -273,11 +279,11 @@ std::string build_row(const char* name, const fs::path& source, const fs::path& 
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "writer") return writer(argv);
     if (argc >= 2 && std::string(argv[1]) == "reader") return reader(argv);
-    if (argc < 7) {
-        std::fprintf(stderr, "usage: mesh_secure_test <python> <site-packages> <canvas_row> <tensor_mint> <tensor_returns> <work dir>\n");
+    if (argc < 4) {
+        std::fprintf(stderr, "usage: mesh_secure_test <python> <site-packages> <work dir>\n");
         return 2;
     }
-    const fs::path work = fs::path(argv[6]) / ("mesh_secure_test_" + std::to_string(std::time(nullptr)));
+    const fs::path work = fs::path(argv[3]) / ("mesh_secure_test_" + std::to_string(std::time(nullptr)));
     fs::create_directories(work);
     const fs::path nodus_root = fs::path(NODUS_REPO_ROOT);
     const fs::path crypto = nodus_root / "module_library" / "source" / "tools" / "mesh_crypto.py";
@@ -311,9 +317,9 @@ int main(int argc, char** argv) {
     std::string rows[4];
     for (int i = 0; i < 4; ++i) {
         rows[i] = build_row(kRows[i], crypto, library, nodus_root);
-        if (rows[i].empty()) { std::fprintf(stderr, "the %s row did not build\n", kRows[i]); return 1; }
+        if (rows[i].empty()) { std::fprintf(stderr, "the %s row wrapper was not generated\n", kRows[i]); return 1; }
     }
-    std::printf("rows built: seal sign verify open\n");
+    std::printf("row wrappers generated: seal sign verify open\n");
 
     // The operator commands of mesh_crypto.py, as an operator would run them between scenarios.
     auto cli = [&](std::vector<std::string> args) -> std::string {
@@ -363,27 +369,43 @@ int main(int argc, char** argv) {
         rp.path = fs::absolute(argv[0]).string();
         rp.working_dir = work.string();
         rp.arguments = {"reader", std::to_string(port), hex(key.data(), key.size()), hex(kid[sc.expected_writer].data(), 32), "25",
-                        argv[3], argv[4], argv[5], rows[2], rows[3]};
+                        "canvas_row", "tensor_mint", "tensor_returns", rows[2], rows[3]};
         nodus::exec::Child reader_child;
         std::string why;
         if (!reader_child.start(rp, why)) { std::fprintf(stderr, "reader: %s\n", why.c_str()); return 1; }
         reader_child.finish_input();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::string out;                                   // the reader's output so far: start the writer once it is up
+        for (auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(300);
+             out.find("[reader] up") == std::string::npos && reader_child.running() &&
+             std::chrono::steady_clock::now() < give_up;) {
+            std::string more;
+            reader_child.take(more);
+            out += more;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
 
         set_env("NODUS_MESH_KEYS", (work / names[sc.writer_keys]).string());
         nodus::exec::Program wp;
         wp.path = rp.path;
         wp.working_dir = work.string();
         wp.arguments = {"writer", work.string(), std::to_string(port), hex(ct.data(), ct.size()), hex(bt.data(), bt.size()),
-                        hex(kid[1].data(), 32), argv[3], argv[4], argv[5], rows[0], rows[1]};
+                        hex(kid[1].data(), 32), "canvas_row", "tensor_mint", "tensor_returns", rows[0], rows[1]};
         nodus::exec::Child writer_child;
         if (!writer_child.start(wp, why)) { std::fprintf(stderr, "writer: %s\n", why.c_str()); return 1; }
         writer_child.finish_input();
 
-        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(40);
-        while (reader_child.running() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        std::string out;
-        reader_child.take(out);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(600);
+        while (reader_child.running() && std::chrono::steady_clock::now() < until) {
+            std::string more;
+            reader_child.take(more);
+            out += more;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        {
+            std::string more;
+            reader_child.take(more);
+            out += more;
+        }
         writer_child.kill();
         const auto at = out.find("RESULT ");
         results[s] = at == std::string::npos ? std::string() : out.substr(at, out.find('\n', at) - at);

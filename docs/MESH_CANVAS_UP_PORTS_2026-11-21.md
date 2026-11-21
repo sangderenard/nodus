@@ -191,3 +191,14 @@ for an add on development work we haven't implemented yet".
   with an overlap and a cutover; a forced change is a record from an offline site root, applied at once. The verify
   row applies records that arrive on the mesh; operators run rotate / accept / root-keygen / force. mesh_secure_test
   adds: B still takes A's canvas after A rotates (127/127); after the root revokes A's key, nothing.
+- **Review f1a3eb8f fixes (operator-codex).** (1) The service-path tests build their rows with
+  `nodus_headless_build_plugin_source` (tests/headless_rows.h), as volunteer_cycle_link_test does, so loading happens
+  in the headless runtime and its registry; none loads through `gp_plugin_load_from_path`, which nodus_headless.dll
+  does not export. The runtime plugin builder now also links the headless image (rows that call the headless ABI, as
+  the build-time row loop already did), and the file rows compile as C++17 (the builder's standard) as well as C++20.
+  (2) mesh_replica_test checks the saved canvas's port records whatever the line ends. (3) A canvas row's held tokens
+  (taken from one side, not yet given to the other) are saved with it (NCR1 v4: per port a raw token, or a tensor as
+  dtype, shape and bytes) and restored; a held tensor is freed with the row. canvas_row_test's custody case drives the
+  row with played ports: under refusal it holds 7 (from the feed) and 1 (from the canvas); saved and restored into a
+  new row, each comes out exactly once among 35 values, none twice. Oracle A1: canvas_row_test, file_link_test (22/22,
+  0 tensors alive), mesh_replica_test and mesh_secure_test (all five scenarios) pass.
