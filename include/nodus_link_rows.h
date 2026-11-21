@@ -1,11 +1,17 @@
 #pragma once
-// The Nodus link on a canvas: two rows, modelled on TcpByteStreamTool, sharing one link endpoint.
-//   <id>.control   Argument = control.out, row port "received" = control.in   U8 [256] tensors, one ControlPacket each
-//   <id>.bulk      Argument = bulk.out,    row port "received" = bulk.in      any dense tensor; it arrives with the
-//                                                                             sender's dtype and shape
+// The Nodus link on a canvas: four rows, one per FIFO, sharing one link endpoint. Each row has one duty (owner,
+// 2026-11-21: "rows should not be doing double duty, if you want double duty bake a plugin from a table with two rows").
+//   <id>.control.send     pops a U8 [256] tensor (one ControlPacket) off the stack and sends it
+//   <id>.control.receive  pushes each arrived ControlPacket onto the stack, a U8 [256] tensor
+//   <id>.bulk.send        pops any dense tensor off the stack and sends it
+//   <id>.bulk.receive     pushes each arrived tensor onto the stack, with the sender's dtype and shape
+// Arrivals go onto the stack (owner, 2026-11-21: "at no point did I ever say arrival should be redirected by a port
+// instead of being fed into the stack"); the table's Output rows carry them on. Put sending and receiving rows in
+// separate tables, so a refused send waiting on a stack is never mistaken for an arrival.
 // The endpoint is a host (a LinkListener on 127.0.0.1, one peer at a time) or a dialer (a LinkDialer, one dial: tickets
-// are single use). Both rows poll it; nothing blocks. Inputs are copied when accepted and stay the caller's; outputs
-// belong to whoever pops them. A refused input is restored to the stack with succeeded=false and the rows below it run.
+// are single use). Every row polls it; nothing blocks. A sent input is copied when accepted and stays the caller's; an
+// arrival belongs to whoever pops it. A refused input is restored to the stack with succeeded=false and the rows below
+// it run. An arrival waits in the endpoint while the stack has no room for it.
 // Research case 98d49cb8520e44d092c5d134c37c3c32, stage 2. Include before <windows.h> (winsock).
 #include "nodus_link.h"
 #include "nodus_link_wss.h"
@@ -19,7 +25,7 @@
 namespace nodus::link {
 
 struct LinkHostConfig {
-    std::string id;                 // rows are <id>.control and <id>.bulk
+    std::string id;                 // rows are <id>.control.send/.receive and <id>.bulk.send/.receive
     std::string prefix;             // /ws/link/<prefix>/{control,bulk}
     uint16_t port = 0;              // 0 = ephemeral
     Key key{};                      // ticket key of the issuing service
@@ -38,49 +44,55 @@ struct LinkDialConfig {
 
 class LinkEndpoint;   // the shared endpoint (module_library/source/tools/nodus_link_endpoint.h)
 
-// The row: <id>.control (bulk=false) or <id>.bulk (bulk=true). Source: module_library/source/tools/nodus_link.cpp.
-// Saved state is the id and which row it is. The endpoint is process state, handed over by the registration; a row
-// made with no endpoint (the no-argument constructor, or a canvas-compiled copy) refuses in execute_stack.
+// Which of the four rows a LinkRow is.
+enum class LinkRowRole : uint32_t { ControlSend = 0, ControlReceive = 1, BulkSend = 2, BulkReceive = 3 };
+inline const char* link_row_suffix(LinkRowRole r) {
+    switch (r) {
+        case LinkRowRole::ControlSend: return ".control.send";
+        case LinkRowRole::ControlReceive: return ".control.receive";
+        case LinkRowRole::BulkSend: return ".bulk.send";
+        default: return ".bulk.receive";
+    }
+}
+
+// One row of the four. Source: module_library/source/tools/nodus_link.cpp. Saved state is the link id and the row's
+// role. The endpoint is process state, handed over by the registration; a row made with no endpoint (the no-argument
+// constructor, or a canvas-compiled copy) refuses in execute_stack.
 class LinkRow final : public ITool {
 public:
-    LinkRow(std::string id, bool bulk, std::shared_ptr<LinkEndpoint> ep);
+    LinkRow(std::string id, LinkRowRole role, std::shared_ptr<LinkEndpoint> ep);
     LinkRow();
-    void configure(std::string id, bool bulk);
+    void configure(std::string id, LinkRowRole role);
     bool serialize(OutputArchive& out) const override;
     bool deserialize(InputArchive& in) override;
     const char* id_cstr() const noexcept override { return id_.c_str(); }
-    const char* name_cstr() const noexcept override { return bulk_ ? "Link bulk" : "Link control"; }
+    const char* name_cstr() const noexcept override;
     ToolCaps caps() const override { return ToolCaps::None; }
-    int32_t port_count() const override { return 1; }
-    ToolPortSpec port_spec(int32_t index) const override {
-        if (index == 0) return {ToolPortKind::Argument, 1};
-        return {};
-    }
-    void initialize(const ToolInitContext&) override;
+    void initialize(const ToolInitContext& ctx) override;
     void shutdown() override {}
     void tick(double, HostAPI&) override;
     void render(RenderContext&) override {}
     void execute_stack(ToolStackContext& context) override;
-    // What arrives goes out on the row's own port "received" (8-byte handle tokens), not onto the stack; an arrival
-    // waits in the endpoint until that port's edge can take it. This routing was an agent's design (commit e053ef6,
-    // 2026-11-19), not the owner's: the owner never said arrivals should go to a port instead of the stack (2026-11-21).
-    // The owner's words that day were that a row may have authority over its own ports, and that refused work stays on
-    // the stack, since a FIFO is never refused.
-    int32_t row_port_count() const override { return 1; }
-    ToolRowPort row_port(int32_t index) const override {
-        if (index == 0) return ToolRowPort{ToolPortKind::Return, 1.0f, 0.5f, "received", 8};
-        return ToolRowPort{};
+    int32_t port_count() const override { return 1; }
+    ToolPortSpec port_spec(int32_t index) const override {
+        if (index == 0) return {sends() ? ToolPortKind::Argument : ToolPortKind::Return, 1};
+        return {};
     }
-    // It copies what it sends and never keeps or destroys it (tool_api.h ToolTensorRole): in a table with a Returns
-    // row a sent tensor goes back to the mint, e.g. a volunteer cycle batch once it is on the wire.
-    ToolTensorRole tensor_role() const override { return ToolTensorRole::Borrower; }
+    // A sending row copies what it sends and never keeps or destroys it (tool_api.h ToolTensorRole): in a table with a
+    // Returns row a sent tensor goes back to the mint, e.g. a volunteer cycle batch once it is on the wire. A receiving
+    // row pops nothing.
+    ToolTensorRole tensor_role() const override { return sends() ? ToolTensorRole::Borrower : ToolTensorRole::Owner; }
 
 private:
+    bool sends() const { return role_ == LinkRowRole::ControlSend || role_ == LinkRowRole::BulkSend; }
+    bool bulk() const { return role_ == LinkRowRole::BulkSend || role_ == LinkRowRole::BulkReceive; }
+    void send(RawStackFrame& stack, bool& accepted);
+    void receive(RawStackFrame& stack);
     bool accept_control(uint64_t h);
     bool accept_bulk(uint64_t h);
     uint64_t control_tensor();
     std::string id_;
-    bool bulk_ = false;
+    LinkRowRole role_ = LinkRowRole::ControlSend;
     std::shared_ptr<LinkEndpoint> ep_;
 };
 

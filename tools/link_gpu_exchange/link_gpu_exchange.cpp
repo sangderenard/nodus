@@ -102,7 +102,7 @@ uint64_t visit(ITool& row, RawStackFrame& f, uint64_t input, bool& taken) {
 
 struct Host {
     nodus::gpu::KernelLibrarySession session{tool_registry_global()};
-    Row dispatch, control, bulk;
+    Row dispatch, control_send, control_receive, bulk_send, bulk_receive;   // the link's four rows, one duty each
     RawStackFrame frame{};
     std::vector<uint8_t> glsl, vulkan;                         // this process's shader: GLSL and the SPIR-V glslang made of it
     fs::path work, glslang;
@@ -176,8 +176,10 @@ struct Host {
             if (glsl.empty() || spirv.empty()) { say("shader files missing in %s", shader_dir.string()); return false; }
             if (!register_shader(spirv)) return false;
         }
-        control = tool_registry_global().create(link_id + ".control"); bulk = tool_registry_global().create(link_id + ".bulk");
-        if (!control || !bulk) { say("rows missing"); return false; }
+        auto& reg = tool_registry_global();
+        control_send = reg.create(link_id + ".control.send"); control_receive = reg.create(link_id + ".control.receive");
+        bulk_send = reg.create(link_id + ".bulk.send"); bulk_receive = reg.create(link_id + ".bulk.receive");
+        if (!control_send || !control_receive || !bulk_send || !bulk_receive) { say("rows missing"); return false; }
         std::array<uint64_t, 12> card{}; card[0] = 1; card[1] = kCard; card[2] = 901; card[4] = 512ull << 20;
         card[5] = card[6] = card[7] = 128ull << 20;
         auto r = library_call(card, 0);
@@ -324,13 +326,14 @@ struct Host {
     void turn() {
         bool taken = false;
         uint64_t in = control_out.empty() ? 0 : control_out.front();
-        uint64_t got = visit(*control, frame, in, taken);
+        bool unused = false;
+        visit(*control_send, frame, in, taken);
         if (taken) { nodus_tensor_destroy(control_out.front()); control_out.pop_front(); }
-        if (got) { on_control(got); pair_bulk(); }
+        for (uint64_t got; (got = visit(*control_receive, frame, 0, unused));) { on_control(got); pair_bulk(); }
         in = bulk_out.empty() ? 0 : bulk_out.front();
-        got = visit(*bulk, frame, in, taken);
+        visit(*bulk_send, frame, in, taken);
         if (taken) { nodus_tensor_destroy(bulk_out.front()); bulk_out.pop_front(); }
-        if (got) on_bulk(got);
+        for (uint64_t got; (got = visit(*bulk_receive, frame, 0, unused));) on_bulk(got);
         work_instructions();
         if (requester && peer_accepted_us && !requested) send_job();
         check_results();
@@ -342,7 +345,7 @@ struct Host {
     ~Host() {
         for (auto t : early_bulk) nodus_tensor_destroy(t);
         for (auto t : control_out) nodus_tensor_destroy(t); for (auto t : bulk_out) nodus_tensor_destroy(t);
-        dispatch.reset(); control.reset(); bulk.reset();
+        dispatch.reset(); control_send.reset(); control_receive.reset(); bulk_send.reset(); bulk_receive.reset();
         raw_stack_free_mask(frame); if (frame.backend) gp_mem_backend_release(frame.backend);
     }
 };

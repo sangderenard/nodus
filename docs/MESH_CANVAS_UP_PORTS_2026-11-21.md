@@ -113,3 +113,15 @@ for an add on development work we haven't implemented yet".
   (`ToolStackContext::dt`, `tick_id`, from the tick request); the canvas row gives that tick to the canvas it holds. The
   contained canvas decides: a table steps on the tick, or free-runs on its own worker where its exec mode is Free (3),
   a choice saved with that canvas (`MODULE_POLICY`). `canvas_row_test` passes both ways, before and after reload.
+- **The link's rows, one duty each.** Owner, 2026-11-21: "rows should not be doing double duty, if you want double duty
+  bake a plugin from a table with two rows"; and "at no point did I ever say arrival should be redirected by a port
+  instead of being fed into the stack". The routing of arrivals to a row port named "received" was an agent's design
+  (e053ef6, 2026-11-19), recorded there as the owner's. A link now has four rows: `<id>.control.send`,
+  `<id>.control.receive`, `<id>.bulk.send`, `<id>.bulk.receive`. A send row pops a tensor off its stack (dropping
+  pads) and sends it, or restores it on refusal. A receive row pushes every arrival that fits onto its stack, oldest on
+  top, and leaves the rest waiting in the endpoint. Sending and receiving rows go in separate tables, so a refused send
+  waiting on a stack is never taken for an arrival; a table's Output rows carry arrivals on. Oracle A1 (2026-11-21):
+  `nodus_headless_runtime_test` all OK; `link_rows_test` PASSED (50 control packets each way, F32 [1024,4096] each way,
+  identical). `link_metrics_test` fails two window checks on this host, and so does the main branch's version, run the
+  same way: its 64-step window is full before the packets go. `test_volunteer_cycle_link` builds; it needs a Vulkan
+  device, which this host has none of, so it has not run.

@@ -85,17 +85,21 @@ int main() {
     CHECK(register_link_dialer(reg, dc, &err), "dialer register: %s", err.c_str());
     CHECK(!register_link_dialer(reg, dc, &err), "the same id registered twice");
 
-    Row hcon = reg.create("proof.link.host.control"), hbulk = reg.create("proof.link.host.bulk");
-    Row dcon = reg.create("proof.link.dialer.control"), dbulk = reg.create("proof.link.dialer.bulk");
-    CHECK(hcon && hbulk && dcon && dbulk, "rows from the registry");
-    if (!(hcon && hbulk && dcon && dbulk)) return 1;
-    CHECK(hbulk->port_count() == 2 && hbulk->port_spec(0).kind == ToolPortKind::Argument && hbulk->port_spec(1).kind == ToolPortKind::Return, "ports");
+    // Four rows a link, one duty each: a send row pops off its stack, a receive row pushes arrivals onto its stack.
+    Row hcs = reg.create("proof.link.host.control.send"), hcr = reg.create("proof.link.host.control.receive");
+    Row hbs = reg.create("proof.link.host.bulk.send"), hbr = reg.create("proof.link.host.bulk.receive");
+    Row dcs = reg.create("proof.link.dialer.control.send"), dcr = reg.create("proof.link.dialer.control.receive");
+    Row dbs = reg.create("proof.link.dialer.bulk.send"), dbr = reg.create("proof.link.dialer.bulk.receive");
+    CHECK(hcs && hcr && hbs && hbr && dcs && dcr && dbs && dbr, "rows from the registry");
+    if (!(hcs && hcr && hbs && hbr && dcs && dcr && dbs && dbr)) return 1;
+    CHECK(hbs->port_count() == 1 && hbs->port_spec(0).kind == ToolPortKind::Argument &&
+          hbr->port_count() == 1 && hbr->port_spec(0).kind == ToolPortKind::Return && hbr->row_port_count() == 0, "ports");
     Frame fhc, fhb, fdc, fdb;
 
     // Before the link is up an input is refused and restored to the stack.
     {
         uint64_t t = packet_tensor(1); bool ok = true, restored = false;
-        visit(*dcon, fdc, t, &ok, &restored);
+        visit(*dcs, fdc, t, &ok, &restored);
         EndpointReport r; link_endpoint_report("proof.link.dialer", &r);
         CHECK(!ok && restored, "input before link: succeeded=%d restored=%d state=%d", int(ok), int(restored), int(r.state));
         nodus_tensor_destroy(t);
@@ -105,7 +109,9 @@ int main() {
     EndpointReport hr, dr;
     Frame idle;
     while (Clock::now() < end) {
-        for (auto* row : {hcon.get(), hbulk.get(), dcon.get(), dbulk.get()}) { uint64_t o = visit(*row, idle, 0); if (o) nodus_tensor_destroy(o); }
+        for (auto* row : {hcs.get(), hcr.get(), hbs.get(), hbr.get(), dcs.get(), dcr.get(), dbs.get(), dbr.get()}) {
+            uint64_t o = visit(*row, idle, 0); if (o) nodus_tensor_destroy(o);
+        }
         link_endpoint_report("proof.link.host", &hr); link_endpoint_report("proof.link.dialer", &dr);
         if (hr.state == EndpointState::Linked && dr.state == EndpointState::Linked) break;
     }
@@ -114,10 +120,10 @@ int main() {
 
     // control.out -> control.in, both ways: one 256-byte packet tensor each.
     for (uint32_t i = 0; i < 50; ++i) {
-        uint64_t t = packet_tensor(100 + i), got = carry(*dcon, fdc, *hcon, fhc, t);
+        uint64_t t = packet_tensor(100 + i), got = carry(*dcs, fdc, *hcr, fhc, t);
         CHECK(got && same_tensor(t, got), "control dialer->host %u", i);
         nodus_tensor_destroy(t); if (got) nodus_tensor_destroy(got);
-        t = packet_tensor(200 + i); got = carry(*hcon, fhc, *dcon, fdc, t);
+        t = packet_tensor(200 + i); got = carry(*hcs, fhc, *dcr, fdc, t);
         CHECK(got && same_tensor(t, got), "control host->dialer %u", i);
         nodus_tensor_destroy(t); if (got) nodus_tensor_destroy(got);
     }
@@ -125,7 +131,7 @@ int main() {
     // A tensor that is not one control packet is refused.
     {
         const uint64_t shape[1] = {100}; uint64_t t = nodus_tensor_create(NODUS_DTYPE_U8, 1, shape); bool restored = false;
-        visit(*dcon, fdc, t, nullptr, &restored);
+        visit(*dcs, fdc, t, nullptr, &restored);
         CHECK(restored, "a 100-byte control input was not refused");
         nodus_tensor_destroy(t);
     }
@@ -134,7 +140,7 @@ int main() {
     for (int dir = 0; dir < 2; ++dir) {
         uint64_t t = f32_tensor(1024, 4096, dir ? -3.5f : 1.0f);
         auto t0 = Clock::now();
-        uint64_t got = dir ? carry(*hbulk, fhb, *dbulk, fdb, t, hcon.get(), dcon.get()) : carry(*dbulk, fdb, *hbulk, fhb, t, hcon.get(), dcon.get());
+        uint64_t got = dir ? carry(*hbs, fhb, *dbr, fdb, t, hcr.get(), dcr.get()) : carry(*dbs, fdb, *hbr, fhb, t, hcr.get(), dcr.get());
         double s = std::chrono::duration<double>(Clock::now() - t0).count();
         CHECK(got && same_tensor(t, got), "bulk %s", dir ? "host->dialer" : "dialer->host");
         std::printf("bulk rows %s: F32 [1024,4096] identical in %.3f s\n", dir ? "host->dialer" : "dialer->host", s);
@@ -147,9 +153,9 @@ int main() {
                 (unsigned long long)hr.link.control_received, (unsigned long long)hr.link.control_sent, (unsigned long long)hr.bulk_tensors_received,
                 (unsigned long long)hr.bulk_tensors_sent, (unsigned long long)hr.control_refused, (unsigned long long)hr.bulk_refused);
 
-    hcon.reset(); hbulk.reset(); dcon.reset(); dbulk.reset();
+    for (Row* row : {&hcs, &hcr, &hbs, &hbr, &dcs, &dcr, &dbs, &dbr}) row->reset();
     unregister_link(reg, "proof.link.host"); unregister_link(reg, "proof.link.dialer");
-    CHECK(!reg.create("proof.link.host.control"), "unregister left a row");
+    CHECK(!reg.create("proof.link.host.control.send") && !reg.create("proof.link.host.bulk.receive"), "unregister left a row");
     std::printf("%s (%d failure%s)\n", failures ? "FAILED" : "PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

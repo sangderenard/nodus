@@ -930,9 +930,8 @@ add_executable(test_volunteer_cycle_link tests/volunteer_cycle_link_test.cpp src
 target_compile_definitions(test_volunteer_cycle_link PRIVATE NODUS_HEADLESS_BUILD=1 NOMINMAX)
 target_link_libraries(test_volunteer_cycle_link PRIVATE canvas_tables_static nodus_runtime)
 target_compile_features(test_volunteer_cycle_link PRIVATE cxx_std_20)
-if(WIN32)
-  target_link_libraries(test_volunteer_cycle_link PRIVATE ${NODUS_LINK_LIBS})
-endif()
+# NODUS_LINK_LIBS is the platform's set (WinHTTP/bcrypt on Windows, OpenSSL on Linux): the link signs tickets everywhere.
+target_link_libraries(test_volunteer_cycle_link PRIVATE ${NODUS_LINK_LIBS})
 
 # Socket qualification uses the same native registry image as its headless graph.
 add_executable(contract_socket_test tests/contract_socket_graph_test.cpp)
@@ -1069,9 +1068,8 @@ add_executable(nodus_headless_runtime_test
 )
 target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
-if(WIN32)
-  target_link_libraries(nodus_headless_runtime_test PRIVATE ${NODUS_LINK_LIBS})  # the link tests sign tickets (nodus_link.h, nodus_link_wss.h)
-endif()
+# the link tests sign tickets (nodus_link.h, nodus_link_wss.h); NODUS_LINK_LIBS is the platform's set
+target_link_libraries(nodus_headless_runtime_test PRIVATE ${NODUS_LINK_LIBS})
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
 

@@ -566,7 +566,8 @@ static void test_link_rows_headless() {
     const auto c=nodus::link::sign_ticket(nodus::link::make_ticket(Channel::Control,Role::Dialer,id,"lab",42,now,60),key);
     const auto b=nodus::link::sign_ticket(nodus::link::make_ticket(Channel::Bulk,Role::Dialer,id,"lab",42,now,60),key);
     REQUIRE(nodus_headless_register_link_dialer(graph,"proof.link.d","127.0.0.1",uint16_t(port),"lab",c.data(),b.data(),3000,0));
-    for(const char* row:{"proof.link.h.control","proof.link.h.bulk","proof.link.d.control","proof.link.d.bulk"}){
+    for(const char* row:{"proof.link.h.control.send","proof.link.h.control.receive","proof.link.h.bulk.send","proof.link.h.bulk.receive",
+                           "proof.link.d.control.send","proof.link.d.control.receive","proof.link.d.bulk.send","proof.link.d.bulk.receive"}){
         GP_CanvasModuleDesc desc{};desc.w=desc.h=64;
         const auto module=nodus_headless_add_module(graph,&desc);REQUIRE(module>=0);
         REQUIRE(nodus_headless_bind_plugin_tool(graph,module,row)>=0);
@@ -595,7 +596,8 @@ static void test_link_wss_dialer_headless() {
     const auto b=nodus::link::sign_ticket(nodus::link::make_ticket(Channel::Bulk,Role::Dialer,id,"lab",43,now,60),key);
     REQUIRE(nodus_headless_register_link_wss_dialer(graph,"proof.wss.d","localhost",uint16_t(port),nullptr,"lab",0,nullptr,
                                                      c.data(),b.data(),5000,0));
-    for(const char* row:{"proof.wss.h.control","proof.wss.h.bulk","proof.wss.d.control","proof.wss.d.bulk"}){
+    for(const char* row:{"proof.wss.h.control.send","proof.wss.h.control.receive","proof.wss.h.bulk.send","proof.wss.h.bulk.receive",
+                           "proof.wss.d.control.send","proof.wss.d.control.receive","proof.wss.d.bulk.send","proof.wss.d.bulk.receive"}){
         GP_CanvasModuleDesc desc{};desc.w=desc.h=64;
         const auto module=nodus_headless_add_module(graph,&desc);REQUIRE(module>=0);
         REQUIRE(nodus_headless_bind_plugin_tool(graph,module,row)>=0);

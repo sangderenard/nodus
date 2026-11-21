@@ -129,7 +129,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_broadcast(
     NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
     uint64_t maximum_frame_bytes, uint32_t max_readers);
 // Nodus link (include/nodus_link_rows.h; research case 98d49cb8520e44d092c5d134c37c3c32): admits two rows,
-// <tool_id>.control and <tool_id>.bulk, sharing one endpoint; bind them with nodus_headless_bind_plugin_tool.
+// <tool_id>.control.send/.receive and <tool_id>.bulk.send/.receive (one duty each), sharing one endpoint; bind them
+// with nodus_headless_bind_plugin_tool.
 // Host: a 127.0.0.1 listener on `port` (0 = ephemeral) for /ws/link/<prefix>/{control,bulk}; tickets are checked
 // with the 32-byte key. Returns the bound port, 0 on refusal. maximum_bulk_bytes 0 = 256 MiB.
 NODUS_HEADLESS_API int32_t nodus_headless_register_link_host(
