@@ -5,13 +5,14 @@
 //   <id>.control.receive  pushes each arrived ControlPacket onto the stack, a U8 [256] tensor
 //   <id>.bulk.send        pops any dense tensor off the stack and sends it
 //   <id>.bulk.receive     pushes each arrived tensor onto the stack, with the sender's dtype and shape
+// A receive row pushes one arrival at a time, once the last has left its stack; put it in a stack-loopback table.
 // Arrivals go onto the stack (owner, 2026-11-21: "at no point did I ever say arrival should be redirected by a port
 // instead of being fed into the stack"); the table's Output rows carry them on. Put sending and receiving rows in
 // separate tables, so a refused send waiting on a stack is never mistaken for an arrival.
 // The endpoint is a host (a LinkListener on 127.0.0.1, one peer at a time) or a dialer (a LinkDialer, one dial: tickets
 // are single use). Every row polls it; nothing blocks. A sent input is copied when accepted and stays the caller's; an
 // arrival belongs to whoever pops it. A refused input is restored to the stack with succeeded=false and the rows below
-// it run. An arrival waits in the endpoint while the stack has no room for it.
+// it run. An arrival waits in the endpoint while the last one is still on the stack.
 // Research case 98d49cb8520e44d092c5d134c37c3c32, stage 2. Include before <windows.h> (winsock).
 #include "nodus_link.h"
 #include "nodus_link_wss.h"
@@ -119,7 +120,7 @@ inline void link_report_counters(const EndpointReport& r, uint64_t out[16]) {
     for (int i = 0; i < 16; ++i) out[i] = v[i];
 }
 
-// Registers <id>.control and <id>.bulk, and <id>.metrics (the metrics row bound to this link; also the generic
+// Registers <id>.control.send/.receive and <id>.bulk.send/.receive, and <id>.metrics (the metrics row bound to this link; also the generic
 // "nodus.link.metrics", whose link comes from saved state; module_library/source/tools/link_metrics.cpp); the listener is open on return (port in report). False on refusal.
 bool register_link_host(ToolRegistry& registry, LinkHostConfig config, uint16_t* listen_port = nullptr, std::string* error = nullptr);
 bool register_link_dialer(ToolRegistry& registry, LinkDialConfig config, std::string* error = nullptr);

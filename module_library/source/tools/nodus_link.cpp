@@ -105,22 +105,23 @@ void LinkRow::send(RawStackFrame& stack, bool& accepted) {
 
 // Receive: every arrival onto the stack while it has room; an arrival the stack cannot hold waits in the endpoint.
 void LinkRow::receive(RawStackFrame& stack) {
-    const ValueType* vt = ValueTypeRegistry::global().get(ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR));
+    // One arrival at a time, and only once the last one has left the stack. A table's Output row moves one value a tick
+    // and leaves it on the stack while its edge is full; a table not in stack loopback resets its stack every tick, so
+    // anything more than that was lost (Oracle A1, 2026-11-21: arrivals pushed in a batch went missing). Put a receive
+    // row in a stack-loopback table: what has not gone out yet stays, and the next arrival waits in the endpoint.
+    const ValueTypeId tensor_type = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+    ValueTypeId top = kInvalidValueTypeId;
+    nodus::tensors::AbstractTensorHandle waiting{};
+    if (raw_stack_peek_type(stack, top) && top == tensor_type && raw_stack_peek_abstract_tensor(stack, waiting) && waiting.id)
+        return;
+    const ValueType* vt = ValueTypeRegistry::global().get(tensor_type);
     const size_t entry = vt ? vt->size : sizeof(nodus::tensors::AbstractTensorHandle);
-    // Taken in arrival order, pushed newest first, so the oldest arrival is on top: whatever pops the stack reads them in
-    // the order they came.
-    std::vector<uint64_t> arrived;
-    size_t room = stack.byte_capacity > stack.byte_count ? (stack.byte_capacity - stack.byte_count) / entry : 0;
-    while (room-- > 0) {
-        const uint64_t t = bulk() ? ep_->take_bulk() : control_tensor();
-        if (!t) break;
-        arrived.push_back(t);
-    }
-    for (size_t i = arrived.size(); i-- > 0;) {
-        if (!raw_stack_push_abstract_tensor(stack, nodus::tensors::AbstractTensorHandle{arrived[i]})) {
-            nodus_tensor_destroy(arrived[i]);   // room was checked; a push that still fails is a fault, never silent
-            ++ep_->report().bulk_dropped;
-        }
+    if (stack.byte_capacity < stack.byte_count + entry) return;
+    const uint64_t t = bulk() ? ep_->take_bulk() : control_tensor();
+    if (!t) return;
+    if (!raw_stack_push_abstract_tensor(stack, nodus::tensors::AbstractTensorHandle{t})) {
+        nodus_tensor_destroy(t);   // room was checked; a push that still fails is a fault, never silent
+        ++ep_->report().bulk_dropped;
     }
 }
 bool LinkRow::accept_control(uint64_t h) {

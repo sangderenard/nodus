@@ -125,3 +125,21 @@ for an add on development work we haven't implemented yet".
   identical). `link_metrics_test` fails two window checks on this host, and so does the main branch's version, run the
   same way: its 64-step window is full before the packets go. `test_volunteer_cycle_link` builds; it needs a Vulkan
   device, which this host has none of, so it has not run.
+- **File rows.** Owner, 2026-11-21: "reading and writing files belongs to reading and writing file rows"; "single
+  event file reads are fine for loading actual row content but not for runtime unless it's an intentional file cache
+  or process destination or source". `file_read` (a source folder: the next file by name, moved into sent/ first, one
+  U8 tensor on the stack at a time) and `file_write` (a destination folder: each tensor to a new exclusively-named
+  `<n>.arrival`, staged under a hidden name, never overwriting) are module_library rows. The link never touches a file.
+- **Two system faults found on the way** (Oracle A1, 2026-11-21, `tests/file_link_test.cpp`):
+  1. `EdgeTensorFifo::push_from_frame` (host path) published from a frame without checking it held an element of the
+     edge's type, then failed to pop. An Output row on an idle tick re-sent the last tensor handle (each 8 MiB arrival
+     was written twice, the second time under an id already destroyed and reused); a reset frame published null
+     handles -- the "pads" rows had been dropping. It now checks the frame's top element, as the backend path did.
+  2. An Output row moves one value a tick and leaves it on the stack while its edge is full; a table not in stack
+     loopback resets its stack every tick, so anything a row pushed beyond that was lost. A row that produces tensors
+     (`file_read`, a link receive row) pushes one at a time, only once the last has gone, and belongs in a
+     stack-loopback table.
+  After both: 12/12 files in one canvas, and 22/22 across the link (two generations with the same names, six 8 MiB
+  each), byte for byte, sender 22 sent / receiver 22 received. canvas_row_test, nodus_headless_runtime_test and
+  link_rows_test pass again. Tests with tensor-typed Output rows that need a GPU (volunteer cycle, GPU inventory, OpenGL
+  rows) have not run on this change.

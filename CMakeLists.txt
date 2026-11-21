@@ -686,6 +686,19 @@ if(TARGET canvas_row)
   add_dependencies(canvas_row_test canvas_row)
 endif()
 
+# The file rows (file_read, file_write) composed with the link's split rows in tables: files from a source folder to a
+# destination folder, in one canvas and across a link between two canvases. Run it with both plugins' paths.
+add_executable(file_link_test tests/file_link_test.cpp)
+target_include_directories(file_link_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(file_link_test PRIVATE nodus_headless ${NODUS_LINK_LIBS})
+target_compile_features(file_link_test PUBLIC cxx_std_20)
+foreach(row file_read file_write)
+  if(TARGET ${row})
+    add_dependencies(file_link_test ${row})
+  endif()
+endforeach()
+
 add_executable(frame_compression_pipeline_test tests/frame_compression_pipeline_test.cpp)
 target_include_directories(frame_compression_pipeline_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
