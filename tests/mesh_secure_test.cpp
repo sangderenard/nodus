@@ -9,6 +9,9 @@
 //   B, writer A   B opens the canvas: readable, a rising generation, the canvas is held
 //   C, writer A   C is no reader: it learns that A's canvas exists and its generation, and holds no canvas
 //   B, writer A, but the snapshots come from D (a node B knows): never adopted, the replica stays empty
+//   B, writer A after A rotates (KEY_CHANGE_PROTOCOL.md section 4): B accepts A's cross-signed rotation record; A's new
+//          epoch is still A (its lineage) and B opens it
+//   B, writer A after the site root force-revokes A's current key (section 5): nothing more is adopted from it
 // Keys are hybrid (Ed25519 + ML-DSA-65 signatures, X25519 + ML-KEM-768 sealing), made by mesh_crypto.py keygen.
 //
 //   mesh_secure_test <python> <python site-packages> <canvas_row> <tensor_mint> <tensor_returns> <work dir>
@@ -312,12 +315,40 @@ int main(int argc, char** argv) {
     }
     std::printf("rows built: seal sign verify open\n");
 
+    // The operator commands of mesh_crypto.py, as an operator would run them between scenarios.
+    auto cli = [&](std::vector<std::string> args) -> std::string {
+        nodus::exec::Program p;
+        p.path = argv[1];
+        p.working_dir = work.string();
+        p.arguments = {crypto.string()};
+        p.arguments.insert(p.arguments.end(), args.begin(), args.end());
+        std::string out;
+        if (!run(p, out, 60)) std::fprintf(stderr, "mesh_crypto %s: %s\n", args[0].c_str(), out.c_str());
+        return out;
+    };
     struct Scenario { const char* what; int writer_keys; int reader_keys; int expected_writer; };
-    const Scenario scenarios[3] = {{"B reads A's canvas", 0, 1, 0}, {"C is no reader of A's canvas", 0, 2, 0},
-                                   {"B takes only A: D's snapshots", 3, 1, 0}};
-    std::string results[3];
-    for (int s = 0; s < 3; ++s) {
+    const Scenario scenarios[5] = {{"B reads A's canvas", 0, 1, 0}, {"C is no reader of A's canvas", 0, 2, 0},
+                                   {"B takes only A: D's snapshots", 3, 1, 0},
+                                   {"B reads A after A rotates", 0, 1, 0},
+                                   {"B after the root revokes A's key", 0, 1, 0}};
+    std::string results[5];
+    for (int s = 0; s < 5; ++s) {
         const auto& sc = scenarios[s];
+        if (s == 3) {       // A rotates; B (A's reader) and C accept the cross-signed record
+            std::printf("%s", cli({"rotate", (work / "A").string(), "600"}).c_str());
+            for (const char* who : {"B", "C"})
+                std::printf("  %s: %s", who, cli({"accept", (work / who).string(), (work / "A" / "rotation-1.rec").string()}).c_str());
+        }
+        if (s == 4) {       // the site root, made offline, force-revokes A's current key everywhere
+            std::printf("%s", cli({"root-keygen", (work / "ROOT").string()}).c_str());
+            for (const char* who : {"B", "C"}) fs::copy_file(work / "ROOT" / "node.pub", work / who / "root.pub");
+            const auto block = read_file(work / "A" / "node.pub");
+            std::vector<uint8_t> current(32);
+            nodus::link::platform::sha256(block.data(), block.size(), current.data());
+            std::printf("%s", cli({"force", (work / "ROOT").string(), (work / "force.rec").string(), hex(current.data(), 32)}).c_str());
+            for (const char* who : {"B", "C"})
+                std::printf("  %s: %s", who, cli({"accept", (work / who).string(), (work / "force.rec").string()}).c_str());
+        }
         nodus::link::Key key{};
         nodus::link::random_bytes(key.data(), key.size());
         std::srand(static_cast<unsigned>(std::time(nullptr)) + s);
@@ -378,6 +409,12 @@ int main(int argc, char** argv) {
     // B named A as the writer; D's snapshots arrive, verify (B knows D), and are never adopted.
     CHECK(field(results[2], "snapshots_received") >= 2);
     CHECK(field(results[2], "last") == 0 && field(results[2], "snapshot_bytes") == 0);
+    // After A's rotation: the new epoch is still A to B, which opens it.
+    CHECK(field(results[3], "snapshots_received") >= 2 && field(results[3], "readable_generations") >= 2 &&
+          field(results[3], "snapshot_bytes") > 0);
+    // After the root revoked A's current key: the snapshots arrive and none is taken.
+    CHECK(field(results[4], "snapshots_received") >= 2 && field(results[4], "last") == 0 &&
+          field(results[4], "snapshot_bytes") == 0);
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("OK\n");
     return 0;

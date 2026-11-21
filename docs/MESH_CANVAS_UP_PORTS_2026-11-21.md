@@ -184,3 +184,10 @@ for an add on development work we haven't implemented yet".
   generation; a non-reader learns only that the writer exists. `tests/mesh_secure_test.cpp` (separate processes per
   node, Oracle A1): B opens A's canvas (127 snapshots, all readable); C, no reader, holds only A's generation; B, given
   D's validly signed snapshots for a canvas whose writer is A, adopts nothing.
+- **Key changes** (the workspace's KEY_CHANGE_PROTOCOL.md). Owner, 2026-11-21: "establish protocol for forcing key
+  changes across the site safely, any time we need to change our crypto". Mesh keys now carry suite, epoch and
+  lineage ("NMP2"); envelopes name their suite ("NMS2") and holders keep an allowlist; a replica's writer is a
+  lineage, so rotation keeps the one-writer rule. Planned rotation is a record cross-signed by the old and new keys,
+  with an overlap and a cutover; a forced change is a record from an offline site root, applied at once. The verify
+  row applies records that arrive on the mesh; operators run rotate / accept / root-keygen / force. mesh_secure_test
+  adds: B still takes A's canvas after A rotates (127/127); after the root revokes A's key, nothing.
