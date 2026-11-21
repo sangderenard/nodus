@@ -4,8 +4,11 @@
 // The row owns its canvas outright: a nested graph with its own scheduler, its own tables and its own sim frame count
 // (ThreadManager::TickRequest::canvas, GP_TableContext::owner_canvas). The canvas's declared ports are the row's ports,
 // in declaration order: an IN canvas port is a row Argument port (into the row, on into the canvas), an OUT canvas
-// port a row Return port. Each execution moves what waits on the row's Argument ports into the canvas, steps the canvas
-// once, and moves what reached its OUT ports onto the row's Return ports while their edges can take it. Nothing is
+// port a row Return port. Owner, 2026-11-21: "the top level gives a tick to a table gives a tick to a row so the
+// contained canvas receives a tick and can respect it or free run". Each execution moves what waits on the row's
+// Argument ports into the canvas, gives the canvas the row's tick (ToolStackContext::dt / tick_id) -- its tables step on
+// it, or free-run on their own workers where their exec mode is Free -- and moves what reached its OUT ports onto the
+// row's Return ports while their edges can take it. Nothing is
 // dropped: a token the canvas refuses is held by the row and offered again next execution, and the row reads no more
 // from that port until it is taken.
 //

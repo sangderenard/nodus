@@ -108,3 +108,8 @@ for an add on development work we haven't implemented yet".
   no canvas owns, the meta-channel readers (`nodus_headless_meta_channel_*` read the primary canvas), and a nested
   canvas's module library root (unset: serialized tables fall back to the cwd default). The canvas signature does not
   include ROW_STATE yet.
+- **The tick goes down.** Owner, 2026-11-21: "the top level gives a tick to a table gives a tick to a row so the
+  contained canvas receives a tick and can respect it or free run". A row's execution carries its tick
+  (`ToolStackContext::dt`, `tick_id`, from the tick request); the canvas row gives that tick to the canvas it holds. The
+  contained canvas decides: a table steps on the tick, or free-runs on its own worker where its exec mode is Free (3),
+  a choice saved with that canvas (`MODULE_POLICY`). `canvas_row_test` passes both ways, before and after reload.

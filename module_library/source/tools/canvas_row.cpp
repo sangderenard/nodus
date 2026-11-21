@@ -140,8 +140,9 @@ void CanvasRow::execute_stack(ToolStackContext& context) {
             p.held.clear();
         }
     }
-    // One step of the canvas, on its own scheduler; it returns once that tick has run.
-    if (!nodus_headless_step(canvas_, 0.0)) return;
+    // The tick this row was given goes on to the canvas it holds: its tables step on it, or free-run on their own workers
+    // if their exec mode is Free (the canvas's own choice, saved with it). The step returns once that tick has run.
+    if (!nodus_headless_step(canvas_, context.dt)) return;
     // Out of the canvas: what reached each OUT port, while the row's Return port edge can take it.
     for (size_t i = 0; i < ports_.size(); ++i) {
         Port& p = ports_[i];

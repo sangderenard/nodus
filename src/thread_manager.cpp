@@ -1094,6 +1094,8 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         frame.default_type = stack_default_type;
                         ToolStackContext tctx;
                         tctx.stack = frame;
+                        tctx.dt = req.dt;
+                        tctx.tick_id = req.tick_id;
                         // The row's own ports, if it declares any: it reads and writes them itself during this tick.
                         RowPortBinding row_port_binding;
                         ToolRowPortAccess row_port_access;

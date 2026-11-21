@@ -172,6 +172,11 @@ struct ToolStackContext {
     const ToolRowPortAccess* row_ports = nullptr;
     // For a Returns row (ITool::tensor_role): the table's used-up handles; null for every other row. Trailing.
     ToolReturnedTensors* returns = nullptr;
+    // The tick this execution belongs to: the top level gives a tick to a table, the table to its rows. A row that holds
+    // a canvas (canvas_row) gives the same tick to that canvas, whose tables respect it or free-run by their own exec
+    // mode. Trailing.
+    double dt = 0.0;
+    uint64_t tick_id = 0;
 };
 
 inline float tool_stack_pop(ToolStackFrame& frame) {

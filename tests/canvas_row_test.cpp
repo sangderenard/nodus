@@ -1,7 +1,8 @@
 // canvas_row_test: a canvas nested in a table row (module_library/source/tools/canvas_row.cpp,
 // docs/MESH_CANVAS_UP_PORTS_2026-11-21.md stage 3).
 //
-// A child canvas passes values from its IN canvas port "in" through one table to its OUT canvas port "out". A parent
+// A child canvas passes values from its IN canvas port "in" through one table to its OUT canvas port "out", once with
+// that table stepping on the tick the canvas row gives the child, once with it free-running (exec mode Free). A parent
 // canvas holds it in a canvas row: the parent's feed table drives the row's Argument port "in", and the row's Return
 // port "out" ends at the parent's own OUT canvas port "result". Two canvases coexist in one process, each on its own
 // scheduler; every value arrives at the top, in order. The parent is saved (the row's state, the child canvas, rides in
@@ -63,8 +64,10 @@ std::vector<uint8_t> read_file(const std::filesystem::path& p) {
     return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
-// The child: canvas port "in" -> pass table -> canvas port "out". Saved, its bytes are a canvas row's state.
-std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir) {
+// The child: canvas port "in" -> pass table -> canvas port "out". Saved, its bytes are a canvas row's state. The pass
+// table's exec mode is the child's own choice: -1 steps on the tick the canvas row gives it, 3 (Free) free-runs on its
+// own worker; the choice is saved with the child (MODULE_POLICY).
+std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir, int32_t exec_mode) {
     NodusHeadlessGraph* child = nodus_headless_create();
     CHECK(child != nullptr);
     if (!child) return {};
@@ -75,10 +78,13 @@ std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir) {
     CHECK(in >= 0 && out >= 0 && root >= 0 && pass >= 0);
     CHECK(edge(child, root, in, pass, 0));
     CHECK(edge(child, pass, 1, root, out));
-    const auto path = dir / "child.nodus.txt";
+    CHECK(nodus_headless_set_module_exec_mode(child, pass, exec_mode));
+    const auto path = dir / ("child_" + std::to_string(exec_mode + 1) + ".nodus.txt");
     CHECK(nodus_headless_save_file(child, path.string().c_str()));
     nodus_headless_destroy(child);
     std::vector<uint8_t> canvas = read_file(path);
+    const std::string text(canvas.begin(), canvas.end());
+    CHECK(text.find("MODULE_POLICY " + std::to_string(pass) + " " + std::to_string(exec_mode) + " ") != std::string::npos);
     // NCR1 v1, then the canvas file's byte count and bytes (canvas_row.cpp's saved state).
     std::vector<uint8_t> state;
     const uint32_t head[2] = {0x3152434E, 1};
@@ -111,24 +117,17 @@ std::vector<float> carry(NodusHeadlessGraph* parent, int n) {
     return got;
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: canvas_row_test <canvas_row plugin library>\n"); return 2; }
-    char tool_id[256] = {};
-    if (!gp_plugin_load_from_path(argv[1], tool_id, sizeof(tool_id))) {
-        std::fprintf(stderr, "cannot load %s\n", argv[1]);
-        return 2;
-    }
-    const auto dir = std::filesystem::temp_directory_path() / ("canvas_row_test_" + std::to_string(::time(nullptr)));
-    std::filesystem::create_directories(dir);
-    const std::vector<uint8_t> state = child_canvas_state(dir);
+// A parent canvas holding that child in a canvas row: its feed table drives the row's "in", and the row's "out" ends at
+// the parent's canvas port "result". The top level gives a tick to the holder table, the table to the canvas row, and
+// the row to the canvas it holds.
+void run_case(const char* tool_id, const std::filesystem::path& dir, int32_t exec_mode, const char* label) {
+    const std::vector<uint8_t> state = child_canvas_state(dir, exec_mode);
     CHECK(!state.empty());
 
     // The parent: feed table -> canvas row "in"; canvas row "out" -> the parent's own canvas port "result".
     NodusHeadlessGraph* parent = nodus_headless_create();
     CHECK(parent != nullptr);
-    if (!parent) return 1;
+    if (!parent) return;
     const int32_t feed = pass_table(parent, "feed");
     const NodusHeadlessFifoConfig fifo = float_fifo();
     CHECK(nodus_headless_declare_input_port_ex(parent, "feed", feed, 0, &fifo));
@@ -146,10 +145,10 @@ int main(int argc, char** argv) {
     for (int i = 1; i <= 12; ++i) wanted.push_back(static_cast<float>(i));
     const std::vector<float> got = carry(parent, 12);
     CHECK(got == wanted);
-    std::printf("nested: %zu of %zu values arrived in order\n", got.size(), wanted.size());
+    std::printf("%s nested: %zu of %zu values arrived in order\n", label, got.size(), wanted.size());
 
     // Saved, the parent carries its canvas row's canvas; loaded into another graph, the row carries values again.
-    const auto saved = dir / "parent.nodus.txt";
+    const auto saved = dir / ("parent_" + std::to_string(exec_mode + 1) + ".nodus.txt");
     CHECK(nodus_headless_save_file(parent, saved.string().c_str()));
     const std::vector<uint8_t> text = read_file(saved);
     const std::string s(text.begin(), text.end());
@@ -158,15 +157,31 @@ int main(int argc, char** argv) {
 
     NodusHeadlessGraph* again = nodus_headless_create();
     CHECK(again != nullptr);
-    if (!again) return 1;
+    if (!again) return;
     CHECK(nodus_headless_load_file(again, saved.string().c_str()));
     size_t restored_size = 0;
     nodus_headless_get_row_state(again, holder, row, nullptr, 0, &restored_size);
     CHECK(restored_size > 16);
     const std::vector<float> got_again = carry(again, 12);
     CHECK(got_again == wanted);
-    std::printf("reloaded: %zu of %zu values arrived in order\n", got_again.size(), wanted.size());
+    std::printf("%s reloaded: %zu of %zu values arrived in order\n", label, got_again.size(), wanted.size());
     nodus_headless_destroy(again);
+
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 2) { std::fprintf(stderr, "usage: canvas_row_test <canvas_row plugin library>\n"); return 2; }
+    char tool_id[256] = {};
+    if (!gp_plugin_load_from_path(argv[1], tool_id, sizeof(tool_id))) {
+        std::fprintf(stderr, "cannot load %s\n", argv[1]);
+        return 2;
+    }
+    const auto dir = std::filesystem::temp_directory_path() / ("canvas_row_test_" + std::to_string(::time(nullptr)));
+    std::filesystem::create_directories(dir);
+    run_case(tool_id, dir, -1, "respects the tick:");
+    run_case(tool_id, dir, 3, "free-runs:");
 
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("OK\n");
