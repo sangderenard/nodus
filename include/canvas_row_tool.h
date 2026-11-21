@@ -20,8 +20,17 @@
 // replica's meta groups carry those records (gp_table_meta_append_records), so every reader of a meta edge sees the
 // writer's traffic.
 //
-// The row's saved state (serialize/deserialize, the canvas file's ROW_STATE record) is its role, its publish interval
-// and the snapshot it holds, so a table's canvas rows are saved inside the canvas that holds the table.
+// The mesh, secured (docs/MESH_CANVAS_UP_PORTS_2026-11-21.md, stages 3-4; module_library/source/tools/mesh_crypto.py).
+// A host in mesh mode names its readers (node kids, public): it puts "NRS1" | n | reader kids | snapshot on "state",
+// and the rows above it seal (to those readers; none = public) and sign (with the node's keys) on its way out. A
+// replica names its one writer (a kid) and takes what the verify and open rows hand it, "NMO1" | writer | generation |
+// readable | snapshot: only that writer, and only a later generation than the last one taken -- one writer per canvas,
+// no replays. A replica that is no reader of the canvas learns only that its writer exists and its generation. A
+// replica with no writer named takes plain snapshots, unsigned (the unsecured mesh of mesh_replica_test).
+//
+// The row's saved state (serialize/deserialize, the canvas file's ROW_STATE record) is its role, its publish interval,
+// its mesh settings (readers, or the writer and the last generation taken) and the snapshot it holds, so a table's
+// canvas rows are saved inside the canvas that holds the table.
 // The source is module_library/source/tools/canvas_row.cpp.
 #pragma once
 
@@ -74,6 +83,7 @@ private:
     void release();
     void host(ToolStackContext& context);
     void replicate(ToolStackContext& context);
+    bool take(const std::vector<uint8_t>& arrived);
 
     CanvasRowRole role_ = CanvasRowRole::Host;
     uint32_t publish_every_ = 0;            // executions between snapshots on "state" (0 = none)
@@ -82,6 +92,11 @@ private:
     std::vector<uint8_t> held_snapshot_;    // the snapshot as last given (a replica's state; a host's if it cannot save)
     uint64_t held_state_ = 0;               // a snapshot tensor the "state" edge refused, offered again
     std::vector<Port> ports_;
+    bool mesh_ = false;                     // host: "state" carries "NRS1" (readers + snapshot) for the seal row
+    std::vector<uint8_t> readers_;          // host: reader kids, 32 bytes each (none = public)
+    std::vector<uint8_t> writer_;           // replica: the one writer's kid (32 bytes), or empty (unsecured)
+    uint64_t last_generation_ = 0;          // replica: the generation last taken from that writer
+    bool readable_ = false;                 // replica: the last snapshot taken could be opened here
 };
 
 }  // namespace nodus::canvas_row

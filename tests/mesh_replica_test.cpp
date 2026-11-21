@@ -108,7 +108,17 @@ bool snapshot_of_row(NodusHeadlessGraph* g, int32_t module, int32_t row, Snapsho
     if (size < 24) return false;
     std::vector<uint8_t> st(size);
     if (!nodus_headless_get_row_state(g, module, row, st.data(), st.size(), &size)) return false;
-    return parse_snapshot(std::vector<uint8_t>(st.begin() + 24, st.end()), out);
+    // NCR1 v3: head 16 | mesh 4 | reader count 4 | readers | writer size 4 | writer | last generation 8 | size 8 | snapshot
+    size_t at = 16 + 4;
+    uint32_t readers = 0, writer = 0;
+    if (st.size() < at + 4) return false;
+    std::memcpy(&readers, st.data() + at, 4);
+    at += 4 + static_cast<size_t>(readers) * 32;
+    if (st.size() < at + 4) return false;
+    std::memcpy(&writer, st.data() + at, 4);
+    at += 4 + writer + 8 + 8;
+    if (st.size() < at) return false;
+    return parse_snapshot(std::vector<uint8_t>(st.begin() + static_cast<std::ptrdiff_t>(at), st.end()), out);
 }
 
 struct Canvas {

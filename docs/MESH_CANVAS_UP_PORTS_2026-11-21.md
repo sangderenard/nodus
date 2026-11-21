@@ -173,3 +173,14 @@ for an add on development work we haven't implemented yet".
   were pushed back onto its stack for a later mint row); a mint with no size set is a plain trash. A sending table
   carries a tensor_returns row whose "returns" port feeds a mint's "returned" port. Oracle A1: file_link_test and
   mesh_replica_test end with the tensors they started with (0 alive before, 0 after; 22 files and 80 snapshots sent).
+- **One writer per canvas, and read privacy (stages 3-4), with post-quantum keys.** Owner, 2026-11-21: "we need to be
+  able to make the correct keys for a quantum future safely on both linux and windows". Native Nodus has no public-key
+  crypto, and Windows CNG has no Ed25519 and this SDK no ML-KEM/ML-DSA, so the crypto runs in pyca/cryptography 50
+  (prebuilt wheels on Windows and Linux arm64, OpenSSL 4.0.1 built in) as interpreted Python rows. The Python row
+  contract gained a Bytes port (ABI v2: one U8 tensor <-> Python bytes; v1 descriptors unchanged), and generated
+  rows are Borrowers. `module_library/source/tools/mesh_crypto.py`: hybrid keys (Ed25519 + ML-DSA-65 signatures,
+  X25519 + ML-KEM-768 sealing, ChaCha20-Poly1305 content), rows seal / sign / verify / open, and `keygen`. A host canvas
+  row in mesh mode names its readers; a replica names its one writer and takes only that writer's snapshots, at a rising
+  generation; a non-reader learns only that the writer exists. `tests/mesh_secure_test.cpp` (separate processes per
+  node, Oracle A1): B opens A's canvas (127 snapshots, all readable); C, no reader, holds only A's generation; B, given
+  D's validly signed snapshots for a canvas whose writer is A, adopts nothing.

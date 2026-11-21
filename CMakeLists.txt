@@ -686,6 +686,20 @@ if(TARGET canvas_row)
   add_dependencies(canvas_row_test canvas_row)
 endif()
 
+# The secured mesh across processes: one writer per canvas and read privacy, with hybrid post-quantum keys
+# (module_library/source/tools/mesh_crypto.py as interpreted Python rows). Run it with a Python that has
+# cryptography >= 50, its site-packages, and the canvas_row, tensor_mint and tensor_returns plugins.
+add_executable(mesh_secure_test tests/mesh_secure_test.cpp)
+target_include_directories(mesh_secure_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mesh_secure_test PRIVATE nodus_headless nodus_python_row nodus_tensor_core ${NODUS_LINK_LIBS})
+target_compile_definitions(mesh_secure_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(mesh_secure_test PUBLIC cxx_std_20)
+foreach(row canvas_row tensor_mint tensor_returns)
+  if(TARGET ${row})
+    add_dependencies(mesh_secure_test ${row})
+  endif()
+endforeach()
+
 # The mesh: a node's canvas (host canvas row) publishes its snapshot -- canvas file and meta edge records -- over the
 # link to another node's replica canvas row. Run it with the canvas_row plugin's path.
 add_executable(mesh_replica_test tests/mesh_replica_test.cpp)

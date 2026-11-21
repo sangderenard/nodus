@@ -73,12 +73,14 @@ bool valid_identifier(const std::string& text) {
 }
 
 bool supported_type(PrimitiveType type) {
-    return type >= PrimitiveType::Float32 && type <= PrimitiveType::UInt64;
+    return type >= PrimitiveType::Float32 && type <= PrimitiveType::Bytes;
 }
+
+bool is_bytes(PrimitiveType type) { return type == PrimitiveType::Bytes; }
 
 bool parse_primitive_type(const std::string& name, PrimitiveType& type) {
     for (uint32_t raw = static_cast<uint32_t>(PrimitiveType::Float32);
-         raw <= static_cast<uint32_t>(PrimitiveType::UInt64); ++raw) {
+         raw <= static_cast<uint32_t>(PrimitiveType::Bytes); ++raw) {
         const auto candidate = static_cast<PrimitiveType>(raw);
         if (name == primitive_type_name(candidate)) {
             type = candidate;
@@ -100,6 +102,7 @@ const char* primitive_enum_name(PrimitiveType type) {
         case PrimitiveType::UInt16: return "UInt16";
         case PrimitiveType::UInt32: return "UInt32";
         case PrimitiveType::UInt64: return "UInt64";
+        case PrimitiveType::Bytes: return "Bytes";
     }
     return "Invalid";
 }
@@ -185,6 +188,7 @@ bool pop_value(RawStackFrame& stack, PrimitiveType type, NativeValue& out) {
         case PrimitiveType::UInt16: return pop_native<uint16_t>(stack, tid, out);
         case PrimitiveType::UInt32: return pop_native<uint32_t>(stack, tid, out);
         case PrimitiveType::UInt64: return pop_native<uint64_t>(stack, tid, out);
+        case PrimitiveType::Bytes: break;
     }
     return false;
 }
@@ -202,6 +206,7 @@ bool push_value(RawStackFrame& stack, const NativeValue& value) {
         case PrimitiveType::UInt16: { const auto v = native_load<uint16_t>(value); return push_exact(stack, tid, v); }
         case PrimitiveType::UInt32: { const auto v = native_load<uint32_t>(value); return push_exact(stack, tid, v); }
         case PrimitiveType::UInt64: { const auto v = native_load<uint64_t>(value); return push_exact(stack, tid, v); }
+        case PrimitiveType::Bytes: break;
     }
     return false;
 }
@@ -228,6 +233,8 @@ PyObject* to_python(const NativeValue& value) {
             return PyLong_FromUnsignedLong(native_load<uint32_t>(value));
         case PrimitiveType::UInt64:
             return PyLong_FromUnsignedLongLong(native_load<uint64_t>(value));
+        case PrimitiveType::Bytes:
+            break;
     }
     return nullptr;
 }
@@ -298,6 +305,7 @@ bool from_python(PyObject* object, PrimitiveType type, NativeValue& out, std::st
         }
         case PrimitiveType::Float32:
         case PrimitiveType::Float64:
+        case PrimitiveType::Bytes:
             break;
     }
     set_error(error, "unsupported Python row primitive type");
@@ -323,6 +331,7 @@ int32_t tensor_dtype(PrimitiveType type) {
         case PrimitiveType::UInt16: return NODUS_DTYPE_U16;
         case PrimitiveType::UInt32: return NODUS_DTYPE_U32;
         case PrimitiveType::UInt64: return NODUS_DTYPE_U64;
+        case PrimitiveType::Bytes: return NODUS_DTYPE_U8;
     }
     return NODUS_DTYPE_UNKNOWN;
 }
@@ -339,6 +348,7 @@ size_t primitive_bytes(PrimitiveType type) {
         case PrimitiveType::UInt16: return sizeof(uint16_t);
         case PrimitiveType::UInt32: return sizeof(uint32_t);
         case PrimitiveType::UInt64: return sizeof(uint64_t);
+        case PrimitiveType::Bytes: return 0;   // variable: never on the primitive bridge
     }
     return 0;
 }
@@ -357,6 +367,7 @@ ValueTypeBuiltin builtin_type(PrimitiveType type) {
         case PrimitiveType::UInt16: return VT_UINT16;
         case PrimitiveType::UInt32: return VT_UINT32;
         case PrimitiveType::UInt64: return VT_UINT64;
+        case PrimitiveType::Bytes: return VT_ABSTRACT_TENSOR;   // carried as one tensor handle
     }
     return VT_BUILTIN_COUNT;
 }
@@ -373,12 +384,13 @@ const char* primitive_type_name(PrimitiveType type) {
         case PrimitiveType::UInt16: return "uint16";
         case PrimitiveType::UInt32: return "uint32";
         case PrimitiveType::UInt64: return "uint64";
+        case PrimitiveType::Bytes: return "bytes";
     }
     return "invalid";
 }
 
 bool validate_descriptor(const Descriptor& descriptor, std::string* error) {
-    if (descriptor.abi_version != kPythonRowAbiVersion) {
+    if (descriptor.abi_version < kPythonRowAbiVersionMin || descriptor.abi_version > kPythonRowAbiVersion) {
         set_error(error, "unsupported Python row ABI version");
         return false;
     }
@@ -406,6 +418,10 @@ bool validate_descriptor(const Descriptor& descriptor, std::string* error) {
             }
             if (!supported_type(ports[i].type)) {
                 set_error(error, std::string(direction) + " port " + ports[i].name + " uses a pointer, tensor, dynamic, or unknown type");
+                return false;
+            }
+            if (is_bytes(ports[i].type) && descriptor.abi_version < 2) {
+                set_error(error, std::string(direction) + " port " + ports[i].name + " is bytes, which needs ABI version 2");
                 return false;
             }
             for (size_t j = 0; j < i; ++j) {
@@ -585,14 +601,18 @@ bool generate_plugin_source(const Descriptor& descriptor, std::string* source, s
     out << "    void shutdown() override { interpreter_.shutdown(); }\n";
     out << "    void tick(double, HostAPI&) override {}\n";
     out << "    void render(RenderContext&) override {}\n";
+    // An interpreted row reads its inputs and never keeps or destroys them (ToolTensorRole::Borrower): in a table with
+    // a Returns row, an input it has used goes back to the mint. Without this, every tensor a chain of Python rows
+    // (seal, then sign) had read was left alive.
+    out << "    ToolTensorRole tensor_role() const override { return ToolTensorRole::Borrower; }\n";
     out << "    int32_t port_count() const override { return 2; }\n";
     out << "    ToolPortSpec port_spec(int32_t i) const override {\n";
     out << "        if (i == 0) return ToolPortSpec{ToolPortKind::Argument, " << static_cast<int32_t>(descriptor.inputs.size()) << "};\n";
     out << "        if (i == 1) return ToolPortSpec{ToolPortKind::Return, " << static_cast<int32_t>(descriptor.outputs.size()) << "};\n";
     out << "        return ToolPortSpec{};\n    }\n";
     out << "    void execute_stack(ToolStackContext& c) override {\n";
-    out << "        if (!c.stack.raw) return; std::string e; if (!interpreter_.execute_tensor_stack(*c.stack.raw, &e)) std::fprintf(stderr, \"python row "
-        << cpp_escape(descriptor.tool_id) << ": %s\\n\", e.c_str());\n    }\n";
+    out << "        if (!c.stack.raw) return; std::string e; if (!interpreter_.execute_tensor_stack(*c.stack.raw, &e)) { c.succeeded = false; std::fprintf(stderr, \"python row "
+        << cpp_escape(descriptor.tool_id) << ": %s\\n\", e.c_str()); }\n    }\n";
     out << "private:\n    nodus::python_row::Interpreter interpreter_;\n};\n} // namespace\n\n";
     out << "extern \"C\" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new " << class_name << "(); }\n";
     out << "extern \"C\" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* t) { delete t; }\n";
@@ -682,6 +702,12 @@ void Interpreter::shutdown() noexcept {
 
 bool Interpreter::execute(RawStackFrame& stack, std::string* error) {
     if (!initialize(error)) return false;
+    for (const Port& port : impl_->descriptor.inputs) {
+        if (is_bytes(port.type)) { set_error(error, "bytes ports run only through execute_tensor_stack"); return false; }
+    }
+    for (const Port& port : impl_->descriptor.outputs) {
+        if (is_bytes(port.type)) { set_error(error, "bytes ports run only through execute_tensor_stack"); return false; }
+    }
     const size_t input_count = impl_->descriptor.inputs.size();
     std::vector<NativeValue> inputs(input_count);
     // Stack top is the last declared argument. Validate all types before the
@@ -801,6 +827,13 @@ bool Interpreter::execute_tensor_stack(RawStackFrame& stack, std::string* error)
         set_error(error, "tensor stack arity/type mismatch for interpreted Python row");
         return false;
     }
+    bool any_bytes = false;
+    for (const Port& port : impl_->descriptor.inputs) any_bytes = any_bytes || is_bytes(port.type);
+    for (const Port& port : impl_->descriptor.outputs) any_bytes = any_bytes || is_bytes(port.type);
+    if (any_bytes) {
+        if (!execute_bytes(inputs, stack, error)) { restore_inputs(); return false; }
+        return true;
+    }
 
     size_t input_bytes = 0;
     size_t output_bytes = 0;
@@ -891,6 +924,119 @@ bool Interpreter::execute_tensor_stack(RawStackFrame& stack, std::string* error)
             return false;
         }
         ++pushed;
+    }
+    return true;
+}
+
+// ABI v2: the callable takes and returns bytes (and scalars) directly; tensors are read and made here, under the GIL
+// only for the Python call. Refusal (an error) leaves the stack for the caller to restore.
+bool Interpreter::execute_bytes(const std::vector<nodus::tensors::AbstractTensorHandle>& inputs, RawStackFrame& stack,
+                                std::string* error) {
+    const auto& d = impl_->descriptor;
+    std::vector<std::vector<uint8_t>> input_bytes(inputs.size());
+    std::vector<NativeValue> input_values(inputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        NodusTensorDesc t{};
+        if (!inputs[i].id || nodus_tensor_describe(inputs[i].id, &t) != NODUS_OK) {
+            set_error(error, "interpreted Python row input " + d.inputs[i].name + " is not a tensor");
+            return false;
+        }
+        if (is_bytes(d.inputs[i].type)) {
+            if (t.dtype != NODUS_DTYPE_U8) { set_error(error, "bytes input " + d.inputs[i].name + " is not a U8 tensor"); return false; }
+            input_bytes[i].resize(static_cast<size_t>(t.total_bytes));
+            if (t.total_bytes && nodus_tensor_read(inputs[i].id, 0, input_bytes[i].data(), input_bytes[i].size()) !=
+                                     static_cast<int64_t>(input_bytes[i].size())) {
+                set_error(error, "could not read bytes input " + d.inputs[i].name);
+                return false;
+            }
+        } else {
+            const size_t n = primitive_bytes(d.inputs[i].type);
+            input_values[i].type = d.inputs[i].type;
+            if (t.dtype != tensor_dtype(d.inputs[i].type) || t.element_count != 1 ||
+                nodus_tensor_read(inputs[i].id, 0, input_values[i].bytes.data(), n) != static_cast<int64_t>(n)) {
+                set_error(error, "scalar input " + d.inputs[i].name + " is not one value of its declared dtype");
+                return false;
+            }
+        }
+    }
+    const size_t output_count = d.outputs.size();
+    std::vector<std::vector<uint8_t>> output_bytes(output_count);
+    std::vector<NativeValue> output_values(output_count);
+    PyGILState_STATE gil = PyGILState_Ensure();
+    PyObject* args = PyTuple_New(static_cast<Py_ssize_t>(inputs.size()));
+    bool ok = args != nullptr;
+    for (size_t i = 0; ok && i < inputs.size(); ++i) {
+        PyObject* v = is_bytes(d.inputs[i].type)
+            ? PyBytes_FromStringAndSize(reinterpret_cast<const char*>(input_bytes[i].data()),
+                                        static_cast<Py_ssize_t>(input_bytes[i].size()))
+            : to_python(input_values[i]);
+        if (!v) { ok = false; break; }
+        PyTuple_SET_ITEM(args, static_cast<Py_ssize_t>(i), v);   // steals v
+    }
+    PyObject* result = ok ? PyObject_CallObject(impl_->callable, args) : nullptr;
+    Py_XDECREF(args);
+    if (!result) {
+        set_error(error, python_error_text());
+        PyGILState_Release(gil);
+        return false;
+    }
+    auto take = [&](PyObject* object, size_t i) -> bool {
+        if (!is_bytes(d.outputs[i].type)) return from_python(object, d.outputs[i].type, output_values[i], error);
+        Py_buffer view{};
+        if (PyObject_GetBuffer(object, &view, PyBUF_SIMPLE) != 0) {
+            PyErr_Clear();
+            set_error(error, "bytes output " + d.outputs[i].name + " is not bytes-like");
+            return false;
+        }
+        const auto* p = static_cast<const uint8_t*>(view.buf);
+        output_bytes[i].assign(p, p + view.len);
+        PyBuffer_Release(&view);
+        return true;
+    };
+    if (output_count == 0) {
+        ok = result == Py_None;
+        if (!ok) set_error(error, "zero-output Python row must return None");
+    } else if (output_count == 1) {
+        ok = take(result, 0);
+    } else if (!PyTuple_Check(result) || PyTuple_GET_SIZE(result) != static_cast<Py_ssize_t>(output_count)) {
+        ok = false;
+        set_error(error, "Python row result tuple arity does not match declared outputs");
+    } else {
+        for (size_t i = 0; ok && i < output_count; ++i) ok = take(PyTuple_GET_ITEM(result, static_cast<Py_ssize_t>(i)), i);
+    }
+    Py_DECREF(result);
+    PyGILState_Release(gil);
+    if (!ok) return false;
+    std::vector<nodus::tensors::AbstractTensorHandle> outputs;
+    for (size_t i = 0; i < output_count; ++i) {
+        uint64_t id = 0;
+        if (is_bytes(d.outputs[i].type)) {
+            if (output_bytes[i].empty()) continue;                    // an empty result pushes nothing
+            const uint64_t shape[1] = {static_cast<uint64_t>(output_bytes[i].size())};
+            id = nodus_tensor_create(NODUS_DTYPE_U8, 1, shape);
+            if (id && nodus_tensor_write(id, 0, output_bytes[i].data(), output_bytes[i].size()) !=
+                          static_cast<int64_t>(output_bytes[i].size())) { nodus_tensor_destroy(id); id = 0; }
+        } else {
+            const size_t n = primitive_bytes(d.outputs[i].type);
+            id = nodus_tensor_create(tensor_dtype(d.outputs[i].type), 0, nullptr);
+            if (id && nodus_tensor_write(id, 0, output_values[i].bytes.data(), n) != static_cast<int64_t>(n)) {
+                nodus_tensor_destroy(id); id = 0;
+            }
+        }
+        if (!id) {
+            for (auto& o : outputs) nodus_tensor_destroy(o.id);
+            set_error(error, "could not materialize Python row output " + d.outputs[i].name);
+            return false;
+        }
+        outputs.push_back(nodus::tensors::AbstractTensorHandle{id});
+    }
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        if (!raw_stack_push_abstract_tensor(stack, outputs[i])) {
+            for (size_t k = 0; k < i; ++k) { nodus::tensors::AbstractTensorHandle undo{}; raw_stack_pop_abstract_tensor(stack, undo); }
+            for (auto& o : outputs) nodus_tensor_destroy(o.id);
+            set_error(error, "Python row outputs do not fit the row stack");
+            return false;
+        }
     }
     return true;
 }
