@@ -13,7 +13,25 @@ static std::string gp_canvas_module_root(GP_CanvasContextImpl* cc, bool warn_on_
     return gp_module_library_default_root();
 }
 
-static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
+// Each plugin row's own saved state (ITool::serialize), the bytes a ROW_STATE record carries. Taken once per save: the
+// signature hashes them and the save writes them, so a change inside a row (a canvas row's nested canvas) is a change.
+struct CanvasRowStateBytes { size_t module = 0; size_t row = 0; std::vector<uint8_t> bytes; };
+static std::vector<CanvasRowStateBytes> canvas_row_states(GP_CanvasContextImpl* c) {
+    std::vector<CanvasRowStateBytes> out;
+    for (size_t mi = 0; mi < c->module_plugin_instances.size(); ++mi) {
+        const auto& insts = c->module_plugin_instances[mi];
+        for (size_t ri = 0; ri < insts.size(); ++ri) {
+            if (!insts[ri]) continue;
+            MemoryOutputArchive state;
+            bool saved = false;
+            try { saved = insts[ri]->serialize(state); } catch (...) { saved = false; }
+            if (saved) out.push_back(CanvasRowStateBytes{mi, ri, std::move(state.bytes)});
+        }
+    }
+    return out;
+}
+
+static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc, const std::vector<CanvasRowStateBytes>* rows = nullptr) {
     std::ostringstream ss;
     ss << cc->modules.size() << ":";
     for (size_t i = 0; i < cc->modules.size(); ++i) {
@@ -30,6 +48,16 @@ static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
     ss << "|O:" << cc->overlays.size();
     ss << "|P:" << cc->canvas_ports.size() << ":";       // a port-only change must still autosave
     for (const auto &p : cc->canvas_ports) ss << p.contact << ',' << p.direction << ',' << p.up << ',' << p.name << ';';
+    // Row state: a save must not be skipped when only a row's state changed (a canvas row's nested canvas, review
+    // 6e1b5069). FNV-1a 64 of each row's bytes.
+    std::vector<CanvasRowStateBytes> own;
+    if (!rows) { own = canvas_row_states(cc); rows = &own; }
+    ss << "|R:" << rows->size() << ":";
+    for (const auto& r : *rows) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t b : r.bytes) { h ^= b; h *= 1099511628211ull; }
+        ss << r.module << ',' << r.row << ',' << r.bytes.size() << ',' << h << ';';
+    }
     return ss.str();
 }
 
@@ -45,8 +73,10 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     #include <sstream>
     if (!ctx_ || !path) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    // quick-change signature to avoid serializing -> disk when nothing changed
-    std::string sig = gp_canvas_compute_signature(c);
+    // quick-change signature to avoid serializing -> disk when nothing changed; it includes every row's saved state,
+    // taken once here and written below as ROW_STATE records
+    const std::vector<CanvasRowStateBytes> row_states = canvas_row_states(c);
+    std::string sig = gp_canvas_compute_signature(c, &row_states);
     // compare against active buffer slot
     int cur_idx = c->last_save_idx.load(std::memory_order_acquire);
     if (!c->last_save_buf[cur_idx].empty() && c->last_save_buf[cur_idx] == sig &&
@@ -430,20 +460,12 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     }
     // Each plugin row's own saved state (ITool::serialize), hex, after everything it may refer to. A canvas row's state
     // is the canvas it holds, so a table's canvas rows are saved inside the canvas that holds the table.
-    for (size_t mi = 0; mi < c->module_plugin_instances.size(); ++mi) {
-        const auto& insts = c->module_plugin_instances[mi];
-        for (size_t ri = 0; ri < insts.size(); ++ri) {
-            if (!insts[ri]) continue;
-            MemoryOutputArchive state;
-            bool saved = false;
-            try { saved = insts[ri]->serialize(state); } catch (...) { saved = false; }
-            if (!saved) continue;
-            static const char kHex[] = "0123456789abcdef";
-            std::string hex;
-            hex.reserve(state.bytes.size() * 2);
-            for (uint8_t b : state.bytes) { hex.push_back(kHex[b >> 4]); hex.push_back(kHex[b & 15]); }
-            ofs << "ROW_STATE " << mi << " " << ri << " " << (hex.empty() ? "-" : hex) << "\n";
-        }
+    for (const auto& r : row_states) {
+        static const char kHex[] = "0123456789abcdef";
+        std::string hex;
+        hex.reserve(r.bytes.size() * 2);
+        for (uint8_t b : r.bytes) { hex.push_back(kHex[b >> 4]); hex.push_back(kHex[b & 15]); }
+        ofs << "ROW_STATE " << r.module << " " << r.row << " " << (hex.empty() ? "-" : hex) << "\n";
     }
     ofs.close();
     // Update in-memory signature to reflect this successful save using atomic flip

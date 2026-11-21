@@ -165,6 +165,18 @@ void run_case(const char* tool_id, const std::filesystem::path& dir, int32_t exe
     const std::vector<float> got_again = carry(again, 12);
     CHECK(got_again == wanted);
     std::printf("%s reloaded: %zu of %zu values arrived in order\n", label, got_again.size(), wanted.size());
+
+    // Saved twice to one path with only the nested canvas changed in between, the second save writes it: the save's
+    // change signature counts row state (review 6e1b5069). The other exec mode's child is a different nested canvas.
+    const auto twice = dir / ("twice_" + std::to_string(exec_mode + 1) + ".nodus.txt");
+    CHECK(nodus_headless_save_file(again, twice.string().c_str()));
+    const std::vector<uint8_t> before = read_file(twice);
+    const std::vector<uint8_t> other = child_canvas_state(dir, exec_mode == -1 ? 3 : -1);
+    CHECK(nodus_headless_set_row_state(again, holder, row, other.data(), other.size()));
+    CHECK(nodus_headless_save_file(again, twice.string().c_str()));
+    const std::vector<uint8_t> after = read_file(twice);
+    CHECK(!before.empty() && after != before);
+    std::printf("%s a second save after only the nested canvas changed: %s\n", label, after != before ? "written" : "SKIPPED");
     nodus_headless_destroy(again);
 
 }
