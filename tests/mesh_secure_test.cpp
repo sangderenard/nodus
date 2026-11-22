@@ -18,10 +18,10 @@
 //   mesh_secure_test <work dir>
 // Every node process builds its own rows inside its own headless runtime (headless_rows.h, nodus_headless_build_plugin
 // _source), the module library rows by name, the mesh rows among them.
+#include "nodus_link.h"          // first: winsock2.h before exec_pipe.h brings in windows.h
 #include "canvas_abi.h"
 #include "exec_pipe.h"
 #include "nodus_headless_abi.h"
-#include "nodus_link.h"
 #include "headless_rows.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
@@ -278,6 +278,18 @@ std::string operate(std::vector<std::string> args) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "writer") return writer(argv);
     if (argc >= 2 && std::string(argv[1]) == "reader") return reader(argv);
+    // tickets: a fresh link key and the writer's two signed tickets, for an orchestrator that runs the writer and the
+    // reader on different machines (tests/mesh_cross_machine.ps1): prints "<link key hex> <control hex> <bulk hex>".
+    if (argc >= 2 && std::string(argv[1]) == "tickets") {
+        nodus::link::Key key{};
+        nodus::link::random_bytes(key.data(), key.size());
+        const auto link = nodus::link::new_link_id();
+        const uint64_t now = uint64_t(std::time(nullptr));
+        const auto ct = nodus::link::sign_ticket(nodus::link::make_ticket(nodus::link::Channel::Control, nodus::link::Role::Dialer, link, "mesh", 7, now, 600), key);
+        const auto bt = nodus::link::sign_ticket(nodus::link::make_ticket(nodus::link::Channel::Bulk, nodus::link::Role::Dialer, link, "mesh", 7, now, 600), key);
+        std::printf("%s %s %s\n", hex(key.data(), key.size()).c_str(), hex(ct.data(), ct.size()).c_str(), hex(bt.data(), bt.size()).c_str());
+        return 0;
+    }
     if (argc < 2) {
         std::fprintf(stderr, "usage: mesh_secure_test <work dir>\n");
         return 2;
