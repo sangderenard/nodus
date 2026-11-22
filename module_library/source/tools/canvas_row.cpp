@@ -53,6 +53,23 @@ void remove_saved(const std::filesystem::path& file) {
     std::filesystem::remove_all(modules_of(file), ec);
 }
 
+// A table file a snapshot names, kept inside the modules folder it is written to. The name comes from a peer, so it
+// must be relative with no root name ("D:") and no root directory ("\x", "/x"): on Windows those are not
+// is_absolute(), yet base / rel leaves base (review eba4505a). No component may climb out, no ':' may name a stream,
+// and the joined path must still begin with the base.
+bool contained_in(const std::filesystem::path& base, const std::string& name) {
+    // Snapshot names are written with '/' (generic_string); a backslash is a separator on Windows and a name character
+    // elsewhere, so a peer's name holding one is refused everywhere: what stays inside on Linux escapes on Windows.
+    if (name.empty() || name.find_first_of(std::string(":\\") + char(0)) != std::string::npos) return false;
+    const std::filesystem::path rel(name);
+    if (rel.is_absolute() || rel.has_root_name() || rel.has_root_directory()) return false;
+    for (const auto& part : rel) if (part == "..") return false;
+    const auto b = base.lexically_normal();
+    const auto t = (base / rel).lexically_normal();
+    const auto [bi, ti] = std::mismatch(b.begin(), b.end(), t.begin(), t.end());
+    return bi == b.end() && ti != t.end();
+}
+
 template <typename T> void put(std::vector<uint8_t>& out, const T& v) {
     const auto* b = reinterpret_cast<const uint8_t*>(&v);
     out.insert(out.end(), b, b + sizeof(T));
@@ -175,9 +192,9 @@ bool CanvasRow::adopt(const std::vector<uint8_t>& snap) {
         const uint8_t* bytes = nullptr;
         if (!r.get(name_size) || name_size > 4096 || !r.take(name_size, name) || !r.get(size) ||
             !r.take(static_cast<size_t>(size), bytes)) { loaded = false; break; }
-        const std::filesystem::path rel(std::string(reinterpret_cast<const char*>(name), name_size));
-        if (rel.empty() || rel.is_absolute() || rel.lexically_normal().string().rfind("..", 0) == 0) { loaded = false; break; }
-        const auto target = modules_of(path) / rel;
+        const std::string rel(reinterpret_cast<const char*>(name), name_size);
+        if (!contained_in(modules_of(path), rel)) { loaded = false; break; }
+        const auto target = modules_of(path) / std::filesystem::path(rel);
         std::error_code ec;
         std::filesystem::create_directories(target.parent_path(), ec);
         std::ofstream out(target, std::ios::binary | std::ios::trunc);
@@ -240,8 +257,7 @@ bool CanvasRow::serialize(OutputArchive& out) const {
            out.write(&last_generation_, sizeof(last_generation_)) && out.write(&size, sizeof(size)) &&
            out.write(snap.data(), snap.size()) && [&] {
                std::vector<uint8_t> held;
-               write_held(held);
-               return out.write(held.data(), held.size());
+               return write_held(held) && out.write(held.data(), held.size());
            }();
 }
 
@@ -345,14 +361,18 @@ bool CanvasRow::deserialize(InputArchive& in) {
     return false;
 }
 
-void CanvasRow::write_held(std::vector<uint8_t>& out) const {
+// The tokens in custody. A held tensor is saved as its contents; if it cannot be described or read whole the save
+// fails, rather than writing a process-local handle or invented bytes (review eba4505a).
+bool CanvasRow::write_held(std::vector<uint8_t>& out) const {
     put(out, static_cast<uint32_t>(ports_.size()));
     for (const Port& p : ports_) {
         uint64_t h = 0;
         NodusTensorDesc d{};
         if (p.held.empty()) { out.push_back(0); continue; }
-        if (p.tensor && p.held.size() == sizeof(h) && (std::memcpy(&h, p.held.data(), sizeof(h)), h) &&
-            nodus_tensor_describe(h, &d) == NODUS_OK) {
+        if (p.tensor) {
+            if (p.held.size() != sizeof(h)) return false;
+            std::memcpy(&h, p.held.data(), sizeof(h));
+            if (!h || nodus_tensor_describe(h, &d) != NODUS_OK || d.rank > 8 || d.total_bytes > kCanvasRowMaxBytes) return false;
             out.push_back(2);
             put(out, static_cast<int32_t>(d.dtype));
             put(out, static_cast<uint32_t>(d.rank));
@@ -362,13 +382,14 @@ void CanvasRow::write_held(std::vector<uint8_t>& out) const {
             out.resize(at + static_cast<size_t>(d.total_bytes));
             if (d.total_bytes && nodus_tensor_read(h, 0, out.data() + at, static_cast<size_t>(d.total_bytes)) !=
                                      static_cast<int64_t>(d.total_bytes))
-                std::memset(out.data() + at, 0, static_cast<size_t>(d.total_bytes));
+                return false;
             continue;
         }
         out.push_back(1);
         put(out, static_cast<uint32_t>(p.held.size()));
         out.insert(out.end(), p.held.begin(), p.held.end());
     }
+    return true;
 }
 
 bool CanvasRow::restore_held(const std::vector<uint8_t>& held) {

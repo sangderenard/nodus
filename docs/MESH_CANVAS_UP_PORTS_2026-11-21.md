@@ -202,3 +202,25 @@ for an add on development work we haven't implemented yet".
   row with played ports: under refusal it holds 7 (from the feed) and 1 (from the canvas); saved and restored into a
   new row, each comes out exactly once among 35 values, none twice. Oracle A1: canvas_row_test, file_link_test (22/22,
   0 tensors alive), mesh_replica_test and mesh_secure_test (all five scenarios) pass.
+- **Native mesh crypto on the pinned OpenSSL (review eba4505a).** Owner, 2026-11-21: move the mesh crypto rows to
+  OpenSSL; no Python for Nodus. The crypto is now one implementation in the headless image,
+  `src/headless/nodus_mesh_crypto.cpp` (OpenSSL 4.0.3 from `scripts/build_openssl.cmake`; built only when the OpenSSL
+  found has ML-KEM and ML-DSA, otherwise the rows refuse), behind `nodus_mesh_row` / `nodus_mesh_operator` in
+  `nodus_headless_abi.h`. The rows are native, one duty each (`module_library/source/tools/mesh_{seal,sign,verify,open}
+  .cpp`, ids `nodus.mesh.*`, Borrowers with the same U8-tensor contract the Python rows had); the operators are
+  `tools/mesh_keys` (`nodus_mesh_keys keygen | root-keygen | rotate | force | accept`). `mesh_crypto.py` is removed;
+  the Python row ABI v2 (Bytes ports) stays. Formats are unchanged except the force record, now "NMF2", which may carry
+  the allowed suites. operator-codex's eba4505a objections: (1) a peer's table-file name in a snapshot must be
+  relative, with no root name, root directory, `..`, `:` or backslash, and stay inside the modules folder
+  (canvas_row_test: 8 of 8 hostile names refused, nothing written outside); (2) a key set is made whole under a staging
+  name and renamed to `epochs/<n>`, its record written, then `current` replaced in one rename, and `rotate` resumes from
+  any stage; (3) `accept` writes each change in one rename and its newness marker last, so an interrupted accept is
+  applied again; (4) a force record's allowlist replaces `suites`, refusing every key of a suite left out; (5) a held
+  tensor that cannot be described or read whole fails the save instead of being saved as a handle or zeros
+  (canvas_row_test: saved by value while live, save refused once freed). `tests/mesh_keys_test.cpp` drills rotation
+  stopped after its key set and after its record, then finished, while a second thread signed throughout (46
+  signatures, 0 failed); an accept interrupted before its marker applied again; a replay refused; a force allowing only
+  suite 2 refusing A, a newer one restoring it, the older refused. Oracle A1: mesh_keys_test, canvas_row_test,
+  mesh_replica_test, file_link_test (0 tensors alive) and mesh_secure_test (all five scenarios: B 127/127 readable; C
+  0 readable; D's snapshots never adopted; after A rotates 127/127; after the root revokes A, nothing) pass. Not yet
+  built on Windows.

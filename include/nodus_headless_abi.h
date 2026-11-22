@@ -541,6 +541,23 @@ NODUS_HEADLESS_API int32_t nodus_headless_is_quiescent(const NodusHeadlessGraph*
 // (up to `capacity`).
 NODUS_HEADLESS_API int32_t nodus_headless_poll_events(NodusHeadlessGraph* g, NodusHeadlessEvent* out, int32_t capacity);
 
+// Mesh crypto (src/headless/nodus_mesh_crypto.cpp, on the pinned OpenSSL): the hybrid post-quantum signing and sealing
+// behind the mesh rows (module_library/source/tools/mesh_{seal,sign,verify,open}.cpp) and the key operators
+// (tools/mesh_keys). The node's keys are the folder NODUS_MESH_KEYS names. nodus_mesh_available is 0 in a build without
+// the pinned OpenSSL, and every call then refuses.
+#define NODUS_MESH_SEAL 1     // "NRS1" readers + snapshot -> "NMC1" sealed (or "NMC0" public)
+#define NODUS_MESH_SIGN 2     // body -> "NMS2" envelope
+#define NODUS_MESH_VERIFY 3   // envelope -> "NMV1" (a rotation or force record is applied instead, and yields nothing)
+#define NODUS_MESH_OPEN 4     // "NMV1" -> "NMO1" (readable or not)
+NODUS_HEADLESS_API int32_t nodus_mesh_available(void);
+// The most bytes `op` can write for this input: the caller sizes its buffer with it (the caller owns the memory).
+NODUS_HEADLESS_API uint64_t nodus_mesh_bound(int32_t op, const uint8_t* in, size_t n);
+// 1: done, `written` bytes in `out` (0 when nothing goes on: a record applied); 0: refused.
+NODUS_HEADLESS_API int32_t nodus_mesh_row(int32_t op, const uint8_t* in, size_t n, uint8_t* out, size_t cap, size_t* written);
+// An operator command (keygen, root-keygen, rotate, force, accept; tools/mesh_keys prints the usage): 1 done, 0 refused;
+// what it did, or why not, in `report`.
+NODUS_HEADLESS_API int32_t nodus_mesh_operator(int32_t argc, const char* const* argv, char* report, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

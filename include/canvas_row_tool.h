@@ -20,7 +20,7 @@
 // replica's meta groups carry those records (gp_table_meta_append_records), so every reader of a meta edge sees the
 // writer's traffic.
 //
-// The mesh, secured (docs/MESH_CANVAS_UP_PORTS_2026-11-21.md, stages 3-4; module_library/source/tools/mesh_crypto.py).
+// The mesh, secured (docs/MESH_CANVAS_UP_PORTS_2026-11-21.md, stages 3-4; the mesh rows on src/headless/nodus_mesh_crypto.cpp).
 // A host in mesh mode names its readers (node kids, public): it puts "NRS1" | n | reader kids | snapshot on "state",
 // and the rows above it seal (to those readers; none = public) and sign (with the node's keys) on its way out. A
 // replica names its one writer (a kid) and takes what the verify and open rows hand it, "NMO1" | writer | generation |
@@ -80,7 +80,7 @@ private:
     };
     // The held tokens, saved: per port a kind (0 none, 1 raw bytes, 2 tensor) and the token -- a tensor as its dtype,
     // shape and bytes, since a handle means nothing in another process. Restored after the canvas is adopted.
-    void write_held(std::vector<uint8_t>& out) const;
+    bool write_held(std::vector<uint8_t>& out) const;   // false: a held tensor could not be saved whole
     bool restore_held(const std::vector<uint8_t>& held);
     // Snapshot: magic "NCS1", version 2, canvas byte count (u64), the canvas file's bytes; the files a save writes beside
     // it in <file>.modules/ (count u32; each: relative name length u32, name, byte count u64, bytes); meta group count

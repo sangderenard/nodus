@@ -1,5 +1,5 @@
 // mesh_secure_test: one writer per canvas, and read privacy, across real processes (docs/MESH_CANVAS_UP_PORTS_2026-11-21.md;
-// module_library/source/tools/mesh_crypto.py; include/canvas_row_tool.h).
+// module_library/source/tools/mesh_{seal,sign,verify,open}.cpp on src/headless/nodus_mesh_crypto.cpp; canvas_row_tool.h).
 //
 // Each node is its own process with its own keys (NODUS_MESH_KEYS). Node A writes a canvas whose one reader is B:
 //   writer  [canvas_row host, mesh, readers {B}] "state" -> [Input | seal | sign | returns | Output]
@@ -12,17 +12,17 @@
 //   B, writer A after A rotates (KEY_CHANGE_PROTOCOL.md section 4): B accepts A's cross-signed rotation record; A's new
 //          epoch is still A (its lineage) and B opens it
 //   B, writer A after the site root force-revokes A's current key (section 5): nothing more is adopted from it
-// Keys are hybrid (Ed25519 + ML-DSA-65 signatures, X25519 + ML-KEM-768 sealing), made by mesh_crypto.py keygen.
+// Keys are hybrid (Ed25519 + ML-DSA-65 signatures, X25519 + ML-KEM-768 sealing) on the pinned OpenSSL, made and
+// changed by the key operators (nodus_mesh_operator, as tools/mesh_keys runs them).
 //
-//   mesh_secure_test <python> <python site-packages> <work dir>
+//   mesh_secure_test <work dir>
 // Every node process builds its own rows inside its own headless runtime (headless_rows.h, nodus_headless_build_plugin
-// _source): the module library rows by name, the mesh_crypto rows from the wrappers the orchestrator generates.
+// _source), the module library rows by name, the mesh rows among them.
 #include "canvas_abi.h"
 #include "exec_pipe.h"
 #include "nodus_headless_abi.h"
 #include "nodus_link.h"
 #include "headless_rows.h"
-#include "python_row_tool.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
 #include <chrono>
@@ -44,7 +44,7 @@ namespace {
 
 constexpr int32_t kTool = 1, kInput = 0, kOutput = 2, kPlugin = 1;
 constexpr int32_t kRowPortBase = 20000, kRowPortStride = 64;
-const char* kRows[4] = {"seal", "sign", "verify", "open"};
+const char* kRows[4] = {"mesh_seal", "mesh_sign", "mesh_verify", "mesh_open"};
 
 std::vector<uint8_t> read_file(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
@@ -257,21 +257,20 @@ bool run(const nodus::exec::Program& p, std::string& out, int seconds) {
     return !child.running() && child.exit_code() == 0;
 }
 
-// One mesh_crypto row's generated wrapper source (each node process builds it in its own runtime).
-std::string build_row(const char* name, const fs::path& source, const fs::path& library, const fs::path&) {
-    nodus::python_row::Descriptor d;
-    d.tool_id = std::string("nodus.mesh.") + name;
-    d.tool_name = std::string("Mesh ") + name;
-    d.source_path = fs::absolute(source).generic_string();
-    d.module_name = "mesh_crypto";
-    d.callable_name = name;
-    d.inputs = {{"in", nodus::python_row::PrimitiveType::Bytes}};
-    d.outputs = {{"out", nodus::python_row::PrimitiveType::Bytes}};
-    const fs::path wrapper = library / "source" / (std::string("mesh_") + name + ".cpp");
-    fs::create_directories(wrapper.parent_path());
-    std::string error;
-    if (!nodus::python_row::write_plugin_source(d, wrapper.string(), &error)) { std::fprintf(stderr, "%s\n", error.c_str()); return {}; }
-    return wrapper.string();
+// A node's current public block: epochs/<current>/node.pub (nodus_mesh_crypto.cpp's folder).
+std::vector<uint8_t> current_block(const fs::path& folder) {
+    std::ifstream in(folder / "current");
+    std::string n;
+    in >> n;
+    return read_file(folder / "epochs" / n / "node.pub");
+}
+std::string operate(std::vector<std::string> args) {
+    std::vector<const char*> a;
+    for (const auto& x : args) a.push_back(x.c_str());
+    char report[1024] = {};
+    const int ok = nodus_mesh_operator(static_cast<int32_t>(a.size()), a.data(), report, sizeof(report));
+    if (!ok) std::fprintf(stderr, "mesh keys %s refused: %s\n", args[0].c_str(), report);
+    return std::string(report) + "\n";
 }
 
 }  // namespace
@@ -279,33 +278,26 @@ std::string build_row(const char* name, const fs::path& source, const fs::path& 
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "writer") return writer(argv);
     if (argc >= 2 && std::string(argv[1]) == "reader") return reader(argv);
-    if (argc < 4) {
-        std::fprintf(stderr, "usage: mesh_secure_test <python> <site-packages> <work dir>\n");
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: mesh_secure_test <work dir>\n");
         return 2;
     }
-    const fs::path work = fs::path(argv[3]) / ("mesh_secure_test_" + std::to_string(std::time(nullptr)));
+    if (!nodus_mesh_available()) { std::fprintf(stderr, "this Nodus was built without the pinned OpenSSL\n"); return 2; }
+    const fs::path work = fs::path(argv[1]) / ("mesh_secure_test_" + std::to_string(std::time(nullptr)));
     fs::create_directories(work);
-    const fs::path nodus_root = fs::path(NODUS_REPO_ROOT);
-    const fs::path crypto = nodus_root / "module_library" / "source" / "tools" / "mesh_crypto.py";
-    set_env("PYTHONPATH", argv[2]);
 
     // Four nodes' keys. A, B and C know one another; B also knows D.
     std::vector<uint8_t> kid[4];
     const char* names[4] = {"A", "B", "C", "D"};
     for (int i = 0; i < 4; ++i) {
-        nodus::exec::Program p;
-        p.path = argv[1];
-        p.working_dir = work.string();
-        p.arguments = {crypto.string(), "keygen", (work / names[i]).string()};
-        std::string out;
-        if (!run(p, out, 60)) { std::fprintf(stderr, "keygen %s: %s\n", names[i], out.c_str()); return 1; }
-        const auto block = read_file(work / names[i] / "node.pub");
+        std::printf("%s: %s", names[i], operate({"keygen", (work / names[i]).string()}).c_str());
+        const auto block = current_block(work / names[i]);
         kid[i] = std::vector<uint8_t>(32);
         nodus::link::platform::sha256(block.data(), block.size(), kid[i].data());
     }
     auto know = [&](int who, int whom) {
-        fs::copy_file(work / names[whom] / "node.pub", work / names[who] / "peers" / (hex(kid[whom].data(), 32) + ".pub"),
-                      fs::copy_options::overwrite_existing);
+        fs::copy_file(work / names[whom] / "epochs" / "0" / "node.pub",
+                      work / names[who] / "peers" / (hex(kid[whom].data(), 32) + ".pub"), fs::copy_options::overwrite_existing);
     };
     for (int a = 0; a < 3; ++a) for (int b = 0; b < 3; ++b) if (a != b) know(a, b);
     know(1, 3);
@@ -313,25 +305,9 @@ int main(int argc, char** argv) {
     std::printf("keys: A %s.. B %s.. C %s.. D %s..\n", hex(kid[0].data(), 4).c_str(), hex(kid[1].data(), 4).c_str(),
                 hex(kid[2].data(), 4).c_str(), hex(kid[3].data(), 4).c_str());
 
-    const fs::path library = work / "module_library";
     std::string rows[4];
-    for (int i = 0; i < 4; ++i) {
-        rows[i] = build_row(kRows[i], crypto, library, nodus_root);
-        if (rows[i].empty()) { std::fprintf(stderr, "the %s row wrapper was not generated\n", kRows[i]); return 1; }
-    }
-    std::printf("row wrappers generated: seal sign verify open\n");
-
-    // The operator commands of mesh_crypto.py, as an operator would run them between scenarios.
-    auto cli = [&](std::vector<std::string> args) -> std::string {
-        nodus::exec::Program p;
-        p.path = argv[1];
-        p.working_dir = work.string();
-        p.arguments = {crypto.string()};
-        p.arguments.insert(p.arguments.end(), args.begin(), args.end());
-        std::string out;
-        if (!run(p, out, 60)) std::fprintf(stderr, "mesh_crypto %s: %s\n", args[0].c_str(), out.c_str());
-        return out;
-    };
+    for (int i = 0; i < 4; ++i) rows[i] = kRows[i];                // each node builds them from the module library
+    auto cli = [&](std::vector<std::string> args) { return operate(std::move(args)); };
     struct Scenario { const char* what; int writer_keys; int reader_keys; int expected_writer; };
     const Scenario scenarios[5] = {{"B reads A's canvas", 0, 1, 0}, {"C is no reader of A's canvas", 0, 2, 0},
                                    {"B takes only A: D's snapshots", 3, 1, 0},
@@ -347,8 +323,8 @@ int main(int argc, char** argv) {
         }
         if (s == 4) {       // the site root, made offline, force-revokes A's current key everywhere
             std::printf("%s", cli({"root-keygen", (work / "ROOT").string()}).c_str());
-            for (const char* who : {"B", "C"}) fs::copy_file(work / "ROOT" / "node.pub", work / who / "root.pub");
-            const auto block = read_file(work / "A" / "node.pub");
+            for (const char* who : {"B", "C"}) fs::copy_file(work / "ROOT" / "epochs" / "0" / "node.pub", work / who / "root.pub");
+            const auto block = current_block(work / "A");
             std::vector<uint8_t> current(32);
             nodus::link::platform::sha256(block.data(), block.size(), current.data());
             std::printf("%s", cli({"force", (work / "ROOT").string(), (work / "force.rec").string(), hex(current.data(), 32)}).c_str());

@@ -76,32 +76,46 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Platform libraries (owner, 2026-11-19: Windows work is regionalized; Nodus ships for Linux too). NODUS_NET_LIBS: sockets;
 # NODUS_LINK_LIBS: the Nodus link (nodus_link.h crypto, nodus_link_wss.h TLS WebSocket, nodus_link_udp.h AES-GCM).
+# The pinned OpenSSL (scripts/build_openssl.cmake: release tarball, SHA-256 checked, static) when it has been built.
+set(NODUS_OPENSSL_ROOT "${CMAKE_SOURCE_DIR}/dev_bundle/deps/openssl-4.0.3" CACHE PATH "Pinned OpenSSL install")
+set(_nodus_openssl_pinned OFF)
+if(EXISTS "${NODUS_OPENSSL_ROOT}/.nodus-pin")
+  # A build directory configured before the pin existed has other paths cached: drop those.
+  foreach(_var OPENSSL_INCLUDE_DIR OPENSSL_CRYPTO_LIBRARY OPENSSL_SSL_LIBRARY LIB_EAY SSL_EAY)
+    if(DEFINED CACHE{${_var}} AND NOT "$CACHE{${_var}}" MATCHES "^${NODUS_OPENSSL_ROOT}/")
+      unset(${_var} CACHE)
+    endif()
+  endforeach()
+  set(OPENSSL_ROOT_DIR "${NODUS_OPENSSL_ROOT}")
+  set(OPENSSL_USE_STATIC_LIBS ON)
+  find_package(OpenSSL 4.0.3 EXACT REQUIRED)
+  set(_nodus_openssl_pinned ON)
+endif()
 if(WIN32)
   set(NODUS_NET_LIBS ws2_32)
   set(NODUS_LINK_LIBS ws2_32 bcrypt winhttp crypt32)
 else()
   find_package(Threads REQUIRED)
-  # The pinned OpenSSL (scripts/build_openssl.cmake: release tarball, SHA-256 checked, static) when it has been built;
-  # otherwise the system's.
-  set(NODUS_OPENSSL_ROOT "${CMAKE_SOURCE_DIR}/dev_bundle/deps/openssl-4.0.3" CACHE PATH "Pinned OpenSSL install")
-  if(EXISTS "${NODUS_OPENSSL_ROOT}/.nodus-pin")
-    # A build directory configured before the pin existed has the system's paths cached: drop those.
-    foreach(_var OPENSSL_INCLUDE_DIR OPENSSL_CRYPTO_LIBRARY OPENSSL_SSL_LIBRARY)
-      if(DEFINED CACHE{${_var}} AND NOT "$CACHE{${_var}}" MATCHES "^${NODUS_OPENSSL_ROOT}/")
-        unset(${_var} CACHE)
-      endif()
-    endforeach()
-    set(OPENSSL_ROOT_DIR "${NODUS_OPENSSL_ROOT}")
-    set(OPENSSL_USE_STATIC_LIBS ON)
-    find_package(OpenSSL 4.0.3 EXACT REQUIRED)
-  else()
+  if(NOT _nodus_openssl_pinned)
     message(STATUS "Pinned OpenSSL not built (cmake -P scripts/build_openssl.cmake); using the system's")
     find_package(OpenSSL REQUIRED)
   endif()
-  message(STATUS "OpenSSL ${OPENSSL_VERSION}: ${OPENSSL_CRYPTO_LIBRARY}")
   set(NODUS_NET_LIBS Threads::Threads)
   set(NODUS_LINK_LIBS OpenSSL::SSL OpenSSL::Crypto Threads::Threads ${CMAKE_DL_LIBS})
 endif()
+# Mesh crypto (src/headless/nodus_mesh_crypto.cpp) needs ML-KEM and ML-DSA: OpenSSL 3.5 or later, the pin. Without it
+# the mesh rows are built but refuse (nodus_mesh_available() is 0).
+set(NODUS_MESH_CRYPTO OFF)
+set(NODUS_MESH_CRYPTO_LIBS "")
+if(OPENSSL_FOUND AND OPENSSL_VERSION VERSION_GREATER_EQUAL 3.5)
+  set(NODUS_MESH_CRYPTO ON)
+  if(WIN32)
+    set(NODUS_MESH_CRYPTO_LIBS OpenSSL::Crypto ws2_32 crypt32 advapi32 user32)   # a static libcrypto's system imports
+  else()
+    set(NODUS_MESH_CRYPTO_LIBS OpenSSL::Crypto)
+  endif()
+endif()
+message(STATUS "OpenSSL ${OPENSSL_VERSION}: ${OPENSSL_CRYPTO_LIBRARY}; mesh crypto ${NODUS_MESH_CRYPTO}")
 
 ## Dependencies are built in isolation under dev_bundle/deps/*
 ## The main project only consumes already-installed packages.
@@ -597,8 +611,16 @@ add_library(nodus_headless SHARED
   src/headless/nodus_headless_abi.cpp
   src/headless/radio_rows.cpp
   src/headless/pcm_playback.cpp
+  src/headless/nodus_mesh_crypto.cpp
 )
 target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
+if(NODUS_MESH_CRYPTO)
+  target_compile_definitions(nodus_headless PRIVATE NODUS_MESH_CRYPTO=1)
+  target_link_libraries(nodus_headless PRIVATE ${NODUS_MESH_CRYPTO_LIBS})
+endif()
+# The mesh key operators (keygen, root-keygen, rotate, force, accept) on the same crypto.
+add_executable(nodus_mesh_keys tools/mesh_keys/mesh_keys.cpp)
+target_link_libraries(nodus_mesh_keys PRIVATE nodus_headless)
 target_include_directories(nodus_headless PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
@@ -704,12 +726,11 @@ if(TARGET canvas_row)
   add_dependencies(canvas_row_test canvas_row)
 endif()
 
-# The secured mesh across processes: one writer per canvas and read privacy, with hybrid post-quantum keys
-# (module_library/source/tools/mesh_crypto.py as interpreted Python rows). Run it with a Python that has
-# cryptography >= 50, its site-packages, and the canvas_row, tensor_mint and tensor_returns plugins.
+# The secured mesh across processes: one writer per canvas and read privacy, with hybrid post-quantum keys (the mesh
+# rows on src/headless/nodus_mesh_crypto.cpp, the pinned OpenSSL). Run it with a work folder.
 add_executable(mesh_secure_test tests/mesh_secure_test.cpp)
 target_include_directories(mesh_secure_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(mesh_secure_test PRIVATE nodus_headless nodus_python_row nodus_tensor_core ${NODUS_LINK_LIBS})
+target_link_libraries(mesh_secure_test PRIVATE nodus_headless nodus_tensor_core ${NODUS_LINK_LIBS})
 target_compile_definitions(mesh_secure_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(mesh_secure_test PUBLIC cxx_std_20)
 foreach(row canvas_row tensor_mint tensor_returns)
@@ -717,6 +738,14 @@ foreach(row canvas_row tensor_mint tensor_returns)
     add_dependencies(mesh_secure_test ${row})
   endif()
 endforeach()
+
+# The mesh's keys in one process (src/headless/nodus_mesh_crypto.cpp): seal/sign/verify/open round trips, a rotation
+# stopped at each stage and resumed while another thread signs, an interrupted accept applied again, a replay refused,
+# and a forced suite change. Run it with a work folder.
+add_executable(mesh_keys_test tests/mesh_keys_test.cpp)
+target_include_directories(mesh_keys_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mesh_keys_test PRIVATE nodus_headless)
+target_compile_features(mesh_keys_test PUBLIC cxx_std_20)
 
 # The mesh: a node's canvas (host canvas row) publishes its snapshot -- canvas file and meta edge records -- over the
 # link to another node's replica canvas row. Run it with the canvas_row plugin's path.

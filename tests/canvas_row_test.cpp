@@ -60,10 +60,17 @@ int32_t pass_table(NodusHeadlessGraph* g, const char* label) {
     return m;
 }
 
-bool edge(NodusHeadlessGraph* g, int32_t a, int32_t ac, int32_t b, int32_t bc, int32_t slots = 8) {
+// One tensor handle a token, lossless (file_link_test's edges): the canvas ports over such edges carry tensors.
+NodusHeadlessFifoConfig tensor_fifo() {
+    NodusHeadlessFifoConfig f{8, 4, 0, 0, 2, 16, 0};
+    f.type_id = nodus_headless_abstract_tensor_type_id();
+    return f;
+}
+
+bool edge(NodusHeadlessGraph* g, int32_t a, int32_t ac, int32_t b, int32_t bc, int32_t slots = 8, bool tensors = false) {
     GP_CanvasEdgeDesc d{a, ac, b, bc};
     const int32_t e = nodus_headless_add_edge(g, &d, 0);
-    NodusHeadlessFifoConfig fifo = float_fifo();
+    NodusHeadlessFifoConfig fifo = tensors ? tensor_fifo() : float_fifo();
     fifo.slots = slots;
     return e >= 0 && nodus_headless_configure_edge_fifo(g, e, &fifo);
 }
@@ -76,7 +83,8 @@ std::vector<uint8_t> read_file(const std::filesystem::path& p) {
 // The child: canvas port "in" -> pass table -> canvas port "out". Saved, its bytes are a canvas row's state. The pass
 // table's exec mode is the child's own choice: -1 steps on the tick the canvas row gives it, 3 (Free) free-runs on its
 // own worker; the choice is saved with the child (MODULE_POLICY).
-std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir, int32_t exec_mode, int32_t slots = 8) {
+std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir, int32_t exec_mode, int32_t slots = 8,
+                                        bool tensors = false) {
     NodusHeadlessGraph* child = nodus_headless_create();
     CHECK(child != nullptr);
     if (!child) return {};
@@ -85,10 +93,11 @@ std::vector<uint8_t> child_canvas_state(const std::filesystem::path& dir, int32_
     const int32_t root = nodus_headless_canvas_root_module(child);
     const int32_t pass = pass_table(child, "pass");
     CHECK(in >= 0 && out >= 0 && root >= 0 && pass >= 0);
-    CHECK(edge(child, root, in, pass, 0, slots));
-    CHECK(edge(child, pass, 1, root, out, slots));
+    CHECK(edge(child, root, in, pass, 0, slots, tensors));
+    CHECK(edge(child, pass, 1, root, out, slots, tensors));
     CHECK(nodus_headless_set_module_exec_mode(child, pass, exec_mode));
-    const auto path = dir / ("child_" + std::to_string(exec_mode + 1) + "_" + std::to_string(slots) + ".nodus.txt");
+    const auto path = dir / ("child_" + std::to_string(exec_mode + 1) + "_" + std::to_string(slots) + (tensors ? "_t" : "") +
+                             ".nodus.txt");
     CHECK(nodus_headless_save_file(child, path.string().c_str()));
     nodus_headless_destroy(child);
     std::vector<uint8_t> canvas = read_file(path);
@@ -295,6 +304,182 @@ void custody_case(const std::filesystem::path& dir) {
     CHECK(unique);
 }
 
+
+// The parts of a saved row (NCR1 v4) around its snapshot: the bytes before its size, the snapshot, the held tokens.
+struct SavedParts {
+    std::vector<uint8_t> head, snapshot, held;
+};
+bool split_saved(const std::vector<uint8_t>& s, SavedParts& parts) {
+    size_t at = 16 + 4;
+    uint32_t n = 0, ws = 0;
+    uint64_t snap = 0;
+    if (s.size() < at + 4) return false;
+    std::memcpy(&n, s.data() + at, 4); at += 4 + static_cast<size_t>(n) * 32;
+    if (s.size() < at + 4) return false;
+    std::memcpy(&ws, s.data() + at, 4); at += 4 + ws + 8;
+    if (s.size() < at + 8) return false;
+    std::memcpy(&snap, s.data() + at, 8);
+    if (s.size() < at + 8 + snap) return false;
+    parts.head.assign(s.begin(), s.begin() + static_cast<std::ptrdiff_t>(at));
+    parts.snapshot.assign(s.begin() + static_cast<std::ptrdiff_t>(at + 8),
+                          s.begin() + static_cast<std::ptrdiff_t>(at + 8 + snap));
+    parts.held.assign(s.begin() + static_cast<std::ptrdiff_t>(at + 8 + snap), s.end());
+    return true;
+}
+// The saved row again with one more table file in its snapshot (magic, version, canvas size, canvas, file count, files).
+std::vector<uint8_t> with_table_file(const SavedParts& parts, const std::string& name, const std::string& body) {
+    std::vector<uint8_t> snap = parts.snapshot;
+    uint64_t canvas = 0;
+    std::memcpy(&canvas, snap.data() + 8, 8);
+    const size_t count_at = 16 + static_cast<size_t>(canvas);
+    uint32_t files = 0;
+    std::memcpy(&files, snap.data() + count_at, 4);
+    ++files;
+    std::memcpy(snap.data() + count_at, &files, 4);
+    std::vector<uint8_t> entry;
+    const uint32_t name_size = static_cast<uint32_t>(name.size());
+    const uint64_t body_size = body.size();
+    entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(&name_size), reinterpret_cast<const uint8_t*>(&name_size) + 4);
+    entry.insert(entry.end(), name.begin(), name.end());
+    entry.insert(entry.end(), reinterpret_cast<const uint8_t*>(&body_size), reinterpret_cast<const uint8_t*>(&body_size) + 8);
+    entry.insert(entry.end(), body.begin(), body.end());
+    snap.insert(snap.begin() + static_cast<std::ptrdiff_t>(count_at + 4), entry.begin(), entry.end());
+    std::vector<uint8_t> out = parts.head;
+    const uint64_t size = snap.size();
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(&size), reinterpret_cast<const uint8_t*>(&size) + 8);
+    out.insert(out.end(), snap.begin(), snap.end());
+    out.insert(out.end(), parts.held.begin(), parts.held.end());
+    return out;
+}
+
+// A snapshot comes from a peer, and its table-file names are the peer's (review eba4505a): a rooted ("\x", "/x"),
+// drive-relative ("D:x"), climbing ("../x", "a/../../x") or stream ("x:s") name is refused and nothing is written
+// outside the row's scratch folder; an ordinary relative name still loads.
+void path_case(const std::filesystem::path& dir) {
+    SavedParts parts;
+    {
+        nodus::canvas_row::CanvasRow row;
+        const std::vector<uint8_t> child = child_canvas_state(dir, -1);
+        MemoryInputArchive in(child);
+        CHECK(row.deserialize(in));
+        MemoryOutputArchive out;
+        CHECK(row.serialize(out));
+        CHECK(split_saved(out.bytes, parts));
+    }
+    const std::string escape = "nodus_escape_" + std::to_string(::time(nullptr)) + ".txt";
+    std::error_code ec;
+    const auto temp = std::filesystem::temp_directory_path(ec);
+    const auto root = temp.root_path();
+    const std::string back(1, static_cast<char>(92));               // a backslash
+    const std::vector<std::string> bad = {back + escape, "/" + escape, "D:" + escape, "../" + escape,
+                                          "a/../../" + escape, ".." + back + escape, escape + ":stream",
+                                          "C:" + back + escape};
+    int refused = 0;
+    for (const std::string& name : bad) {
+        nodus::canvas_row::CanvasRow row;
+        const std::vector<uint8_t> state = with_table_file(parts, name, "escaped");
+        MemoryInputArchive in(state);
+        if (!row.deserialize(in)) ++refused;
+        else std::fprintf(stderr, "path: '%s' was accepted%s", name.c_str(), "\n");
+    }
+    const bool outside = std::filesystem::exists(temp / escape, ec) || std::filesystem::exists(root / escape, ec) ||
+                         std::filesystem::exists(std::filesystem::current_path(ec) / escape, ec);
+    std::printf("path: %d of %zu peer names refused; a file outside the scratch folder: %s%s", refused, bad.size(),
+                outside ? "yes" : "no", "\n");
+    CHECK(refused == static_cast<int>(bad.size()));
+    CHECK(!outside);
+    nodus::canvas_row::CanvasRow row;
+    const std::vector<uint8_t> state = with_table_file(parts, "sub/ok.txt", "fine");
+    MemoryInputArchive in(state);
+    CHECK(row.deserialize(in));
+}
+
+// Held tensors are saved as their contents, or the save fails (review eba4505a): never a stale handle or zeros. The
+// child's edges carry tensors; the feed offers tensor handles and the output refuses, so the row takes some into its
+// custody. Saved while they live, they are saved by value; once they are freed, the save is refused.
+struct TensorPorts {
+    std::deque<uint64_t> feed;
+    static int32_t consume(void* h, int32_t port, void* out, size_t cap, size_t* written) {
+        auto* p = static_cast<TensorPorts*>(h);
+        if (written) *written = 0;
+        if (port != 0 || p->feed.empty() || cap < sizeof(uint64_t)) return 0;
+        std::memcpy(out, &p->feed.front(), sizeof(uint64_t));
+        p->feed.pop_front();
+        if (written) *written = sizeof(uint64_t);
+        return 1;
+    }
+    static int32_t publish(void*, int32_t, const void*, size_t) { return 0; }
+    static int32_t can_publish(void*, int32_t port, int32_t) { return port == 1 ? 1 : 0; }
+    ToolRowPortAccess access() {
+        ToolRowPortAccess a{};
+        a.host = this; a.consume = &consume; a.publish = &publish; a.can_publish = &can_publish;
+        return a;
+    }
+};
+
+void tensor_custody_case(const std::filesystem::path& dir) {
+    const std::vector<uint8_t> child = child_canvas_state(dir, -1, 1, true);
+    TensorPorts ports;
+    std::vector<uint64_t> made;
+    for (int v = 1; v <= 12; ++v) {
+        const uint64_t shape[1] = {1};
+        const uint64_t t = nodus_tensor_create(NODUS_DTYPE_F32, 1, shape);
+        const float x = 100.0f + static_cast<float>(v);
+        CHECK(t && nodus_tensor_write(t, 0, &x, sizeof(x)) == static_cast<int64_t>(sizeof(x)));
+        made.push_back(t);
+        ports.feed.push_back(t);
+    }
+    nodus::canvas_row::CanvasRow row;
+    MemoryInputArchive in(child);
+    CHECK(row.deserialize(in));
+    for (int i = 0; i < 6; ++i) {
+        RawStackFrame frame{};
+        raw_stack_init_frame(frame, 1 << 12);
+        const ToolRowPortAccess access = ports.access();
+        ToolStackContext c{};
+        c.stack.raw = &frame;
+        c.row_ports = &access;
+        c.dt = 1.0 / 60.0;
+        row.execute_stack(c);
+        raw_stack_free_mask(frame);
+    }
+    MemoryOutputArchive live;
+    const bool saved_live = row.serialize(live);
+    SavedParts parts;
+    int tensors_saved = 0;
+    if (saved_live && split_saved(live.bytes, parts) && parts.held.size() >= 4) {
+        size_t at = 4;
+        uint32_t nports = 0;
+        std::memcpy(&nports, parts.held.data(), 4);
+        for (uint32_t i = 0; i < nports && at < parts.held.size(); ++i) {
+            const uint8_t kind = parts.held[at++];
+            if (kind == 1) {
+                uint32_t n = 0;
+                std::memcpy(&n, parts.held.data() + at, 4);
+                at += 4 + n;
+            } else if (kind == 2) {
+                uint32_t rank = 0;
+                std::memcpy(&rank, parts.held.data() + at + 4, 4);
+                at += 8 + static_cast<size_t>(rank) * 8;
+                uint64_t n = 0;
+                std::memcpy(&n, parts.held.data() + at, 8);
+                at += 8;
+                float x = 0.0f;
+                if (n == sizeof(x)) std::memcpy(&x, parts.held.data() + at, sizeof(x));
+                if (x > 100.0f && x <= 112.0f) ++tensors_saved;
+                at += static_cast<size_t>(n);
+            }
+        }
+    }
+    for (uint64_t t : made) nodus_tensor_destroy(t);                // the held handles no longer name live tensors
+    MemoryOutputArchive stale;
+    const bool saved_stale = row.serialize(stale);
+    std::printf("tensor custody: saved live: %s, %d tensor(s) by value; saved after they were freed: %s%s",
+                saved_live ? "yes" : "no", tensors_saved, saved_stale ? "yes" : "no", "\n");
+    CHECK(saved_live && tensors_saved >= 1);
+    CHECK(!saved_stale);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -307,6 +492,8 @@ int main(int argc, char** argv) {
     run_case(tool_id, dir, -1, "respects the tick:");
     run_case(tool_id, dir, 3, "free-runs:");
     custody_case(dir);
+    path_case(dir);
+    tensor_custody_case(dir);
 
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("OK\n");
