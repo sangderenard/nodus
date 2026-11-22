@@ -114,6 +114,22 @@ extern "C" int gp_canvas_port_consume(GP_CanvasContext* ctx_, const char* name, 
     return 1;
 }
 
+// Whether the port's edge carries AbstractTensor handles (its tensor spec names the tensor type): 1 yes, 0 no (raw
+// tokens: scalars), -1 no such port or no edge yet. A row that holds a token of a tensor port across a save keeps the
+// tensor's bytes, not the handle, which means nothing in another process.
+extern "C" int gp_canvas_port_carries_tensors(GP_CanvasContext* ctx_, const char* name) {
+    auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    const int i = canvas_port_index(c, name);
+    if (i < 0) return -1;
+    GP_TableContext* table = nullptr;
+    int32_t edge_idx = -1;
+    uint64_t key = 0;
+    if (!canvas_port_edge(c, c->canvas_ports[static_cast<size_t>(i)], &table, &edge_idx, &key)) return -1;
+    GP_TableEdgeTensorSpecTyped spec{};
+    if (!gp_table_edge_get_tensor_spec(table, edge_idx, &spec)) return 0;
+    return spec.type_id == static_cast<int32_t>(ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR)) ? 1 : 0;
+}
+
 extern "C" int gp_canvas_port_publish(GP_CanvasContext* ctx_, const char* name, const void* bytes, int len) {
     auto* c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     const int i = canvas_port_index(c, name);

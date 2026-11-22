@@ -13,7 +13,25 @@ static std::string gp_canvas_module_root(GP_CanvasContextImpl* cc, bool warn_on_
     return gp_module_library_default_root();
 }
 
-static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
+// Each plugin row's own saved state (ITool::serialize), the bytes a ROW_STATE record carries. Taken once per save: the
+// signature hashes them and the save writes them, so a change inside a row (a canvas row's nested canvas) is a change.
+struct CanvasRowStateBytes { size_t module = 0; size_t row = 0; std::vector<uint8_t> bytes; };
+static std::vector<CanvasRowStateBytes> canvas_row_states(GP_CanvasContextImpl* c) {
+    std::vector<CanvasRowStateBytes> out;
+    for (size_t mi = 0; mi < c->module_plugin_instances.size(); ++mi) {
+        const auto& insts = c->module_plugin_instances[mi];
+        for (size_t ri = 0; ri < insts.size(); ++ri) {
+            if (!insts[ri]) continue;
+            MemoryOutputArchive state;
+            bool saved = false;
+            try { saved = insts[ri]->serialize(state); } catch (...) { saved = false; }
+            if (saved) out.push_back(CanvasRowStateBytes{mi, ri, std::move(state.bytes)});
+        }
+    }
+    return out;
+}
+
+static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc, const std::vector<CanvasRowStateBytes>* rows = nullptr) {
     std::ostringstream ss;
     ss << cc->modules.size() << ":";
     for (size_t i = 0; i < cc->modules.size(); ++i) {
@@ -30,6 +48,16 @@ static std::string gp_canvas_compute_signature(GP_CanvasContextImpl* cc) {
     ss << "|O:" << cc->overlays.size();
     ss << "|P:" << cc->canvas_ports.size() << ":";       // a port-only change must still autosave
     for (const auto &p : cc->canvas_ports) ss << p.contact << ',' << p.direction << ',' << p.up << ',' << p.name << ';';
+    // Row state: a save must not be skipped when only a row's state changed (a canvas row's nested canvas, review
+    // 6e1b5069). FNV-1a 64 of each row's bytes.
+    std::vector<CanvasRowStateBytes> own;
+    if (!rows) { own = canvas_row_states(cc); rows = &own; }
+    ss << "|R:" << rows->size() << ":";
+    for (const auto& r : *rows) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t b : r.bytes) { h ^= b; h *= 1099511628211ull; }
+        ss << r.module << ',' << r.row << ',' << r.bytes.size() << ',' << h << ';';
+    }
     return ss.str();
 }
 
@@ -45,8 +73,10 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     #include <sstream>
     if (!ctx_ || !path) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    // quick-change signature to avoid serializing -> disk when nothing changed
-    std::string sig = gp_canvas_compute_signature(c);
+    // quick-change signature to avoid serializing -> disk when nothing changed; it includes every row's saved state,
+    // taken once here and written below as ROW_STATE records
+    const std::vector<CanvasRowStateBytes> row_states = canvas_row_states(c);
+    std::string sig = gp_canvas_compute_signature(c, &row_states);
     // compare against active buffer slot
     int cur_idx = c->last_save_idx.load(std::memory_order_acquire);
     if (!c->last_save_buf[cur_idx].empty() && c->last_save_buf[cur_idx] == sig &&
@@ -174,7 +204,10 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     // canvas save/load cycles. For each module table enumerate its meta-groups
     // and emit a small, textual block describing vertices and restored fields.
     for (size_t i = 0; i < c->modules.size(); ++i) {
-        GP_TableContext* t = (i < c->module_tables.size()) ? c->module_tables[i] : nullptr;
+        // The ROOT module's groups are the root/container table's (see the restore below): a loaded ROOT module has a
+        // table of its own, which holds none of them.
+        GP_TableContext* t = (static_cast<int>(i) == c->root_module_idx) ? canvas_ensure_root_table(c)
+                           : (i < c->module_tables.size()) ? c->module_tables[i] : nullptr;
         if (!t) continue;
         int mgcount = gp_table_get_meta_group_count(t);
         for (int mgi = 0; mgi < mgcount; ++mgi) {
@@ -425,6 +458,15 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
         for (const auto &p : c->canvas_ports)
             ofs << "CANVAS_PORT " << p.contact << " " << p.direction << " " << p.up << " " << p.name << "\n";
     }
+    // Each plugin row's own saved state (ITool::serialize), hex, after everything it may refer to. A canvas row's state
+    // is the canvas it holds, so a table's canvas rows are saved inside the canvas that holds the table.
+    for (const auto& r : row_states) {
+        static const char kHex[] = "0123456789abcdef";
+        std::string hex;
+        hex.reserve(r.bytes.size() * 2);
+        for (uint8_t b : r.bytes) { hex.push_back(kHex[b >> 4]); hex.push_back(kHex[b & 15]); }
+        ofs << "ROW_STATE " << r.module << " " << r.row << " " << (hex.empty() ? "-" : hex) << "\n";
+    }
     ofs.close();
     // Update in-memory signature to reflect this successful save using atomic flip
     try {
@@ -536,6 +578,8 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
 
     int saved_root_module_idx = -1;  // declared by the file's ROOT_MODULE record, -1 if absent
     std::vector<GP_CanvasContextImpl::CanvasPortDecl> saved_ports;   // CANVAS_PORT records, restored after the edges
+    struct RowStateSnapshot { int module_idx = -1; int row = -1; std::vector<uint8_t> bytes; };
+    std::vector<RowStateSnapshot> row_states;                       // ROW_STATE records, handed to the rows last
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
         std::istringstream ss(line);
@@ -629,6 +673,26 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
                 saved_ports.push_back(p);
         } else if (tag == "ROOT_MODULE") {
             ss >> saved_root_module_idx;
+        } else if (tag == "ROW_STATE") {
+            RowStateSnapshot rs;
+            std::string hex;
+            if (ss >> rs.module_idx >> rs.row >> hex && rs.module_idx >= 0 && rs.row >= 0) {
+                auto nib = [](char ch) -> int {
+                    if (ch >= '0' && ch <= '9') return ch - '0';
+                    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+                    return -1;
+                };
+                bool ok = hex == "-" || hex.size() % 2 == 0;
+                if (ok && hex != "-") {
+                    rs.bytes.reserve(hex.size() / 2);
+                    for (size_t k = 0; k + 1 < hex.size() && ok; k += 2) {
+                        const int hi = nib(hex[k]), lo = nib(hex[k + 1]);
+                        ok = hi >= 0 && lo >= 0;
+                        if (ok) rs.bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+                    }
+                }
+                if (ok) row_states.push_back(std::move(rs));
+            }
         } else if (tag == "OFFSET") {
             ss >> file_offx >> file_offy;
         } else if (tag == "META_GROUP") {
@@ -857,6 +921,22 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
     }
     // Canvas ports belong to the ROOT module the file declared; without one they have nothing to be contacts of.
     if (c->root_module_idx >= 0) c->canvas_ports = saved_ports;
+    // Rows get their saved state back once the canvas around them exists (ROW_STATE, written by save).
+    for (const auto& rs : row_states) {
+        if (rs.module_idx >= static_cast<int>(c->module_plugin_instances.size())) continue;
+        auto& insts = c->module_plugin_instances[static_cast<size_t>(rs.module_idx)];
+        if (rs.row >= static_cast<int>(insts.size()) || !insts[static_cast<size_t>(rs.row)]) {
+            fprintf(stderr, "gp_canvas_load_from_file: ROW_STATE for module=%d row=%d has no row instance\n",
+                    rs.module_idx, rs.row);
+            continue;
+        }
+        MemoryInputArchive in(rs.bytes);
+        bool restored = false;
+        try { restored = insts[static_cast<size_t>(rs.row)]->deserialize(in); } catch (...) { restored = false; }
+        if (!restored)
+            fprintf(stderr, "gp_canvas_load_from_file: row module=%d row=%d refused its saved state\n",
+                    rs.module_idx, rs.row);
+    }
 
     // Register per-table rope UIDs with the canvas so overlay attachments
     // can resolve persisted stable rope IDs to runtime indices. Doing this
@@ -901,7 +981,12 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             }
             return nullptr;
         };
-        if (ms.module_idx >= 0 && ms.module_idx < static_cast<int>(c->module_tables.size())) {
+        if (ms.module_idx >= 0 && ms.module_idx == c->root_module_idx) {
+            // The ROOT module mirrors the root/container table (canvas_ensure_root_module); its groups live there, which
+            // is where save read them and where every reader of the container's groups looks. A loaded ROOT module has
+            // a table of its own, so module_tables would put the group out of their reach (Oracle A1, 2026-11-21).
+            t = canvas_ensure_root_table(c);
+        } else if (ms.module_idx >= 0 && ms.module_idx < static_cast<int>(c->module_tables.size())) {
             t = c->module_tables[static_cast<size_t>(ms.module_idx)];
         } else if (ms.module_idx < 0) {
             int overlay_idx = ms.meta_slot;

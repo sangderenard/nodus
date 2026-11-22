@@ -129,7 +129,8 @@ NODUS_HEADLESS_API int32_t nodus_headless_register_tcp_broadcast(
     NodusHeadlessGraph* g, const char* tool_id, uint16_t port,
     uint64_t maximum_frame_bytes, uint32_t max_readers);
 // Nodus link (include/nodus_link_rows.h; research case 98d49cb8520e44d092c5d134c37c3c32): admits two rows,
-// <tool_id>.control and <tool_id>.bulk, sharing one endpoint; bind them with nodus_headless_bind_plugin_tool.
+// <tool_id>.control.send/.receive and <tool_id>.bulk.send/.receive (one duty each), sharing one endpoint; bind them
+// with nodus_headless_bind_plugin_tool.
 // Host: a 127.0.0.1 listener on `port` (0 = ephemeral) for /ws/link/<prefix>/{control,bulk}; tickets are checked
 // with the 32-byte key. Returns the bound port, 0 on refusal. maximum_bulk_bytes 0 = 256 MiB.
 NODUS_HEADLESS_API int32_t nodus_headless_register_link_host(
@@ -282,6 +283,10 @@ NODUS_HEADLESS_API int32_t nodus_headless_meta_snapshot(NodusHeadlessGraph* g, u
 // Records still in the group FIFO with sequence >= from_seq, oldest first; *out_write_seq is the next sequence.
 NODUS_HEADLESS_API int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint64_t group_id, uint64_t from_seq,
     uint64_t* out_words, int32_t max_records, uint64_t* out_write_seq);
+// A replica's records: another node's records of this group's members (GP_META_RECORD_WORDS words each), appended as
+// they were taken. Returns records appended.
+NODUS_HEADLESS_API int32_t nodus_headless_meta_append_records(NodusHeadlessGraph* g, uint64_t group_id, const uint64_t* words,
+                                                             int32_t count);
 // Process-wide readers for rows (a row has no graph handle; they read the canvas of this process): the latest record of
 // every member of every group whose channel group is `channel`, groups then members in order. Returns words written.
 NODUS_HEADLESS_API int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words);
@@ -395,11 +400,20 @@ NODUS_HEADLESS_API int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph
                                                                int32_t up);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_count(NodusHeadlessGraph* g);
+// A row's saved state (ITool::serialize / deserialize; the canvas file's ROW_STATE record), at a quiescent boundary. A
+// canvas row's (module_library/source/tools/canvas_row.cpp) is the canvas it holds. get reports the size in *out_size
+// and returns 0 when `capacity` is too small.
+NODUS_HEADLESS_API int32_t nodus_headless_get_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row,
+                                                        uint8_t* out, size_t capacity, size_t* out_size);
+NODUS_HEADLESS_API int32_t nodus_headless_set_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row,
+                                                        const uint8_t* bytes, size_t size);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_at(NodusHeadlessGraph* g, int32_t ordinal, char* out_name,
                                                           int32_t out_name_capacity, int32_t* out_direction,
                                                           int32_t* out_contact, int32_t* out_up);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, const char* name, void* out_bytes,
                                                                size_t cap, size_t* out_written);
+// 1 when the canvas port's edge carries AbstractTensor handles, 0 raw tokens (scalars), -1 no such port or edge.
+NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_carries_tensors(NodusHeadlessGraph* g, const char* name);
 NODUS_HEADLESS_API int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
                                                                size_t len);
 NODUS_HEADLESS_API int32_t nodus_headless_get_port_fifo_config(

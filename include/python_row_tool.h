@@ -19,7 +19,9 @@
 
 namespace nodus::python_row {
 
-inline constexpr uint32_t kPythonRowAbiVersion = 1;
+// Version 2 adds the Bytes port (below); version 1 descriptors are still read and run unchanged.
+inline constexpr uint32_t kPythonRowAbiVersion = 2;
+inline constexpr uint32_t kPythonRowAbiVersionMin = 1;
 
 // Interpreted and compiled rows deliberately have different execution modes.
 // This implementation accepts Interpreted only; a compiler adapter must create
@@ -32,6 +34,11 @@ enum class ExecutionMode : uint32_t {
 // Version 1 admits only self-contained primitive values. Pointer and tensor
 // carriers are intentionally absent: their ownership cannot cross CPython's
 // object boundary through a numeric conversion without a separate contract.
+// Version 2 is that contract for bytes (Bytes): an input is one U8 tensor of any shape, read whole into a Python
+// `bytes`; the tensor stays the caller's (it is never kept or destroyed here). An output is a `bytes` (or bytearray /
+// memoryview) the callable returns, copied into a new U8 [n] tensor that belongs to whoever pops it; an empty result
+// pushes nothing for that port. No pointer crosses: only copies of the bytes. Bytes ports run only through
+// execute_tensor_stack (the row stack carries tensors); the primitive execute() refuses them.
 enum class PrimitiveType : uint32_t {
     Float32 = 0,
     Float64,
@@ -43,6 +50,7 @@ enum class PrimitiveType : uint32_t {
     UInt16,
     UInt32,
     UInt64,
+    Bytes,      // ABI v2: one U8 tensor <-> Python bytes (see above)
 };
 
 struct Port {
@@ -111,6 +119,8 @@ public:
     const Descriptor& descriptor() const noexcept;
 
 private:
+    bool execute_bytes(const std::vector<nodus::tensors::AbstractTensorHandle>& inputs, RawStackFrame& stack,
+                       std::string* error);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -9,9 +9,10 @@
 // an idle Input row (which pushes 0) changes nothing. dtype is the Nodus tensor dtype code (2 = float64); the rank is
 // the count of leading positive dims; depth is how many cleaned tensors the row keeps in hand (default 8).
 //
-// Returned tensors come in on the row's own port "returned" and on the stack under its parameters (what an earlier mint
-// row of the table passed on). Those of this row's size are zeroed and kept; the rest are pushed back onto the stack for
-// the next mint row. Each port "blank0".."blank7" wired to a borrowing row is kept full of blanks: the oldest kept
+// Returned tensors come in on the row's own port "returned" and on the stack under its parameters. Those of this row's
+// size are zeroed and kept; everything else is destroyed. Owner, 2026-11-21: "change the mint trash to just trash
+// anything there is no reason to have mints filtered ... there's no point to filter the garbage slot". So a mint with no
+// size set is a plain trash: whatever a returns row hands it (sent files, canvas snapshots, any size) is freed. Each port "blank0".."blank7" wired to a borrowing row is kept full of blanks: the oldest kept
 // tensor first, a new one only when none is kept (owner, 2026-11-19: "prefer old tensors before new ones"). Those edges
 // are lossless (top_k = 0), so a full edge refuses and the tensor stays here: the loans are bounded by the edges' slots.
 // The row's buffer holds depth tensors; the newest arrivals that do not fit are killed (owner, 2026-11-19).
@@ -103,12 +104,11 @@ public:
         if (p[5] > 0.0) depth_ = static_cast<size_t>(std::llround(p[5]));
         const bool sized = dtype_ > 0 && rank_ > 0;
 
-        // Returns: from under the parameters (an earlier mint row's pass-on) and from the "returned" port.
-        std::vector<uint64_t> others;
+        // Returns: from under the parameters and from the "returned" port. Kept if this row's size, else trash.
         auto take = [&](uint64_t id) {
             if (!id) return;
             if (sized && is_my_size(id) && nodus_tensor_zero(id, 0, 0) == NODUS_OK) kept_.push_back(id);
-            else others.push_back(id);
+            else nodus_tensor_destroy(id);
         };
         std::vector<uint64_t> from_stack;
         for (;;) {
@@ -127,7 +127,6 @@ public:
                 take(id);
             }
         }
-        for (uint64_t id : others) raw_stack_push_abstract_tensor(frame, nodus::tensors::AbstractTensorHandle{id});
 
         // Loans: keep every wired blank port full.
         if (sized && ctx.row_ports && ctx.row_ports->publish) {

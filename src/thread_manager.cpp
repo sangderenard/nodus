@@ -43,10 +43,10 @@
 // EventPayload is declared in canvas_abi.h and used for pointer-mode FIFO
 // events published by the canvas.
 
-extern bool canvas_get_module_input_state(int module_idx, ModuleInputState* out_state);
-extern void canvas_clear_module_input_pulses(int module_idx);
-extern void canvas_set_module_stack_snapshot(int module_idx, int row_idx, const float* values, int count);
-extern void canvas_set_module_stack_snapshot_meta(int module_idx, int row_idx, const int* types, const int* counts, int count);
+extern bool canvas_get_module_input_state(GP_CanvasContext* canvas, int module_idx, ModuleInputState* out_state);
+extern void canvas_clear_module_input_pulses(GP_CanvasContext* canvas, int module_idx);
+extern void canvas_set_module_stack_snapshot(GP_CanvasContext* canvas, int module_idx, int row_idx, const float* values, int count);
+extern void canvas_set_module_stack_snapshot_meta(GP_CanvasContext* canvas, int module_idx, int row_idx, const int* types, const int* counts, int count);
 
 namespace {
 GP_TableTensorToolState* get_tensor_tool_state() {
@@ -54,7 +54,7 @@ GP_TableTensorToolState* get_tensor_tool_state() {
     return state;
 }
 } // namespace
-extern void canvas_set_module_stack_tail(int module_idx, const float* values, int count);
+extern void canvas_set_module_stack_tail(GP_CanvasContext* canvas, int module_idx, const float* values, int count);
 
 // Scheduling helpers used inside run_scheduled_tick.
 namespace {
@@ -168,10 +168,15 @@ static inline int32_t clamp_size_to_int32(size_t value) {
 
 // Helper: compute canonical table key for a module/contact, preferring
 // the stable per-port UUID when the contact maps to a module frame port.
-static uint64_t canvas_contact_key(int module_idx, int contact_idx) {
+// The canvas a tick belongs to: the request names it (each canvas, nested or primary, submits its own); a request that
+// names none is a standalone manager's and keeps the primary canvas.
+static GP_CanvasContext* tick_canvas(const ThreadManager::TickRequest& req) {
+    return req.canvas ? req.canvas : gp_canvas_get_singleton();
+}
+
+static uint64_t canvas_contact_key(GP_CanvasContext* cvs, int module_idx, int contact_idx) {
     // Fallback canonical composition
     uint64_t composed = ((uint64_t)static_cast<uint32_t>(module_idx) << 32) | ((uint64_t)static_cast<uint32_t>(contact_idx) << 16) | 0ull;
-    GP_CanvasContext* cvs = gp_canvas_get_singleton();
     if (!cvs) return composed;
     // Only consider module frame contacts
     const int frame_base = kModuleFrameContactBase;
@@ -206,7 +211,7 @@ static int32_t row_port_publish(void* host, int32_t port, const void* bytes, siz
     for (const auto& e : b->req->edges) {
         if (e.a_module != b->mod_idx || e.a_contact_idx != contact) continue;
         int32_t dropped = 0;
-        return gp_table_edge_publish(b->fifo_table, e.edge_idx, canvas_contact_key(b->mod_idx, contact), bytes,
+        return gp_table_edge_publish(b->fifo_table, e.edge_idx, canvas_contact_key(tick_canvas(*b->req), b->mod_idx, contact), bytes,
                                      static_cast<int32_t>(len), &dropped) ? 1 : 0;
     }
     return 0;
@@ -228,7 +233,7 @@ static int32_t row_port_consume(void* host, int32_t port, void* out, size_t capa
     const int contact = row_port_contact(b->row, port);
     for (const auto& e : b->req->edges) {
         if (e.b_module != b->mod_idx || e.b_contact_idx != contact) continue;
-        const uint64_t reader = canvas_contact_key(b->mod_idx, contact);
+        const uint64_t reader = canvas_contact_key(tick_canvas(*b->req), b->mod_idx, contact);
         gp_table_edge_subscribe_ex(b->fifo_table, e.edge_idx, reader, /*start_at_head=*/1);
         int32_t got = 0;
         if (!gp_table_edge_consume(b->fifo_table, e.edge_idx, reader, out, static_cast<int32_t>(capacity), &got) || got <= 0) return 0;
@@ -577,7 +582,7 @@ void ThreadManager::start_free_workers(const TickRequest& req) {
     };
     std::vector<ChannelSet> channels;
     channels.reserve(indices.size());
-    GP_CanvasContext* canvas = gp_canvas_get_singleton();
+    GP_CanvasContext* canvas = tick_canvas(req);
     for (int idx : indices) {
         ChannelSet set;
         set.module = idx;
@@ -604,7 +609,7 @@ void ThreadManager::start_free_workers(const TickRequest& req) {
                     }
                     if (edge_idx < 0) continue;
                     if (row.kind == ModuleRowKind::Input) {
-                        uint64_t reader = canvas_contact_key(idx, contact);
+                        uint64_t reader = canvas_contact_key(tick_canvas(req), idx, contact);
                         if (!reader) reader = 0x8000000000000000ull;
                         auto found = std::find_if(set.inputs.begin(), set.inputs.end(), [&](const auto& entry) {
                             return entry.edge == edge_idx && entry.reader == reader;
@@ -936,7 +941,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
         }
         auto load_input_state = [&]() -> bool {
             if (!input_state_loaded) {
-                input_state_loaded = canvas_get_module_input_state(mod_idx, &input_state);
+                input_state_loaded = canvas_get_module_input_state(tick_canvas(req), mod_idx, &input_state);
             }
             return input_state_loaded;
         };
@@ -974,7 +979,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                     int contact_idx = meta.contact_idx + ai;
                     // Find the edge index for this input (mod_idx is the consumer)
                     int edge_idx = -1;
-                    uint64_t reader_key = canvas_contact_key(mod_idx, contact_idx);
+                    uint64_t reader_key = canvas_contact_key(tick_canvas(req), mod_idx, contact_idx);
                     if (reader_key == 0) reader_key = 0x8000000000000000ull;
                     // Find the edge in req.edges where b_module == mod_idx and b_contact_idx == contact_idx
                     for (const auto& e : req.edges) {
@@ -995,7 +1000,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                     // always sees the val=0.0f default below, regardless of
                     // what was pushed. Resolve it the same way real edges do.
                     if (edge_idx < 0 && fifo_table) {
-                        GP_CanvasContext* cvs_for_key = gp_canvas_get_singleton();
+                        GP_CanvasContext* cvs_for_key = tick_canvas(req);
                         if (cvs_for_key) {
                             uint64_t port_key = gp_canvas_get_tool_row_id(cvs_for_key, mod_idx, contact_idx);
                             if (port_key != 0ull) {
@@ -1036,7 +1041,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                                             if (!(gp_edge_consume_ptr(fifo_table, edge_idx, reader_key, &maybe_p) && is_valid_event_payload_ptr(maybe_p))) break;
                                             EventPayload* ep = reinterpret_cast<EventPayload*>(maybe_p);
                                             void* pa = ep->pending;
-                                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                                            GP_CanvasContext* canvas_single = tick_canvas(req);
                                             if (canvas_single && pa) {
                                                 // If this pending action encodes a text/tensor action
                                                 // deliver its payload into the module frame port and
@@ -1089,6 +1094,8 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         frame.default_type = stack_default_type;
                         ToolStackContext tctx;
                         tctx.stack = frame;
+                        tctx.dt = req.dt;
+                        tctx.tick_id = req.tick_id;
                         // The row's own ports, if it declares any: it reads and writes them itself during this tick.
                         RowPortBinding row_port_binding;
                         ToolRowPortAccess row_port_access;
@@ -1184,7 +1191,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         if (fifo_table) {
                             // Only consider module-frame contacts that actually have
                             // an edge bound to this module (respect the binding)
-                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                            GP_CanvasContext* canvas_single = tick_canvas(req);
                             for (const auto &e : req.edges) {
                                 if (e.b_module != mod_idx) continue;
                                 int contact_idx = e.b_contact_idx;
@@ -1201,7 +1208,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                                 // Only process contacts bound to mouse actions
                                 if (!(bound_action >= CANVAS_ACT_MOUSE_DOWN && bound_action <= CANVAS_ACT_MOUSE_SCROLL_DOWN)) continue;
 
-                                uint64_t reader_key = canvas_contact_key(mod_idx, contact_idx);
+                                uint64_t reader_key = canvas_contact_key(tick_canvas(req), mod_idx, contact_idx);
                                 if (reader_key == 0) reader_key = 0x8000000000000000ull;
                                 // Debug: report computed reader_key and target edge so we can
                                 // compare it with the writer_key printed at publish time.
@@ -1233,7 +1240,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                                     if (pa->action_id != bound_action) {
                                         // Not our action: log and stash it back as managed payload
                                         ML_DEBUGF("[DBG] stash not-matching action=%d bound=%d mod=%d contact=%d edge=%d src_mod=%d frame=%d\n", pa->action_id, bound_action, mod_idx, contact_idx, edge_idx, ep->src_module, ep->frame_idx);
-                                        GP_CanvasContext* c_single = gp_canvas_get_singleton();
+                                        GP_CanvasContext* c_single = tick_canvas(req);
                                         if (c_single) {
                                             gp_canvas_set_module_frame_ptr(c_single, ep->src_module, 0, ep->frame_idx, pa_void);
                                             gp_canvas_stash_managed_event_payload(c_single, ep->src_module, ep->frame_idx, pa_void);
@@ -1261,7 +1268,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                                     // (the single canonical stack). We require a RawStackFrame
                                     // to be present for this contact; otherwise the event is
                                     // dropped. Use the registry builtin id for float32.
-                                    GP_CanvasContext* canvas_for_push = gp_canvas_get_singleton();
+                                    GP_CanvasContext* canvas_for_push = tick_canvas(req);
                                     RawStackFrame* rs_for_push = nullptr;
                                     if (canvas_for_push) {
                                         void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_for_push, mod_idx, contact_idx);
@@ -1313,7 +1320,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         // Build float snapshot (for legacy preview) and metadata (type id + element count per item)
                         raw_stack_to_float_values(*module_stack, stack_default_type, stack_snapshot);
                         const float* snap_ptr = stack_snapshot.empty() ? nullptr : stack_snapshot.data();
-                        canvas_set_module_stack_snapshot(mod_idx, row, snap_ptr, static_cast<int>(stack_snapshot.size()));
+                        canvas_set_module_stack_snapshot(tick_canvas(req), mod_idx, row, snap_ptr, static_cast<int>(stack_snapshot.size()));
 
                         // Build metadata by scanning the per-byte type mask
                         std::vector<int> types;
@@ -1333,7 +1340,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                             }
                         }
                         if (!types.empty()) {
-                            canvas_set_module_stack_snapshot_meta(mod_idx, row, types.data(), counts.data(), static_cast<int>(types.size()));
+                            canvas_set_module_stack_snapshot_meta(tick_canvas(req), mod_idx, row, types.data(), counts.data(), static_cast<int>(types.size()));
                         }
                         break;
                     }
@@ -1354,7 +1361,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                     case ModuleToolKind::TensorAllocator: {
                         // Built-in tensor allocator: operate on a RawStackFrame
                         // stored in the module frame pointer for this contact.
-                        GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                        GP_CanvasContext* canvas_single = tick_canvas(req);
                         if (!canvas_single) break;
                         void* maybe_raw = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, meta.contact_idx);
                         if (!maybe_raw) break;
@@ -1447,7 +1454,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         // Clear and free any managed event payload that delivered this frame
                         {
                             int led_idx = (meta.contact_idx - kModuleFrameContactBase) % kModuleExtraLedCount;
-                            GP_CanvasContext* canvas_single2 = gp_canvas_get_singleton();
+                            GP_CanvasContext* canvas_single2 = tick_canvas(req);
                             if (canvas_single2) {
                                 gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 1, led_idx, nullptr);
                                 gp_canvas_set_module_frame_ptr(canvas_single2, mod_idx, 0, led_idx, nullptr);
@@ -1548,7 +1555,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                 for (int ai = 0; ai < attachments; ++ai) {
                     int contact_idx = meta.contact_idx + ai;
                     int edge_idx = -1;
-                    uint64_t writer_key = canvas_contact_key(mod_idx, contact_idx);
+                    uint64_t writer_key = canvas_contact_key(tick_canvas(req), mod_idx, contact_idx);
                     // Find the edge in req.edges where a_module == mod_idx and a_contact_idx == contact_idx
                     for (const auto& e : req.edges) {
                         if (e.a_module == mod_idx && e.a_contact_idx == contact_idx) {
@@ -1566,7 +1573,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                     // reason: that port's edge was already created self-keyed
                     // at gp_canvas_get_tool_row_id(mod_idx, contact_idx).
                     if (edge_idx < 0 && fifo_table) {
-                        GP_CanvasContext* cvs_for_key = gp_canvas_get_singleton();
+                        GP_CanvasContext* cvs_for_key = tick_canvas(req);
                         if (cvs_for_key) {
                             uint64_t port_key = gp_canvas_get_tool_row_id(cvs_for_key, mod_idx, contact_idx);
                             if (port_key != 0ull) {
@@ -1597,7 +1604,7 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                         const int frame_base = kModuleFrameContactBase;
                         const int frame_end = frame_base + kModuleExtraLedCount * kModuleExtraLedRows;
                         if (contact_idx >= frame_base && contact_idx < frame_end) {
-                            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
+                            GP_CanvasContext* canvas_single = tick_canvas(req);
                             void* p = nullptr;
                             if (canvas_single) p = gp_canvas_get_module_frame_ptr_for_contact(canvas_single, mod_idx, contact_idx);
                             if (p && edge_stride_allows_pointer(fifo_table, edge_idx) && is_valid_event_payload_ptr(p)) {
@@ -1640,11 +1647,11 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
             }
         }
         if (input_state_used) {
-            canvas_clear_module_input_pulses(mod_idx);
+            canvas_clear_module_input_pulses(tick_canvas(req), mod_idx);
         }
         raw_stack_to_float_values(*module_stack, stack_default_type, stack_snapshot);
         const float* tail_ptr = stack_snapshot.empty() ? nullptr : stack_snapshot.data();
-        canvas_set_module_stack_tail(mod_idx, tail_ptr, static_cast<int>(stack_snapshot.size()));
+        canvas_set_module_stack_tail(tick_canvas(req), mod_idx, tail_ptr, static_cast<int>(stack_snapshot.size()));
         if (_tm_enabled) {
             auto _tm_end = std::chrono::high_resolution_clock::now();
             _tm_last_run_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1703,8 +1710,8 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req, bool preserve_fre
         // subgroup toolbar RGBA values. We expect producers to publish 4-float
         // RGBA samples to the root-edge consuming the toolbar contact index.
         if (req.root_table) {
-            GP_CanvasContext* canvas_single = gp_canvas_get_singleton();
-            int root_mod = gp_canvas_get_root_module_idx();
+            GP_CanvasContext* canvas_single = tick_canvas(req);
+            int root_mod = canvas_single ? gp_canvas_root_module_of(canvas_single) : -1;
             if (canvas_single && root_mod >= 0) {
                 for (const auto &e : req.edges) {
                     // consume samples for edges where either endpoint is the synthetic root module
@@ -1718,7 +1725,7 @@ void ThreadManager::run_scheduled_tick(const TickRequest& req, bool preserve_fre
                     // toolbar colours nor hold a never-draining reader on their lossless edges.
                     if (contact_idx >= GP_CANVAS_PORT_CONTACT_BASE &&
                         contact_idx < GP_CANVAS_PORT_CONTACT_BASE + GP_CANVAS_PORT_MAX) continue;
-                    uint64_t reader_key = canvas_contact_key(root_mod, contact_idx);
+                    uint64_t reader_key = canvas_contact_key(tick_canvas(req), root_mod, contact_idx);
                     if (reader_key == 0) reader_key = 0x8000000000000000ull;
                     gp_table_edge_subscribe_ex(req.root_table, edge_idx, reader_key, /*start_at_head=*/1);
                     int32_t unread = 0;

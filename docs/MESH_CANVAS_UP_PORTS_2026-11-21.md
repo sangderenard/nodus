@@ -77,3 +77,128 @@ Ticket `e12fd0f545c44f868591bbe7ef505cc1` (follows `e2f19532`, regional state br
 - **Save/load**: CANVAS V4 text; the loader skips unknown tags; a new core record goes beside `ROOT_MODULE`, restored
   after the edge rebuild, and must enter `gp_canvas_compute_signature`. Headless trailers (`PORT`, `EDGE_FIFO`, ...)
   are parsed strictly, so a new tag must not reuse their names. A child canvas needs its own `module_library_root`.
+
+## Stage 3: the canvas row (2026-11-21)
+
+Owner, 2026-11-21: "we need the canvas in a table and going up from the canvas into a table"; "compartmentalize the
+canvas in a table, don't use mandated global namespace just nest it"; "eliminate the use of python for nodus unless it's
+for an add on development work we haven't implemented yet".
+
+- **A canvas is a compartment.** Every tick request names its canvas (`ThreadManager::TickRequest::canvas`); the
+  scheduler's contact keys, module input state, stack snapshots, frame pointers and ROOT lookup read it from there.
+  Every table records the canvas that owns it (`GP_TableContext::owner_canvas`, stamped as a canvas creates or is given
+  a table); its edge ids, scheduler mirror and sim frame count come from that canvas. Each canvas keeps its own sim
+  frame count; only the primary also advances the process-wide pair for tables no canvas owns. Only the primary canvas
+  loads or autosaves the workspace file. `nodus_headless_create` no longer refuses a second graph.
+- **Rows keep their settings.** `ITool::serialize` / `deserialize` existed but no canvas called them. A canvas file now
+  carries `ROW_STATE <module> <row> <hex>` for every row whose serialize answers, handed back on load once the canvas
+  exists; `nodus_headless_get_row_state` / `set_row_state` read and set the same bytes.
+- **canvas_row** (`module_library/source/tools/canvas_row.cpp`, built as its own plugin like every row): its state is a
+  whole canvas, so the table holds the canvas. The canvas's IN ports are the row's Argument ports and its OUT ports the
+  row's Return ports, in declaration order. Each execution moves waiting tokens in, steps the canvas once on its own
+  scheduler, and moves arrivals out while the edge takes them; a refused token is held by the row, never dropped.
+- **Going up.** A canvas's up ports reach the layer above as the ports of the row that holds it: the layer above is a
+  table, and the link's ends belong on that table's edges, not in a host.
+- **Proof.** `tests/canvas_row_test.cpp` (native, Oracle A1, 2026-11-21): two canvases in one process; 12 of 12 values
+  through the nested canvas in order; the parent saved with its ROW_STATE and loaded into a third graph carries 12 of 12
+  again.
+- **Python removed from this lane.** The link ends that lived in `tools/run_canvas.py`, the canvas-port wrappers in
+  `nodus_graph/native.py` and their Python tests are gone; the link's ends move into tables (next).
+- **Still process-wide, by design or not yet:** the tool registry (a catalogue), `ThreadManager::global()` for tables
+  no canvas owns, the meta-channel readers (`nodus_headless_meta_channel_*` read the primary canvas), and a nested
+  canvas's module library root (unset: serialized tables fall back to the cwd default). The canvas signature does not
+  include ROW_STATE yet.
+- **The tick goes down.** Owner, 2026-11-21: "the top level gives a tick to a table gives a tick to a row so the
+  contained canvas receives a tick and can respect it or free run". A row's execution carries its tick
+  (`ToolStackContext::dt`, `tick_id`, from the tick request); the canvas row gives that tick to the canvas it holds. The
+  contained canvas decides: a table steps on the tick, or free-runs on its own worker where its exec mode is Free (3),
+  a choice saved with that canvas (`MODULE_POLICY`). `canvas_row_test` passes both ways, before and after reload.
+- **The link's rows, one duty each.** Owner, 2026-11-21: "rows should not be doing double duty, if you want double duty
+  bake a plugin from a table with two rows"; and "at no point did I ever say arrival should be redirected by a port
+  instead of being fed into the stack". The routing of arrivals to a row port named "received" was an agent's design
+  (e053ef6, 2026-11-19), recorded there as the owner's. A link now has four rows: `<id>.control.send`,
+  `<id>.control.receive`, `<id>.bulk.send`, `<id>.bulk.receive`. A send row pops a tensor off its stack (dropping
+  pads) and sends it, or restores it on refusal. A receive row pushes every arrival that fits onto its stack, oldest on
+  top, and leaves the rest waiting in the endpoint. Sending and receiving rows go in separate tables, so a refused send
+  waiting on a stack is never taken for an arrival; a table's Output rows carry arrivals on. Oracle A1 (2026-11-21):
+  `nodus_headless_runtime_test` all OK; `link_rows_test` PASSED (50 control packets each way, F32 [1024,4096] each way,
+  identical). `link_metrics_test` fails two window checks on this host, and so does the main branch's version, run the
+  same way: its 64-step window is full before the packets go. `test_volunteer_cycle_link` builds; it needs a Vulkan
+  device, which this host has none of, so it has not run.
+- **File rows.** Owner, 2026-11-21: "reading and writing files belongs to reading and writing file rows"; "single
+  event file reads are fine for loading actual row content but not for runtime unless it's an intentional file cache
+  or process destination or source". `file_read` (a source folder: the next file by name, moved into sent/ first, one
+  U8 tensor on the stack at a time) and `file_write` (a destination folder: each tensor to a new exclusively-named
+  `<n>.arrival`, staged under a hidden name, never overwriting) are module_library rows. The link never touches a file.
+- **Two system faults found on the way** (Oracle A1, 2026-11-21, `tests/file_link_test.cpp`):
+  1. `EdgeTensorFifo::push_from_frame` (host path) published from a frame without checking it held an element of the
+     edge's type, then failed to pop. An Output row on an idle tick re-sent the last tensor handle (each 8 MiB arrival
+     was written twice, the second time under an id already destroyed and reused); a reset frame published null
+     handles -- the "pads" rows had been dropping. It now checks the frame's top element, as the backend path did.
+  2. An Output row moves one value a tick and leaves it on the stack while its edge is full; a table not in stack
+     loopback resets its stack every tick, so anything a row pushed beyond that was lost. A row that produces tensors
+     (`file_read`, a link receive row) pushes one at a time, only once the last has gone, and belongs in a
+     stack-loopback table.
+  After both: 12/12 files in one canvas, and 22/22 across the link (two generations with the same names, six 8 MiB
+  each), byte for byte, sender 22 sent / receiver 22 received. canvas_row_test, nodus_headless_runtime_test and
+  link_rows_test pass again. Tests with tensor-typed Output rows that need a GPU (volunteer cycle, GPU inventory, OpenGL
+  rows) have not run on this change.
+- **Replicas: the canvas state with its traffic metrics.** Owner, 2026-11-21: "by having the canvas state we should
+  collect also any meta edges supplying traffic metrics". A canvas row is a host (the canvas runs here; with a publish
+  interval it puts the canvas's snapshot on a Return port "state" every that many ticks) or a replica (another node's
+  canvas, read only, never stepped; each snapshot arriving on its Argument port "state" replaces it). A snapshot is the
+  canvas file, the files a save writes beside it (`<file>.modules/`: the container table's rope ids, which meta members
+  resolve through), and every meta group's records. A replica's meta groups carry those records
+  (`gp_table_meta_append_records`, `nodus_headless_meta_append_records`), so every reader of a meta edge sees the
+  writer's traffic. Only the node that runs a canvas publishes it.
+  `tests/mesh_replica_test.cpp` (Oracle A1, 2026-11-21): 40/40 values through the writer's canvas while 80 snapshots
+  crossed the link (80 sent, 80 received); the replica's meta group holds 800 of the writer's 804 records, an exact
+  prefix (the last snapshot that crossed), and they survive the reader canvas's save and load.
+- **A load fault found on the way:** a meta group saved from the ROOT module's table (the container) was restored onto
+  the table a loaded ROOT module gets of its own, out of reach of every reader of the container's groups; and save then
+  read the ROOT module's own table. Both now take the root/container table for the ROOT module.
+- **Not this change:** `meta_edge_headless_test` fails its edge_introspect check on Linux: `nodus_meta_channel.h` finds
+  the headless image only on Windows (`GetModuleHandleA`), so a row reading meta channels sees nothing elsewhere.
+- **Two Linux faults diagnosed** (Oracle A1, 2026-11-21):
+  1. `link_metrics_test`'s window checks: a step there costs about 30 us, and five control packets sent after the
+     handshake reached the host only 37 ms later (Nagle holding small frames behind the handshake's delayed ACK). By
+     then 1200 steps had passed and the 64-row window held only idle rows. The link stream now sets TCP_NODELAY, as the
+     wss dialer's socket already did; the packets arrive on the next step and the test passes.
+  2. `nodus_meta_channel.h` returned no symbol off Windows, so rows reading meta channels (edge_introspect, link
+     metrics channel columns) saw nothing. It now finds the headless image's readers in the process's global symbols
+     (dlsym RTLD_DEFAULT); `meta_edge_headless_test` passes on Linux.
+- **Sent tensors are freed.** A send row is a Borrower: what it sends stays the caller's. Owner, 2026-11-21: "change the
+  mint trash to just trash anything there is no reason to have mints filtered ... there's no point to filter the
+  garbage slot". tensor_mint now keeps returned tensors of its own size and destroys everything else (before, other sizes
+  were pushed back onto its stack for a later mint row); a mint with no size set is a plain trash. A sending table
+  carries a tensor_returns row whose "returns" port feeds a mint's "returned" port. Oracle A1: file_link_test and
+  mesh_replica_test end with the tensors they started with (0 alive before, 0 after; 22 files and 80 snapshots sent).
+- **One writer per canvas, and read privacy (stages 3-4), with post-quantum keys.** Owner, 2026-11-21: "we need to be
+  able to make the correct keys for a quantum future safely on both linux and windows". Native Nodus has no public-key
+  crypto, and Windows CNG has no Ed25519 and this SDK no ML-KEM/ML-DSA, so the crypto runs in pyca/cryptography 50
+  (prebuilt wheels on Windows and Linux arm64, OpenSSL 4.0.1 built in) as interpreted Python rows. The Python row
+  contract gained a Bytes port (ABI v2: one U8 tensor <-> Python bytes; v1 descriptors unchanged), and generated
+  rows are Borrowers. `module_library/source/tools/mesh_crypto.py`: hybrid keys (Ed25519 + ML-DSA-65 signatures,
+  X25519 + ML-KEM-768 sealing, ChaCha20-Poly1305 content), rows seal / sign / verify / open, and `keygen`. A host canvas
+  row in mesh mode names its readers; a replica names its one writer and takes only that writer's snapshots, at a rising
+  generation; a non-reader learns only that the writer exists. `tests/mesh_secure_test.cpp` (separate processes per
+  node, Oracle A1): B opens A's canvas (127 snapshots, all readable); C, no reader, holds only A's generation; B, given
+  D's validly signed snapshots for a canvas whose writer is A, adopts nothing.
+- **Key changes** (the workspace's KEY_CHANGE_PROTOCOL.md). Owner, 2026-11-21: "establish protocol for forcing key
+  changes across the site safely, any time we need to change our crypto". Mesh keys now carry suite, epoch and
+  lineage ("NMP2"); envelopes name their suite ("NMS2") and holders keep an allowlist; a replica's writer is a
+  lineage, so rotation keeps the one-writer rule. Planned rotation is a record cross-signed by the old and new keys,
+  with an overlap and a cutover; a forced change is a record from an offline site root, applied at once. The verify
+  row applies records that arrive on the mesh; operators run rotate / accept / root-keygen / force. mesh_secure_test
+  adds: B still takes A's canvas after A rotates (127/127); after the root revokes A's key, nothing.
+- **Review f1a3eb8f fixes (operator-codex).** (1) The service-path tests build their rows with
+  `nodus_headless_build_plugin_source` (tests/headless_rows.h), as volunteer_cycle_link_test does, so loading happens
+  in the headless runtime and its registry; none loads through `gp_plugin_load_from_path`, which nodus_headless.dll
+  does not export. The runtime plugin builder now also links the headless image (rows that call the headless ABI, as
+  the build-time row loop already did), and the file rows compile as C++17 (the builder's standard) as well as C++20.
+  (2) mesh_replica_test checks the saved canvas's port records whatever the line ends. (3) A canvas row's held tokens
+  (taken from one side, not yet given to the other) are saved with it (NCR1 v4: per port a raw token, or a tensor as
+  dtype, shape and bytes) and restored; a held tensor is freed with the row. canvas_row_test's custody case drives the
+  row with played ports: under refusal it holds 7 (from the feed) and 1 (from the canvas); saved and restored into a
+  new row, each comes out exactly once among 35 values, none twice. Oracle A1: canvas_row_test, file_link_test (22/22,
+  0 tensors alive), mesh_replica_test and mesh_secure_test (all five scenarios) pass.

@@ -30,11 +30,13 @@ extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
     c->thread_mgr->start();
     // expose as global for table-layer integration
     if (is_primary_canvas) ThreadManager::set_global(c->thread_mgr.get());
-    c->autosave_path = kCanvasDefaultWorkspacePath;
+    // Only the primary canvas is the workspace: a nested canvas (one a table row holds) starts empty and never autosaves
+    // over the workspace file; its holder loads and saves it.
+    c->autosave_path = is_primary_canvas ? kCanvasDefaultWorkspacePath : "";
     c->autosave_interval_s = 2.0;
     c->autosave_accum_s = 0.0;
     std::ifstream ifs(kCanvasDefaultWorkspacePath);
-    if (ifs.good()) {
+    if (is_primary_canvas && ifs.good()) {
         gp_canvas_load_from_file(reinterpret_cast<GP_CanvasContext*>(c), kCanvasDefaultWorkspacePath);
     }
     return reinterpret_cast<GP_CanvasContext*>(c);

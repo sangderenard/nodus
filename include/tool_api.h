@@ -172,6 +172,11 @@ struct ToolStackContext {
     const ToolRowPortAccess* row_ports = nullptr;
     // For a Returns row (ITool::tensor_role): the table's used-up handles; null for every other row. Trailing.
     ToolReturnedTensors* returns = nullptr;
+    // The tick this execution belongs to: the top level gives a tick to a table, the table to its rows. A row that holds
+    // a canvas (canvas_row) gives the same tick to that canvas, whose tables respect it or free-run by their own exec
+    // mode. Trailing.
+    double dt = 0.0;
+    uint64_t tick_id = 0;
 };
 
 inline float tool_stack_pop(ToolStackFrame& frame) {
@@ -298,6 +303,33 @@ public:
 
 private:
     std::ofstream stream_;
+};
+
+// A row's saved state held in memory: the canvas saves every row's serialize() output in its file (ROW_STATE records)
+// and hands it back to deserialize() on load, so a row's settings travel with the canvas that holds it.
+class MemoryOutputArchive : public OutputArchive {
+public:
+    bool write(const void* data, size_t len) override {
+        const auto* b = static_cast<const uint8_t*>(data);
+        bytes.insert(bytes.end(), b, b + len);
+        return true;
+    }
+    std::vector<uint8_t> bytes;
+};
+
+class MemoryInputArchive : public InputArchive {
+public:
+    explicit MemoryInputArchive(const std::vector<uint8_t>& bytes) : bytes_(bytes) {}
+    bool read(void* data, size_t len) override {
+        if (len > bytes_.size() - at_) return false;
+        std::memcpy(data, bytes_.data() + at_, len);
+        at_ += len;
+        return true;
+    }
+    size_t remaining() const { return bytes_.size() - at_; }
+private:
+    const std::vector<uint8_t>& bytes_;
+    size_t at_ = 0;
 };
 
 class HostAPI {

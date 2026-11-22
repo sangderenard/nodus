@@ -1065,6 +1065,14 @@ public:
         const ValueType* vt = ValueTypeRegistry::global().get(type_id);
         if (!vt || vt->size == 0) return false;
         size_t need = vt->size;
+        // Publish only an element the frame holds, of this type, as the backend path above checks
+        // (gp_raw_stack_frame_pop_into_backend). Without it an empty frame -- an Output row's table on an idle tick --
+        // published the bytes left where the last popped element was, then failed to pop: the last tensor handle went
+        // out again (Oracle A1, 2026-11-21: each 8 MiB arrival written twice, the second time under an id already
+        // destroyed and reused), and a frame reset to zero published null handles.
+        if (src_frame->byte_count < need || !src_frame->types_per_byte) return false;
+        for (size_t i = src_frame->byte_count - need; i < src_frame->byte_count; ++i)
+            if (src_frame->types_per_byte[i] != type_id) return false;
         std::vector<uint8_t> tmp;
         try { tmp.resize(bytes); } catch(...) { return false; }
         std::memset(tmp.data(), 0, bytes);

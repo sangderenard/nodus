@@ -4,15 +4,17 @@
 // Server (this process; a LinkListener on 127.0.0.1, it never dials):
 //   tensor mint:        Input(6) | tensor_mint | Input(6) | tensor_mint      (U64[8,10] batches)
 //   volunteer library:  Input(2) | nodus.volunteer.library | Output(1)       (Input 0: queued work; 1: from the link)
-//   server link:        intake | intake | intake | cycle.server.bulk | tensor_returns | Input(3) | tensor_filter_send
-//   edges: library Output -> intake (row 2) "supply"; link "received" -> library Input 1. Port pairs: mint.1 blank0 >
+//   server link:        intake | intake | intake | cycle.server.bulk.send | tensor_returns | Input(3) | tensor_filter_send
+//   server receive:     cycle.server.bulk.receive | Output(1)                (arrivals onto its stack, then out)
+//   edges: library Output -> intake (row 2) "supply"; receive Output -> library Input 1. Port pairs: mint.1 blank0 >
 //   library blank, library spent > mint.1 returned, link returns > mint.3 returned (a sent batch goes back to the
 //   mint), filter loop<i> > intake (row 2 - i) loop: a batch the link refused goes back up and is offered again first.
 // Volunteer (a child process; it only dials out):
-//   volunteer link:     intake | intake | intake | cycle.volunteer.bulk | tensor_returns | Input(3) | tensor_filter_send
+//   volunteer link:     intake | intake | intake | cycle.volunteer.bulk.send | tensor_returns | Input(3) | tensor_filter_send
+//   volunteer receive:  cycle.volunteer.bulk.receive | Output(1)
 //   volunteer work:     Input(1) | one work row per device and program | Output(1)
 //   tensor mint:        Input(6) | tensor_mint                               (takes the volunteer's sent batches back)
-//   edges: link "received" -> work Input; work Output -> intake (row 2) "supply". Port pairs: link returns > mint
+//   edges: receive Output -> work Input; work Output -> intake (row 2) "supply". Port pairs: link returns > mint
 //   returned, filter loop<i> > intake (row 2 - i) loop.
 // The volunteer's own KernelLibrarySession holds the states and runs the jobs; the server's library queues the work,
 // chooses targets, and finishes each packet from its receipt. When every packet is done the server closes the link;
@@ -250,7 +252,9 @@ int volunteer(int argc, char** argv) {
         {
             Canvas canvas;
             const int link = canvas.table("volunteer link", 0,
-                                          link_rows("cycle.volunteer.bulk", intake_id, returns_id, filter_id));
+                                          link_rows("cycle.volunteer.bulk.send", intake_id, returns_id, filter_id));
+            // Arrivals: the receive row pushes them onto its table's stack and the Output row carries them on.
+            const int recv = canvas.table("volunteer receive", 0, {{1, 0, 0, 1, "cycle.volunteer.bulk.receive"}, {2, 0, 1, 0, nullptr}});
             std::vector<std::string> work_ids;
             for (std::size_t d = 0; d < devices; ++d)
                 for (const auto& contract : contracts)
@@ -260,8 +264,8 @@ int volunteer(int argc, char** argv) {
             rows.push_back({2, 0, 1, 0, nullptr});
             const int wrk = canvas.table("volunteer work", 480, rows);
             const int mint = canvas.table("tensor mint", 960, {{0, 0, 6, 0, nullptr}, {1, 0, 0, 1, mint_id}});
-            if (link < 0 || wrk < 0 || mint < 0) return fail("tables");
-            if (!canvas.edge(link, Canvas::row_port(3, 0), wrk, 0) || !canvas.edge(wrk, 1, link, Canvas::row_port(2, 1)))
+            if (link < 0 || recv < 0 || wrk < 0 || mint < 0) return fail("tables");
+            if (!canvas.edge(recv, 0, wrk, 0) || !canvas.edge(wrk, 1, link, Canvas::row_port(2, 1)))
                 return fail("edges");
             if (!canvas.pair("volunteer link.4:returns > tensor mint.1:returned", 16)) return fail("port pair");
             if (!canvas.loopback("volunteer link", link, "filter")) return fail("loopback");
@@ -350,9 +354,10 @@ int server(int argc, char** argv) {
         const int lib = canvas.table("volunteer library", 480, {{0, 0, 2, 0, nullptr},
                                                                  {1, 0, 0, 1, "nodus.volunteer.library"},
                                                                  {2, 0, 1, 0, nullptr}});
-        const int link = canvas.table("server link", 960, link_rows("cycle.server.bulk", intake_id, returns_id, filter_id));
-        if (mint < 0 || lib < 0 || link < 0) return fail("tables");
-        if (!canvas.edge(lib, 2, link, Canvas::row_port(2, 1)) || !canvas.edge(link, Canvas::row_port(3, 0), lib, 1))
+        const int link = canvas.table("server link", 960, link_rows("cycle.server.bulk.send", intake_id, returns_id, filter_id));
+        const int recv = canvas.table("server receive", 960, {{1, 0, 0, 1, "cycle.server.bulk.receive"}, {2, 0, 1, 0, nullptr}});
+        if (mint < 0 || lib < 0 || link < 0 || recv < 0) return fail("tables");
+        if (!canvas.edge(lib, 2, link, Canvas::row_port(2, 1)) || !canvas.edge(recv, 0, lib, 1))
             return fail("edges");
         if (!canvas.pair("tensor mint.1:blank0 > volunteer library.1:blank") ||
             !canvas.pair("volunteer library.1:spent > tensor mint.1:returned") ||

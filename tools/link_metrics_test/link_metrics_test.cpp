@@ -88,10 +88,12 @@ int main() {
     dc.bulk_ticket = sign_ticket(make_ticket(Channel::Bulk, Role::Dialer, id, "lab", 42, now, 60), key);
     CHECK(register_link_dialer(reg, dc, &err), "dialer register: %s", err.c_str());
 
-    Row hcon = reg.create("proof.metrics.host.control"), dcon = reg.create("proof.metrics.dialer.control");
+    // The receive rows take what arrives off the link onto their stacks; the dialer's send row sends the packets.
+    Row hcon = reg.create("proof.metrics.host.control.receive"), dcon = reg.create("proof.metrics.dialer.control.receive");
+    Row dsend = reg.create("proof.metrics.dialer.control.send");
     Row hmet = reg.create("proof.metrics.host.metrics"), dmet = reg.create("proof.metrics.dialer.metrics");
-    CHECK(hcon && dcon && hmet && dmet, "rows from the registry");
-    if (!(hcon && dcon && hmet && dmet)) return 1;
+    CHECK(hcon && dcon && dsend && hmet && dmet, "rows from the registry");
+    if (!(hcon && dcon && dsend && hmet && dmet)) return 1;
     CHECK(std::strcmp(hmet->id_cstr(), "proof.metrics.host.metrics") == 0 && hmet->row_port_count() == 1
           && std::strcmp(hmet->row_port(0).name, "metrics") == 0 && hmet->row_port(0).token_bytes == 8, "row port");
     Row generic = reg.create("nodus.link.metrics");
@@ -107,7 +109,7 @@ int main() {
 
     const uint64_t N = 64;
     std::vector<double> dm, hm, gm;   // the newest matrix each metrics row published
-    Frame fhc, fdc, fhm, fdm, fgm;
+    Frame fhc, fdc, fds, fhm, fdm, fgm;
     Edge hedge, dedge, gedge;
     ToolRowPortAccess hport = hedge.access(), dport = dedge.access(), gport = gedge.access();
     auto step = [&] {
@@ -135,7 +137,7 @@ int main() {
     for (int i = 0; i < kPackets; ++i) {
         uint64_t t = packet_tensor(100 + uint32_t(i)); bool accepted = false;
         for (auto stop = Clock::now() + std::chrono::seconds(5); !accepted && Clock::now() < stop;) {
-            bool restored = true; uint64_t o = visit(*dcon, fdc, t, nullptr, &restored); accepted = !restored; if (o) nodus_tensor_destroy(o);
+            bool restored = true; uint64_t o = visit(*dsend, fds, t, nullptr, &restored); accepted = !restored; if (o) nodus_tensor_destroy(o);
             step();
         }
         CHECK(accepted, "packet %d accepted", i);

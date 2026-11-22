@@ -37,16 +37,21 @@ bool register_rows(ToolRegistry& registry, const std::string& id, std::shared_pt
         std::lock_guard<std::mutex> g(endpoints_mutex());
         if (endpoints().count(id)) { if (error) *error = "link " + id + " is already registered"; return false; }
     }
-    for (bool bulk : {false, true}) {
+    constexpr LinkRowRole kRoles[4] = {LinkRowRole::ControlSend, LinkRowRole::ControlReceive, LinkRowRole::BulkSend,
+                                       LinkRowRole::BulkReceive};
+    for (size_t r = 0; r < 4; ++r) {
+        const LinkRowRole role = kRoles[r];
         ToolRegistry::Entry entry;
-        entry.id = id + (bulk ? ".bulk" : ".control"); entry.name = bulk ? "Link bulk" : "Link control"; entry.caps = ToolCaps::None;
+        entry.id = id + link_row_suffix(role);
+        entry.name = LinkRow(std::string(), role, nullptr).name_cstr();
+        entry.caps = ToolCaps::None;
         entry.source_path = nodus_link_source();
-        entry.factory = [rid = entry.id, bulk, ep] {
-            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkRow(rid, bulk, ep), [](ITool* t) { nodus_link_destroy(t); });
+        entry.factory = [rid = entry.id, role, ep] {
+            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkRow(rid, role, ep), [](ITool* t) { nodus_link_destroy(t); });
         };
         if (!registry.register_tool(std::move(entry))) {
-            if (bulk) registry.unregister_tool(id + ".control");
-            if (error) *error = "tool registry refused " + id;
+            for (size_t k = 0; k < r; ++k) registry.unregister_tool(id + link_row_suffix(kRoles[k]));
+            if (error) *error = "tool registry refused " + id + link_row_suffix(role);
             return false;
         }
     }
@@ -58,7 +63,7 @@ bool register_rows(ToolRegistry& registry, const std::string& id, std::shared_pt
             return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkMetricsRow(rid, id, LinkMetricsRow::kDefaultWindow, metrics_channel_of(id)), [](ITool* t) { nodus_link_metrics_destroy(t); });
         };
         if (!registry.register_tool(std::move(entry))) {
-            registry.unregister_tool(id + ".control"); registry.unregister_tool(id + ".bulk");
+            for (LinkRowRole role : kRoles) registry.unregister_tool(id + link_row_suffix(role));
             if (error) *error = "tool registry refused " + id + ".metrics";
             return false;
         }
@@ -119,7 +124,9 @@ void set_link_metrics_channel(const std::string& id, int32_t channel) {
 }
 
 void unregister_link(ToolRegistry& registry, const std::string& id) {
-    registry.unregister_tool(id + ".control"); registry.unregister_tool(id + ".bulk"); registry.unregister_tool(id + ".metrics");
+    for (LinkRowRole role : {LinkRowRole::ControlSend, LinkRowRole::ControlReceive, LinkRowRole::BulkSend, LinkRowRole::BulkReceive})
+        registry.unregister_tool(id + link_row_suffix(role));
+    registry.unregister_tool(id + ".metrics");
     std::lock_guard<std::mutex> g(endpoints_mutex());
     endpoints().erase(id);
     metrics_channels().erase(id);

@@ -272,25 +272,6 @@ def _load(lib_path: Optional[str] = None):
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32,
         ctypes.POINTER(_NativeFifoConfig), ctypes.c_int32,
     )
-    # Canvas ports (canvas_abi.h GP_CANVAS_PORT_*). A library built before them lacks the symbols; Graph methods say so.
-    if hasattr(lib, "nodus_headless_declare_canvas_port"):
-        lib.nodus_headless_declare_canvas_port.restype = ctypes.c_int32
-        lib.nodus_headless_declare_canvas_port.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32)
-        lib.nodus_headless_canvas_root_module.restype = ctypes.c_int32
-        lib.nodus_headless_canvas_root_module.argtypes = (ctypes.c_void_p,)
-        lib.nodus_headless_canvas_port_count.restype = ctypes.c_int32
-        lib.nodus_headless_canvas_port_count.argtypes = (ctypes.c_void_p,)
-        lib.nodus_headless_canvas_port_at.restype = ctypes.c_int32
-        lib.nodus_headless_canvas_port_at.argtypes = (
-            ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_int32,
-            ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32),
-        )
-        lib.nodus_headless_canvas_port_consume.restype = ctypes.c_int32
-        lib.nodus_headless_canvas_port_consume.argtypes = (
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
-        )
-        lib.nodus_headless_canvas_port_publish.restype = ctypes.c_int32
-        lib.nodus_headless_canvas_port_publish.argtypes = (ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t)
     lib.nodus_headless_set_module_uuid.restype = ctypes.c_int32
     lib.nodus_headless_set_module_uuid.argtypes = (ctypes.c_void_p, ctypes.c_int32, ctypes.c_uint64)
     lib.nodus_headless_get_module_uuid.restype = ctypes.c_uint64
@@ -1185,50 +1166,6 @@ class Graph:
 
     def push_f32(self, name: str, value: float) -> None:
         self.push_bytes(name, struct.pack("f", value))
-
-    # ---- canvas ports: the canvas's own boundary, contacts of its ROOT module (canvas_abi.h GP_CANVAS_PORT_*) ----
-    def _canvas_ports_lib(self):
-        if not hasattr(self.lib, "nodus_headless_declare_canvas_port"):
-            raise RuntimeError("this nodus_headless library predates canvas ports")
-        return self.lib
-
-    def declare_canvas_port(self, name: str, direction: str = "out", up: bool = False) -> int:
-        """Declare a canvas port; returns its ROOT contact. "out": an edge inside the canvas ends there and
-        canvas_port_pull reads it; "in": canvas_port_push writes it and an edge inside starts there."""
-        if direction not in ("out", "in"):
-            raise ValueError("direction is 'out' or 'in'")
-        contact = int(self._canvas_ports_lib().nodus_headless_declare_canvas_port(
-            self._handle, name.encode(), 0 if direction == "out" else 1, int(bool(up))))
-        if contact < 0:
-            raise ValueError(f"canvas port {name!r} refused (name 1-63 bytes without whitespace; direction fixed)")
-        return contact
-
-    def canvas_root_module(self) -> int:
-        return int(self._canvas_ports_lib().nodus_headless_canvas_root_module(self._handle))
-
-    def canvas_ports(self) -> list:
-        lib = self._canvas_ports_lib()
-        out = []
-        for ordinal in range(max(0, int(lib.nodus_headless_canvas_port_count(self._handle)))):
-            name = ctypes.create_string_buffer(64)
-            direction, contact, up = ctypes.c_int32(), ctypes.c_int32(), ctypes.c_int32()
-            if lib.nodus_headless_canvas_port_at(self._handle, ordinal, name, len(name), ctypes.byref(direction),
-                                                 ctypes.byref(contact), ctypes.byref(up)):
-                out.append({"name": name.value.decode(), "direction": "out" if direction.value == 0 else "in",
-                            "contact": contact.value, "up": bool(up.value)})
-        return out
-
-    def canvas_port_pull(self, name: str, capacity: int) -> Optional[bytes]:
-        buf = ctypes.create_string_buffer(capacity)
-        written = ctypes.c_size_t()
-        if not self._canvas_ports_lib().nodus_headless_canvas_port_consume(
-                self._handle, name.encode(), buf, capacity, ctypes.byref(written)):
-            return None
-        return buf.raw[:written.value]
-
-    def canvas_port_push(self, name: str, data: bytes) -> bool:
-        return bool(self._canvas_ports_lib().nodus_headless_canvas_port_publish(
-            self._handle, name.encode(), data, len(data)))
 
     def pull_bytes(self, name: str, capacity: int) -> Optional[bytes]:
         self._ensure_scalar_execution()

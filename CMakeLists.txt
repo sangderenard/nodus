@@ -691,6 +691,61 @@ target_include_directories(frame_artifact_file_tool_test PRIVATE
 target_link_libraries(frame_artifact_file_tool_test PRIVATE canvas_tables_static nodus_tensor_core)
 target_compile_features(frame_artifact_file_tool_test PUBLIC cxx_std_20)
 
+# A canvas nested in a table row (module_library/source/tools/canvas_row.cpp): two canvases in one process, each on its
+# own scheduler, values carried through, and the row's canvas saved and restored with the canvas that holds it. Run it
+# with the canvas_row plugin's path.
+add_executable(canvas_row_test tests/canvas_row_test.cpp)
+target_include_directories(canvas_row_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(canvas_row_test PRIVATE nodus_headless nodus_tensor_core)  # the custody case compiles the row in
+target_compile_features(canvas_row_test PUBLIC cxx_std_20)
+target_compile_definitions(canvas_row_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")  # its rows are built from module_library sources
+if(TARGET canvas_row)
+  add_dependencies(canvas_row_test canvas_row)
+endif()
+
+# The secured mesh across processes: one writer per canvas and read privacy, with hybrid post-quantum keys
+# (module_library/source/tools/mesh_crypto.py as interpreted Python rows). Run it with a Python that has
+# cryptography >= 50, its site-packages, and the canvas_row, tensor_mint and tensor_returns plugins.
+add_executable(mesh_secure_test tests/mesh_secure_test.cpp)
+target_include_directories(mesh_secure_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mesh_secure_test PRIVATE nodus_headless nodus_python_row nodus_tensor_core ${NODUS_LINK_LIBS})
+target_compile_definitions(mesh_secure_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(mesh_secure_test PUBLIC cxx_std_20)
+foreach(row canvas_row tensor_mint tensor_returns)
+  if(TARGET ${row})
+    add_dependencies(mesh_secure_test ${row})
+  endif()
+endforeach()
+
+# The mesh: a node's canvas (host canvas row) publishes its snapshot -- canvas file and meta edge records -- over the
+# link to another node's replica canvas row. Run it with the canvas_row plugin's path.
+add_executable(mesh_replica_test tests/mesh_replica_test.cpp)
+target_include_directories(mesh_replica_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(mesh_replica_test PRIVATE nodus_headless nodus_tensor_core ${NODUS_LINK_LIBS})  # counts live tensors
+target_compile_features(mesh_replica_test PUBLIC cxx_std_20)
+target_compile_definitions(mesh_replica_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")  # its rows are built from module_library sources
+foreach(row canvas_row tensor_mint tensor_returns)
+  if(TARGET ${row})
+    add_dependencies(mesh_replica_test ${row})
+  endif()
+endforeach()
+
+# The file rows (file_read, file_write) composed with the link's split rows in tables: files from a source folder to a
+# destination folder, in one canvas and across a link between two canvases. Run it with both plugins' paths.
+add_executable(file_link_test tests/file_link_test.cpp)
+target_include_directories(file_link_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(file_link_test PRIVATE nodus_headless nodus_tensor_core ${NODUS_LINK_LIBS})  # counts live tensors
+target_compile_features(file_link_test PUBLIC cxx_std_20)
+target_compile_definitions(file_link_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")  # its rows are built from module_library sources
+foreach(row file_read file_write tensor_mint tensor_returns)
+  if(TARGET ${row})
+    add_dependencies(file_link_test ${row})
+  endif()
+endforeach()
+
 add_executable(frame_compression_pipeline_test tests/frame_compression_pipeline_test.cpp)
 target_include_directories(frame_compression_pipeline_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -935,9 +990,8 @@ add_executable(test_volunteer_cycle_link tests/volunteer_cycle_link_test.cpp src
 target_compile_definitions(test_volunteer_cycle_link PRIVATE NODUS_HEADLESS_BUILD=1 NOMINMAX)
 target_link_libraries(test_volunteer_cycle_link PRIVATE canvas_tables_static nodus_runtime)
 target_compile_features(test_volunteer_cycle_link PRIVATE cxx_std_20)
-if(WIN32)
-  target_link_libraries(test_volunteer_cycle_link PRIVATE ${NODUS_LINK_LIBS})
-endif()
+# NODUS_LINK_LIBS is the platform's set (WinHTTP/bcrypt on Windows, OpenSSL on Linux): the link signs tickets everywhere.
+target_link_libraries(test_volunteer_cycle_link PRIVATE ${NODUS_LINK_LIBS})
 
 # Socket qualification uses the same native registry image as its headless graph.
 add_executable(contract_socket_test tests/contract_socket_graph_test.cpp)
@@ -1074,9 +1128,8 @@ add_executable(nodus_headless_runtime_test
 )
 target_include_directories(nodus_headless_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(nodus_headless_runtime_test PRIVATE nodus_headless)
-if(WIN32)
-  target_link_libraries(nodus_headless_runtime_test PRIVATE ${NODUS_LINK_LIBS})  # the link tests sign tickets (nodus_link.h, nodus_link_wss.h)
-endif()
+# the link tests sign tickets (nodus_link.h, nodus_link_wss.h); NODUS_LINK_LIBS is the platform's set
+target_link_libraries(nodus_headless_runtime_test PRIVATE ${NODUS_LINK_LIBS})
 target_compile_features(nodus_headless_runtime_test PUBLIC cxx_std_20)
 add_test(NAME nodus_headless_runtime_test COMMAND nodus_headless_runtime_test)
 

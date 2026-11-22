@@ -271,7 +271,7 @@ extern "C" int32_t gp_table_edge_transaction_snapshot_restore(
 
     // The FIFO is authoritative. Keep the legacy coordinator mirror current
     // for table scheduling/diagnostics after the exact state is restored.
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm && static_cast<size_t>(edge_idx) < ctx->edge_subscriber_slots.size()) {
         auto& slots_by_key = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         for (size_t i = 0; i < EdgeTensorFifo::kMaxReaders; ++i) {
@@ -294,7 +294,7 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
     ctx->edges.emplace_back(a, b);
     // create and record a persistent unique id for this edge
     uint64_t uid = 0ull;
-    uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+    uid = gp_canvas_generate_id(table_canvas(ctx), 0ull);
     ctx->edge_ids.push_back(uid);
     // ensure relax arrays stay in sync
     // start unrelaxed so the cable animates into place
@@ -375,24 +375,24 @@ int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned l
         float slack = 0.0f;
         float plug_z = -ctx->st.cable_plug_depth;
         int idx = rope_sim_add_rope3(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), plug_z, static_cast<float>(bx), static_cast<float>(by), plug_z, segs, slack);
-        uint64_t rid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+        uint64_t rid = gp_canvas_generate_id(table_canvas(ctx), 0ull);
         ctx->rope_ids.push_back(rid);
         printf("gp_table_add_edge: ctx=%p rope_ids_count=%zu after push id=%llu\n", (void*)ctx, ctx->rope_ids.size(), (unsigned long long)rid);
         ctx->rope_id_to_sim_idx[rid] = idx;
         printf("gp_table_add_edge: ctx=%p added rope idx=%d id=%llu\n", (void*)ctx, idx, (unsigned long long)rid);
         {
-            GP_CanvasContext* cvs = gp_canvas_get_singleton();
+            GP_CanvasContext* cvs = table_canvas(ctx);
             if (cvs) {
                 uint64_t tmp = rid;
                 gp_canvas_register_table_rope_ids_from_array(cvs, ctx, &tmp, 1);
             }
         }
     } else {
-        uint64_t rid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+        uint64_t rid = gp_canvas_generate_id(table_canvas(ctx), 0ull);
         ctx->rope_ids.push_back(rid);
         printf("gp_table_add_edge: ctx=%p queued edge id=%llu (no sim)\n", (void*)ctx, (unsigned long long)rid);
         {
-            GP_CanvasContext* cvs = gp_canvas_get_singleton();
+            GP_CanvasContext* cvs = table_canvas(ctx);
             if (cvs) {
                 uint64_t tmp = rid;
                 gp_canvas_register_table_rope_ids_from_array(cvs, ctx, &tmp, 1);
@@ -439,7 +439,7 @@ extern "C" int32_t gp_table_register_ring_edge(GP_TableContext* ctx, int32_t rin
     re.ring_id = ring_id;
     re.key = ring_key;
     re.fifo.configure_default();
-    re.uid = gp_canvas_generate_id(gp_canvas_get_singleton(), 0ull);
+    re.uid = gp_canvas_generate_id(table_canvas(ctx), 0ull);
     ctx->rings.push_back(std::move(re));
     return static_cast<int32_t>(ctx->rings.size() - 1);
 }
@@ -522,7 +522,7 @@ extern "C" int32_t gp_table_ring_subscribe_ex(GP_TableContext* ctx, int32_t ring
     auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
     bool ok = re.fifo.subscribe(subscriber_key, start_at_head != 0);
     if (!ok) return 0;
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         if (static_cast<size_t>(ring_entry_idx) >= ctx->ring_subscriber_slots.size()) ctx->ring_subscriber_slots.resize(ctx->rings.size());
         auto &map = ctx->ring_subscriber_slots[static_cast<size_t>(ring_entry_idx)];
@@ -545,7 +545,7 @@ extern "C" int32_t gp_table_ring_unsubscribe(GP_TableContext* ctx, int32_t ring_
     if (ring_entry_idx < 0 || ring_entry_idx >= static_cast<int>(ctx->rings.size())) return 0;
     auto &re = ctx->rings[static_cast<size_t>(ring_entry_idx)];
     re.fifo.unsubscribe(subscriber_key);
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         if (static_cast<size_t>(ring_entry_idx) < ctx->ring_subscriber_slots.size()) {
             auto &m = ctx->ring_subscriber_slots[static_cast<size_t>(ring_entry_idx)];
@@ -584,7 +584,7 @@ extern "C" int32_t gp_table_ring_publish(GP_TableContext* ctx, int32_t ring_entr
         ok = re.fifo.push(rid, writer_key, sample_bytes, static_cast<size_t>(sample_len_bytes), &dropped);
     }
     if (out_dropped && dropped) *out_dropped = 1;
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         if (static_cast<size_t>(ring_entry_idx) < ctx->ring_subscriber_slots.size()) {
             auto &m = ctx->ring_subscriber_slots[static_cast<size_t>(ring_entry_idx)];
@@ -649,7 +649,7 @@ int32_t gp_table_edge_set_tensor_spec(GP_TableContext* ctx, int32_t edge_idx, co
     // If a ThreadManager is present, update registered reader slots with
     // the freshly-initialized sequence (usually zero) so manager state
     // remains consistent after reconfigure.
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         auto &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
@@ -689,7 +689,7 @@ int32_t gp_table_edge_subscribe_ex(GP_TableContext* ctx, int32_t edge_idx, unsig
     if (!ok) return 0;
     // Register reader slot with ThreadManager global (if available).
     // Avoid re-registering if this subscriber already has a slot mapping.
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &map = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         if (map.find(subscriber_key) == map.end()) {
@@ -712,7 +712,7 @@ int32_t gp_table_edge_unsubscribe(GP_TableContext* ctx, int32_t edge_idx, unsign
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
     ctx->edge_fifos[static_cast<size_t>(edge_idx)].unsubscribe(subscriber_key);
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         auto it = m.find(subscriber_key);
@@ -761,7 +761,7 @@ int32_t gp_table_edge_publish(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     // After a publish, the FIFO implementation may have advanced reader sequences
     // (e.g., during top-k trimming). Ensure the ThreadManager has up-to-date
     // per-slot sequences for all registered subscribers on this edge.
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         // Snapshot subscriber map to avoid iterator invalidation if
@@ -793,7 +793,7 @@ int32_t gp_table_edge_publish_blocking(GP_TableContext* ctx, int32_t edge_idx, u
     bool ok = fifo.push_blocking(edge_id, writer_key, sample_bytes, static_cast<size_t>(sample_len_bytes), &dropped, timeout_ms);
     if (out_dropped && dropped) *out_dropped = 1;
     if (!ok) return 0;
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         std::vector<std::pair<uint64_t,int>> subs;
@@ -839,7 +839,7 @@ int32_t gp_table_edge_publish_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
     bool ok = fifo.push_ptr(edge_id, writer_key, ptr, &dropped);
     if (out_dropped && dropped) *out_dropped = 1;
     // Sync ThreadManager reader sequences similar to float publish.
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         std::vector<std::pair<uint64_t,int>> subs;
@@ -905,7 +905,7 @@ int32_t gp_table_edge_consume_ptr(GP_TableContext* ctx, int32_t edge_idx, unsign
     if (!ok) return 0;
     if (out_ptr) *out_ptr = p;
     // Notify ThreadManager of read advancement
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         auto it = m.find(subscriber_key);
@@ -938,7 +938,7 @@ int32_t gp_table_edge_consume_ptr_many(GP_TableContext* ctx, int32_t edge_idx, u
     }
     if (consumed == 0) return 0;
     // Notify ThreadManager of read advancement using reader seq from fifo
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         auto it = m.find(subscriber_key);
@@ -1028,7 +1028,7 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
     // Notify ThreadManager of reader advancement, if registered.
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         auto it = m.find(subscriber_key);
@@ -1051,7 +1051,7 @@ int32_t gp_table_edge_consume_into_frame(GP_TableContext* ctx, int32_t edge_idx,
     EdgeTensorFifo &fifo = ctx->edge_fifos[static_cast<size_t>(edge_idx)];
     if (!fifo.pop_to_frame(subscriber_key, dst_frame, type_id)) return 0;
 
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         auto it = m.find(subscriber_key);
@@ -1156,7 +1156,7 @@ int32_t gp_table_edge_consume_blocking(GP_TableContext* ctx, int32_t edge_idx, u
     }
     if (out_written) *out_written = static_cast<int32_t>(wrote);
     if (!ok) return 0;
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         auto it = m.find(subscriber_key);
@@ -1323,7 +1323,7 @@ extern "C" int gp_table_bind_rope_id_to_sim_index(GP_TableContext* ctx, uint64_t
     if (ctx->rope_ids[static_cast<size_t>(rope_idx)] == 0ull) {
         ctx->rope_ids[static_cast<size_t>(rope_idx)] = id;
     }
-    if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+    if (GP_CanvasContext* cvs = table_canvas(ctx)) {
         gp_canvas_mark_rope_map_dirty(cvs);
     }
     // Diagnostic: report binding activity and associated sim pointer
@@ -1340,7 +1340,7 @@ extern "C" int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint
     if (!ctx) return 0;
     if (!ids || count <= 0) {
         ctx->rope_ids.clear();
-        if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+        if (GP_CanvasContext* cvs = table_canvas(ctx)) {
             gp_canvas_mark_rope_map_dirty(cvs);
         }
         return 1;
@@ -1370,7 +1370,7 @@ extern "C" int gp_table_set_rope_ids_from_array(GP_TableContext* ctx, const uint
             printf("  id[%d]=%llu -> idx=%d verts=%d\n", i, (unsigned long long)uid, ridx, vc);
         }
     }
-    if (GP_CanvasContext* cvs = gp_canvas_get_singleton()) {
+    if (GP_CanvasContext* cvs = table_canvas(ctx)) {
         gp_canvas_mark_rope_map_dirty(cvs);
     }
     return 1;
@@ -1546,7 +1546,7 @@ int32_t gp_table_remove_edge(GP_TableContext* ctx, int32_t edge_idx) {
     if (!ctx) return 0;
     ensure_edge_fifos(ctx);
     if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edges.size())) return 0;
-    ThreadManager* tm = ThreadManager::global();
+    ThreadManager* tm = table_thread_manager(ctx);
     if (tm && edge_idx < static_cast<int32_t>(ctx->edge_subscriber_slots.size())) {
         auto &m = ctx->edge_subscriber_slots[static_cast<size_t>(edge_idx)];
         for (const auto &kv : m) {

@@ -271,9 +271,10 @@ extern "C" NodusHeadlessGraph* nodus_headless_create(void) {
     std::call_once(abstract_tensor_vocabulary_once, [] {
         nodus::tensors::register_abstract_tensor_tool_ir(tool_registry_global());
     });
-    // The native canvas still owns process-global contact and table helpers.
-    // Refuse coexistence instead of perturbing an already-running UI/bridge.
-    if (gp_canvas_get_singleton() != nullptr) return nullptr;
+    // Graphs coexist: each canvas runs on its own scheduler with its own tables, tick state and sim frame count
+    // (ThreadManager::TickRequest::canvas, GP_TableContext::owner_canvas), so a graph made while another canvas exists
+    // -- a canvas a table row holds (canvas_row) -- is a compartment of its own. gp_canvas_create keeps the first canvas
+    // as the process's primary; a later one never loads or autosaves the workspace file.
     auto* g = new NodusHeadlessGraph();
     g->ctx = gp_canvas_create(1, 1);
     if (!g->ctx) {
@@ -1176,6 +1177,11 @@ extern "C" int32_t nodus_headless_meta_read_records(NodusHeadlessGraph* g, uint6
     GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
     return mg ? gp_table_meta_read_records(g->table, mg, from_seq, out_words, max_records, out_write_seq) : 0;
 }
+extern "C" int32_t nodus_headless_meta_append_records(NodusHeadlessGraph* g, uint64_t group_id, const uint64_t* words,
+                                                     int32_t count) {
+    GP_MetaGroup* mg = g ? find_meta_group(g->table, group_id) : nullptr;
+    return mg ? gp_table_meta_append_records(g->table, mg, words, count) : 0;
+}
 extern "C" int32_t nodus_headless_meta_channel_records(int32_t channel, uint64_t* out_words, int32_t capacity_words) {
     GP_TableContext* table = process_container_table();
     if (!table || !out_words || capacity_words < GP_META_RECORD_WORDS) return 0;
@@ -1337,6 +1343,22 @@ extern "C" int32_t nodus_headless_declare_canvas_port(NodusHeadlessGraph* g, con
     return gp_canvas_declare_port(g->ctx, name, direction, up);
 }
 
+extern "C" int32_t nodus_headless_get_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row, uint8_t* out,
+                                               size_t capacity, size_t* out_size) {
+    if (out_size) *out_size = 0;
+    if (!g || !g->ctx || capacity > static_cast<size_t>(INT32_MAX)) return 0;
+    int size = 0;
+    const int ok = gp_canvas_row_state_get(g->ctx, module_idx, row, out, static_cast<int>(capacity), &size);
+    if (out_size) *out_size = static_cast<size_t>(size);
+    return ok;
+}
+
+extern "C" int32_t nodus_headless_set_row_state(NodusHeadlessGraph* g, int32_t module_idx, int32_t row,
+                                               const uint8_t* bytes, size_t size) {
+    if (!g || !g->ctx || size > static_cast<size_t>(INT32_MAX)) return 0;
+    return gp_canvas_row_state_set(g->ctx, module_idx, row, bytes, static_cast<int>(size));
+}
+
 extern "C" int32_t nodus_headless_canvas_root_module(NodusHeadlessGraph* g) {
     return (g && g->ctx) ? gp_canvas_root_module_of(g->ctx) : -1;
 }
@@ -1365,6 +1387,10 @@ extern "C" int32_t nodus_headless_canvas_port_consume(NodusHeadlessGraph* g, con
     const int ok = gp_canvas_port_consume(g->ctx, name, out_bytes, static_cast<int>(cap), &written);
     if (out_written) *out_written = static_cast<size_t>(written);
     return ok;
+}
+
+extern "C" int32_t nodus_headless_canvas_port_carries_tensors(NodusHeadlessGraph* g, const char* name) {
+    return (g && g->ctx) ? gp_canvas_port_carries_tensors(g->ctx, name) : -1;
 }
 
 extern "C" int32_t nodus_headless_canvas_port_publish(NodusHeadlessGraph* g, const char* name, const void* bytes,
