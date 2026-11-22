@@ -52,24 +52,30 @@ function Invoke-Pair([string]$name, [bool]$windowsWrites, [string]$writerKid, [s
     $env:NODUS_MESH_KEYS = $W
     $env:MESH_TEST_LINK = "wss:${Front}:${ct}:${bt}"
     $hostEnv = "NODUS_MESH_KEYS=$rwork/O MESH_TEST_LINK=host:$linkKey"
-    if ($windowsWrites) {
-        $remote = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 600 $RemoteBuild/mesh_secure_test reader $Port $linkKey $writerKid $Seconds $($rows -join ' ') mesh_verify mesh_open'")) `
-                  -PassThru -WindowStyle Hidden -RedirectStandardOutput $readerOut -RedirectStandardError "$readerOut.err"
-        if (-not (Wait-Line $readerOut '[reader] up' 300)) { throw "${name}: the Linux reader did not come up" }
-        $local = Start-Process $test -ArgumentList (@('writer', $work, $Port, $ct, $bt, $readerKid) + $rows + @('mesh_seal', 'mesh_sign')) `
-                 -WorkingDirectory $work -PassThru -WindowStyle Hidden -RedirectStandardOutput "$work\$name.writer.txt" -RedirectStandardError "$work\$name.writer.err"
-        $remote | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
-    } else {
-        $remote = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 420 $RemoteBuild/mesh_secure_test writer $rwork $Port $ct $bt $readerKid $($rows -join ' ') mesh_seal mesh_sign'")) `
-                  -PassThru -WindowStyle Hidden -RedirectStandardOutput "$work\$name.writer.txt" -RedirectStandardError "$work\$name.writer.err"
-        if (-not (Wait-Line "$work\$name.writer.txt" '[writer] up' 300)) { throw "${name}: the Linux writer did not come up" }
-        $local = Start-Process $test -ArgumentList (@('reader', $Port, $linkKey, $writerKid, $Seconds) + $rows + @('mesh_verify', 'mesh_open')) `
-                 -WorkingDirectory $work -PassThru -WindowStyle Hidden -RedirectStandardOutput $readerOut -RedirectStandardError "$readerOut.err"
-        $local | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+    $local, $remote = $null, $null
+    # The cleanup is in a finally: a node that never comes up throws, and the remote test must not keep the listener
+    # port until its own 420/600-second timeout.
+    try {
+        if ($windowsWrites) {
+            $remote = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 600 $RemoteBuild/mesh_secure_test reader $Port $linkKey $writerKid $Seconds $($rows -join ' ') mesh_verify mesh_open'")) `
+                      -PassThru -WindowStyle Hidden -RedirectStandardOutput $readerOut -RedirectStandardError "$readerOut.err"
+            if (-not (Wait-Line $readerOut '[reader] up' 300)) { throw "${name}: the Linux reader did not come up" }
+            $local = Start-Process $test -ArgumentList (@('writer', $work, $Port, $ct, $bt, $readerKid) + $rows + @('mesh_seal', 'mesh_sign')) `
+                     -WorkingDirectory $work -PassThru -WindowStyle Hidden -RedirectStandardOutput "$work\$name.writer.txt" -RedirectStandardError "$work\$name.writer.err"
+            $remote | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+        } else {
+            $remote = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 420 $RemoteBuild/mesh_secure_test writer $rwork $Port $ct $bt $readerKid $($rows -join ' ') mesh_seal mesh_sign'")) `
+                      -PassThru -WindowStyle Hidden -RedirectStandardOutput "$work\$name.writer.txt" -RedirectStandardError "$work\$name.writer.err"
+            if (-not (Wait-Line "$work\$name.writer.txt" '[writer] up' 300)) { throw "${name}: the Linux writer did not come up" }
+            $local = Start-Process $test -ArgumentList (@('reader', $Port, $linkKey, $writerKid, $Seconds) + $rows + @('mesh_verify', 'mesh_open')) `
+                     -WorkingDirectory $work -PassThru -WindowStyle Hidden -RedirectStandardOutput $readerOut -RedirectStandardError "$readerOut.err"
+            $local | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+        }
+    } finally {
+        foreach ($p in $local, $remote) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
+        try { Invoke-Remote "pkill -f mesh_secure_test.*$Port || true" | Out-Null } catch { Write-Host "  remote cleanup: $_" }
+        Remove-Item Env:MESH_TEST_LINK -ErrorAction SilentlyContinue
     }
-    foreach ($p in $local, $remote) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
-    Invoke-Remote "pkill -f mesh_secure_test.*$Port || true" | Out-Null
-    Remove-Item Env:MESH_TEST_LINK -ErrorAction SilentlyContinue
     foreach ($f in "$work\$name.writer.txt", $readerOut) {    # each change of link state, with the endpoint's reason
         if (Test-Path $f) { Select-String -Path $f -Pattern '^\[(writer|reader)\] link' | ForEach-Object { Write-Host "  $($_.Line)" } }
     }
