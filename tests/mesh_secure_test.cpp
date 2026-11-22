@@ -141,6 +141,66 @@ std::vector<uint8_t> small_canvas(const fs::path& dir) {
 
 fs::path g_rows;   // this process's own module library root: a loaded plugin is never rebuilt in place
 
+// How a child joins the link. By default the writer dials 127.0.0.1 and the reader is the link host (one machine).
+// MESH_TEST_LINK overrides it, so either role can be either end, as across machines where the node behind NAT always
+// dials out (tests/mesh_cross_machine.ps1):
+//   host:<link key hex>                         the link host (listener) on <port>, loopback
+//   wss:<host>:<control hex>:<bulk hex>         dial wss://<host>/ws/link/mesh/{control,bulk} through the front (TLS)
+//   wss:<host>:<port>:<control hex>:<bulk hex>[:<pin hex>]   the same on <port>; a pin (SHA-256 of the certificate DER)
+//                                               replaces CA and host name checks, as for a front reached by address
+std::vector<std::string> split(const std::string& s, char c) {
+    std::vector<std::string> out;
+    size_t at = 0;
+    for (size_t k; (k = s.find(c, at)) != std::string::npos; at = k + 1) out.push_back(s.substr(at, k - at));
+    out.push_back(s.substr(at));
+    return out;
+}
+// 1 joined, 0 refused; -1 when MESH_TEST_LINK is unset (the caller's own default applies).
+int join_link(NodusHeadlessGraph* g, const char* id, uint16_t port) {
+    const char* spec = std::getenv("MESH_TEST_LINK");
+    if (!spec || !*spec) return -1;
+    const auto parts = split(spec, ':');
+    if (parts.size() == 2 && parts[0] == "host") {
+        const auto key = unhex(parts[1]);
+        return key.size() == 32 && nodus_headless_register_link_host(g, id, "mesh", port, key.data(), 0) > 0 ? 1 : 0;
+    }
+    if (parts.size() >= 4 && parts.size() <= 6 && parts[0] == "wss") {
+        const bool ported = parts.size() >= 5;
+        const int wss_port = ported ? std::stoi(parts[2]) : 443;
+        const auto ct = unhex(parts[ported ? 3 : 2]), bt = unhex(parts[ported ? 4 : 3]);
+        const auto pin = parts.size() == 6 ? unhex(parts[5]) : std::vector<uint8_t>{};
+        if (ct.size() != 128 || bt.size() != 128 || (parts.size() == 6 && pin.size() != 32) || wss_port <= 0 || wss_port > 65535)
+            return 0;
+        return nodus_headless_register_link_wss_dialer(g, id, parts[1].c_str(), uint16_t(wss_port), nullptr, "mesh", 1,
+                                                       pin.empty() ? nullptr : pin.data(), ct.data(), bt.data(), 15000, 0)
+                   ? 1
+                   : 0;
+    }
+    return 0;
+}
+
+// Prints the link's state when it changes, with the endpoint's reason (the record of a failed or closed link).
+struct LinkWatch {
+    const char* id;
+    const char* role;
+    int32_t last = -2;
+    int32_t poll() {
+        int32_t s = -1;
+        uint64_t v[16] = {};
+        nodus_headless_link_report(id, &s, v);
+        if (s != last) {
+            char why[256] = {};
+            nodus_headless_link_reason(id, why, sizeof(why));
+            std::printf("[%s] link state %d%s%s (control sent %llu received %llu, bulk sent %llu received %llu, refused %llu/%llu)\n",
+                        role, s, why[0] ? ": " : "", why, (unsigned long long)v[2], (unsigned long long)v[3],
+                        (unsigned long long)v[6], (unsigned long long)v[7], (unsigned long long)v[8], (unsigned long long)v[9]);
+            std::fflush(stdout);
+            last = s;
+        }
+        return s;
+    }
+};
+
 // A row by module library name, or a generated wrapper source (.cpp), built and loaded in this process's runtime.
 bool load(const char* spec, std::string& id) {
     const std::string s(spec);
@@ -158,8 +218,9 @@ int writer(char** argv) {
         return 2;
     Canvas c;
     const auto ct = unhex(argv[4]), bt = unhex(argv[5]);
-    if (!nodus_headless_register_link_dialer(c.g, "mesh.w", "127.0.0.1", uint16_t(std::stoi(argv[3])), "mesh", ct.data(),
-                                             bt.data(), 10000, 0)) return 3;
+    const int joined = join_link(c.g, "mesh.w", uint16_t(std::stoi(argv[3])));
+    if (joined == 0 || (joined < 0 && !nodus_headless_register_link_dialer(c.g, "mesh.w", "127.0.0.1", uint16_t(std::stoi(argv[3])),
+                                                                          "mesh", ct.data(), bt.data(), 10000, 0))) return 3;
     const std::vector<uint8_t> readers = std::string(argv[6]) == "-" ? std::vector<uint8_t>{} : unhex(argv[6]);
     const int node = c.table("node", {{kTool, 0, 0, kPlugin, row.c_str()}}, false);
     const auto state = row_state(0, 5, true, readers, {}, small_canvas(work));
@@ -173,8 +234,10 @@ int writer(char** argv) {
         !c.trash(secure, 3, mint.c_str()) || !c.trash(send, 2, mint.c_str())) return 5;
     std::printf("[writer] up\n");
     std::fflush(stdout);
+    LinkWatch watch{"mesh.w", "writer"};
     for (;;) {                                      // until the orchestrator ends it
         nodus_headless_step(c.g, 1.0 / 60.0);
+        watch.poll();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
@@ -188,7 +251,9 @@ int reader(char** argv) {
         return 2;
     Canvas c;
     const auto key = unhex(argv[3]);
-    if (nodus_headless_register_link_host(c.g, "mesh.r", "mesh", uint16_t(std::stoi(argv[2])), key.data(), 0) <= 0) return 3;
+    const int joined = join_link(c.g, "mesh.r", uint16_t(std::stoi(argv[2])));
+    if (joined == 0 || (joined < 0 && nodus_headless_register_link_host(c.g, "mesh.r", "mesh", uint16_t(std::stoi(argv[2])),
+                                                                        key.data(), 0) <= 0)) return 3;
     const int receive = c.table("receive", {{kTool, 0, 0, kPlugin, "mesh.r.bulk.receive"}, {kTool, 0, 0, kPlugin, verify.c_str()},
                                             {kTool, 0, 0, kPlugin, open.c_str()}, {kTool, 0, 0, kPlugin, returns.c_str()},
                                             {kOutput, 0, 1, 0, nullptr}}, true);
@@ -200,11 +265,12 @@ int reader(char** argv) {
     std::fflush(stdout);
     int32_t hs = -1;
     uint64_t hv[16] = {};
+    LinkWatch watch{"mesh.r", "reader"};
     // The writer builds its rows too before it dials: wait for the link, then watch for the window.
     for (auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(240);
          hs != 1 && std::chrono::steady_clock::now() < give_up;) {
         nodus_headless_step(c.g, 1.0 / 60.0);
-        nodus_headless_link_report("mesh.r", &hs, hv);
+        hs = watch.poll();
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(std::stoi(argv[5]));
@@ -213,6 +279,7 @@ int reader(char** argv) {
     size_t snap_bytes = 0;
     while (std::chrono::steady_clock::now() < until) {
         nodus_headless_step(c.g, 1.0 / 60.0);
+        watch.poll();
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         size_t size = 0;
         nodus_headless_get_row_state(c.g, replica, 0, nullptr, 0, &size);
@@ -285,8 +352,11 @@ int main(int argc, char** argv) {
         nodus::link::random_bytes(key.data(), key.size());
         const auto link = nodus::link::new_link_id();
         const uint64_t now = uint64_t(std::time(nullptr));
-        const auto ct = nodus::link::sign_ticket(nodus::link::make_ticket(nodus::link::Channel::Control, nodus::link::Role::Dialer, link, "mesh", 7, now, 600), key);
-        const auto bt = nodus::link::sign_ticket(nodus::link::make_ticket(nodus::link::Channel::Bulk, nodus::link::Role::Dialer, link, "mesh", 7, now, 600), key);
+        // The longest life the listener admits (a longer ticket is refused, close 1008): both children build their rows
+        // after the tickets are made, and the dial must land inside it.
+        const uint64_t life = nodus::link::ListenerConfig{}.max_ticket_life;
+        const auto ct = nodus::link::sign_ticket(nodus::link::make_ticket(nodus::link::Channel::Control, nodus::link::Role::Dialer, link, "mesh", 7, now, life), key);
+        const auto bt = nodus::link::sign_ticket(nodus::link::make_ticket(nodus::link::Channel::Bulk, nodus::link::Role::Dialer, link, "mesh", 7, now, life), key);
         std::printf("%s %s %s\n", hex(key.data(), key.size()).c_str(), hex(ct.data(), ct.size()).c_str(), hex(bt.data(), bt.size()).c_str());
         return 0;
     }

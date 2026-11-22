@@ -80,7 +80,8 @@ public:
         ++core_->refs; core_->request = request;                  // released by the request's HANDLE_CLOSING
         bool ok = WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) != FALSE;
         if (ok && t.secure && t.pinned) {
-            DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA;          // the pin decides instead of the CA chain
+            // the pin decides instead of the CA chain and the name, as the OpenSSL lane skips SSL_set1_host when pinned
+            DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
             ok = WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags)) != FALSE;
         }
         if (!ok || !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, ctx)) fail("WinHttpSendRequest refused");
