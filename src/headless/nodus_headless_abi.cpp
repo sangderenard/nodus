@@ -981,6 +981,10 @@ static int32_t sync_ui_edges(NodusHeadlessGraph* g) {
     return 1;
 }
 
+extern "C" GP_CanvasContext* nodus_headless_canvas_context(NodusHeadlessGraph* g) {
+    return g ? g->ctx : nullptr;
+}
+
 extern "C" int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height) {
     return g && g->ctx && width >= 64 && height >= 64 && width <= 4096 && height <= 4096
         ? gp_canvas_set_size(g->ctx, width, height) : 0;

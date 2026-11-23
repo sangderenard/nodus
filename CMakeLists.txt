@@ -607,12 +607,15 @@ add_test(NAME edge_runtime_abi_test COMMAND edge_runtime_abi_test)
 # data at named external ports. Links canvas_tables_static (not just the
 # lean nodus_runtime sources) because it needs gp_canvas_*/gp_table_edge_*/
 # ThreadManager, but exports only its own narrow nodus_headless_* surface.
-add_library(nodus_headless SHARED
+# The same sources are compiled into the native host's image too (frontend_shell, NODUS_HEADLESS_STATIC), so it has
+# the whole headless file path, contract ports, cron, compile host and links on one copy of the engine.
+set(NODUS_HEADLESS_SOURCES
   src/headless/nodus_headless_abi.cpp
   src/headless/radio_rows.cpp
   src/headless/pcm_playback.cpp
   src/headless/nodus_mesh_crypto.cpp
 )
+add_library(nodus_headless SHARED ${NODUS_HEADLESS_SOURCES})
 target_compile_definitions(nodus_headless PRIVATE NODUS_HEADLESS_BUILD=1)
 if(NODUS_MESH_CRYPTO)
   target_compile_definitions(nodus_headless PRIVATE NODUS_MESH_CRYPTO=1)
@@ -726,6 +729,13 @@ if(TARGET canvas_row)
   add_dependencies(canvas_row_test canvas_row)
 endif()
 
+# The native Nodus host (frontend_shell --canvas): it runs a saved canvas as tools/run_canvas.py does. Run it with a
+# work folder and the frontend_shell executable.
+add_executable(native_host_test tests/native_host_test.cpp)
+target_include_directories(native_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(native_host_test PRIVATE nodus_headless ${NODUS_LINK_LIBS})
+target_compile_features(native_host_test PUBLIC cxx_std_20)
+
 # The front route map: many links on one public port, each routed by its name to its own loopback port (the row
 # nodus.link.route). Run it with a work folder; tests/link_route_front.ps1 runs it through a private Apache front.
 add_executable(link_route_test tests/link_route_test.cpp)
@@ -835,15 +845,32 @@ find_package(OpenGL REQUIRED)
 
 # frontend_shell is built with or without Torch: only its device probe uses Torch (gated on NODUS_ENABLE_TORCH).
 if(TRUE)
-  add_executable(frontend_shell tools/frontend_shell.cpp)
-  target_include_directories(frontend_shell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # The native Nodus host (docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md): the headless ABI's own sources are compiled
+  # into this image, so the host loads and saves every canvas-file record and attaches cron, compile hosts and links
+  # exactly as the headless library does, on the one copy of the engine below.
+  add_executable(frontend_shell tools/frontend_shell.cpp ${NODUS_HEADLESS_SOURCES})
+  target_include_directories(frontend_shell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(frontend_shell PRIVATE NODUS_HEADLESS_STATIC=1 NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+  if(NODUS_MESH_CRYPTO)
+    target_compile_definitions(frontend_shell PRIVATE NODUS_MESH_CRYPTO=1)
+    target_link_libraries(frontend_shell PRIVATE ${NODUS_MESH_CRYPTO_LIBS})
+  endif()
   # One image only: the static canvas library carries the tool registry and the
   # contract-port runtime; linking the DLL beside it duplicated every gp_canvas_* symbol.
   target_link_libraries(frontend_shell PRIVATE
     canvas_tables_static
     nodus_runtime
     OpenGL::GL
+    ${NODUS_LINK_LIBS}
   )
+  # As for nodus_headless: keep the self-registering exec rows the static library would otherwise leave out.
+  if(WIN32)
+    target_link_options(frontend_shell PRIVATE "/INCLUDE:nodus_exec_row_source")
+  elseif(APPLE)
+    target_link_options(frontend_shell PRIVATE "LINKER:-u,_nodus_exec_row_source")
+  else()
+    target_link_options(frontend_shell PRIVATE "LINKER:--undefined=nodus_exec_row_source")
+  endif()
   if(NODUS_ENABLE_TORCH)
     target_link_libraries(frontend_shell PRIVATE Torch::Torch)
   endif()
@@ -859,7 +886,7 @@ if(TRUE)
   else()
     message(FATAL_ERROR "SDL3 is required (SDL2 support removed). Please install SDL3 or enable network fetch to fetch it.")
   endif()
-  target_compile_features(frontend_shell PUBLIC cxx_std_17)
+  target_compile_features(frontend_shell PUBLIC cxx_std_20)   # the headless sources it compiles need C++20
 
   if(TARGET SDL3::SDL3)
     add_custom_command(TARGET frontend_shell POST_BUILD

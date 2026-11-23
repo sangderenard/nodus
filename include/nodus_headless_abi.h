@@ -32,7 +32,11 @@
 #include "turing_product_adopter.h"
 #include "common/tensors/abstraction/tensor_abi.h"
 
-#if defined(_WIN32)
+// NODUS_HEADLESS_STATIC: these sources compiled into one image with the canvas library (the native host,
+// frontend_shell; docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md), so nothing is exported or imported.
+#if defined(NODUS_HEADLESS_STATIC)
+#  define NODUS_HEADLESS_API
+#elif defined(_WIN32)
 #  if defined(NODUS_HEADLESS_BUILD)
 #    define NODUS_HEADLESS_API __declspec(dllexport)
 #  else
@@ -230,6 +234,10 @@ NODUS_HEADLESS_API int32_t nodus_headless_apply_port_pair(NodusHeadlessGraph* g,
 // Drive the same canvas UI handlers used by the GUI, on the graph's owning
 // thread. Mouse kinds: 0 click, 1 down, 2 up, 3 move, 4 scroll.
 NODUS_HEADLESS_API int32_t nodus_headless_ui_viewport(NodusHeadlessGraph* g, int32_t width, int32_t height);
+// The graph's canvas, for a host that holds these sources and the canvas library in ONE image (the native host,
+// NODUS_HEADLESS_STATIC): it rasterizes it (gp_canvas_raster_rgba) and gives it input. Through the DLL the pointer
+// belongs to the DLL's own copy of the canvas library and is only for passing back to this ABI.
+NODUS_HEADLESS_API GP_CanvasContext* nodus_headless_canvas_context(NodusHeadlessGraph* g);
 NODUS_HEADLESS_API int32_t nodus_headless_ui_mouse(NodusHeadlessGraph* g, int32_t kind,
     float x, float y, float dx, float dy, int32_t button, float scroll);
 NODUS_HEADLESS_API int32_t nodus_headless_ui_key(NodusHeadlessGraph* g,

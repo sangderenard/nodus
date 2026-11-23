@@ -1720,7 +1720,10 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 std::vector<uint8_t> tmp_buf(static_cast<size_t>(tw) * static_cast<size_t>(table_render_h) * 4u);
                 int ok = gp_table_render_rgba_with_state(t, nullptr, tmp_buf.data(), static_cast<int32_t>(tmp_buf.size()), &geom, hits.data(), hitcap, &hits_written);
                 if (ok) {
-                    int copy_h = std::min(table_clip_h, table_render_h);
+                    // Only the rows inside the module image (tw x th): a module shorter than its top UI has table_y == h
+                    // and a clip of 1 (module_layout_for), and that row lay past the image -- a heap overflow found when
+                    // the native host first drew a fully loaded canvas (a 173 px ROOT module, 2026-11-23).
+                    int copy_h = std::min({table_clip_h, table_render_h, th - table_offset_y});
                     for (int yy = 0; yy < copy_h; ++yy) {
                         const uint8_t* src = tmp_buf.data() + static_cast<size_t>(yy) * static_cast<size_t>(tw) * 4u;
                         uint8_t* dst = module_tables[mi].data() + static_cast<size_t>(yy + table_offset_y) * static_cast<size_t>(tw) * 4u;

@@ -53,6 +53,7 @@
 #endif
 
 #include "canvas_abi.h"
+#include "native_host.h"   // host mode: --canvas (docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md, stage A)
 
 // Defined in the static canvas library (also used by thread_manager.cpp); writes the
 // stack tail of a module on the primary canvas context. Attach mode reuses it.
@@ -89,6 +90,8 @@ struct CanvasHead {
     // Contract ports hosted for this canvas (same class the headless graph uses).
     // Destroyed BEFORE the canvas context (see destroy_canvas_head).
     std::unique_ptr<nodus::contracts::CanvasContractPorts> contract_ports;
+    // The canvas of a hosted graph (host mode): the graph owns it, so the head never destroys it.
+    bool hosted = false;
 };
 
 static constexpr size_t kMaxCanvasHeads = 8;
@@ -1509,7 +1512,8 @@ void destroy_canvas_head(CanvasHead& head) {
         return;
     }
     head.contract_ports.reset();  // listeners/sockets before the canvas they publish into
-    gp_canvas_destroy(head.context);
+    if (!head.hosted) gp_canvas_destroy(head.context);   // a hosted canvas is its graph's (native_host.h)
+    head.hosted = false;
     head.context = nullptr;
     head.pixels.clear();
     head.width = 0;
@@ -2000,6 +2004,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
                 event.type == SDL_EVENT_KEY_DOWN ? 1 : 0,
                 mods
             );
+            nodus::host::canvas_changed().store(true);   // a hosted canvas saves the change (native_host.h)
             break;
         }
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -2029,6 +2034,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
                 fprintf(stderr, "[DBG] frontend on_mouse_up ctx=%p lx=%f,ly=%f fdx=%f,fdy=%f btn=%d\n", (void*)ctx, lx, ly, fdx, fdy, button);
                 gp_canvas_on_mouse_up(ctx, lx, ly, fdx, fdy, button);
             }
+            nodus::host::canvas_changed().store(true);   // a press, a release, the end of a drag
             break;
         }
         case SDL_EVENT_MOUSE_MOTION: {
@@ -2080,6 +2086,7 @@ void InputDispatcher::handle_event(const SDL_Event& event) {
             float scroll = static_cast<float>(event.wheel.y);
             fprintf(stderr, "[DBG] frontend on_mouse_scroll ctx=%p lx=%f,ly=%f mdx=%f,mdy=%f scroll=%f\n", (void*)ctx, lx, ly, mdx, mdy, scroll);
             gp_canvas_on_mouse_scroll(ctx, lx, ly, mdx, mdy, scroll);
+            nodus::host::canvas_changed().store(true);
             break;
         }
         case SDL_EVENT_GAMEPAD_ADDED:
@@ -2279,6 +2286,7 @@ int InputDispatcher::scancode_to_digit(SDL_Scancode scan) const {
 
 void InputDispatcher::switch_to_canvas(size_t index) {
     if (index >= kMaxCanvasHeads) return;
+    if (resources_.canvas_heads[0].hosted) return;   // host mode shows its one hosted canvas
     if (!ensure_canvas_head_initialized(resources_, index)) {
         std::cerr << "Failed to prepare canvas head " << index << "\n";
         return;
@@ -2964,7 +2972,81 @@ void prepare_torch(FrontendResources& resources, const FrontendOptions& opts) {
 
 }  // namespace
 
+// Host mode (--canvas; native_host.h): the hosted graph steps at --rate on its own thread. With --offscreen nothing
+// else runs: no SDL, no window, no GL. Otherwise the window draws the hosted canvas through the rasterizer and gives it
+// input, and closing it stops the host. Returns the process exit code.
+int run_host(nodus::host::Options options) {
+    const bool offscreen = options.offscreen;
+    // The display first: a host that cannot open its window refuses before its ready line says it is up.
+    if (!offscreen && !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+        std::cerr << "nodus: no display (" << SDL_GetError() << "); run with --offscreen\n";
+        return 2;
+    }
+    nodus::host::Host host(std::move(options));
+    if (const int code = host.start()) return code;
+    if (offscreen) {
+        host.run();
+        return host.finish();
+    }
+    FrontendResources resources;
+    initialize_collection_state(resources.collection_state);
+    if (!initialize_window(resources)) {
+        cleanup(resources);
+        host.request_stop();
+        host.finish();
+        return 2;
+    }
+    auto& head = resources.canvas_heads[0];
+    head.context = nodus_headless_canvas_context(host.graph());
+    head.hosted = true;
+    head.width = resources.canvas_width_hint;
+    head.height = resources.canvas_height_hint;
+    head.pixels.assign(static_cast<size_t>(head.width) * head.height * 4, 0u);
+    gp_canvas_set_size(head.context, head.width, head.height);
+    resources.active_canvas_index = 0;
+    std::thread stepping([&host] { host.run(); });
+    int failed = 0;
+    try {
+        CanvasTickController tick_controller(resources);   // never started: the host steps the canvas
+        InputFilters filters;
+        InputDispatcher dispatcher(resources, filters);
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(resources.window, &ww, &wh);
+        dispatcher.on_window_resized(ww, wh);
+        bool running = true;
+        while (running && !nodus::host::stop_requested().load()) {
+            pump_events(running, dispatcher);
+            dispatcher.update();
+            render_frame(resources, tick_controller);
+            SDL_Delay(16);
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "nodus: the window failed: %s\n", e.what());
+        failed = 2;
+    }
+    host.request_stop();
+    stepping.join();   // on every path: a joinable thread destroyed in unwinding would end the process
+    cleanup(resources);   // the head leaves the hosted canvas to its graph
+    const int code = host.finish();
+    return failed ? failed : code;
+}
+
 int main(int argc, char** argv) {
+    {
+        nodus::host::Options host_options;
+        bool host_mode = false;
+        try {
+            host_mode = nodus::host::parse(argc, argv, host_options);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "nodus: %s\n", e.what());
+            return 2;
+        }
+        if (host_mode) {
+            const int code = run_host(std::move(host_options));
+            std::fflush(nullptr);
+            _exit(code);   // as below: no static teardown after the host has finished cleanly
+        }
+    }
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         std::cerr << "SDL_Init failed: " << SDL_GetError();
 // Optionally include Win32 formatted/system-localized error text. Define
