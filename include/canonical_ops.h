@@ -122,7 +122,8 @@ enum class CanonicalOp : uint16_t {
     METHOD_DEFINE = 90,
     FUNCTION_DEFINE = 91,
     SIGMOID = 92,  // CT_OP_SIGMOID
-    COUNT = 93,
+    BITCAST = 93,
+    COUNT = 94,
 };
 
 enum class OpClass : uint8_t { Unary, Binary, Compare, Cast, Opaque,
@@ -239,9 +240,10 @@ inline constexpr OpDesc kOps[] = {
     {"method_define", 90, OpClass::Value, -1, "", 0, false, false, false, false, "", "MethodDefine", "", ""},
     {"function_define", 91, OpClass::Value, -1, "", 0, false, false, false, false, "", "FunctionDefine", "", ""},
     {"sigmoid", 92, OpClass::Unary, 49, "CT_OP_SIGMOID", 1, false, false, true, false, "UNARY", "Call", "", ""},
+    {"bitcast", 93, OpClass::Cast, -1, "", 1, false, false, true, false, "CAST", "BitCast", "", ""},
 };
 
-inline constexpr size_t kOpCount = 93;
+inline constexpr size_t kOpCount = 94;
 
 // Lookups return nullptr when unknown. A hard null beats a silent zero: research/06
 // and research/12 document what silently-defaulting lookups have already cost here.

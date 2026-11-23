@@ -1614,6 +1614,22 @@
    "c_fn": null,
    "notes": "Logistic activation as a primitive, not a composition. Assembled from comparisons, exp and a blend it recorded as one opaque op no backend had, so a model using it failed to lower. The stable branch lives once in C; abstract_nn's Sigmoid activation is the layer that wraps it.",
    "tier1_class": null
+  },
+  {
+   "name": "bitcast",
+   "class": "cast",
+   "ct_op": null,
+   "ct_value": null,
+   "arity": 1,
+   "returns": "value",
+   "kernel_op": "CAST",
+   "lowerable": true,
+   "handler": "BitCast",
+   "sympy": [],
+   "reflectable": false,
+   "c_fn": null,
+   "notes": "Same-width bit reinterpretation: the operand's bits typed as the CAST's result type (GLSL floatBitsToUint/uintBitsToFloat, SPIR-V OpBitcast, LLVM bitcast, C memcpy). Unlike every other cast it keeps the bits, not the value, so it is exactly inverted by the opposite bitcast and has no derivative (turing bit_reinterpretation; autograd declares it nondifferentiable).",
+   "tier1_class": null
   }
  ]
 }

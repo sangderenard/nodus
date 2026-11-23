@@ -707,6 +707,13 @@ private:
                 // to a signedness reinterpretation (the assembler's OpBitcast).
                 values_[out] = Value{dst, x.bits};
                 return true;
+            case CanonicalOp::BITCAST:
+                // Same-width bit reinterpretation, f32 <-> i32/u32 included:
+                // the bits are kept and only their type changes (GLSL
+                // floatBitsToUint, SPIR-V OpBitcast).  Every scalar here is
+                // 32 bits, so there is no width to check.
+                values_[out] = Value{dst, x.bits};
+                return true;
             default:
                 return fail("CAST sub_op " + std::to_string(ins.sub_op) +
                             " has no CPU execution yet");
