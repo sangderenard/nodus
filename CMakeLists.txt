@@ -726,6 +726,14 @@ if(TARGET canvas_row)
   add_dependencies(canvas_row_test canvas_row)
 endif()
 
+# The front route map: many links on one public port, each routed by its name to its own loopback port (the row
+# nodus.link.route). Run it with a work folder; tests/link_route_front.ps1 runs it through a private Apache front.
+add_executable(link_route_test tests/link_route_test.cpp)
+target_include_directories(link_route_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(link_route_test PRIVATE nodus_headless ${NODUS_LINK_LIBS})
+target_compile_definitions(link_route_test PRIVATE NODUS_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(link_route_test PUBLIC cxx_std_20)
+
 # The secured mesh across processes: one writer per canvas and read privacy, with hybrid post-quantum keys (the mesh
 # rows on src/headless/nodus_mesh_crypto.cpp, the pinned OpenSSL). Run it with a work folder.
 add_executable(mesh_secure_test tests/mesh_secure_test.cpp)
