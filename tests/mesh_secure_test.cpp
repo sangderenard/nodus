@@ -84,10 +84,13 @@ struct Canvas {
             return -1;
         return m;
     }
-    bool edge(int a, int ac, int b, int bc) {
+    // wheel > 0 makes the edge a wheel keeping its newest `wheel` tensors (top_k); 0 is lossless, refusing when full.
+    bool edge(int a, int ac, int b, int bc, int wheel = 0) {
         GP_CanvasEdgeDesc e{a, ac, b, bc};
         const int idx = nodus_headless_add_edge(g, &e, 0);
-        return idx >= 0 && nodus_headless_configure_edge_fifo(g, idx, &tensor);
+        NodusHeadlessFifoConfig config = tensor;
+        config.top_k = wheel;
+        return idx >= 0 && nodus_headless_configure_edge_fifo(g, idx, &config);
     }
     // A returns row at `row` of table `t` hands what the table's Borrower rows used up to a trash mint of its own.
     bool trash(int t, int row, const char* mint_id) {
@@ -179,23 +182,30 @@ int join_link(NodusHeadlessGraph* g, const char* id, uint16_t port) {
     return 0;
 }
 
-// Prints the link's state when it changes, with the endpoint's reason (the record of a failed or closed link).
+// Prints the link's state when it changes, with the endpoint's reason (the record of a failed or closed link), and its
+// tensor counters every 2 s while they move (link_report_counters: 6/7 bulk tensors, 8/9 control/bulk refused, 10 dropped).
 struct LinkWatch {
     const char* id;
     const char* role;
     int32_t last = -2;
+    uint64_t moved[4] = {};
+    std::chrono::steady_clock::time_point next{};
     int32_t poll() {
         int32_t s = -1;
         uint64_t v[16] = {};
         nodus_headless_link_report(id, &s, v);
-        if (s != last) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool changed = v[6] != moved[0] || v[7] != moved[1] || v[9] != moved[2] || v[10] != moved[3];
+        if (s != last || (changed && now >= next)) {
             char why[256] = {};
             nodus_headless_link_reason(id, why, sizeof(why));
-            std::printf("[%s] link state %d%s%s (control sent %llu received %llu, bulk sent %llu received %llu, refused %llu/%llu)\n",
-                        role, s, why[0] ? ": " : "", why, (unsigned long long)v[2], (unsigned long long)v[3],
-                        (unsigned long long)v[6], (unsigned long long)v[7], (unsigned long long)v[8], (unsigned long long)v[9]);
+            std::printf("[%s] link %s %d%s%s (bulk tensors sent %llu received %llu; refused control %llu bulk %llu; dropped %llu)\n",
+                        role, s != last ? "state" : "counters", s, why[0] ? ": " : "", why, (unsigned long long)v[6],
+                        (unsigned long long)v[7], (unsigned long long)v[8], (unsigned long long)v[9], (unsigned long long)v[10]);
             std::fflush(stdout);
             last = s;
+            moved[0] = v[6], moved[1] = v[7], moved[2] = v[9], moved[3] = v[10];
+            next = now + std::chrono::seconds(2);
         }
         return s;
     }
@@ -230,14 +240,27 @@ int writer(char** argv) {
                                           {kOutput, 0, 1, 0, nullptr}}, true);
     const int send = c.table("send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, "mesh.w.bulk.send"},
                                       {kTool, 0, 0, kPlugin, returns.c_str()}}, true);
-    if (secure < 0 || send < 0 || !c.edge(node, kRowPortBase, secure, 0) || !c.edge(secure, 1, send, 0) ||
+    // The sealed snapshots reach the send table over a wheel of one: while the link is down the send table holds the
+    // snapshot it was refused and takes no other, and the wheel keeps only the newest; each one it overwrites goes to the
+    // send table's Returns row and the trash. A replica wants the latest state, not the queue (owner, 2026-11-23).
+    if (secure < 0 || send < 0 || !c.edge(node, kRowPortBase, secure, 0) || !c.edge(secure, 1, send, 0, 1) ||
         !c.trash(secure, 3, mint.c_str()) || !c.trash(send, 2, mint.c_str())) return 5;
     std::printf("[writer] up\n");
     std::fflush(stdout);
     LinkWatch watch{"mesh.w", "writer"};
+    // Tensors alive in the writer, every 5 s, the way mesh_replica_test counts them (ids are small and reused). With the
+    // link down the wheel keeps one snapshot and the trash takes the rest, so this stays flat; a queue would climb.
+    auto count_at = std::chrono::steady_clock::now();
     for (;;) {                                      // until the orchestrator ends it
         nodus_headless_step(c.g, 1.0 / 60.0);
         watch.poll();
+        if (std::chrono::steady_clock::now() >= count_at) {
+            count_at += std::chrono::seconds(5);
+            int alive = 0;
+            for (uint64_t id = 1; id <= (1u << 16); ++id) { NodusTensorDesc d{}; if (nodus_tensor_describe(id, &d) == NODUS_OK) ++alive; }
+            std::printf("[writer] tensors alive %d\n", alive);
+            std::fflush(stdout);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }

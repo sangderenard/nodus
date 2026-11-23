@@ -28,6 +28,9 @@ namespace nodus::contracts::platform {
 inline bool would_block(){return WSAGetLastError()==WSAEWOULDBLOCK;}
 inline bool set_nonblocking(SOCKET s){u_long on=1;return ioctlsocket(s,FIONBIO,&on)==0;}
 inline void close_socket(SOCKET s){closesocket(s);}
+// Windows rebinds a port whose old connections are in TIME_WAIT already; its SO_REUSEADDR would let another
+// process take a port that is in use, so nothing is set here.
+inline bool reuse_listen_port(SOCKET){return true;}
 constexpr int kSendFlags=0;
 #else
 inline bool would_block(){return errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR;}
@@ -36,6 +39,8 @@ inline bool set_nonblocking(SOCKET s){
     return flags>=0 && fcntl(s,F_SETFL,flags|O_NONBLOCK)>=0;
 }
 inline void close_socket(SOCKET s){close(s);}
+// A listener restarted while its last connections are in TIME_WAIT (about 60 s) is refused its port without this.
+inline bool reuse_listen_port(SOCKET s){int on=1;return setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&on,sizeof(on))==0;}
 #ifdef MSG_NOSIGNAL
 constexpr int kSendFlags=MSG_NOSIGNAL;   // a closed peer is an error return, not SIGPIPE
 #else
@@ -108,6 +113,7 @@ public:
     static bool would_block(){return platform::would_block();}
     static bool set_nonblocking(SOCKET s){return platform::set_nonblocking(s);}
     static void close_socket(SOCKET s){platform::close_socket(s);}
+    static bool reuse_listen_port(SOCKET s){return platform::reuse_listen_port(s);}
 protected:
     WireSocket(SOCKET socket,size_t capacity):socket_(socket),capacity_(capacity){
         if(socket==INVALID_SOCKET || !capacity) throw std::invalid_argument("invalid contract socket");

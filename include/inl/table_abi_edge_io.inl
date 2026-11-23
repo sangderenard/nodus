@@ -1066,6 +1066,15 @@ int32_t gp_table_edge_consume_into_frame(GP_TableContext* ctx, int32_t edge_idx,
     return 1;
 }
 
+int32_t gp_table_edge_take_overwritten(GP_TableContext* ctx, int32_t edge_idx, unsigned long long* out_ids, int32_t capacity) {
+    if (!ctx || !out_ids || capacity <= 0) return 0;
+    ensure_edge_fifos(ctx);
+    if (edge_idx < 0 || edge_idx >= static_cast<int32_t>(ctx->edge_fifos.size())) return 0;
+    static_assert(sizeof(unsigned long long) == sizeof(uint64_t), "tensor ids are 64-bit");
+    return static_cast<int32_t>(ctx->edge_fifos[static_cast<size_t>(edge_idx)].take_overwritten(
+        reinterpret_cast<uint64_t*>(out_ids), static_cast<size_t>(capacity)));
+}
+
 int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written) {
     if (out_written) *out_written = 0;
     if (!ctx || !out_sample_bytes || out_len_bytes < 0) return 0;

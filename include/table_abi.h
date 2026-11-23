@@ -400,7 +400,10 @@ int32_t gp_table_get_edge(const GP_TableContext* ctx, int32_t idx, unsigned long
 // A single writer appends samples; any number of subscribers can read through
 // their own circular heads. When the buffer is full, `top_k` controls whether
 // the oldest unread samples are advanced (drop old data, keep last top_k) or
-// writes are rejected (top_k == 0).
+// writes are rejected (top_k == 0). A wheel (top_k > 0) of tensor handles
+// keeps each handle it overwrites before any reader took it, and the reading
+// table's Returns row hands it on (gp_table_edge_take_overwritten): a table
+// reading such a wheel needs a Returns row, or those tensors are never freed.
 typedef struct GP_TableEdgeTensorSpec {
     int32_t dims[8];    // up to 8 dimensions; each <= INT32_MAX, clamped to >=1
     int32_t dim_count;  // number of dims used in `dims`
@@ -488,6 +491,9 @@ int32_t gp_table_edge_consume(GP_TableContext* ctx, int32_t edge_idx, unsigned l
 // Consume one typed element directly into a RawStackFrame. The edge's
 // configured type and byte width must exactly match `type_id`.
 int32_t gp_table_edge_consume_into_frame(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, struct RawStackFrame* dst_frame, int32_t type_id);
+// A wheel (top_k > 0) of tensor handles overwrites slots no reader took; their handles wait here for the reading table
+// to return them. Copies up to `capacity` ids into `out_ids` and removes them; returns how many were written.
+int32_t gp_table_edge_take_overwritten(GP_TableContext* ctx, int32_t edge_idx, unsigned long long* out_ids, int32_t capacity);
 int32_t gp_table_edge_peek(GP_TableContext* ctx, int32_t edge_idx, unsigned long long subscriber_key, void* out_sample_bytes, int32_t out_len_bytes, int32_t* out_written);
 
 // Pointer-oriented edge publish/consume helpers.

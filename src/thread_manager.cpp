@@ -968,6 +968,15 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
             }
         }
         std::vector<uint64_t> tensors_before, tensors_after;
+        // A table in stack loopback that starts its tick with a tensor still on its stack (a refused send, waiting) takes
+        // no tensor from its edges this tick: the next one waits on its edge, where the edge's own policy holds it -- a
+        // lossless edge refuses its writer, a wheel keeps its newest (owner, 2026-11-23). Only what was there before this
+        // tick counts, so a table with two tensor Input rows still takes both.
+        bool tensor_waiting = false;
+        if (mod.stack_loopback) {
+            stack_tensor_ids(module_stack, tensors_before);
+            tensor_waiting = !tensors_before.empty();
+        }
         for (int row = 0; row < row_count; ++row) {
             ModuleIORow meta = (row < (int)io_rows.size()) ? io_rows[row] : ModuleIORow{ModuleRowKind::Tool, row, ModuleToolKind::None, 0};
             if (meta.kind == ModuleRowKind::Input) {
@@ -1008,6 +1017,18 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                             }
                         }
                     }
+                    // A wheel of tensor handles hands the reading table every handle it overwrote; they go to this
+                    // table's Returns row, and on to the trash mint, like any handle a Borrower used up.
+                    if (edge_idx >= 0 && fifo_table && pending_returns) {
+                        unsigned long long overwritten[16];
+                        for (int32_t n; (n = gp_table_edge_take_overwritten(fifo_table, edge_idx, overwritten, 16)) > 0;) {
+                            for (int32_t k = 0; k < n; ++k) {
+                                const uint64_t id = static_cast<uint64_t>(overwritten[k]);
+                                if (std::find(pending_returns->begin(), pending_returns->end(), id) == pending_returns->end())
+                                    pending_returns->push_back(id);
+                            }
+                        }
+                    }
                     if (edge_idx >= 0 && fifo_table) {
                         int32_t unread = 0;
                         gp_table_edge_subscribe_ex(fifo_table, edge_idx, reader_key, /*start_at_head=*/1);
@@ -1023,8 +1044,11 @@ void ThreadManager::execute_module_iteration(const TickRequest& req, int mod_idx
                                 // The module execution contract owns stack currency. Do not let the
                                 // legacy row marker reinterpret an explicitly typed tensor token.
                                 typed_input = true;
-                                (void)gp_table_edge_consume_into_frame(
-                                    fifo_table, edge_idx, reader_key, module_stack, edge_spec.type_id);
+                                static const int32_t tensor_edge_type =
+                                    static_cast<int32_t>(ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR));
+                                if (!tensor_waiting || edge_spec.type_id != tensor_edge_type)
+                                    (void)gp_table_edge_consume_into_frame(
+                                        fifo_table, edge_idx, reader_key, module_stack, edge_spec.type_id);
                             } else {
                                 // Legacy pointer-mode marker for EventPayload delivery.
                                 GP_TableRow tbl_row{};

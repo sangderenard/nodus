@@ -60,6 +60,12 @@ struct EdgeTensorFifo {
         // writes refused because the ring was full, and writes that made room by dropping the oldest unread slots.
         std::atomic<uint64_t> refused_pushes{0};
         std::atomic<uint64_t> dropped_pushes{0};
+        // A wheel (top_k > 0) on an edge of tensor handles: each handle it overwrites before any reader took it, kept
+        // here until the reading table takes them (take_overwritten) and hands them to its Returns row (owner,
+        // 2026-11-23: "an edge wheel hands the tensors it overwrites to the trash mint"). A handle is a loan: dropped
+        // with its slot, the tensor behind it would never be freed.
+        std::mutex overwritten_mu;
+        std::vector<uint64_t> overwritten;
         std::mutex cv_mu;
         std::condition_variable cv;
         bool configured = false;
@@ -818,6 +824,53 @@ public:
         return used >= static_cast<uint64_t>(impl->slots);
     }
 
+    // One published slot's bytes, read the way pop() reads them.
+    bool read_slot_bytes(size_t slot, void* out, size_t bytes) const {
+        if (impl->backend) {
+            const gp_mem_backend_vtable_t* vt = gp_mem_backend_get_vtable(impl->backend);
+            if (vt && vt->copy_from_backend) return vt->copy_from_backend(impl->backend, slot * bytes, out, bytes);
+        }
+        void* m = gp_mem_backend_map_or_null(impl->storage_handle);
+        if (!m) return false;
+        std::memcpy(out, reinterpret_cast<const uint8_t*>(m) + slot * bytes, bytes);
+        gp_mem_backend_unmap(impl->storage_handle);
+        return true;
+    }
+
+    // Before a wheel moves its readers up to target_min: the tensor handles in the slots no reader has taken yet (every
+    // reader's next sequence at or below the slot) go to the overwritten list. A slot some reader already took belongs
+    // to that reader. Only an edge of tensor handles has any; every other edge's samples are plain values.
+    void collect_overwritten_handles(uint64_t target_min) {
+        static const ValueTypeId tensor_type = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+        if (impl->type_id != tensor_type || impl->stride * impl->elem_size != sizeof(uint64_t)) return;
+        uint64_t taken = 0;    // the furthest any reader has read: every slot below it reached someone
+        bool any = false;
+        for (size_t i = 0; i < kMaxReaders; ++i) {
+            if (impl->readers[i].key.load(std::memory_order_relaxed) == 0) continue;
+            taken = std::max(taken, impl->readers[i].seq.load(std::memory_order_relaxed));
+            any = true;
+        }
+        if (!any) return;
+        std::lock_guard<std::mutex> lk(impl->overwritten_mu);
+        for (uint64_t s = taken; s < target_min; ++s) {
+            const size_t slot = static_cast<size_t>(s % static_cast<uint64_t>(impl->slots));
+            if (impl->slot_seq[slot].load(std::memory_order_acquire) != s + 1) continue;
+            uint64_t id = 0;
+            if (read_slot_bytes(slot, &id, sizeof(id)) && id) impl->overwritten.push_back(id);
+        }
+    }
+
+    // Up to `capacity` of the tensor handles this wheel overwrote, oldest first, each handed over once (the reading
+    // table returns them).
+    size_t take_overwritten(uint64_t* out, size_t capacity) {
+        if (!impl || !out) return 0;
+        std::lock_guard<std::mutex> lk(impl->overwritten_mu);
+        const size_t n = std::min(capacity, impl->overwritten.size());
+        std::copy(impl->overwritten.begin(), impl->overwritten.begin() + static_cast<std::ptrdiff_t>(n), out);
+        impl->overwritten.erase(impl->overwritten.begin(), impl->overwritten.begin() + static_cast<std::ptrdiff_t>(n));
+        return n;
+    }
+
     bool ensure_space_for_write(uint64_t seq, bool* out_dropped, uint64_t edge_id = 0) {
         (void)edge_id; // retained for source compatibility with table callers
         if (!impl) return false;
@@ -830,6 +883,7 @@ public:
         uint64_t window = std::min<uint64_t>(static_cast<uint64_t>(impl->top_k), static_cast<uint64_t>(impl->slots));
         uint64_t target_min = (window > 0 && seq >= (window - 1)) ? (seq - (window - 1)) : 0;
         if (target_min <= min_seq) { impl->refused_pushes.fetch_add(1, std::memory_order_relaxed); return false; }
+        collect_overwritten_handles(target_min);
         for (size_t i = 0; i < kMaxReaders; ++i) {
             if (impl->readers[i].key.load(std::memory_order_relaxed) == 0) continue;
             uint64_t s = impl->readers[i].seq.load(std::memory_order_relaxed);

@@ -39,7 +39,22 @@ public:
         if (!c.stack.raw) return;
         RawStackFrame& stack = *c.stack.raw;
         nodus::tensors::AbstractTensorHandle input{};
-        if (!raw_stack_pop_abstract_tensor(stack, input)) { c.succeeded = false; return; }
+        // The tensor waiting on top. An Input row pads its empty edge with one value of the stack's default type (or a
+        // null handle); every pad above the tensor is filtered out, as the link send row does (nodus_link.cpp). Left on
+        // a loopback stack, pads pile up under this row until the stack is full and the table stops taking input: the
+        // mesh writer stalled at 127 snapshots that way (2026-11-22).
+        const ValueTypeId tensor_type = ValueTypeRegistry::global().builtin(VT_ABSTRACT_TENSOR);
+        for (ValueTypeId top = kInvalidValueTypeId; raw_stack_peek_type(stack, top);) {
+            if (top == tensor_type) {
+                if (!raw_stack_pop_abstract_tensor(stack, input)) break;
+                if (input.id) break;
+                continue;
+            }
+            const ValueType* pad = ValueTypeRegistry::global().get(top);
+            std::vector<uint8_t> discard(pad ? pad->size : 0);
+            if (!pad || !pad->size || !raw_stack_pop_typed(stack, discard.data(), top)) break;
+        }
+        if (!input.id) { c.succeeded = false; return; }
         NodusTensorDesc d{};
         std::vector<uint8_t> in;
         bool ok = input.id && nodus_tensor_describe(input.id, &d) == NODUS_OK && d.dtype == NODUS_DTYPE_U8;

@@ -597,7 +597,7 @@ public:
         listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listener_ == INVALID_SOCKET) throw std::runtime_error("link listener socket refused");
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(config_.port);
-        if (bind(listener_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(listener_, 16) != 0 || !WireSocket::set_nonblocking(listener_)) {
+        if (!WireSocket::reuse_listen_port(listener_) || bind(listener_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(listener_, 16) != 0 || !WireSocket::set_nonblocking(listener_)) {
             WireSocket::close_socket(listener_); throw std::runtime_error("link listener bind/listen refused");
         }
         platform::socklen len = sizeof(a);

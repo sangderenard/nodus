@@ -52,28 +52,29 @@ function Invoke-Pair([string]$name, [bool]$windowsWrites, [string]$writerKid, [s
     $env:NODUS_MESH_KEYS = $W
     $env:MESH_TEST_LINK = "wss:${Front}:${ct}:${bt}"
     $hostEnv = "NODUS_MESH_KEYS=$rwork/O MESH_TEST_LINK=host:$linkKey"
-    $local, $remote = $null, $null
+    $localProc, $remoteProc = $null, $null
+    # $remoteProc, not $remote: PowerShell names ignore case, so $remote would be $Remote, the host
     # The cleanup is in a finally: a node that never comes up throws, and the remote test must not keep the listener
     # port until its own 420/600-second timeout.
     try {
         if ($windowsWrites) {
-            $remote = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 600 $RemoteBuild/mesh_secure_test reader $Port $linkKey $writerKid $Seconds $($rows -join ' ') mesh_verify mesh_open'")) `
+            $remoteProc = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 600 $RemoteBuild/mesh_secure_test reader $Port $linkKey $writerKid $Seconds $($rows -join ' ') mesh_verify mesh_open'")) `
                       -PassThru -WindowStyle Hidden -RedirectStandardOutput $readerOut -RedirectStandardError "$readerOut.err"
             if (-not (Wait-Line $readerOut '[reader] up' 300)) { throw "${name}: the Linux reader did not come up" }
-            $local = Start-Process $test -ArgumentList (@('writer', $work, $Port, $ct, $bt, $readerKid) + $rows + @('mesh_seal', 'mesh_sign')) `
+            $localProc = Start-Process $test -ArgumentList (@('writer', $work, $Port, $ct, $bt, $readerKid) + $rows + @('mesh_seal', 'mesh_sign')) `
                      -WorkingDirectory $work -PassThru -WindowStyle Hidden -RedirectStandardOutput "$work\$name.writer.txt" -RedirectStandardError "$work\$name.writer.err"
-            $remote | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+            $remoteProc | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
         } else {
-            $remote = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 420 $RemoteBuild/mesh_secure_test writer $rwork $Port $ct $bt $readerKid $($rows -join ' ') mesh_seal mesh_sign'")) `
+            $remoteProc = Start-Process ssh -ArgumentList ($ssh + @($Remote, "sudo -u $RemoteUser bash -c 'cd $rwork && $hostEnv timeout 420 $RemoteBuild/mesh_secure_test writer $rwork $Port $ct $bt $readerKid $($rows -join ' ') mesh_seal mesh_sign'")) `
                       -PassThru -WindowStyle Hidden -RedirectStandardOutput "$work\$name.writer.txt" -RedirectStandardError "$work\$name.writer.err"
             if (-not (Wait-Line "$work\$name.writer.txt" '[writer] up' 300)) { throw "${name}: the Linux writer did not come up" }
-            $local = Start-Process $test -ArgumentList (@('reader', $Port, $linkKey, $writerKid, $Seconds) + $rows + @('mesh_verify', 'mesh_open')) `
+            $localProc = Start-Process $test -ArgumentList (@('reader', $Port, $linkKey, $writerKid, $Seconds) + $rows + @('mesh_verify', 'mesh_open')) `
                      -WorkingDirectory $work -PassThru -WindowStyle Hidden -RedirectStandardOutput $readerOut -RedirectStandardError "$readerOut.err"
-            $local | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+            $localProc | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
         }
     } finally {
-        foreach ($p in $local, $remote) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
-        try { Invoke-Remote "pkill -f mesh_secure_test.*$Port || true" | Out-Null } catch { Write-Host "  remote cleanup: $_" }
+        foreach ($p in $localProc, $remoteProc) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
+        try { Invoke-Remote "pkill -u $RemoteUser -f mesh_secure_test.*$Port || true" | Out-Null } catch { Write-Host "  remote cleanup: $_" }
         Remove-Item Env:MESH_TEST_LINK -ErrorAction SilentlyContinue
     }
     foreach ($f in "$work\$name.writer.txt", $readerOut) {    # each change of link state, with the endpoint's reason
@@ -82,8 +83,18 @@ function Invoke-Pair([string]$name, [bool]$windowsWrites, [string]$writerKid, [s
     $result = Select-String -Path $readerOut -Pattern '^RESULT' | Select-Object -Last 1
     $line = if ($result) { $result.Line } else { 'RESULT none' }
     Write-Host "$name : $line"
-    $readable = if ($line -match 'readable_generations (\d+)') { [int]$Matches[1] } else { 0 }
-    return [pscustomobject]@{ Name = $name; Linked = ($line -match 'linked 1 '); Readable = $readable }
+    $num = { param($key) if ($line -match "$key (\d+)") { [decimal]$Matches[1] } else { [decimal]0 } }
+    $received, $readable = (& $num 'snapshots_received'), (& $num 'readable_generations')
+    # Generations are the writer's wall clock in ns: first to last is how long snapshots kept arriving. A writer that
+    # stalls (2026-11-22: a loopback stack full of pads stopped it at 127 sends, 9.6 s into a 25 s window) ends early.
+    # readable_generations counts the rises of the replica's generation the reader's poll saw, not snapshots: several
+    # that land in one step (a queue draining after the link comes up) are one rise, and snapshots_received counts every
+    # arrival of the whole run. So the check is that the generation keeps rising: at least once a second, over most of
+    # the window.
+    $span = ((& $num 'last') - (& $num 'first')) / 1e9
+    $ok = ($line -match 'linked 1 ') -and $readable -ge $Seconds -and $span -ge 0.6 * $Seconds
+    Write-Host ("  {0}: {1} rises of the generation ({2} received), rising over {3:N1} s of {4} s" -f ($(if ($ok) { 'pass' } else { 'FAIL' })), $readable, $received, $span, $Seconds)
+    return [pscustomobject]@{ Name = $name; Ok = $ok }
 }
 
 # Keys, each made on its own machine; public blocks exchanged (key files are 0600, so copied out by their owner).
@@ -97,6 +108,7 @@ Invoke-Remote "cp /tmp/W_$stamp.pub $rwork/O/peers/$kidW.pub" | Out-Null
 Write-Host "keys: W $($kidW.Substring(0,8)).. (Windows)  O $($kidO.Substring(0,8)).. (Linux); front $Front, listener $Port"
 
 $results = @()
+$restoreFailed = $false
 try {
     if ($PauseCommand) { Write-Host 'pausing the listener port holder'; & ssh @ssh $Remote $PauseCommand }
     $results += Invoke-Pair 'W writes (dials), O reads (listens)' $true $kidW $kidO
@@ -106,8 +118,12 @@ try {
     Write-Host ('O: ' + ((Invoke-Remote "cp /tmp/W_rot_$stamp.rec $rwork/W-rotation-1.rec && $RemoteBuild/nodus_mesh_keys accept $rwork/O $rwork/W-rotation-1.rec") -split "`n" | Select-Object -Last 1))
     $results += Invoke-Pair 'W at epoch 1 writes (dials), O reads' $true $kidW $kidO
 } finally {
-    if ($ResumeCommand) { Write-Host 'restoring the listener port holder'; & ssh @ssh $Remote $ResumeCommand }
+    if ($ResumeCommand) {
+        Write-Host 'restoring the listener port holder'
+        & ssh @ssh $Remote $ResumeCommand
+        if ($LASTEXITCODE) { Write-Host "RESTORE FAILED (exit $LASTEXITCODE): the listener port holder is not back"; $restoreFailed = $true }
+    }
 }
-$failed = @($results | Where-Object { -not $_.Linked -or $_.Readable -lt 1 })
-if ($failed.Count -or $results.Count -lt 3) { Write-Host "FAILED: $($failed.Name -join '; ')"; exit 1 }
+$failed = @($results | Where-Object { -not $_.Ok })
+if ($failed.Count -or $results.Count -lt 3 -or $restoreFailed) { Write-Host "FAILED: $($failed.Name -join '; ')"; exit 1 }
 Write-Host 'OK'
