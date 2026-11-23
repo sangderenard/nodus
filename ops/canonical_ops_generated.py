@@ -106,6 +106,7 @@ class CanonicalOp(IntEnum):
     METHOD_DEFINE = 90
     FUNCTION_DEFINE = 91
     SIGMOID = 92  # CT_OP_SIGMOID
+    BITCAST = 93
 
 
 class OpDesc(NamedTuple):
@@ -1707,6 +1708,23 @@ OPS: tuple[OpDesc, ...] = (
         c_fn=None,
         tier1_class=None,
         notes="Logistic activation as a primitive, not a composition. Assembled from comparisons, exp and a blend it recorded as one opaque op no backend had, so a model using it failed to lower. The stable branch lives once in C; abstract_nn's Sigmoid activation is the layer that wraps it.",
+    ),
+    OpDesc(
+        canonical_id=93,
+        name='bitcast',
+        op_class='cast',
+        ct_op=None,
+        ct_value=None,
+        arity=1,
+        returns='value',
+        lowerable=True,
+        reflectable=False,
+        kernel_op='CAST',
+        handler='BitCast',
+        sympy=(),
+        c_fn=None,
+        tier1_class=None,
+        notes="Same-width bit reinterpretation: the operand's bits typed as the CAST's result type (GLSL floatBitsToUint/uintBitsToFloat, SPIR-V OpBitcast, LLVM bitcast, C memcpy). Unlike every other cast it keeps the bits, not the value, so it is exactly inverted by the opposite bitcast and has no derivative (turing bit_reinterpretation; autograd declares it nondifferentiable).",
     ),
 )
 

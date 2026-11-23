@@ -81,6 +81,8 @@ spirv::ScalarType output_scalar(const ops::OpDesc& op) {
         case CanonicalOp::INVERT:
         case CanonicalOp::FPTOUI:
         case CanonicalOp::ZEXT:
+        // f32 bits read as u32: the reinterpretation, not the identity.
+        case CanonicalOp::BITCAST:
             return ScalarType::U32;
         case CanonicalOp::FPTOSI:
         case CanonicalOp::INT_TRUNC:
@@ -442,8 +444,9 @@ int main(int argc, char** argv) {
         }
         ++covered;
     }
-    if (covered != 58) {
-        std::cerr << "[CATALOG] expected 58 Tier-0 operations, covered " << covered << "\n";
+    // 59: ``bitcast`` (same-width bit reinterpretation) joined the casts.
+    if (covered != 59) {
+        std::cerr << "[CATALOG] expected 59 Tier-0 operations, covered " << covered << "\n";
         return 1;
     }
 
@@ -467,6 +470,14 @@ int main(int argc, char** argv) {
         execute_scalar(*sign, {-2.0f, 0.0f, 0.0f}) != -1.0f ||
         std::fabs(execute_scalar(*sigmoid, {0.0f, 0.0f, 0.0f}) - 0.5f) > 1e-6f) {
         std::cerr << "[CATALOG] scalar semantic concordance failed\n";
+        return 1;
+    }
+    // bitcast keeps every bit: 1.0f is 0x3F800000 and -2.5f is 0xC0200000.
+    const auto* bitcast = ops::find_op("bitcast");
+    if (!bitcast ||
+        f32_bits(execute_scalar(*bitcast, {1.0f, 0.0f, 0.0f})) != 0x3F800000u ||
+        f32_bits(execute_scalar(*bitcast, {-2.5f, 0.0f, 0.0f})) != 0xC0200000u) {
+        std::cerr << "[CATALOG] bitcast changed the bits it reinterprets\n";
         return 1;
     }
     std::cout << "[CATALOG] PASS: " << covered

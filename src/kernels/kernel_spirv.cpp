@@ -710,6 +710,11 @@ void ModuleAssembler::lower_cast(const spirv::Instruction& ins) {
             // a signedness reinterpretation.
             opcode = kOpBitcast;
             break;
+        case CanonicalOp::BITCAST:
+            // Same-width bit reinterpretation, f32 <-> i32/u32 included; SPIR-V
+            // allows OpBitcast between any scalar types of equal width.
+            opcode = kOpBitcast;
+            break;
         default:
             shortfall("CAST sub_op " + std::to_string(ins.sub_op) +
                       " has no direct SPIR-V lowering yet");
