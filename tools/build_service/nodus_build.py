@@ -8,7 +8,8 @@ row hands it one request on standard input and takes the product from standard o
 
   request   b"NBR1" | header length u32 | header JSON | source archive (tar of the Nodus tree; never fetched with git here)
             header: {"triple": "x64-linux" | "x64-windows"}
-  product   a tar.gz: the native libraries the headless graph loads, nodus_graph, tools/run_canvas.py, BUILD.json
+  product   a tar.gz: the native libraries the headless graph loads, the native host frontend_shell (--canvas; nodus
+            docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md), nodus_graph, tools/run_canvas.py (until every host has moved), BUILD.json
 
 Toolchains: x64-windows is CMake + MSVC with vcpkg's x64-windows-static-md triplet on this machine; x64-linux is the same
 CMake project inside the service account's own WSL2 distro (NODUS_BUILD_DISTRO, default nodus-build) with gcc and vcpkg's
@@ -31,7 +32,7 @@ import sys
 import tarfile
 from pathlib import Path
 
-VERSION = 1
+VERSION = 2   # 2: the product carries the native host; older cached products do not
 MAGIC = b"NBR1"
 TRIPLETS = {"x64-linux": "x64-linux", "x64-windows": "x64-windows-static-md"}
 HERE = Path(__file__).resolve().parent
@@ -106,11 +107,12 @@ def build_windows(job: Path, key: str, triplet: str, log) -> Path:
     for step in (["cmake", "-S", str(src), "-B", str(build), "-G", "Visual Studio 17 2022",
                   f"-DCMAKE_TOOLCHAIN_FILE={vcpkg}/scripts/buildsystems/vcpkg.cmake", f"-DVCPKG_TARGET_TRIPLET={triplet}",
                   "-DNODUS_ENABLE_TORCH=OFF"],
-                 ["cmake", "--build", str(build), "--config", "Release", "--target", "nodus_headless"]):
+                 ["cmake", "--build", str(build), "--config", "Release", "--target", "nodus_headless", "frontend_shell"]):
         if subprocess.run(step, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=env).returncode != 0:
             raise RuntimeError(f"the Windows build failed at: {' '.join(step[:3])}")
     for f in (build / "Release").glob("*.dll"):
         shutil.copy2(f, product)
+    shutil.copy2(build / "Release" / "frontend_shell.exe", product)   # the native host (frontend_shell --canvas)
     for name in ("nodus_graph", "nodus_headless_bridge.py"):
         p = src / name
         if p.is_dir():

@@ -34,10 +34,13 @@ export VCPKG_DEFAULT_BINARY_CACHE="$STATE/vcpkg-binary-cache"; mkdir -p "$VCPKG_
 cmake -S "$WORK/src" -B "$WORK/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET="$TRIPLET" \
   -DNODUS_ENABLE_TORCH=OFF
-cmake --build "$WORK/build" --target nodus_headless
+cmake --build "$WORK/build" --target nodus_headless frontend_shell
 
-# The product: the native libraries the headless graph loads, and the Python side that drives them.
+# The product: the native libraries the headless graph loads, the native host (frontend_shell --canvas, run with
+# --offscreen where there is no display; docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md), and, until every host has moved to
+# it, the Python side.
 find "$WORK/build" -maxdepth 2 -name '*.so*' -exec cp -a {} "$WORK/product/" \;
+cp -a "$WORK/build/frontend_shell" "$WORK/product/"
 cp -a "$WORK/src/nodus_graph" "$WORK/src/nodus_headless_bridge.py" "$WORK/product/" 2>/dev/null || true
 mkdir -p "$WORK/product/tools" && cp -a "$WORK/src/tools/run_canvas.py" "$WORK/product/tools/" 2>/dev/null || true
 printf '{"triple": "%s", "key": "%s", "compiler": "%s"}\n' "$TRIPLET" "$KEY" "$(g++ --version | head -1)" > "$WORK/product/BUILD.json"
