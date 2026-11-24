@@ -22,7 +22,35 @@ This is the research and the plan.
   - **Not yet done:**
     - Sent tensors are not returned to a mint (no Returns row in the send table), as before.
     - Oracle's hand-made `/srv/svc/link-test` canvas becomes an ordinary canvas with a `LINK_HOST` record at the stage D cut-over.
-- **Stage D is not built.**
+- **Stage D is prepared, not switched** (2026-11-23).
+  - **Rehearsal:** a copy of the live messenger canvas was hosted by `run_canvas.py` and by the native host side by side, with the live instance's arguments: the four acquires, the compile host, cron and the console. The contract ports were set to 0 in the copy and the jobs folders were private. Every view, ACTION reply and SNAPSHOT matched. The only differences were rope ids (random per process) and Python's race refusal.
+  - **Supervisor:** `"native": true` in a nodus instance runs the native host directly, without Python, with `--offscreen` unless `"window": true`, and with `"link_route_map"`. This is on Turing branch `claude/native-nodus-host`, tested by `test_nodus_native_host_command`.
+  - **Build products:** the build service products carry `frontend_shell` (driver version 2).
+
+## Stage D: the switches (each the owner's)
+
+1. **Land the reviews.** Nodus `claude/mesh-canvas-rows`, Turing `claude/native-nodus-host`, Turing `claude/link-route-map`.
+2. **Rebuild the service build.** Build `frontend_shell` in `C:/dev/Powershell/nodus/build-service`: `cmake --build build-service --config Release --target nodus_headless frontend_shell`.
+3. **Change `nodus-messenger`** in `turing/examples/meowdoku/deploy/instances.json`:
+   - `"tool"`: `"C:/dev/Powershell/nodus/build-service/Release/frontend_shell.exe"`
+   - add `"native": true`
+   - the `"args"` stay as they are (`--compile-host`, `--compile-python`, `--cron`).
+
+   Restart the stack with `deploy/Restart-Stack.ps1`. Then check:
+   - the console on 47612;
+   - `/api/nodus/*`;
+   - the cron log, `srv/state/jobs/cron/cron.log`;
+   - a compile through `gui.proof`.
+
+   To roll back, revert the two keys and restart.
+4. **`nodus-training`.** `train_aapl_continuous.py` drives its own Python training loop and imports run_canvas's `ConsoleServer` to serve a console beside it. It is not a canvas host that `--canvas` replaces. Moving it is its own piece of work (the loop itself), and it needs the owner's direction.
+5. **Modal.** The subordinate scripts start `run_canvas.py` inside the Modal image. Moving them means rebuilding that image with the native host and running it on Modal, which is billed, so it waits for the owner's go.
+6. **Oracle's link-test canvas.** Rewrite `/srv/svc/link-test` as an ordinary canvas: one `LINK_HOST state state 47616 0 /srv/svc/link-test/nodus_link.key` record, hosted by `frontend_shell --canvas ... --offscreen` from a build of this branch. Then the pause and resume scripts need no `link_host` ACTION.
+7. **Remove `run_canvas.py`.** Once nothing launches it, delete `run_canvas.py` and `nodus_graph/console_views.py`, and take `run_canvas.py` out of the build products.
+
+**The FRAME console verb is built** (2026-11-23). It answers `FRAME <revision> <width> <height> <n>` followed by the canvas's RGBA bytes, at the viewport's size, built between steps. The window's draw and FRAME share one raster lock. It is tested on Windows and on Oracle A1, which has no display: there the canvas is rasterized offscreen.
+
+Not built yet: a Returns row on the link's send table.
 
 ## Where things are
 

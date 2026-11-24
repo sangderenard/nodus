@@ -1624,8 +1624,11 @@ bool update_active_canvas_texture(FrontendResources& resources) {
     if (!ensure_canvas_texture(resources, head.width, head.height)) return false;
     size_t buf_len = static_cast<size_t>(head.width) * head.height * 4u;
     if (head.pixels.size() < buf_len) head.pixels.resize(buf_len);
-    if (!gp_canvas_raster_rgba(head.context, head.pixels.data(), static_cast<int32_t>(buf_len))) {
-        return false;
+    {
+        std::lock_guard<std::mutex> lk(nodus::host::raster_mutex());   // the console's FRAME rasterizes the same canvas
+        if (!gp_canvas_raster_rgba(head.context, head.pixels.data(), static_cast<int32_t>(buf_len))) {
+            return false;
+        }
     }
     int pitch = head.width * 4;
     SDL_UpdateTexture(resources.canvas_texture, nullptr, head.pixels.data(), pitch);

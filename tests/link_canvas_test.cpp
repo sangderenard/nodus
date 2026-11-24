@@ -9,7 +9,8 @@
 // 3. The saved canvas loaded by a new graph hosts the link again (a new port, the line written again) with its tables and
 //    ports restored from the file.
 // 4. A dialer opened on a third graph composes its own tables (nodus_headless_compose_link_tables) and sends a tensor
-//    into <id>.send; it arrives byte for byte at the reloaded host's <id>.received. A dialed link is not recorded.
+//    into <id>.send; it arrives byte for byte at the reloaded host's <id>.received, and the sent tensor is freed by the
+//    send table's trash (its returns row hands it on). A dialed link is not recorded.
 #include "nodus_link.h"          // first: winsock2.h before windows.h
 #include "nodus_headless_abi.h"
 
@@ -49,11 +50,17 @@ bool port_named(NodusHeadlessGraph* g, const std::string& name, int32_t is_outpu
     }
     return false;
 }
+// Tensor handles alive in the process (mesh_replica_test's count: ids are small and reused).
+int live_tensors(uint64_t limit = 1u << 16) {
+    int n = 0;
+    for (uint64_t id = 1; id <= limit; ++id) { NodusTensorDesc d{}; if (nodus_tensor_describe(id, &d) == NODUS_OK) ++n; }
+    return n;
+}
 uint64_t listen_port_of(const char* id) { int32_t s = 0; uint64_t c[16] = {}; return nodus_headless_link_report(id, &s, c) ? c[0] : 0; }
 int32_t state_of(const char* id) { int32_t s = -1; uint64_t c[16] = {}; return nodus_headless_link_report(id, &s, c) ? s : -1; }
 
 void check_tables(NodusHeadlessGraph* g, const std::string& id, bool routed, bool metrics) {
-    for (const char* t : {" bulk send", " bulk receive", " control send", " control receive"})
+    for (const char* t : {" bulk send", " bulk receive", " control send", " control receive", " bulk trash", " control trash"})
         CHECK(module_named(g, "link " + id + t) >= 0);
     CHECK((module_named(g, "link " + id + " route") >= 0) == routed);
     CHECK((module_named(g, "link " + id + " metrics") >= 0) == metrics);
@@ -115,6 +122,7 @@ int main(int argc, char** argv) {
     CHECK(nodus_headless_register_link_dialer(c, "dl", "127.0.0.1", uint16_t(reloaded), "mesh-lk", ct.data(), bt.data(), 10000, 0));
     CHECK(nodus_headless_compose_link_tables(c, "dl", 0));
     check_tables(c, "dl", false, false);
+    const int alive_before = live_tensors();
     const uint64_t shape[1] = {4096};
     const uint64_t sent = nodus_tensor_create(NODUS_DTYPE_U8, 1, shape);
     const std::string payload(4096, char(0x5A));
@@ -140,6 +148,17 @@ int main(int argc, char** argv) {
               nodus_tensor_read(arrived, 0, got.data(), got.size()) == int64_t(got.size()) && got == payload);
         nodus_tensor_destroy(arrived);
     }
+    // What was sent is not kept: the send table's returns row handed it to the trash, which freed it. Tensor ids are
+    // process-wide and reused (the arrival took the sent tensor's id once it was freed), so the proof is the count of
+    // live tensors: back to what it was before the push, with the arrival freed above.
+    int alive = -1;
+    for (int i = 0; i < 200 && alive != alive_before; ++i) {
+        nodus_headless_step(c, 1.0 / 60.0);
+        nodus_headless_step(b, 1.0 / 60.0);
+        alive = live_tensors();
+    }
+    std::printf("tensors alive before the push %d, after %d (the sent one freed by the trash)\n", alive_before, alive);
+    CHECK(alive == alive_before);
     const fs::path dialer_canvas = work / "dialer.nodus.txt";
     CHECK(nodus_headless_save_file(c, dialer_canvas.string().c_str()));
     CHECK(read_text(dialer_canvas).find("LINK_HOST") == std::string::npos);   // a dial is not recorded

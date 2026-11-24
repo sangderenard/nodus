@@ -4,6 +4,10 @@
 // ConsoleServer serves it and with the documents nodus_graph/console_views.py builds, so its clients
 // (nodus_service.py, demo_canvas_tables.py --attach-console, frontend_shell --attach, console_client.py) are unchanged:
 //   HELLO nodus-console/1|2 <token>; SNAPSHOT; DIGEST GRAPH TOOLS ACTIVITY META; v2 ACTION <n> + JSON.
+// One verb run_canvas.py had not (it never rasterized): FRAME, the canvas as the rasterizer draws it,
+//   "FRAME <revision> <width> <height> <n>\n" + n bytes of RGBA (n = width * height * 4), built on the stepping thread
+// like every view, so a client without the engine sees what the window shows. The size is the viewport's (ACTION
+// viewport sets it).
 // Client threads never touch the graph: they ask, and the stepping thread builds what was asked between steps
 // (service()), coalesced for 100 ms. An ACTION is applied on the stepping thread too, and a change of revision saves the
 // canvas through the headless file path.
@@ -413,6 +417,8 @@ struct Context {
     std::vector<std::pair<std::string, uint64_t>> hosts;   // attached compile hosts
     std::vector<std::string> link_ids;
     std::function<long long()> ticks;
+    // The rasterized canvas (RGBA, width * height * 4) for FRAME; empty: no frames.
+    std::function<bool(std::string& rgba, int& width, int& height)> frame;
 };
 
 inline int32_t count_of(int32_t n) { return std::max(0, n); }
@@ -1017,6 +1023,7 @@ private:
         long long revision = 0;
         std::map<std::string, std::string> views;
         std::set<std::string> attempted;   // the views this build was asked for (a view asked for and absent failed)
+        int frame_width = 0, frame_height = 0;   // views["frame"]: the RGBA raster
     };
     struct Action { Json request; Json reply; bool done = false; };
 
@@ -1092,6 +1099,10 @@ private:
             if (wanted.count("tools")) snap->views["tools"] = dumps_view(tools_document(c_.g, graph_doc ? &*graph_doc : nullptr));
             if (wanted.count("meta")) snap->views["meta"] = dumps_view(meta_document(c_, tick));
             if (wanted.count("activity")) snap->views["activity"] = dumps_view(activity_document(c_, tick));
+            if (wanted.count("frame") && c_.frame) {
+                std::string rgba;
+                if (c_.frame(rgba, snap->frame_width, snap->frame_height)) snap->views["frame"] = std::move(rgba);
+            }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "nodus: console view failed: %s\n", e.what());
         }
@@ -1533,6 +1544,12 @@ private:
                 if (!snap) { if (!send("REFUSED unavailable\n")) break; continue; }
                 if (!send("CANVAS " + std::to_string(snap->revision) + " " + std::to_string(snap->data.size()) + "\n" + snap->data +
                           "\nSTATE " + snap->state + "\n")) break;
+            } else if (line == "FRAME") {   // the rasterized canvas: "FRAME <revision> <width> <height> <n>\n" + n RGBA bytes
+                auto snap = snapshot("frame");
+                if (!snap || !snap->views.count("frame")) { if (!send("REFUSED unavailable\n")) break; continue; }
+                const std::string& rgba = snap->views.at("frame");
+                if (!send("FRAME " + std::to_string(snap->revision) + " " + std::to_string(snap->frame_width) + " " +
+                          std::to_string(snap->frame_height) + " " + std::to_string(rgba.size()) + "\n" + rgba)) break;
             } else if (verbs.count(line)) {
                 const std::string& view = verbs.at(line);
                 auto snap = snapshot(view);

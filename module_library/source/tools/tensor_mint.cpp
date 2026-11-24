@@ -59,7 +59,10 @@ bool pop_number(RawStackFrame& frame, double& out) {
 
 class TensorMintTool final : public ITool {
 public:
-    const char* id_cstr() const noexcept override { return "tensor_mint"; }
+    // The id is the plugin's ("tensor_mint") unless an image registers its own copy under another (nodus_link_rows.cpp:
+    // "nodus.link.trash", the trash of a link's send tables).
+    explicit TensorMintTool(const char* id = "tensor_mint") : id_(id) {}
+    const char* id_cstr() const noexcept override { return id_; }
     const char* name_cstr() const noexcept override { return "Tensor mint"; }
     ToolCaps caps() const override { return static_cast<ToolCaps>(0); }
     void initialize(const ToolInitContext&) override {}
@@ -170,6 +173,7 @@ private:
     std::array<uint64_t, 4> shape_{};
     size_t depth_ = 8;
     std::deque<uint64_t> kept_;  // oldest at the front: lent first; newest at the back: killed first when over depth
+    const char* id_;
 };
 
 }  // namespace

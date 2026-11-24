@@ -12,7 +12,8 @@
 //   - malformed host options exit 2 before anything starts (run_canvas's checks);
 //   - the native console (--console-port): HELLO v1/v2, DIGEST, SNAPSHOT with STATE, the views, ACTIONs (a stale
 //     revision, a type error, a viewport that changes the revision and saves the canvas with its records), the
-//     refusals (read-only, bad token, bad hello, invalid action) and the ninth client refused.
+//     refusals (read-only, bad token, bad hello, invalid action) and the ninth client refused; FRAME, the canvas
+//     rasterized at the viewport's size.
 #include "nodus_link.h"          // first: winsock2.h before windows.h
 #include "contract_socket.h"
 #include "contract_negotiator.h"
@@ -196,6 +197,14 @@ void console_checks(const std::string& exe, const fs::path& work, const fs::path
               "JSON ACTION 58\n{\"handled\":true,\"revision\":2,\"canvas\":\"console.nodus.txt\"}");
         CHECK(read_text(canvas).find("CANVAS V4\r\n800 600") == 0 || read_text(canvas).find("CANVAS V4\n800 600") == 0);   // saved
         CHECK(read_text(canvas).find("CONTRACT_PORT nh.port 4 ") != std::string::npos);   // with its records
+        {   // FRAME: the rasterized canvas at the viewport's size
+            c.send_text("FRAME\n");
+            const std::string head = c.line();
+            std::printf("FRAME head: %s", head.c_str());
+            CHECK(head.rfind("FRAME 2 800 600 1920000\n", 0) == 0);
+            const std::string rgba = c.bytes(1920000);
+            CHECK(rgba.size() == 1920000 && rgba.find_first_not_of('\0') != std::string::npos);   // something was drawn
+        }
         CHECK(c.action("{\"op\": \"link_host\", \"expected_revision\": 2, \"id\": \"x\"}") ==
               "JSON ACTION 50\n{\"error\":\"link prefix: 1-60 of A-Z a-z 0-9 . _ -\"}");
         {   // a link opened by ACTION is declared in the canvas: a LINK_HOST record in the save, its tables, its port

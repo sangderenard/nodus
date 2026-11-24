@@ -33,6 +33,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -57,6 +58,9 @@ namespace nodus::host {
 // A change made through the window (the shell's input calls set it); the stepping thread saves it.
 inline std::atomic<bool>& canvas_changed() { static std::atomic<bool> v{false}; return v; }
 inline std::atomic<bool>& stop_requested() { static std::atomic<bool> v{false}; return v; }
+// One rasterization of the canvas at a time: the window's draw and the console's FRAME both call gp_canvas_raster_rgba,
+// which updates the canvas's scroll and palette state as it draws.
+inline std::mutex& raster_mutex() { static std::mutex m; return m; }
 
 struct Acquire { std::string prefix; int32_t capacity = 0; uint64_t loan = 0; };   // loan 0: the native default (60)
 struct CompileHost { std::string prefix; uint64_t id = 0; std::string jobs; };
@@ -250,6 +254,13 @@ public:
                 context.rate = o_.rate;
                 context.started = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
                 context.ticks = [this] { return ticks_; };
+                context.frame = [this](std::string& rgba, int& width, int& height) {   // FRAME: what the window would show
+                    GP_CanvasContext* ctx = nodus_headless_canvas_context(g_);
+                    std::lock_guard<std::mutex> lk(raster_mutex());
+                    if (!ctx || !gp_canvas_get_size(ctx, &width, &height) || width <= 0 || height <= 0) return false;
+                    rgba.assign(size_t(width) * size_t(height) * 4, '\0');
+                    return gp_canvas_raster_rgba(ctx, reinterpret_cast<uint8_t*>(rgba.data()), int32_t(rgba.size())) != 0;
+                };
                 console_ = std::make_unique<nodus::console::Server>(token, std::move(context));
                 console_port_ = console_->start(static_cast<uint16_t>(o_.console_port));
             }
