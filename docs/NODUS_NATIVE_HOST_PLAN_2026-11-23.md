@@ -7,7 +7,13 @@ This is the research and the plan.
 
 **Status:**
 - **Stage A is built** (2026-11-23): `frontend_shell --canvas`, in `tools/native_host.h`, tested by `tests/native_host_test.cpp` on Windows and on Oracle A1.
-- **Stages B, C and D are not built.**
+- **Stage B is built** (2026-11-23): the console server, `tools/native_console.h`.
+  - Parity with `run_canvas.py` was checked byte for byte on three canvases: a meta-group canvas, a contract-port canvas, and a strict graph-definition canvas.
+  - Only live values differed: ticks, rope ids, ephemeral ports, queue fill.
+  - Two deliberate differences:
+    1. **Link ACTIONs wait for stage C.** `link_host`, `link_dial`, `link_udp` and `link_send` answer an error until stage C, because in `run_canvas.py` they place the pre-split rows. `link_report` is served.
+    2. **A race is fixed.** A view requested while another client's build was already running answered `REFUSED unavailable` in `run_canvas.py`. The native console asks again until a build has tried the view.
+- **Stages C and D are not built.**
 
 ## Where things are
 

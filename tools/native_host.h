@@ -10,13 +10,15 @@
 //   --canvas PATH (host mode)  --rate F (60)  --ticks N  --acquire PREFIX:CAPACITY[:LOAN_TICKS]  (repeatable)
 //   --compile-host PREFIX:HOST_ID:JOBS_DIR  --compile-python EXE  --turing-root DIR  --module-library-root DIR
 //   --compile-adopt  --cron PREFIX:ENGINE_ID:JOBS_DIR  --link-host ID:PREFIX:PORT:KEYFILE  (repeatable)
-//   --console-port N  --console-token-file PATH   (the console server is stage B; until then they are refused)
+//   --console-port N  --console-token-file PATH   the canvas console on 127.0.0.1 (tools/native_console.h; 0: the system
+//                     picks the port, reported as console_port in the ready line)
 //   --offscreen   no window: no SDL video and no GL. The rasterizer draws only when something asks for a frame.
 //   --nodus-root DIR   the Nodus checkout the compile host builds against (default: this build's source tree)
 // With a window, the window draws the hosted canvas and gives it input; a change made there is saved through the
 // headless file path (every record kept), at most every 2 s, between steps. Closing the window stops the host.
 #pragma once
 
+#include "native_console.h"
 #include "nodus_headless_abi.h"
 
 #include <atomic>
@@ -69,7 +71,8 @@ struct Options {
     std::vector<LinkHost> link_hosts;
     std::string compile_python, turing_root, module_library_root, nodus_root = NODUS_REPO_ROOT;
     bool compile_adopt = false;
-    bool console = false;                 // --console-port or --console-token-file given
+    long long console_port = -1;          // --console-port (0: the system picks); -1: no console
+    std::string console_token_file;
     bool offscreen = false;
 };
 
@@ -180,7 +183,8 @@ inline bool parse(int argc, char** argv, Options& o) {
         else if (name == "--turing-root") o.turing_root = value;
         else if (name == "--module-library-root") o.module_library_root = value;
         else if (name == "--nodus-root") o.nodus_root = value;
-        else o.console = true;   // --console-port / --console-token-file
+        else if (name == "--console-port") o.console_port = std::stoll(value);
+        else o.console_token_file = value;
     }
     if (!o.enabled) {
         if (any || o.compile_adopt || o.offscreen) throw std::invalid_argument("host options need --canvas");
@@ -188,8 +192,8 @@ inline bool parse(int argc, char** argv, Options& o) {
     }
     if (!(o.rate > 0.0)) throw std::invalid_argument("--rate must be positive");
     if (o.ticks < -1) throw std::invalid_argument("--ticks must not be negative");
-    if (o.console) throw std::invalid_argument("--console-port: the native console server is stage B of "
-                                               "docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md and is not built yet");
+    if (o.console_port >= 0 && o.console_token_file.empty()) throw std::invalid_argument("--console-port requires --console-token-file");
+    if (o.console_port > 65535) throw std::invalid_argument("--console-port must be 0..65535");
     std::set<std::string> acquired;
     for (const auto& a : o.acquires) acquired.insert(a.prefix);
     std::set<std::pair<std::string, uint64_t>> seen;
@@ -224,8 +228,26 @@ public:
     // 0, or 2 after printing the reason (run_canvas's exit codes).
     int start() {
         try {
+            std::string token;
+            if (o_.console_port >= 0) {   // run_canvas: the first line, "\r\n" stripped, must not be empty
+                std::ifstream in(o_.console_token_file, std::ios::binary);
+                if (!in) throw std::runtime_error("console token file could not be read: " + o_.console_token_file);
+                std::getline(in, token);
+                while (!token.empty() && (token.back() == '\r' || token.back() == '\n')) token.pop_back();
+                if (token.empty()) throw std::runtime_error("console token file is empty");
+            }
             install_signals();
             claim_stdout();
+            if (o_.console_port >= 0) {   // before the graph, as run_canvas starts its ConsoleServer
+                nodus::console::Context context;
+                context.canvas_name = std::filesystem::path(o_.canvas).filename().string();
+                context.canvas_path = o_.canvas;
+                context.rate = o_.rate;
+                context.started = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+                context.ticks = [this] { return ticks_; };
+                console_ = std::make_unique<nodus::console::Server>(token, std::move(context));
+                console_port_ = console_->start(static_cast<uint16_t>(o_.console_port));
+            }
             g_ = nodus_headless_create();
             if (!g_) throw std::runtime_error("native graph creation failed");
             if (!nodus_headless_set_scheduler_mode(g_, 1)) throw std::runtime_error("native scheduler mode refused");
@@ -272,6 +294,11 @@ public:
                     cron << ", \"attached\": false, \"reason\": " << detail::json_string(why) << "}";
                 }
             }
+            if (console_) {
+                std::vector<std::string> link_ids;
+                for (const auto& l : links_) link_ids.push_back(l.first.id);
+                console_->set_context(g_, attached_, link_ids);
+            }
             ready_line(cron.str());
             return 0;
         } catch (const std::exception& e) {
@@ -290,6 +317,7 @@ public:
         while (!stop_requested().load() && (o_.ticks < 0 || ticks_ < o_.ticks)) {
             if (!nodus_headless_step(g_, dt)) { std::fprintf(stderr, "nodus: native graph step failed\n"); failed_ = true; break; }
             ++ticks_;
+            if (console_) console_->service();   // the console's views and ACTIONs, between steps
             const auto now = std::chrono::steady_clock::now();
             if (canvas_changed().load() && now >= save_after) { save(); save_after = now + std::chrono::seconds(2); }
             next += period;
@@ -310,6 +338,7 @@ public:
         if (canvas_changed().load()) save();
         nodus_headless_destroy(g_);
         g_ = nullptr;
+        if (console_) console_->close();   // after the graph, as run_canvas closes its console
         if (out_) { std::fprintf(out_, "{\"ticks\": %lld}\n", ticks_); std::fflush(out_); }
         std::fflush(stderr);
         return failed_ ? 2 : 0;
@@ -372,7 +401,8 @@ private:
 #else
         const long pid = static_cast<long>(getpid());
 #endif
-        s << "], \"pid\": " << pid << ", \"console_port\": null, \"cron\": [" << cron << "]}";
+        s << "], \"pid\": " << pid << ", \"console_port\": " << (console_ ? std::to_string(console_port_) : std::string("null"))
+          << ", \"cron\": [" << cron << "]}";
         std::fprintf(out_, "%s\n", s.str().c_str());
         std::fflush(out_);
     }
@@ -382,6 +412,8 @@ private:
     }
 
     Options o_;
+    std::unique_ptr<nodus::console::Server> console_;
+    uint16_t console_port_ = 0;
     NodusHeadlessGraph* g_ = nullptr;
     FILE* out_ = nullptr;
     long long ticks_ = 0;

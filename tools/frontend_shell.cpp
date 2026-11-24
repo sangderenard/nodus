@@ -1,4 +1,5 @@
-// Winsock headers (via contract_listener.h) must precede <windows.h>.
+// Winsock headers (via nodus_link.h and contract_listener.h) must precede <windows.h>.
+#include "nodus_link.h"          // first: ws2tcpip before windows.h (the native console uses its sha256)
 #include "contract_port_canvas.h"
 #include <algorithm>
 #include <array>

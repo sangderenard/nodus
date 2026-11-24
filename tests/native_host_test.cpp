@@ -9,7 +9,10 @@
 //     port, a pid, console_port null;
 //   - while it runs: the restored contract port and the link listener accept a connection;
 //   - the host ends on --ticks with {"ticks": 600} and exit 0, and the canvas file still holds its records;
-//   - malformed host options exit 2 before anything starts (run_canvas's checks).
+//   - malformed host options exit 2 before anything starts (run_canvas's checks);
+//   - the native console (--console-port): HELLO v1/v2, DIGEST, SNAPSHOT with STATE, the views, ACTIONs (a stale
+//     revision, a type error, a viewport that changes the revision and saves the canvas with its records), the
+//     refusals (read-only, bad token, bad hello, invalid action) and the ninth client refused.
 #include "nodus_link.h"          // first: winsock2.h before windows.h
 #include "contract_socket.h"
 #include "contract_negotiator.h"
@@ -75,6 +78,146 @@ bool tcp_accepts(uint16_t port) {
     close(s);
 #endif
     return ok;
+}
+
+// One console connection (docs/NODUS_CONSOLE_READ_PROTOCOL_2026-11-10.md): lines out, a line or a framed reply back.
+struct ConsoleClient {
+    SOCKET s = INVALID_SOCKET;
+    std::string buf;
+    explicit ConsoleClient(uint16_t port) {
+        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in a{};
+        a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
+        if (connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) { close_now(); return; }
+#if defined(_WIN32)
+        DWORD ms = 10000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+#else
+        timeval tv{10, 0};
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    }
+    ~ConsoleClient() { close_now(); }
+    void close_now() {
+        if (s == INVALID_SOCKET) return;
+#if defined(_WIN32)
+        closesocket(s);
+#else
+        close(s);
+#endif
+        s = INVALID_SOCKET;
+    }
+    void send_text(const std::string& t) { if (s != INVALID_SOCKET) ::send(s, t.data(), int(t.size()), 0); }
+    bool fill() {
+        char b[4096];
+        const int n = ::recv(s, b, sizeof(b), 0);
+        if (n <= 0) return false;
+        buf.append(b, size_t(n));
+        return true;
+    }
+    std::string line() {   // one line with its "\n", or what arrived before the end of the stream
+        for (;;) {
+            const size_t nl = buf.find('\n');
+            if (nl != std::string::npos) { std::string l = buf.substr(0, nl + 1); buf.erase(0, nl + 1); return l; }
+            if (s == INVALID_SOCKET || !fill()) { std::string l = buf; buf.clear(); return l; }
+        }
+    }
+    std::string bytes(size_t n) {
+        while (buf.size() < n && s != INVALID_SOCKET && fill()) {}
+        std::string out = buf.substr(0, std::min(n, buf.size()));
+        buf.erase(0, out.size());
+        return out;
+    }
+    std::string ask(const std::string& request) {   // a verb's reply: a line, or "JSON <VERB> <n>\n" + n bytes
+        send_text(request + "\n");
+        std::string head = line();
+        if (head.rfind("JSON ", 0) == 0) head += bytes(size_t(std::atoll(head.c_str() + head.rfind(' ') + 1)));
+        return head;
+    }
+    std::string action(const std::string& json) {
+        send_text("ACTION " + std::to_string(json.size()) + "\n" + json);
+        std::string head = line();
+        if (head.rfind("JSON ", 0) == 0) head += bytes(size_t(std::atoll(head.c_str() + head.rfind(' ') + 1)));
+        return head;
+    }
+};
+
+// The native console (tools/native_console.h): protocol replies, an ACTION that changes and saves the canvas, the
+// refusals, and the client limit.
+void console_checks(const std::string& exe, const fs::path& work, const fs::path& canvas_source) {
+    const fs::path dir = work / "console";
+    fs::create_directories(dir);
+    const fs::path canvas = dir / "console.nodus.txt";
+    fs::copy_file(canvas_source, canvas, fs::copy_options::overwrite_existing);
+    { std::ofstream t(dir / "token", std::ios::binary); t << "console-secret\r\n"; }
+    nodus::exec::Child child;
+    std::string why, out;
+    CHECK(child.start({exe, {"--canvas", canvas.string(), "--rate", "60", "--offscreen", "--acquire", "nh.port:4:600",
+                             "--console-port", "0", "--console-token-file", (dir / "token").string()}, dir.string(), {}}, why));
+    child.finish_input();
+    std::string ready;
+    for (auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(30); ready.empty() && child.running() && std::chrono::steady_clock::now() < give_up;) {
+        child.take(out);
+        const size_t nl = out.find('\n');
+        if (nl != std::string::npos) ready = out.substr(0, nl);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const long long port = json_int(ready, "console_port");
+    std::printf("console ready line: %s\n", ready.c_str());
+    CHECK(port > 0 && port < 65536);
+    if (port <= 0) { child.kill(); return; }
+    const uint16_t p = uint16_t(port);
+    {
+        ConsoleClient c(p);
+        CHECK(c.ask("HELLO nodus-console/2 console-secret") == "OK console console.nodus.txt actions\n");
+        const std::string digest = c.ask("DIGEST");
+        std::printf("DIGEST: %s\n", digest.c_str());
+        CHECK(digest.rfind("JSON DIGEST ", 0) == 0 && digest.find("\"protocol\":2") != std::string::npos &&
+              digest.find("\"revision\":1") != std::string::npos && digest.find("\"contract_ports\":1") != std::string::npos &&
+              digest.find("\"rate\":60.0") != std::string::npos);
+        c.send_text("SNAPSHOT\n");
+        const std::string head = c.line();
+        CHECK(head.rfind("CANVAS 1 ", 0) == 0);
+        const std::string data = c.bytes(size_t(std::atoll(head.c_str() + 9)));
+        CHECK(data.rfind("CANVAS V4", 0) == 0 && data.find("CONTRACT_PORT nh.port 4 ") != std::string::npos);
+        CHECK(c.line() == "\n");
+        const std::string state = c.line();
+        CHECK(state.rfind("STATE {\"revision\": 1, \"ticks\": ", 0) == 0 && state.find("\"events\": []}") != std::string::npos);
+        CHECK(c.ask("digest") == "REFUSED read-only\n");
+        CHECK(c.ask("GRAPH").rfind("JSON GRAPH ", 0) == 0);
+        CHECK(c.ask("TOOLS").find("\"name\":\"nh.port.market\"") != std::string::npos);
+        CHECK(c.ask("ACTIVITY").find("\"contract_ports\":[{\"engines\":0,\"hosts\":0,\"pending\":null,\"prefix\":\"nh.port\"}]") != std::string::npos);
+        CHECK(c.ask("META").rfind("JSON META ", 0) == 0);
+        CHECK(c.action("{\"op\": \"viewport\", \"expected_revision\": 7, \"width\": 800, \"height\": 600}") ==
+              "JSON ACTION 48\n{\"error\":\"canvas revision changed\",\"revision\":1}");
+        CHECK(c.action("{\"op\": \"viewport\", \"expected_revision\": 1, \"width\": 800.0, \"height\": 600}") ==
+              "JSON ACTION 54\n{\"error\":\"viewport width and height must be integers\"}");
+        CHECK(c.action("{\"op\": \"viewport\", \"expected_revision\": 1, \"width\": 800, \"height\": 600}") ==
+              "JSON ACTION 58\n{\"handled\":true,\"revision\":2,\"canvas\":\"console.nodus.txt\"}");
+        CHECK(read_text(canvas).find("CANVAS V4\r\n800 600") == 0 || read_text(canvas).find("CANVAS V4\n800 600") == 0);   // saved
+        CHECK(read_text(canvas).find("CONTRACT_PORT nh.port 4 ") != std::string::npos);   // with its records
+        CHECK(c.action("{\"op\": \"link_host\", \"expected_revision\": 2, \"id\": \"x\"}").find("stage C") != std::string::npos);
+        CHECK(c.ask("ACTION nope") == "REFUSED invalid action\n");
+    }
+    {
+        ConsoleClient v1(p);
+        CHECK(v1.ask("HELLO nodus-console/1 console-secret") == "OK console console.nodus.txt read-only\n");
+        CHECK(v1.ask("ACTION 2") == "REFUSED read-only\n");
+        ConsoleClient bad(p);
+        CHECK(bad.ask("HELLO nodus-console/2 wrong") == "REFUSED bad token\n");
+        ConsoleClient hello(p);
+        CHECK(hello.ask("HELO") == "REFUSED bad hello\n");
+    }
+    {   // eight clients at once; the ninth is refused
+        std::vector<std::unique_ptr<ConsoleClient>> held;
+        for (int k = 0; k < 8; ++k) {
+            held.push_back(std::make_unique<ConsoleClient>(p));
+            CHECK(held.back()->ask("HELLO nodus-console/1 console-secret") == "OK console console.nodus.txt read-only\n");
+        }
+        ConsoleClient ninth(p);
+        CHECK(ninth.line() == "REFUSED too many clients\n");
+    }
+    child.kill();
 }
 
 }  // namespace
@@ -153,7 +296,8 @@ int main(int argc, char** argv) {
         {"--canvas", canvas.string(), "--offscreen", "--acquire", "nh.port:4", "--cron", "nh.port:0:" + work.string()},
         {"--canvas", canvas.string(), "--offscreen", "--acquire", "nh.port:4:0"},
         {"--canvas", canvas.string(), "--offscreen", "--link-host", "a:b:0:" + (work / "link.key").string()},
-        {"--canvas", canvas.string(), "--offscreen", "--console-port", "0", "--console-token-file", "t"},
+        {"--canvas", canvas.string(), "--offscreen", "--console-port", "0", "--console-token-file", (work / "missing.token").string()},
+        {"--canvas", canvas.string(), "--offscreen", "--console-port", "0"},
         {"--rate", "60"},
         {"--canvas", (work / "missing.nodus.txt").string(), "--offscreen"},
     };
@@ -164,6 +308,8 @@ int main(int argc, char** argv) {
         std::printf("refused (exit %d): %s\n", code, joined.c_str());
         CHECK(code == 2);
     }
+
+    console_checks(exe, work, canvas);
 
     if (failures) { std::printf("FAILED %d\n", failures); return 1; }
     std::printf("OK\n");
