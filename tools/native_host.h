@@ -14,6 +14,9 @@
 //                     picks the port, reported as console_port in the ready line)
 //   --offscreen   no window: no SDL video and no GL. The rasterizer draws only when something asks for a frame.
 //   --nodus-root DIR   the Nodus checkout the compile host builds against (default: this build's source tree)
+//   --link-route-map PATH   the front's route map (RewriteMap txt:): a routed LINK_HOST of the canvas writes its line there
+// Links are declared in the canvas (LINK_HOST records, nodus_headless_abi.h) and restored as it loads; --link-host
+// registers one for this run only, as run_canvas did.
 // With a window, the window draws the hosted canvas and gives it input; a change made there is saved through the
 // headless file path (every record kept), at most every 2 s, between steps. Closing the window stops the host.
 #pragma once
@@ -71,6 +74,7 @@ struct Options {
     std::vector<LinkHost> link_hosts;
     std::string compile_python, turing_root, module_library_root, nodus_root = NODUS_REPO_ROOT;
     bool compile_adopt = false;
+    std::string link_route_map;           // --link-route-map: the front's route map for routed links (LINK_HOST flag 1)
     long long console_port = -1;          // --console-port (0: the system picks); -1: no console
     std::string console_token_file;
     bool offscreen = false;
@@ -155,7 +159,7 @@ inline std::string json_string(const std::string& s) {
 inline bool parse(int argc, char** argv, Options& o) {
     static const std::set<std::string> kValued = {"--canvas", "--rate", "--ticks", "--acquire", "--compile-host", "--cron",
         "--link-host", "--compile-python", "--turing-root", "--module-library-root", "--console-port", "--console-token-file",
-        "--nodus-root"};
+        "--nodus-root", "--link-route-map"};
     static const std::set<std::string> kFlags = {"--compile-adopt", "--offscreen"};
     bool any = false;
     for (int i = 1; i < argc; ++i) {
@@ -184,6 +188,7 @@ inline bool parse(int argc, char** argv, Options& o) {
         else if (name == "--module-library-root") o.module_library_root = value;
         else if (name == "--nodus-root") o.nodus_root = value;
         else if (name == "--console-port") o.console_port = std::stoll(value);
+        else if (name == "--link-route-map") o.link_route_map = value;
         else o.console_token_file = value;
     }
     if (!o.enabled) {
@@ -248,6 +253,7 @@ public:
                 console_ = std::make_unique<nodus::console::Server>(token, std::move(context));
                 console_port_ = console_->start(static_cast<uint16_t>(o_.console_port));
             }
+            if (!o_.link_route_map.empty()) nodus_headless_set_link_route_map(o_.link_route_map.c_str());   // before LINK_HOST loads
             g_ = nodus_headless_create();
             if (!g_) throw std::runtime_error("native graph creation failed");
             if (!nodus_headless_set_scheduler_mode(g_, 1)) throw std::runtime_error("native scheduler mode refused");

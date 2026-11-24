@@ -13,7 +13,16 @@ This is the research and the plan.
   - Two deliberate differences:
     1. **Link ACTIONs wait for stage C.** `link_host`, `link_dial`, `link_udp` and `link_send` answer an error until stage C, because in `run_canvas.py` they place the pre-split rows. `link_report` is served.
     2. **A race is fixed.** A view requested while another client's build was already running answered `REFUSED unavailable` in `run_canvas.py`. The native console asks again until a build has tried the view.
-- **Stages C and D are not built.**
+- **Stage C is built** (2026-11-23): links declared in the canvas.
+  - **Hosted links are recorded:** a hosted link is a `LINK_HOST <id> <name> <port> <flags> <key file>` record. A load reads these records before the canvas body, so the link rows resolve; a save writes them. The key stays in its file. Port 0 lets the system pick.
+  - **Route and metrics:** flag 1 registers `<id>.route`, the front route row (the host's `--link-route-map`); flag 2 registers `<id>.metrics`.
+  - **Tables:** `nodus_headless_compose_link_tables` puts the four link rows in their own stack-loopback tables, beside the declared ports `<id>.send`, `<id>.received`, `<id>.control` and `<id>.control.received`, plus a metrics table and a route table when flagged.
+  - **Console ACTIONs:** `link_host` opens a recorded link (`nodus_headless_open_link_host`, port 0 allowed, `"route": true`). `link_dial` and `link_udp` open a dialed link and compose or rebind its tables. A dial is not recorded: its tickets are short-lived secrets. `link_send` pushes into `<id>.send`.
+  - **Tested by** `tests/link_canvas_test.cpp`: open, save, destroy, reload, then a tensor across the reloaded link, byte for byte.
+  - **Not yet done:**
+    - Sent tensors are not returned to a mint (no Returns row in the send table), as before.
+    - Oracle's hand-made `/srv/svc/link-test` canvas becomes an ordinary canvas with a `LINK_HOST` record at the stage D cut-over.
+- **Stage D is not built.**
 
 ## Where things are
 

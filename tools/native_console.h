@@ -8,9 +8,11 @@
 // (service()), coalesced for 100 ms. An ACTION is applied on the stepping thread too, and a change of revision saves the
 // canvas through the headless file path.
 //
-// Not yet native: the link ACTIONs that open or feed a link (link_host, link_dial, link_udp, link_send). In
-// run_canvas.py they place rows that no longer exist since the link's four-row split; links move into the canvas file in
-// stage C, and until then these four answer {"error": ...}. link_report is served.
+// Links (stage C): link_host opens a link declared in the canvas (nodus_headless_open_link_host: a LINK_HOST record the
+// next save writes; port 0 lets the system pick; "route": true adds the front route row); link_dial and link_udp open a
+// dialed link and compose its tables (nodus_headless_compose_link_tables: the four rows in their own tables); link_send
+// pushes a tensor into the declared port <id>.send. run_canvas.py placed <id>.bulk and <id>.control, rows that no longer
+// exist since the four-row split.
 #pragma once
 
 #include "contract_listener.h"   // ensure_sockets, SOCKET and the socket includes (contract_socket.h)
@@ -1132,6 +1134,154 @@ private:
         return found[0];
     }
 
+    static bool decode_hex(const std::string& s, std::string& out) {
+        if (s.size() % 2) return false;
+        out.clear();
+        for (size_t k = 0; k < s.size(); k += 2) {
+            auto nib = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+            const int hi = nib(s[k]), lo = nib(s[k + 1]);
+            if (hi < 0 || lo < 0) return false;
+            out += char(hi * 16 + lo);
+        }
+        return true;
+    }
+    // base64.b64decode(..., validate=True): the standard alphabet and padding, nothing else.
+    static bool decode_base64(const std::string& s, std::string& out) {
+        static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        if (s.size() % 4) return false;
+        out.clear();
+        for (size_t k = 0; k < s.size(); k += 4) {
+            int v[4];
+            int pad = 0;
+            for (int j = 0; j < 4; ++j) {
+                const char c = s[k + size_t(j)];
+                if (c == '=' && k + 4 == s.size() && j >= 2) { v[j] = 0; ++pad; continue; }
+                if (pad) return false;
+                const size_t p = alphabet.find(c);
+                if (p == std::string::npos) return false;
+                v[j] = int(p);
+            }
+            const uint32_t n = uint32_t(v[0] << 18 | v[1] << 12 | v[2] << 6 | v[3]);
+            out += char(n >> 16);
+            if (pad < 2) out += char((n >> 8) & 0xFF);
+            if (pad < 1) out += char(n & 0xFF);
+        }
+        return true;
+    }
+
+    // The link ops that open or feed a link (run_canvas _apply_link), with the link declared in the canvas
+    // (nodus_headless_open_link_host records a host; a dial composes its tables, which bind again when it is reopened).
+    template <class Subset, class ValueOr>
+    bool apply_link(const std::string& op, const std::string& id, const Json& request, Subset subset, ValueOr value_or) {
+        static const auto name_ok = [](const std::string& s) {
+            if (s.empty() || s.size() > 60) return false;
+            for (char ch : s) if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '.' || ch == '_' || ch == '-')) return false;
+            return true;
+        };
+        auto metrics_options = [&]() {   // run_canvas _metrics_options: the channel is set before the row is made
+            const Json metrics = value_or("metrics", Json::boolean(false));
+            const Json channel = value_or("metrics_channel", Json::integer(0));
+            if (metrics.t != Json::T::Bool || !channel.is_int() || channel.big || channel.t != Json::T::Int || channel.i < 0 || channel.i > 0x7FFFFFFF)
+                throw ValueError("metrics is true or false; metrics_channel is a meta channel group 0..2147483647");
+            if (channel.i && !metrics.b) throw ValueError("metrics_channel needs metrics: true");
+            if (metrics.b) nodus_headless_set_link_metrics_channel(id.c_str(), int32_t(channel.i));
+            return metrics.b ? NODUS_LINK_METRICS : 0;
+        };
+        if (op == "link_send") {
+            if (!request.get("bytes") || !subset({"op", "expected_revision", "id", "bytes", "fill"}))
+                throw ValueError("link_send takes op, expected_revision, id, bytes[, fill]");
+            const Json size = *request.get("bytes");
+            const Json fill = value_or("fill", Json::integer(0));
+            if (!size.is_int() || size.big || size.t != Json::T::Int || size.i < 1 || size.i > (64ll << 20) || !fill.is_int() || fill.big ||
+                fill.t != Json::T::Int || fill.i < 0 || fill.i > 255)
+                throw ValueError("link_send: bytes 1..64 MiB, fill 0..255");
+            const uint64_t shape[1] = {uint64_t(size.i)};
+            const uint64_t handle = nodus_tensor_create(NODUS_DTYPE_U8, 1, shape);
+            if (!handle) throw RuntimeError("the tensor core refused the tensor");
+            const std::string data(size_t(size.i), char(fill.i));
+            if (nodus_tensor_write(handle, 0, data.data(), data.size()) != int64_t(data.size())) {
+                nodus_tensor_destroy(handle);
+                throw RuntimeError("the tensor could not be written");
+            }
+            NodusHeadlessPublishResult result{};
+            if (!nodus_headless_push_token_ex(c_.g, (id + ".send").c_str(), &handle, sizeof(handle), &result) || !result.accepted) {
+                nodus_tensor_destroy(handle);
+                throw RuntimeError(id + ".send is full");
+            }
+            return true;
+        }
+        if (op == "link_udp") {
+            static const std::set<std::string> keys = {"op", "expected_revision", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at"};
+            for (const auto& k : keys) if (!request.get(k)) throw ValueError("link_udp takes op, expected_revision, id, broker_host, broker_port, prefix, role, link_id, key, expires_at[, account, metrics, metrics_channel]");
+            if (!subset({"op", "expected_revision", "id", "broker_host", "broker_port", "prefix", "role", "link_id", "key", "expires_at", "account", "metrics", "metrics_channel"}))
+                throw ValueError("link_udp takes op, expected_revision, id, broker_host, broker_port, prefix, role, link_id, key, expires_at[, account, metrics, metrics_channel]");
+            const Json& prefix = *request.get("prefix");
+            const Json& port = *request.get("broker_port");
+            const Json& role = *request.get("role");
+            const Json& expires = *request.get("expires_at");
+            const Json& host = *request.get("broker_host");
+            if (prefix.t != Json::T::Str || !name_ok(prefix.s) || port.t != Json::T::Int || port.i <= 0 || port.i >= 65536 ||
+                role.t != Json::T::Int || (role.i != 1 && role.i != 2) || expires.t != Json::T::Int || host.t != Json::T::Str)
+                throw ValueError("link_udp: a prefix, a broker port 1-65535, role 1 or 2, an integer expiry and a broker host");
+            std::string link_id, key;
+            const Json& lid = *request.get("link_id");
+            const Json& k = *request.get("key");
+            if (lid.t != Json::T::Str || k.t != Json::T::Str || !decode_hex(lid.s, link_id) || !decode_hex(k.s, key)) throw ValueError("link_id and key are hex");
+            if (link_id.size() != 16 || key.size() != 32) throw ValueError("role is 1 or 2, the link id 16 bytes and the key 32");
+            const Json account = value_or("account", Json::integer(0));
+            const int flags = metrics_options();
+            if (!nodus_headless_register_link_udp_dialer(c_.g, id.c_str(), host.s.c_str(), uint16_t(port.i), prefix.s.c_str(), int32_t(role.i),
+                                                         reinterpret_cast<const uint8_t*>(link_id.data()), uint64_t(expires.i),
+                                                         reinterpret_cast<const uint8_t*>(key.data()),
+                                                         account.t == Json::T::Int ? uint64_t(account.i) : 0, 15000, 0))
+                throw RuntimeError("native UDP link registration refused: " + id);
+            if (!nodus_headless_compose_link_tables(c_.g, id.c_str(), flags)) throw RuntimeError("the link tables of " + id + " could not be placed");
+            return true;
+        }
+        const Json prefix = value_or("prefix", Json::null());
+        const Json port = value_or("port", Json::null());
+        if (prefix.t != Json::T::Str || !name_ok(prefix.s)) throw ValueError("link prefix: 1-60 of A-Z a-z 0-9 . _ -");
+        if (op == "link_host") {
+            if (!(port.t == Json::T::Int && port.i >= 0 && port.i < 65536)) throw ValueError("link port is 0-65535 (0: the system picks it)");
+            for (const char* k : {"key_file"}) if (!request.get(k)) throw ValueError("link_host takes op, expected_revision, id, prefix, port, key_file[, metrics, metrics_channel, route]");
+            if (!subset({"op", "expected_revision", "id", "prefix", "port", "key_file", "metrics", "metrics_channel", "route"}))
+                throw ValueError("link_host takes op, expected_revision, id, prefix, port, key_file[, metrics, metrics_channel, route]");
+            const Json& key_file = *request.get("key_file");
+            const Json route = value_or("route", Json::boolean(false));
+            if (key_file.t != Json::T::Str || key_file.s.empty()) throw ValueError("key_file is the path of the 32-byte link key");
+            if (route.t != Json::T::Bool) throw ValueError("route is true or false");
+            const int flags = metrics_options() | (route.b ? NODUS_LINK_ROUTE : 0);
+            if (nodus_headless_open_link_host(c_.g, id.c_str(), prefix.s.c_str(), uint16_t(port.i), flags, key_file.s.c_str()) <= 0)
+                throw RuntimeError("native link host registration refused: " + id);
+            return true;
+        }
+        if (op != "link_dial") throw ValueError("unknown canvas UI action");
+        if (!(port.t == Json::T::Int && port.i > 0 && port.i < 65536)) throw ValueError("link port is 1-65535");
+        for (const char* k : {"host", "control_ticket", "bulk_ticket"})
+            if (!request.get(k)) throw ValueError("link_dial takes op, expected_revision, id, host, port, prefix, control_ticket, bulk_ticket[, secure, pin, metrics, metrics_channel]");
+        if (!subset({"op", "expected_revision", "id", "host", "port", "prefix", "control_ticket", "bulk_ticket", "secure", "pin", "metrics", "metrics_channel"}))
+            throw ValueError("link_dial takes op, expected_revision, id, host, port, prefix, control_ticket, bulk_ticket[, secure, pin, metrics, metrics_channel]");
+        const Json& host = *request.get("host");
+        if (host.t != Json::T::Str || host.s.empty() || host.s.size() > 253) throw ValueError("link host is a name or an address");
+        std::string control, bulk, pin;
+        const Json& ct = *request.get("control_ticket");
+        const Json& bt = *request.get("bulk_ticket");
+        const Json pinv = value_or("pin", Json::null());
+        if (ct.t != Json::T::Str || bt.t != Json::T::Str || !decode_base64(ct.s, control) || !decode_base64(bt.s, bulk) ||
+            (pinv.t != Json::T::Null && (pinv.t != Json::T::Str || !decode_hex(pinv.s, pin))))
+            throw ValueError("link tickets are base64, a pin is hex");
+        const Json secure = value_or("secure", Json::boolean(true));
+        if (secure.t != Json::T::Bool) throw ValueError("secure is true or false");
+        if (control.size() != 128 || bulk.size() != 128 || (pinv.t != Json::T::Null && pin.size() != 32)) throw ValueError("tickets are 128 bytes and a pin is 32");
+        const int flags = metrics_options();
+        if (!nodus_headless_register_link_wss_dialer(c_.g, id.c_str(), host.s.c_str(), uint16_t(port.i), "/ws/link/", prefix.s.c_str(), secure.b ? 1 : 0,
+                                                     pinv.t == Json::T::Null ? nullptr : reinterpret_cast<const uint8_t*>(pin.data()),
+                                                     reinterpret_cast<const uint8_t*>(control.data()), reinterpret_cast<const uint8_t*>(bulk.data()), 10000, 0))
+            throw RuntimeError("native wss link dialer registration refused: " + id);
+        if (!nodus_headless_compose_link_tables(c_.g, id.c_str(), flags)) throw RuntimeError("the link tables of " + id + " could not be placed");
+        return true;
+    }
+
     // run_canvas ConsoleServer._apply_action, on the stepping thread.
     Json apply_action(const Json& request) {
         const Json* expected = request.t == Json::T::Obj ? request.get("expected_revision") : nullptr;
@@ -1190,12 +1340,14 @@ private:
                 return true;
             };
             if (!idv || idv->t != Json::T::Str || !valid(idv->s)) throw ValueError("link id: 1-60 of A-Z a-z 0-9 . _ -");
-            if (op != "link_report")
-                throw ValueError(op + ": links move into the canvas file (stage C of docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md); "
-                                      "this native host does not open them by ACTION yet");
-            if (!exactly({"op", "expected_revision", "id"})) throw ValueError("link_report takes op, expected_revision, id");
-            return Json::object().set("handled", Json::boolean(true)).set("revision", Json::integer(revision_))
-                .set("canvas", Json::string(c_.canvas_name)).set("link", link_report(idv->s));
+            const std::string id = idv->s;
+            if (op == "link_report") {
+                if (!exactly({"op", "expected_revision", "id"})) throw ValueError("link_report takes op, expected_revision, id");
+                return Json::object().set("handled", Json::boolean(true)).set("revision", Json::integer(revision_))
+                    .set("canvas", Json::string(c_.canvas_name)).set("link", link_report(id));
+            }
+            handled = apply_link(op, id, request, subset, value_or);
+            if (std::find(c_.link_ids.begin(), c_.link_ids.end(), id) == c_.link_ids.end() && op != "link_send") c_.link_ids.push_back(id);
         } else if (op == "meta_group" || op == "meta_report" || op == "meta_destroy") {
             if (op == "meta_group") {
                 if (!exactly({"op", "expected_revision", "edges", "channel_group"}))

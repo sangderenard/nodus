@@ -736,6 +736,13 @@ target_include_directories(native_host_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} 
 target_link_libraries(native_host_test PRIVATE nodus_headless ${NODUS_LINK_LIBS})
 target_compile_features(native_host_test PUBLIC cxx_std_20)
 
+# Links declared in the canvas (LINK_HOST records, the link tables, a tensor across a reloaded link). Run it with a
+# work folder.
+add_executable(link_canvas_test tests/link_canvas_test.cpp)
+target_include_directories(link_canvas_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(link_canvas_test PRIVATE nodus_headless nodus_tensor_core ${NODUS_LINK_LIBS})
+target_compile_features(link_canvas_test PUBLIC cxx_std_20)
+
 # The front route map: many links on one public port, each routed by its name to its own loopback port (the row
 # nodus.link.route). Run it with a work folder; tests/link_route_front.ps1 runs it through a private Apache front.
 add_executable(link_route_test tests/link_route_test.cpp)

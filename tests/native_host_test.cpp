@@ -196,7 +196,23 @@ void console_checks(const std::string& exe, const fs::path& work, const fs::path
               "JSON ACTION 58\n{\"handled\":true,\"revision\":2,\"canvas\":\"console.nodus.txt\"}");
         CHECK(read_text(canvas).find("CANVAS V4\r\n800 600") == 0 || read_text(canvas).find("CANVAS V4\n800 600") == 0);   // saved
         CHECK(read_text(canvas).find("CONTRACT_PORT nh.port 4 ") != std::string::npos);   // with its records
-        CHECK(c.action("{\"op\": \"link_host\", \"expected_revision\": 2, \"id\": \"x\"}").find("stage C") != std::string::npos);
+        CHECK(c.action("{\"op\": \"link_host\", \"expected_revision\": 2, \"id\": \"x\"}") ==
+              "JSON ACTION 50\n{\"error\":\"link prefix: 1-60 of A-Z a-z 0-9 . _ -\"}");
+        {   // a link opened by ACTION is declared in the canvas: a LINK_HOST record in the save, its tables, its port
+            std::ofstream k(dir / "link.key", std::ios::binary);
+            k << std::string(32, 'k');
+        }
+        std::string key_path = (dir / "link.key").string();
+        for (auto& ch : key_path) if (ch == '\\') ch = '/';
+        const std::string opened = c.action("{\"op\": \"link_host\", \"expected_revision\": 2, \"id\": \"ck\", \"prefix\": \"mesh-ck\", "
+                                            "\"port\": 0, \"key_file\": \"" + key_path + "\", \"metrics\": true}");
+        std::printf("link_host: %s\n", opened.c_str());
+        CHECK(opened == "JSON ACTION 58\n{\"handled\":true,\"revision\":3,\"canvas\":\"console.nodus.txt\"}");
+        CHECK(read_text(canvas).find("LINK_HOST ck mesh-ck 0 2 " + key_path) != std::string::npos);
+        const std::string report = c.action("{\"op\": \"link_report\", \"expected_revision\": 3, \"id\": \"ck\"}");
+        CHECK(report.find("\"state\":\"waiting\"") != std::string::npos && report.find("\"listen_port\":0") == std::string::npos);
+        CHECK(c.action("{\"op\": \"link_send\", \"expected_revision\": 3, \"id\": \"ck\", \"bytes\": 64, \"fill\": 9}").find("\"handled\":true") != std::string::npos);
+        CHECK(c.ask("META").find("\"id\":\"ck\"") != std::string::npos);
         CHECK(c.ask("ACTION nope") == "REFUSED invalid action\n");
     }
     {

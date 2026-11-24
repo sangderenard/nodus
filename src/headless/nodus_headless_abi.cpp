@@ -76,6 +76,10 @@ struct NodusHeadlessGraph {
 
     // Contract-port runtime shared with the GUI shell (include/contract_port_canvas.h).
     nodus::contracts::CanvasContractPorts contract_ports;
+
+    // Hosted links of this canvas: LINK_HOST records, written by a save (nodus_headless_open_link_host, load).
+    struct LinkHostRecord { std::string id, name; uint16_t port = 0; int32_t flags = 0; std::string key_file; };
+    std::vector<LinkHostRecord> link_hosts;
 };
 
 namespace {
@@ -539,6 +543,134 @@ extern "C" int32_t nodus_headless_register_link_udp_dialer(
     return 1;
 }
 
+// ---- links declared in the canvas (stage C of docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md) ---------------------------
+namespace {
+
+std::mutex& link_route_map_mutex() { static std::mutex m; return m; }
+std::string& link_route_map() { static std::string path; return path; }
+
+bool link_name_ok(const std::string& s, size_t max) {
+    if (s.empty() || s.size() > max) return false;
+    for (char c : s)
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+    return true;
+}
+
+int32_t module_by_label(NodusHeadlessGraph* g, const std::string& label) {
+    const int32_t n = nodus_headless_get_module_count(g);
+    for (int32_t m = 0; m < n; ++m) {
+        GP_CanvasModuleDesc d{};
+        if (nodus_headless_get_module_desc(g, m, &d) && std::string(d.label, strnlen(d.label, sizeof(d.label))) == label) return m;
+    }
+    return -1;
+}
+
+// One link table: found by its label or made, given these rows, the tensor-handle stack contract and stack loopback.
+int32_t link_table(NodusHeadlessGraph* g, const std::string& label, const std::vector<GP_CanvasModuleRowDesc>& rows, int32_t x, int32_t y) {
+    int32_t m = module_by_label(g, label);
+    if (m < 0) {
+        GP_CanvasModuleDesc d{};
+        d.x = x; d.y = y; d.w = 220; d.h = 140;
+        std::snprintf(d.label, sizeof(d.label), "%s", label.c_str());
+        m = nodus_headless_add_module(g, &d);
+        if (m < 0) return -1;
+    }
+    if (!nodus_headless_set_module_rows(g, m, rows.data(), static_cast<int32_t>(rows.size())) ||
+        !nodus_headless_set_module_stack_contract(g, m, 1) || !nodus_headless_set_module_stack_loopback(g, m, 1)) return -1;
+    return m;
+}
+
+// Loads the link host a LINK_HOST record names: the endpoint and, for a routed link, its route row; no tables (a load
+// brings them from the file, an open composes them). The bound port, or 0.
+int32_t register_recorded_link_host(NodusHeadlessGraph* g, const NodusHeadlessGraph::LinkHostRecord& r) {
+    std::ifstream in(r.key_file, std::ios::binary);
+    std::string key((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (key.size() != 32) {
+        std::fprintf(stderr, "nodus link %s: the key file %s does not hold 32 bytes\n", r.id.c_str(), r.key_file.c_str());
+        return 0;
+    }
+    std::string map;
+    if (r.flags & NODUS_LINK_ROUTE) {
+        std::lock_guard<std::mutex> lk(link_route_map_mutex());
+        map = link_route_map();
+        if (map.empty()) {
+            std::fprintf(stderr, "nodus link %s: routed, but this host has no front route map\n", r.id.c_str());
+            return 0;
+        }
+    }
+    const int32_t bound = nodus_headless_register_link_host(g, r.id.c_str(), r.name.c_str(), r.port,
+                                                            reinterpret_cast<const uint8_t*>(key.data()), 0);
+    if (bound <= 0) return 0;
+    std::string error;
+    if ((r.flags & NODUS_LINK_ROUTE) && !nodus::link::register_link_route(tool_registry_global(), r.id, r.name, map, &error)) {
+        std::fprintf(stderr, "nodus link %s: %s\n", r.id.c_str(), error.c_str());
+        nodus::link::unregister_link(tool_registry_global(), r.id);
+        g->registered_links.erase(std::remove(g->registered_links.begin(), g->registered_links.end(), r.id), g->registered_links.end());
+        return 0;
+    }
+    return bound;
+}
+
+} // namespace
+
+extern "C" int32_t nodus_headless_set_link_route_map(const char* path) {
+    std::lock_guard<std::mutex> lk(link_route_map_mutex());
+    link_route_map() = path ? path : "";
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_compose_link_tables(NodusHeadlessGraph* g, const char* tool_id, int32_t flags) {
+    if (!g || !g->ctx || !tool_id || !link_name_ok(tool_id, 60) || flags < 0 || flags > 3) return 0;
+    const std::string id = tool_id;
+    const std::string bulk_send = id + ".bulk.send", bulk_receive = id + ".bulk.receive";
+    const std::string control_send = id + ".control.send", control_receive = id + ".control.receive";
+    const std::string metrics = id + ".metrics", route = id + ".route";
+    constexpr int32_t kInput = 0, kTool = 1, kOutput = 2, kPlugin = 1;
+    const int32_t y = 40 + 180 * (std::max<int32_t>(0, nodus_headless_get_module_count(g)) / 6);   // a new link's tables: a row below
+    NodusHeadlessFifoConfig port{};
+    port.token_bytes = 8; port.slots = 4; port.top_k = 0; port.type_id = nodus_headless_abstract_tensor_type_id();
+    port.layout = 2; port.dtype = 16; port.backend_type = 0;
+    struct Table { std::string label; std::vector<GP_CanvasModuleRowDesc> rows; const char* in_port; const char* out_port; };
+    const std::string in_bulk = id + ".send", out_bulk = id + ".received", in_control = id + ".control", out_control = id + ".control.received";
+    std::vector<Table> tables = {
+        {"link " + id + " bulk send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, bulk_send.c_str()}}, in_bulk.c_str(), nullptr},
+        {"link " + id + " bulk receive", {{kTool, 0, 0, kPlugin, bulk_receive.c_str()}, {kOutput, 0, 1, 0, nullptr}}, nullptr, out_bulk.c_str()},
+        {"link " + id + " control send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, control_send.c_str()}}, in_control.c_str(), nullptr},
+        {"link " + id + " control receive", {{kTool, 0, 0, kPlugin, control_receive.c_str()}, {kOutput, 0, 1, 0, nullptr}}, nullptr, out_control.c_str()},
+    };
+    if (flags & NODUS_LINK_METRICS) tables.push_back({"link " + id + " metrics", {{kTool, 0, 0, kPlugin, metrics.c_str()}}, nullptr, nullptr});
+    if (flags & NODUS_LINK_ROUTE) tables.push_back({"link " + id + " route", {{kTool, 0, 0, kPlugin, route.c_str()}}, nullptr, nullptr});
+    for (size_t k = 0; k < tables.size(); ++k) {
+        const Table& t = tables[k];
+        const int32_t m = link_table(g, t.label, t.rows, 40 + 240 * static_cast<int32_t>(k), y);
+        if (m < 0) {
+            std::fprintf(stderr, "nodus_headless_compose_link_tables: %s: table \"%s\" refused\n", tool_id, t.label.c_str());
+            return 0;
+        }
+        if (t.in_port && !g->input_ports.count(t.in_port) && !nodus_headless_declare_input_port_ex(g, t.in_port, m, 0, &port)) return 0;
+        if (t.out_port && !g->output_ports.count(t.out_port) && !nodus_headless_declare_output_port_ex(g, t.out_port, m, 0, &port, 1)) return 0;
+    }
+    return 1;
+}
+
+extern "C" int32_t nodus_headless_open_link_host(NodusHeadlessGraph* g, const char* tool_id, const char* name,
+                                                 uint16_t port, int32_t flags, const char* key_file) {
+    if (!g || !g->ctx || !tool_id || !link_name_ok(tool_id, 60) || !name || !link_name_ok(name, 60) || flags < 0 || flags > 3 ||
+        !key_file || !*key_file || std::strpbrk(key_file, "\r\n")) return 0;
+    for (const auto& r : g->link_hosts)
+        if (r.id == tool_id) { std::fprintf(stderr, "nodus_headless_open_link_host: %s is already hosted\n", tool_id); return 0; }
+    NodusHeadlessGraph::LinkHostRecord record{tool_id, name, port, flags, key_file};
+    const int32_t bound = register_recorded_link_host(g, record);
+    if (bound <= 0) return 0;
+    if (!nodus_headless_compose_link_tables(g, tool_id, flags)) {   // nothing half-open: the endpoint goes again
+        nodus::link::unregister_link(tool_registry_global(), tool_id);
+        g->registered_links.erase(std::remove(g->registered_links.begin(), g->registered_links.end(), std::string(tool_id)), g->registered_links.end());
+        return 0;
+    }
+    g->link_hosts.push_back(std::move(record));
+    return bound;
+}
+
 extern "C" int32_t nodus_headless_link_reason(const char* tool_id, char* out, int32_t capacity) {
     nodus::link::EndpointReport r;
     if (!tool_id || !nodus::link::link_endpoint_report(tool_id, &r)) return -1;
@@ -617,12 +749,43 @@ struct ScopedModuleRoot {
 
 extern "C" int32_t nodus_headless_load_file(NodusHeadlessGraph* g, const char* path) {
     if (!g || !g->ctx || !path) return 0;
+    // LINK_HOST records first: the link's endpoint and rows are registered before the canvas body loads, so the rows
+    // its tables name resolve as they load (run_canvas registered --link-host before its load for the same reason).
+    std::vector<NodusHeadlessGraph::LinkHostRecord> trailer_links;
+    {
+        std::ifstream ifs(path);
+        std::string line;
+        while (std::getline(ifs, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("LINK_HOST ", 0) != 0) continue;
+            std::istringstream ss(line.substr(10));
+            NodusHeadlessGraph::LinkHostRecord r;
+            unsigned long port = 0;
+            if (!(ss >> r.id >> r.name >> port >> r.flags) || port > 65535 || r.flags < 0 || r.flags > 3) {
+                std::fprintf(stderr, "nodus_headless_load_file: malformed record: %s\n", line.c_str());
+                return 0;
+            }
+            std::getline(ss, r.key_file);
+            if (!r.key_file.empty() && r.key_file[0] == ' ') r.key_file.erase(0, 1);
+            r.port = static_cast<uint16_t>(port);
+            trailer_links.push_back(std::move(r));
+        }
+    }
+    for (const auto& r : trailer_links) {
+        bool held = false;   // this graph hosts it already (the same canvas loaded again)
+        for (const auto& h : g->link_hosts) held = held || h.id == r.id;
+        if (!held && register_recorded_link_host(g, r) <= 0) {
+            std::fprintf(stderr, "nodus_headless_load_file: cannot host LINK_HOST %s\n", r.id.c_str());
+            return 0;
+        }
+    }
     int32_t rc;
     {
         ScopedModuleRoot root(g->ctx, std::string(path) + ".modules", false);
         rc = gp_canvas_load_from_file(g->ctx, path);
     }
     if (!rc) return 0;
+    g->link_hosts = std::move(trailer_links);
     g->table = gp_canvas_get_container_table(g->ctx);
     // Port and edge bindings are process-local host views; CANVAS V4 does not
     // carry them. Drop stale ones, then restore from the trailer records
@@ -817,6 +980,8 @@ extern "C" int32_t nodus_headless_save_file(NodusHeadlessGraph* g, const char* p
         trailer << " " << *p.name << "\n";
     }
     g->contract_ports.write_trailer(trailer);
+    for (const auto& r : g->link_hosts)   // the key stays in its file; the record names the file
+        trailer << "LINK_HOST " << r.id << " " << r.name << " " << r.port << " " << r.flags << " " << r.key_file << "\n";
     {
         ScopedModuleRoot root(g->ctx, std::string(path) + ".modules", true);
         if (!gp_canvas_save_to_file(g->ctx, path)) return 0;
