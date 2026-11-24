@@ -27,6 +27,14 @@ This is the research and the plan.
   - **Supervisor:** `"native": true` in a nodus instance runs the native host directly, without Python, with `--offscreen` unless `"window": true`, and with `"link_route_map"`. This is on Turing branch `claude/native-nodus-host`, tested by `test_nodus_native_host_command`.
   - **Build products:** the build service products carry `frontend_shell` (driver version 2).
 
+**Switched on 2026-11-23** (owner: "do as much of the switching over as you can do on your own"):
+- **Oracle's link-test canvas runs on the native host.**
+  - The canvas is `/srv/svc/link-test/link-test.nodus.txt`, with the record `LINK_HOST state state 47616 0 /srv/svc/link-test/nodus_link.key`. It is started by `/srv/svc/link-test/run_native.sh`, which runs `/srv/svc/nodus-native/66dcbb5a/frontend_shell --offscreen`.
+  - The old canvas and `run_canvas.py` are no longer started there.
+  - The cross-machine pairs pass through it: 311/311, 926/926 after a 25 s outage, 323/323 after rotation. Its restart brings 47616 back from the record alone.
+- **The Windows product is built:** `C:/dev/Powershell/srv/state/products/nodus-native/66dcbb5a/` holds `frontend_shell.exe` and its DLLs. It was rehearsed on a copy of the live messenger canvas.
+- **The messenger switch is a reviewed change** (Turing `claude/native-nodus-host`, `instances.json`). It takes effect when it lands, the live tree is updated, and the stack restarts. The restart is the owner's.
+
 ## Stage D: the switches (each the owner's)
 
 1. **Land the reviews.** Nodus `claude/mesh-canvas-rows`, Turing `claude/native-nodus-host`, Turing `claude/link-route-map`.
