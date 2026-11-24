@@ -51,6 +51,14 @@ extern "C" int gp_canvas_set_size(GP_CanvasContext* ctx_, int width, int height)
     return 1;
 }
 
+extern "C" int gp_canvas_get_size(GP_CanvasContext* ctx_, int* out_width, int* out_height) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (out_width) *out_width = c->width;
+    if (out_height) *out_height = c->height;
+    return 1;
+}
+
 extern "C" int gp_canvas_on_mouse_scroll(GP_CanvasContext* ctx_, float x, float y, float dx, float dy, float scroll) {
     if (!ctx_) return 0;
     if (scroll == 0.0f) return 0;

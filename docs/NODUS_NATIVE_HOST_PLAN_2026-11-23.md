@@ -48,9 +48,9 @@ This is the research and the plan.
 6. **Oracle's link-test canvas.** Rewrite `/srv/svc/link-test` as an ordinary canvas: one `LINK_HOST state state 47616 0 /srv/svc/link-test/nodus_link.key` record, hosted by `frontend_shell --canvas ... --offscreen` from a build of this branch. Then the pause and resume scripts need no `link_host` ACTION.
 7. **Remove `run_canvas.py`.** Once nothing launches it, delete `run_canvas.py` and `nodus_graph/console_views.py`, and take `run_canvas.py` out of the build products.
 
-Not built yet:
-- The FRAME console verb, the rasterized canvas served to a client without the engine.
-- A Returns row on the link's send table.
+**The FRAME console verb is built** (2026-11-23). It answers `FRAME <revision> <width> <height> <n>` followed by the canvas's RGBA bytes, at the viewport's size, built between steps. The window's draw and FRAME share one raster lock. It is tested on Windows and on Oracle A1, which has no display: there the canvas is rasterized offscreen.
+
+Not built yet: a Returns row on the link's send table.
 
 ## Where things are
 

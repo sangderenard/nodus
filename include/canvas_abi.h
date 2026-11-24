@@ -204,6 +204,8 @@ int gp_canvas_get_scroll_flags(GP_CanvasContext* ctx, int* out_has_h, int* out_h
 // Set the canvas logical pixel size (background/work area). This updates
 // internal viewport sizes used by rasterization and scroll calculations.
 int gp_canvas_set_size(GP_CanvasContext* ctx, int width, int height);
+// The canvas's raster size (what gp_canvas_raster_rgba draws: width * height * 4 bytes). 1, or 0 without a canvas.
+int gp_canvas_get_size(GP_CanvasContext* ctx, int* out_width, int* out_height);
 
 // Create/destroy a canvas-owned table attached to module. The created table
 // will be owned by the canvas and destroyed when detached or when canvas
