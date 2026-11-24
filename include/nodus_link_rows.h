@@ -124,6 +124,10 @@ inline void link_report_counters(const EndpointReport& r, uint64_t out[16]) {
 // "nodus.link.metrics", whose link comes from saved state; module_library/source/tools/link_metrics.cpp); the listener is open on return (port in report). False on refusal.
 bool register_link_host(ToolRegistry& registry, LinkHostConfig config, uint16_t* listen_port = nullptr, std::string* error = nullptr);
 bool register_link_dialer(ToolRegistry& registry, LinkDialConfig config, std::string* error = nullptr);
+// Registers <id>.route: the row that keeps this hosted link's line "<name> 127.0.0.1:<port>" in the front's route map
+// (module_library/source/tools/link_route.cpp). False on refusal.
+bool register_link_route(ToolRegistry& registry, const std::string& id, const std::string& name, const std::string& map,
+                         std::string* error = nullptr);
 // State and counters of a registered endpoint (by the id given at registration).
 bool link_endpoint_report(const std::string& id, EndpointReport* out);
 // The meta-edge channel group the NEXT "<id>.metrics" row created for this link starts with (0 = none, the default):

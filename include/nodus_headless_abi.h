@@ -150,6 +150,30 @@ NODUS_HEADLESS_API int32_t nodus_headless_register_link_dialer(
 // Windows certificate validation. Nothing blocks; the rows advance the dial. 1 on success.
 // A link that meets its peer at a UDP broker (rendezvous from POST /api/link/rendezvous/<prefix>) and then runs directly
 // over UDP (include/nodus_link_udp.h). role 1 host, 2 dialer; link_id16 and key32 are the rendezvous's.
+// Links declared in the canvas (stage C of docs/NODUS_NATIVE_HOST_PLAN_2026-11-23.md). A hosted link is a record of the
+// canvas file, "LINK_HOST <id> <name> <port> <flags> <key file>": a load registers it before the canvas body, so the
+// link's rows resolve as the canvas loads, and a save writes it. The key stays in its file; port 0 lets the system pick.
+// flags: NODUS_LINK_ROUTE (the row <id>.route keeps the link's line in the front's route map, nodus_headless_set_link_
+// route_map) and NODUS_LINK_METRICS (the row <id>.metrics). A dialed link is not recorded: its tickets are short-lived
+// secrets, so it is opened again by its holder; its tables are saved with the canvas and bind again when it is.
+#define NODUS_LINK_ROUTE 1
+#define NODUS_LINK_METRICS 2
+// The front's route map this process's routed links write their lines into ("" = none). 1.
+NODUS_HEADLESS_API int32_t nodus_headless_set_link_route_map(const char* path);
+// Hosts a link (registration as nodus_headless_register_link_host, with its 32-byte key read from `key_file`), composes
+// its tables (nodus_headless_compose_link_tables) and records it for the next save. Returns the bound port, 0 on refusal.
+NODUS_HEADLESS_API int32_t nodus_headless_open_link_host(NodusHeadlessGraph* g, const char* tool_id, const char* name,
+    uint16_t port, int32_t flags, const char* key_file);
+// The tables a registered link's rows live in, one duty each, every one in stack loopback; made once, found again by
+// label and given their rows again (so a link registered after its saved tables loaded binds them):
+//   "link <id> bulk send"        Input (declared input port <id>.send) | <id>.bulk.send
+//   "link <id> bulk receive"     <id>.bulk.receive | Output (declared output port <id>.received)
+//   "link <id> control send"     Input (port <id>.control) | <id>.control.send
+//   "link <id> control receive"  <id>.control.receive | Output (port <id>.control.received)
+//   "link <id> metrics"          <id>.metrics             (flags & NODUS_LINK_METRICS)
+//   "link <id> route"            <id>.route               (flags & NODUS_LINK_ROUTE)
+// The ports carry 8-byte AbstractTensor handles, 4 slots, lossless. 1, or 0 on refusal.
+NODUS_HEADLESS_API int32_t nodus_headless_compose_link_tables(NodusHeadlessGraph* g, const char* tool_id, int32_t flags);
 // Why a link endpoint failed (empty while it has not); the reason's length, or -1 for an unknown id.
 NODUS_HEADLESS_API int32_t nodus_headless_link_reason(const char* tool_id, char* out, int32_t capacity);
 NODUS_HEADLESS_API int32_t nodus_headless_register_link_udp_dialer(

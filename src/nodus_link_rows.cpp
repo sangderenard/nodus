@@ -15,6 +15,15 @@
 #define NODUS_PLUGIN_DESTROY_NAME nodus_link_metrics_destroy
 #define NODUS_PLUGIN_SOURCE_NAME nodus_link_metrics_source
 #include "../module_library/source/tools/link_metrics.cpp"
+// The route row (module_library/source/tools/link_route.cpp), likewise: registered per hosted link as <id>.route when the
+// host has a front route map (set_link_route_map).
+#undef NODUS_PLUGIN_FACTORY_NAME
+#undef NODUS_PLUGIN_DESTROY_NAME
+#undef NODUS_PLUGIN_SOURCE_NAME
+#define NODUS_PLUGIN_FACTORY_NAME nodus_link_route_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_link_route_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_link_route_source
+#include "../module_library/source/tools/link_route.cpp"
 
 namespace nodus::link {
 namespace {
@@ -106,6 +115,19 @@ bool register_link_dialer(ToolRegistry& registry, LinkDialConfig config, std::st
     return register_rows(registry, id, std::move(ep), error);
 }
 
+bool register_link_route(ToolRegistry& registry, const std::string& id, const std::string& name, const std::string& map,
+                         std::string* error) {
+    if (!LinkRouteRow::valid_name(name) || map.empty()) { if (error) *error = "a route needs a name of [A-Za-z0-9._-]{1,64} and a map"; return false; }
+    ToolRegistry::Entry entry;
+    entry.id = id + ".route"; entry.name = "Link route"; entry.caps = ToolCaps::None;
+    entry.source_path = nodus_link_route_source();
+    entry.factory = [rid = entry.id, id, name, map] {
+        return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkRouteRow(rid, id, name, map), [](ITool* t) { nodus_link_route_destroy(t); });
+    };
+    if (!registry.register_tool(std::move(entry))) { if (error) *error = "tool registry refused " + id + ".route"; return false; }
+    return true;
+}
+
 bool link_endpoint_report(const std::string& id, EndpointReport* out) {
     std::shared_ptr<LinkEndpoint> ep;
     {
@@ -127,6 +149,7 @@ void unregister_link(ToolRegistry& registry, const std::string& id) {
     for (LinkRowRole role : {LinkRowRole::ControlSend, LinkRowRole::ControlReceive, LinkRowRole::BulkSend, LinkRowRole::BulkReceive})
         registry.unregister_tool(id + link_row_suffix(role));
     registry.unregister_tool(id + ".metrics");
+    registry.unregister_tool(id + ".route");   // registered only for a routed host; absent is fine
     std::lock_guard<std::mutex> g(endpoints_mutex());
     endpoints().erase(id);
     metrics_channels().erase(id);

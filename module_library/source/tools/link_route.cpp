@@ -39,6 +39,13 @@ namespace fs = std::filesystem;
 
 class LinkRouteRow final : public ITool {
 public:
+    // The generic row: its link, name and map come from saved state.
+    LinkRouteRow() = default;
+    // The row bound to one hosted link at registration ("<link id>.route", nodus_link_rows.cpp), as <id>.metrics is.
+    LinkRouteRow(std::string row_id, std::string link_id, std::string name, std::string map)
+        : row_id_(std::move(row_id)), link_id_(std::move(link_id)), name_(std::move(name)), map_(std::move(map)) {
+        if (!valid_name(name_)) name_.clear();   // refused: the row then does nothing
+    }
     static bool valid_name(const std::string& n) {
         if (n.empty() || n.size() > 64) return false;
         for (char c : n)
@@ -64,7 +71,7 @@ public:
         link_id_ = std::move(id); name_ = std::move(name); map_ = std::move(map); written_ = 0;
         return true;
     }
-    const char* id_cstr() const noexcept override { return "nodus.link.route"; }
+    const char* id_cstr() const noexcept override { return row_id_.c_str(); }
     const char* name_cstr() const noexcept override { return "Link route"; }
     void initialize(const ToolInitContext& ctx) override {
         if (ctx.serialized_path && ctx.serialized_path[0] != '\0') {
@@ -154,6 +161,7 @@ private:
         return ok;
     }
 
+    std::string row_id_ = "nodus.link.route";
     mutable std::mutex mutex_;
     std::string link_id_, name_, map_;
     uint16_t written_ = 0;   // the port of the line this row last wrote; 0: none
