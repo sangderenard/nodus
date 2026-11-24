@@ -18,7 +18,10 @@ namespace {
 
 class TensorReturnsTool final : public ITool {
 public:
-    const char* id_cstr() const noexcept override { return "tensor_returns"; }
+    // The id is the plugin's ("tensor_returns") unless an image registers its own copy under another
+    // (nodus_link_rows.cpp: "nodus.link.returns", on a link's send tables).
+    explicit TensorReturnsTool(const char* id = "tensor_returns") : id_(id) {}
+    const char* id_cstr() const noexcept override { return id_; }
     const char* name_cstr() const noexcept override { return "Tensor returns"; }
     ToolCaps caps() const override { return static_cast<ToolCaps>(0); }
     void initialize(const ToolInitContext&) override {}
@@ -45,6 +48,9 @@ public:
         }
         r.taken = taken;
     }
+
+private:
+    const char* id_;
 };
 
 }  // namespace

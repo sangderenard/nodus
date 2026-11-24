@@ -632,14 +632,22 @@ extern "C" int32_t nodus_headless_compose_link_tables(NodusHeadlessGraph* g, con
     port.layout = 2; port.dtype = 16; port.backend_type = 0;
     struct Table { std::string label; std::vector<GP_CanvasModuleRowDesc> rows; const char* in_port; const char* out_port; };
     const std::string in_bulk = id + ".send", out_bulk = id + ".received", in_control = id + ".control", out_control = id + ".control.received";
+    // A send row copies what it sends and never keeps or destroys it (a Borrower): the returns row of its table hands
+    // each sent tensor to that table's trash, a mint with no size, which frees it (owner, 2026-11-23: "send the copied
+    // into transit data to a mint to be disposed of").
     std::vector<Table> tables = {
-        {"link " + id + " bulk send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, bulk_send.c_str()}}, in_bulk.c_str(), nullptr},
+        {"link " + id + " bulk send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, bulk_send.c_str()},
+                                       {kTool, 0, 0, kPlugin, "nodus.link.returns"}}, in_bulk.c_str(), nullptr},
         {"link " + id + " bulk receive", {{kTool, 0, 0, kPlugin, bulk_receive.c_str()}, {kOutput, 0, 1, 0, nullptr}}, nullptr, out_bulk.c_str()},
-        {"link " + id + " control send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, control_send.c_str()}}, in_control.c_str(), nullptr},
+        {"link " + id + " control send", {{kInput, 0, 1, 0, nullptr}, {kTool, 0, 0, kPlugin, control_send.c_str()},
+                                          {kTool, 0, 0, kPlugin, "nodus.link.returns"}}, in_control.c_str(), nullptr},
         {"link " + id + " control receive", {{kTool, 0, 0, kPlugin, control_receive.c_str()}, {kOutput, 0, 1, 0, nullptr}}, nullptr, out_control.c_str()},
+        {"link " + id + " bulk trash", {{kTool, 0, 0, kPlugin, "nodus.link.trash"}}, nullptr, nullptr},
+        {"link " + id + " control trash", {{kTool, 0, 0, kPlugin, "nodus.link.trash"}}, nullptr, nullptr},
     };
     if (flags & NODUS_LINK_METRICS) tables.push_back({"link " + id + " metrics", {{kTool, 0, 0, kPlugin, metrics.c_str()}}, nullptr, nullptr});
     if (flags & NODUS_LINK_ROUTE) tables.push_back({"link " + id + " route", {{kTool, 0, 0, kPlugin, route.c_str()}}, nullptr, nullptr});
+    std::vector<int32_t> modules;
     for (size_t k = 0; k < tables.size(); ++k) {
         const Table& t = tables[k];
         const int32_t m = link_table(g, t.label, t.rows, 40 + 240 * static_cast<int32_t>(k), y);
@@ -647,8 +655,29 @@ extern "C" int32_t nodus_headless_compose_link_tables(NodusHeadlessGraph* g, con
             std::fprintf(stderr, "nodus_headless_compose_link_tables: %s: table \"%s\" refused\n", tool_id, t.label.c_str());
             return 0;
         }
+        modules.push_back(m);
         if (t.in_port && !g->input_ports.count(t.in_port) && !nodus_headless_declare_input_port_ex(g, t.in_port, m, 0, &port)) return 0;
         if (t.out_port && !g->output_ports.count(t.out_port) && !nodus_headless_declare_output_port_ex(g, t.out_port, m, 0, &port, 1)) return 0;
+    }
+    // Each send table's returns row (row 2, its port "returns") to its trash's port "returned" (row 0, port 0): a
+    // lossless edge of tensor handles, made once (a load brings it back with its EDGE_FIFO record).
+    for (const auto& [send, trash] : {std::pair<size_t, size_t>{0, 4}, std::pair<size_t, size_t>{2, 5}}) {
+        GP_CanvasEdgeDesc e{};
+        e.a_module = modules[send]; e.a_contact_idx = GP_CANVAS_ROW_PORT_CONTACT_BASE + 2 * GP_CANVAS_ROW_PORT_STRIDE;
+        e.b_module = modules[trash]; e.b_contact_idx = GP_CANVAS_ROW_PORT_CONTACT_BASE;
+        bool present = false;
+        for (int32_t k = 0, n = nodus_headless_get_edge_count(g); k < n && !present; ++k) {
+            GP_CanvasEdgeDesc d{};
+            int32_t type_id = 0;
+            present = nodus_headless_get_edge(g, k, &d, &type_id) && d.a_module == e.a_module && d.a_contact_idx == e.a_contact_idx &&
+                      d.b_module == e.b_module && d.b_contact_idx == e.b_contact_idx;
+        }
+        if (present) continue;
+        const int32_t edge = nodus_headless_add_edge(g, &e, 0);
+        if (edge < 0 || !nodus_headless_configure_edge_fifo(g, edge, &port)) {
+            std::fprintf(stderr, "nodus_headless_compose_link_tables: %s: the returns edge to %s refused\n", tool_id, tables[trash].label.c_str());
+            return 0;
+        }
     }
     return 1;
 }

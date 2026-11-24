@@ -166,10 +166,12 @@ NODUS_HEADLESS_API int32_t nodus_headless_open_link_host(NodusHeadlessGraph* g, 
     uint16_t port, int32_t flags, const char* key_file);
 // The tables a registered link's rows live in, one duty each, every one in stack loopback; made once, found again by
 // label and given their rows again (so a link registered after its saved tables loaded binds them):
-//   "link <id> bulk send"        Input (declared input port <id>.send) | <id>.bulk.send
+//   "link <id> bulk send"        Input (declared input port <id>.send) | <id>.bulk.send | nodus.link.returns
 //   "link <id> bulk receive"     <id>.bulk.receive | Output (declared output port <id>.received)
-//   "link <id> control send"     Input (port <id>.control) | <id>.control.send
+//   "link <id> control send"     Input (port <id>.control) | <id>.control.send | nodus.link.returns
 //   "link <id> control receive"  <id>.control.receive | Output (port <id>.control.received)
+//   "link <id> bulk trash", "link <id> control trash"   nodus.link.trash: each send table's returns row hands every
+//                                sent tensor to its trash (a mint with no size), which frees it
 //   "link <id> metrics"          <id>.metrics             (flags & NODUS_LINK_METRICS)
 //   "link <id> route"            <id>.route               (flags & NODUS_LINK_ROUTE)
 // The ports carry 8-byte AbstractTensor handles, 4 slots, lossless. 1, or 0 on refusal.

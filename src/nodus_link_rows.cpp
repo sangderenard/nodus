@@ -24,6 +24,24 @@
 #define NODUS_PLUGIN_DESTROY_NAME nodus_link_route_destroy
 #define NODUS_PLUGIN_SOURCE_NAME nodus_link_route_source
 #include "../module_library/source/tools/link_route.cpp"
+// The returns row and the mint (module_library/source/tools/tensor_returns.cpp, tensor_mint.cpp), likewise, under
+// their own ids: "nodus.link.returns" sits on a link's send tables and hands what a send row used up to
+// "nodus.link.trash", a mint with no size, which frees it (owner, 2026-11-23: "send the copied into transit data to a
+// mint to be disposed of").
+#undef NODUS_PLUGIN_FACTORY_NAME
+#undef NODUS_PLUGIN_DESTROY_NAME
+#undef NODUS_PLUGIN_SOURCE_NAME
+#define NODUS_PLUGIN_FACTORY_NAME nodus_link_returns_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_link_returns_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_link_returns_source
+#include "../module_library/source/tools/tensor_returns.cpp"
+#undef NODUS_PLUGIN_FACTORY_NAME
+#undef NODUS_PLUGIN_DESTROY_NAME
+#undef NODUS_PLUGIN_SOURCE_NAME
+#define NODUS_PLUGIN_FACTORY_NAME nodus_link_trash_create
+#define NODUS_PLUGIN_DESTROY_NAME nodus_link_trash_destroy
+#define NODUS_PLUGIN_SOURCE_NAME nodus_link_trash_source
+#include "../module_library/source/tools/tensor_mint.cpp"
 
 namespace nodus::link {
 namespace {
@@ -83,6 +101,22 @@ bool register_rows(ToolRegistry& registry, const std::string& id, std::shared_pt
             return std::unique_ptr<ITool, std::function<void(ITool*)>>(new LinkMetricsRow(), [](ITool* t) { nodus_link_metrics_destroy(t); });
         };
         registry.register_tool(std::move(generic));   // already there from an earlier link: fine
+    }
+    {   // The send tables' returns row and their trash (nodus_headless_compose_link_tables); registered once.
+        ToolRegistry::Entry returns;
+        returns.id = "nodus.link.returns"; returns.name = "Link returns"; returns.caps = ToolCaps::None;
+        returns.source_path = nodus_link_returns_source();
+        returns.factory = [] {
+            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new TensorReturnsTool("nodus.link.returns"), [](ITool* t) { nodus_link_returns_destroy(t); });
+        };
+        registry.register_tool(std::move(returns));
+        ToolRegistry::Entry trash;
+        trash.id = "nodus.link.trash"; trash.name = "Link trash"; trash.caps = ToolCaps::None;
+        trash.source_path = nodus_link_trash_source();
+        trash.factory = [] {
+            return std::unique_ptr<ITool, std::function<void(ITool*)>>(new TensorMintTool("nodus.link.trash"), [](ITool* t) { nodus_link_trash_destroy(t); });
+        };
+        registry.register_tool(std::move(trash));
     }
     std::lock_guard<std::mutex> g(endpoints_mutex());
     endpoints()[id] = std::move(ep);
