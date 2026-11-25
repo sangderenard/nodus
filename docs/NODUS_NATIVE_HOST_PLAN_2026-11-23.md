@@ -60,6 +60,18 @@ This is the research and the plan.
 
    To roll back, revert the two keys and restart.
 4. **`nodus-training`.** `train_aapl_continuous.py` drives its own Python training loop and imports run_canvas's `ConsoleServer` to serve a console beside it. It is not a canvas host that `--canvas` replaces. Moving it is its own piece of work (the loop itself), and it needs the owner's direction.
+
+   The move has five stages (owner, 2026-11-24: "Yes, stage 1"):
+   1. **The training step as a compiled row.**
+      - Compile: **done 2026-11-24.** `examples/tensor_network_train_row.py` holds the loss. `tools/compile_tensor_network_train_row.py` records it and hands it to Turing's `compile_native_training_schedule` (`src/compiler/llvm_training_runtime.py`), which derives the backward pass and the native SGD update. The compile takes about 52 s.
+      - `--check` runs it beside `PolicyNetwork.step` (batch 64, learning rate 0.01, 50 steps, same weights). The loss is bit-identical at step 0 and differs in the 17th significant digit at step 49. The largest weight difference is 6.9e-18.
+      - Adoption: **not built.** `src/turing_product_adopter.cpp` reads a row-tool product (BACKEND, MANIFEST, ABI, BINARY). It does not read a training schedule's `schedule.json`, so the compiled step is not yet a row on a canvas.
+      - The live loop uses two batch shapes: the full history, and a 32 + 32 mix with live rows. A schedule is compiled at one batch.
+      - The inference row keeps its biases as (2, n). The training step keeps them as (1, n).
+   2. **The weights in a loopback table**, wired to the inference row by edges. The history tensors are read at load.
+   3. **Market data through a contract port pair.** The service fetches it with the secrets, and the canvas asks every 60 s.
+   4. **Validation and run records through a second pair.** The service scores with `paper_arena` and writes `qualification_runs`.
+   5. **A timed save in the native host, then the switch.** The canvas file holds the weights. After that, `train_aapl_continuous.py` is deleted.
 5. **Modal.** The subordinate scripts start `run_canvas.py` inside the Modal image. Moving them means rebuilding that image with the native host and running it on Modal, which is billed, so it waits for the owner's go.
 6. **Oracle's link-test canvas.** Rewrite `/srv/svc/link-test` as an ordinary canvas: one `LINK_HOST state state 47616 0 /srv/svc/link-test/nodus_link.key` record, hosted by `frontend_shell --canvas ... --offscreen` from a build of this branch. Then the pause and resume scripts need no `link_host` ACTION.
 7. **Remove `run_canvas.py`.** Once nothing launches it, delete `run_canvas.py` and `nodus_graph/console_views.py`, and take `run_canvas.py` out of the build products.
