@@ -59,7 +59,8 @@ BUFFER_ABI_SCHEMA = "nodus-turing-buffer-abi-v2"
 REQUEST_SCHEMA = "nodus-turing-row-tool-request-v1"
 ADOPTION_RECEIPT_NAME = "nodus-row-tool-product.receipt"
 _BACKENDS = {"c", "llvm", "fortran"}
-_COLUMN_ROLES = {"input", "output", "inout"}
+# "state" is a training row's trained parameter: the row owns it across calls (ABI V2 VALUE STATE).
+_COLUMN_ROLES = {"input", "output", "inout", "state"}
 _IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
 
 
@@ -162,6 +163,9 @@ class RowToolRequest:
     site_artifact_context: Mapping[str, Any] | None = None
     unstable_source_only: bool = False
     source_names: tuple[str, ...] = ()
+    # A training row: {"learning_rate": float, "steps": int}. The row entry returns the loss, then the further
+    # outputs; the state columns are trained in place by the native SGD update.
+    training: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RowToolRequest":
@@ -206,11 +210,32 @@ class RowToolRequest:
                     f"column {column.name!r} rank does not match shape source "
                     f"{source.name!r}"
                 )
+        training = value.get("training")
+        states = [column for column in columns if column.role == "state"]
+        if training is None:
+            if states:
+                raise ValueError("state columns belong to a training request")
+        else:
+            if not isinstance(training, Mapping):
+                raise ValueError("training must be an object")
+            learning_rate = float(training.get("learning_rate", 0))
+            steps = training.get("steps", 1)
+            if not learning_rate > 0 or type(steps) is not int or steps < 1:
+                raise ValueError("training requires a positive learning_rate and an integer steps >= 1")
+            if backend != "llvm":
+                raise ValueError("a training row is compiled on the LLVM backend")
+            if not states or not any(column.role == "output" for column in columns):
+                raise ValueError("a training row needs state columns and a loss output column")
+            for column in columns:
+                if column.role == "inout" or column.shape is None:
+                    raise ValueError(f"training column {column.name!r} must be input, state or output, "
+                                     "with a fixed shape")
+            training = {"learning_rate": learning_rate, "steps": steps}
         output_dir = value.get("output_dir")
         if not output_dir:
             raise ValueError("request requires output_dir")
         extraction_contract = value.get("extraction_contract")
-        if not extraction_contract:
+        if not extraction_contract and training is None:
             raise ValueError("request requires an explicit extraction_contract")
         composition = value.get("ssa_composition")
         composition_directory = None
@@ -239,11 +264,12 @@ class RowToolRequest:
                 None if value.get("turing_root") is None
                 else Path(str(value["turing_root"]))
             ),
-            extraction_contract=Path(str(extraction_contract)),
+            extraction_contract=None if not extraction_contract else Path(str(extraction_contract)),
             ssa_composition_directory=composition_directory,
             ssa_composition_options=composition_options,
             allow_uncompiled=bool(value.get("allow_uncompiled", True)),
             site_artifact_context=value.get("site_artifact_context"),
+            training=training,
         )
 
 
@@ -896,6 +922,42 @@ class TuringBoundary:
         self.head = _compiler_head(self.root)
         self.toolchain = compiler_toolchain_fingerprint()
 
+    def train(self, function: Any, columns: Sequence["Column"], *, name: str, learning_rate: float,
+              directory: Path) -> tuple[Any, dict[str, int], dict[str, int]]:
+        """Record a training row's loss on an SSATensorProgram and compile it with Turing's
+        compile_native_training_schedule, which derives the backward graph and the native SGD update.
+
+        The input and state columns are the function's arguments, in order. It returns the loss first, then one
+        value per further output column. The state columns are the trained parameters: one parameter group."""
+
+        sys.path.insert(0, str(self.root))
+        try:
+            from src.common.tensors.accelerator_backends.ssa_backend import (
+                SSATensorOperations, SSATensorProgram)
+            from src.compiler.llvm_training_runtime import (
+                NativeParameterGroup, compile_native_training_schedule)
+
+            program = SSATensorProgram(name)
+            arguments = [column for column in columns if column.role in {"input", "state"}]
+            values = {column.name: SSATensorOperations.input(program, tuple(column.shape))
+                      for column in arguments}
+            ids = {column_name: int(value.data.value.id) for column_name, value in values.items()}
+            result = function(*values.values())
+            result = tuple(result) if isinstance(result, (tuple, list)) else (result,)
+            outputs = [column for column in columns if column.role == "output"]
+            if len(result) != len(outputs):
+                raise ProductError(f"training row returned {len(result)} values for {len(outputs)} output columns")
+            observed = {column.name: int(value.data.value.id) for column, value in zip(outputs[1:], result[1:])}
+            schedule = compile_native_training_schedule(
+                result[0], bindings=values,
+                parameter_groups=(NativeParameterGroup(
+                    "state", tuple(ids[column.name] for column in arguments if column.role == "state"),
+                    float(learning_rate)),),
+                observed_outputs=observed or None, name=name, directory=directory)
+        finally:
+            sys.path.pop(0)
+        return schedule, ids, observed
+
     def lower(self, source: str, entrypoint: str, **kwargs: Any) -> tuple[Any, Any, Any]:
         kwargs.setdefault("tensor_ssa_reference", self._tensor_reference())
         bindings = dict(kwargs.pop("python_bindings", None) or {})
@@ -1142,6 +1204,181 @@ def compile_row_tool(
         _write_json(receipt, lifecycle)
 
 
+def _training_buffer_abi(
+    request: RowToolRequest,
+    artifact: Any,
+    ids: Mapping[str, int],
+    outputs: Mapping[str, int],
+    observed: Mapping[str, int],
+) -> tuple[dict[str, Any], str]:
+    """The ABI V2 descriptor of a compiled training step.
+
+    Input columns are INPUT. State columns, the step count and the learning rate are STATE: the row owns them and
+    the native SGD loop updates the parameters in place. The loss and the observed outputs are OUTPUT. Every other
+    buffer (the gradients) is WORKSPACE."""
+
+    if tuple(getattr(artifact, "extent_order", ()) or ()):
+        raise ProductError("a training step with runtime extents is not supported")
+    order = tuple(int(item) for item in artifact.buffer_order)
+    shapes = {value_id: _normalize_shape(shape) for value_id, shape in zip(order, artifact.buffer_shapes)}
+    dtypes = {value_id: _nodus_dtype(dtype) for value_id, dtype in zip(order, artifact.buffer_dtypes)}
+    output_columns = [column for column in request.columns if column.role == "output"]
+    output_ids = {output_columns[0].name: int(outputs["loss_0"])}
+    output_ids.update({name: int(value_id) for name, value_id in observed.items()})
+    steps_id = int(artifact.training_steps_value_id)
+    rate_id = int(artifact.learning_rate_value_id)
+    values: list[dict[str, Any]] = []
+    for column in request.columns:
+        value_id = int(ids[column.name]) if column.role in {"input", "state"} else output_ids[column.name]
+        if shapes.get(value_id) != list(column.shape):
+            raise ProductError(f"column {column.name!r} shape {list(column.shape)!r} disagrees with the "
+                               f"compiled buffer {shapes.get(value_id)!r}")
+        values.append({"ssa_value_id": value_id, "role": column.role, "column": column.name})
+    values.append({"ssa_value_id": steps_id, "role": "state", "column": "steps",
+                   "init": int(request.training["steps"])})
+    values.append({"ssa_value_id": rate_id, "role": "state", "column": "learning_rate",
+                   "init": float(request.training["learning_rate"])})
+    named = {value["ssa_value_id"] for value in values}
+    values += [{"ssa_value_id": value_id, "role": "workspace", "column": None}
+               for value_id in order if value_id not in named]
+    if {value["ssa_value_id"] for value in values} != set(order):
+        raise ProductError("training ABI does not name every compiled buffer exactly once")
+    rank_of = {"input": 0, "state": 1, "output": 2, "workspace": 3}
+    values.sort(key=lambda value: rank_of[value["role"]])
+    for value in values:
+        value["dtype"] = dtypes[value["ssa_value_id"]]
+        value["shape"] = shapes[value["ssa_value_id"]]
+    tool_id = f"imported.{_safe_name(request.product_name or request.row_entry)}.llvm"
+    descriptor = {
+        "schema": BUFFER_ABI_SCHEMA,
+        "backend": "llvm",
+        "symbol": str(artifact.name),
+        "row_entry": request.row_entry,
+        "columns": [column.to_mapping() for column in request.columns],
+        "training": dict(request.training),
+        "buffer_order": list(order),
+        "buffers": values,
+        "extent_order": [],
+        "tool_id": tool_id,
+        "tool_name": f"trained {request.row_entry} (llvm)",
+        "call": "void symbol(void **buffers, int32_t *extents)",
+        "extent_dtype": "i32",
+    }
+    lines = [
+        "NODUS BUFFER ABI V2",
+        'BACKEND "llvm"',
+        f"TOOL {_quoted(tool_id)} {_quoted(descriptor['tool_name'])}",
+        f"ENTRY {_quoted(descriptor['symbol'])}",
+        'EXTENT_DTYPE "i32"',
+    ]
+    for value in values:
+        shape = value["shape"]
+        lines.append(f"VALUE {value['role'].upper()} {_quoted(_ssa_spelling(value['ssa_value_id']))} "
+                     f"{_quoted(value['dtype'])} {len(shape)}" + ("".join(f" {extent}" for extent in shape)))
+    for value in values:
+        if value["role"] == "state":
+            lines.append(f"STATE {_quoted(_ssa_spelling(value['ssa_value_id']))} {_quoted(value['column'])}"
+                         + (f" {value['init']!r}" if "init" in value else ""))
+    lines += [f"BUFFER {_quoted(_ssa_spelling(value_id))}" for value_id in order]
+    return descriptor, "\n".join(lines) + "\n"
+
+
+def _compile_training_row_tool(
+    request: RowToolRequest,
+    *,
+    compiler: CompilerBoundary | None = None,
+) -> dict[str, Any]:
+    """A training row: the authored loss compiled by Turing's compile_native_training_schedule (backward graph and
+    native SGD update), retained as a row-tool product whose state columns the row owns across calls."""
+
+    output = request.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    (output / ADOPTION_RECEIPT_NAME).unlink(missing_ok=True)
+    product_name = _safe_name(request.product_name or request.row_entry)
+    authored, authored_origin = _read_authored_source(request)
+    authored_path = output / "authored-source.py"
+    _write_text(authored_path, authored)
+    namespace: dict[str, Any] = {"__name__": f"nodus_training_row_{product_name}"}
+    exec(compile(authored, str(authored_path), "exec"), namespace)
+    function = namespace.get(request.row_entry)
+    if not callable(function):
+        raise ProductError(f"authored source defines no function {request.row_entry!r}")
+    compiler_work = output / "compiler-work"
+    if compiler is None:
+        turing_root = (request.turing_root.resolve() if request.turing_root is not None
+                       else Path(__file__).resolve().parents[2] / "turing")
+        with _compiler_working_directory(compiler_work):
+            compiler = TuringBoundary(turing_root)
+    backend_dir = output / "backend"
+    with _compiler_working_directory(compiler_work):
+        schedule, ids, observed = compiler.train(
+            function, request.columns, name=product_name,
+            learning_rate=float(request.training["learning_rate"]), directory=backend_dir)
+    artifact = schedule.artifacts["state"]
+    if artifact.library_path is None or not Path(artifact.library_path).is_file():
+        raise ProductError("the training compile produced no native library")
+    binary_path = Path(artifact.library_path)
+    backend_source_path = binary_path.with_suffix(".ll")
+    if not backend_source_path.is_file():
+        _write_text(backend_source_path, str(artifact.llvm_ir))
+    abi_path = binary_path.parent / f"{artifact.name}.nodus_buffer_abi.txt"
+    buffer_abi_manifest, buffer_abi_text = _training_buffer_abi(
+        request, artifact, ids, schedule.outputs, observed)
+    _write_text(abi_path, buffer_abi_text)
+    training_path = output / "training.json"
+    _write_json(training_path, {"value_ids": dict(ids), "outputs": dict(schedule.outputs),
+                                "saved_binding_count": int(schedule.saved_binding_count),
+                                **dict(request.training)})
+    sys.stdout.flush()
+    sys.stderr.flush()
+    artifact_records = [
+        _artifact_record(output, authored_path, "authored-source"),
+        _artifact_record(output, training_path, "training-schedule"),
+        _artifact_record(output, backend_source_path, "backend-source"),
+        _artifact_record(output, abi_path, "abi-descriptor"),
+        _artifact_record(output, binary_path, "native-library"),
+    ]
+    tracked = {str(Path(record["path"])) for record in artifact_records}
+    for side_product in sorted(path for path in compiler_work.rglob("*") if path.is_file()):
+        relative = _product_relative(output, side_product)
+        if str(Path(relative)) not in tracked:
+            artifact_records.append(_artifact_record(output, side_product, "compiler-side-product"))
+            tracked.add(str(Path(relative)))
+    manifest = {
+        "schema": PRODUCT_SCHEMA,
+        "request_schema": REQUEST_SCHEMA,
+        "site_artifact_context": _site_context(request),
+        "product_name": product_name,
+        "backend": "llvm",
+        "row_entry": request.row_entry,
+        "ssa_root": str(artifact.name),
+        "exports": [str(artifact.name)],
+        "columns": [column.to_mapping() for column in request.columns],
+        "training": dict(request.training),
+        "source": {
+            "origin": authored_origin,
+            "global_scope_wrapped": False,
+            "authored_sha256": _sha256(authored_path),
+        },
+        "composition": None,
+        "compiler": {
+            "public_entry": "src.compiler.llvm_training_runtime.compile_native_training_schedule",
+            "git_head": str(compiler.head),
+            "toolchain_fingerprint": dict(compiler.toolchain),
+        },
+        "loadable": True,
+        "build_error": None,
+        "buffer_abi": buffer_abi_manifest,
+        "adoption_receipt": ADOPTION_RECEIPT_NAME,
+        "artifacts": artifact_records,
+    }
+    manifest_path = output / "nodus-row-tool-product.json"
+    _write_json(manifest_path, manifest)
+    _write_adoption_receipt(output, backend="llvm", manifest_path=manifest_path,
+                            abi_path=abi_path, binary_path=binary_path)
+    return manifest
+
+
 def _compile_row_tool(
     request: RowToolRequest | Mapping[str, Any],
     *,
@@ -1151,6 +1388,8 @@ def _compile_row_tool(
 
     if not isinstance(request, RowToolRequest):
         request = RowToolRequest.from_mapping(request)
+    if request.training is not None:
+        return _compile_training_row_tool(request, compiler=compiler)
     if request.extraction_contract is None:
         raise ValueError("request requires an explicit extraction_contract")
     if request.backend == "fortran" and any(
