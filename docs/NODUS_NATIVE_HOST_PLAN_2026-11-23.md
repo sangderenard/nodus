@@ -35,6 +35,14 @@ This is the research and the plan.
 - **The Windows product is built:** `C:/dev/Powershell/srv/state/products/nodus-native/66dcbb5a/` holds `frontend_shell.exe` and its DLLs. It was rehearsed on a copy of the live messenger canvas.
 - **The messenger switch is a reviewed change** (Turing `claude/native-nodus-host`, `instances.json`). It takes effect when it lands, the live tree is updated, and the stack restarts. The restart is the owner's.
 
+**The messenger runs on the native host since 2026-11-24 11:15 local** (owner's restart). The check at 18:13 found:
+- The console port 47612 is held by `frontend_shell.exe` (pid 20072), a child of the supervisor. Its log is `srv/state/logs/nodus-messenger-20261124-111528.log`.
+- `/api/nodus/instances` shows `nodus-messenger` running with a console. DIGEST answers at tick 1503961 (60 Hz, consistent with seven hours up). TOOLS lists the four market/worker plugin pairs.
+- Cron rows have kept firing. The exit statuses in `cron.log` since the restart are the same set as before it.
+- The log's 52 `ToolRegistry failed to register` lines are the same count as in the last `run_canvas.py` log (2026-11-22). They are not new.
+- Not exercised: a `gui.proof` compile. None was requested in that time, and starting one is a build.
+- `run_canvas.py` stays for now: `nodus-training` and the Modal subordinates (items 4 and 5 below) still launch it.
+
 ## Stage D: the switches (each the owner's)
 
 1. **Land the reviews.** Nodus `claude/mesh-canvas-rows`, Turing `claude/native-nodus-host`, Turing `claude/link-route-map`.
