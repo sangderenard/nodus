@@ -60,28 +60,6 @@ This is the research and the plan.
 
    To roll back, revert the two keys and restart.
 4. **`nodus-training`.** `train_aapl_continuous.py` drives its own Python training loop and imports run_canvas's `ConsoleServer` to serve a console beside it. It is not a canvas host that `--canvas` replaces. Moving it is its own piece of work (the loop itself), and it needs the owner's direction.
-
-   The move has five stages (owner, 2026-11-24: "Yes, stage 1"):
-   1. **The training step as a compiled row.**
-      - Compile: **done 2026-11-24.** `examples/tensor_network_train_row.py` holds the loss. `tools/compile_tensor_network_train_row.py` records it and hands it to Turing's `compile_native_training_schedule` (`src/compiler/llvm_training_runtime.py`), which derives the backward pass and the native SGD update. The compile takes about 52 s.
-      - `--check` runs it beside `PolicyNetwork.step` (batch 64, learning rate 0.01, 50 steps, same weights). The loss is bit-identical at step 0 and differs in the 17th significant digit at step 49. The largest weight difference is 6.9e-18.
-      - Adoption: **done 2026-11-25.** The row-tool compiler (`tools/turing_row_tool_compiler.py`) takes a `training` request. Its `state` columns are the trained parameters. It writes an ordinary row-tool product: manifest, ABI V2, LLVM library and receipt.
-      - NODUS BUFFER ABI V2 has a `STATE` role, read by `src/artifact_importer.cpp`. The generated row owns these buffers across calls and the entry updates them in place.
-        - A state starts at zero, or at its declared scalar value: the step count starts at 1, the learning rate at 0.01.
-        - A tensor of the same dtype and shape that arrives on the state's load port replaces it.
-        - States save with the canvas through `serialize`/`deserialize`.
-      - `tests/training_row_test.cpp` adopts the real product, loads the initial weights through the ports and runs 50 calls.
-        - The first loss is bit-identical to `PolicyNetwork.step`.
-        - The largest weight difference after 50 steps is 6.9e-18.
-        - A restored instance saves the same bytes.
-        - A tensor of the wrong shape on a load port is destroyed and leaves the state as it was.
-      - The live loop uses two batch shapes: the full history, and a 32 + 32 mix with live rows. A product is compiled at one batch.
-      - The inference row keeps its biases as (2, n). The training row keeps them as (1, n).
-      - The importer tests build their wrappers with cmake below `module_library/test_build`. From a deep checkout path, MSBuild's FileTracker passes the path limit, so they were run through a `subst` drive.
-   2. **The weights in a loopback table**, wired to the inference row by edges. The history tensors are read at load.
-   3. **Market data through a contract port pair.** The service fetches it with the secrets, and the canvas asks every 60 s.
-   4. **Validation and run records through a second pair.** The service scores with `paper_arena` and writes `qualification_runs`.
-   5. **A timed save in the native host, then the switch.** The canvas file holds the weights. After that, `train_aapl_continuous.py` is deleted.
 5. **Modal.** The subordinate scripts start `run_canvas.py` inside the Modal image. Moving them means rebuilding that image with the native host and running it on Modal, which is billed, so it waits for the owner's go.
 6. **Oracle's link-test canvas.** Rewrite `/srv/svc/link-test` as an ordinary canvas: one `LINK_HOST state state 47616 0 /srv/svc/link-test/nodus_link.key` record, hosted by `frontend_shell --canvas ... --offscreen` from a build of this branch. Then the pause and resume scripts need no `link_host` ACTION.
 7. **Remove `run_canvas.py`.** Once nothing launches it, delete `run_canvas.py` and `nodus_graph/console_views.py`, and take `run_canvas.py` out of the build products.

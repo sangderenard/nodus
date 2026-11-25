@@ -1591,17 +1591,6 @@ target_compile_definitions(test_artifact_buffer_import PRIVATE
 target_compile_features(test_artifact_buffer_import PRIVATE cxx_std_20)
 add_test(NAME artifact_buffer_import_test COMMAND test_artifact_buffer_import)
 
-# A stateful training row (ABI V2 STATE) against Python's PolicyNetwork.step. The product and reference come from
-# tools/compile_tensor_network_train_row.py (needs Turing): test_training_row <product dir> <reference.txt>.
-add_executable(test_training_row tests/training_row_test.cpp)
-target_link_libraries(test_training_row PRIVATE nodus_tensor_core)
-target_compile_definitions(test_training_row PRIVATE
-  NODUS_REPO_ROOT="${NODUS_REPO_ROOT_PATH}"
-  NODUS_BUILD_DIR="${NODUS_BUILD_DIR_PATH}"
-)
-target_compile_features(test_training_row PRIVATE cxx_std_20)
-add_test(NAME training_row_test COMMAND test_training_row)
-
 # Complete Turing-product adoption through the existing artifact importer and
 # ordinary plugin build/load path.  The fixture proves that the retained row
 # source and same-stem binary are discoverable while the loaded tool is also

@@ -5,7 +5,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -122,14 +121,8 @@ struct ApiDoc {
 };
 
 struct BufferValue {
-    // State: a buffer the row owns across calls (a network's weights, a step count). It is created when the row first
-    // runs, zeroed or set to its declared initial value, replaced by a tensor that arrives on its load port, and saved
-    // with the canvas through serialize/deserialize. The entry reads and writes it in place.
-    enum class Role { Input, Output, Workspace, State };
+    enum class Role { Input, Output, Workspace };
     Role role = Role::Input;
-    std::string state_name;  // the state's load port; set by its STATE record
-    bool has_init = false;
-    double init = 0.0;       // a scalar state's initial value
     std::string ssa_id;
     std::string dtype;
     int32_t nodus_dtype = 0;
@@ -243,9 +236,8 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
             if (role == "INPUT") value.role = BufferValue::Role::Input;
             else if (role == "OUTPUT") value.role = BufferValue::Role::Output;
             else if (role == "WORKSPACE") value.role = BufferValue::Role::Workspace;
-            else if (role == "STATE" && doc.version >= 2) value.role = BufferValue::Role::State;
             else {
-                *err = "line " + std::to_string(line_no) + ": VALUE role must be INPUT, OUTPUT, WORKSPACE, or (V2) STATE";
+                *err = "line " + std::to_string(line_no) + ": VALUE role must be INPUT, OUTPUT, or WORKSPACE";
                 return false;
             }
             if (!ss || value.ssa_id.empty() || rank < 0 || rank > 8) {
@@ -367,38 +359,6 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
             value->shape_source[static_cast<size_t>(target_axis)] = source;
             value->shape_source_axis[static_cast<size_t>(target_axis)] =
                 static_cast<uint32_t>(source_axis);
-        } else if (tag == "STATE") {
-            // STATE "<ssa id>" "<port name>" [initial value]: names a STATE value's load port; a scalar may start at
-            // a declared value instead of zero.
-            std::string id, name;
-            ss >> std::quoted(id) >> std::quoted(name);
-            BufferValue* value = find_buffer_value(doc, id);
-            const bool name_ok = !name.empty() && std::all_of(name.begin(), name.end(), [](unsigned char c) {
-                return std::isalnum(c) || c == '_' || c == '.';
-            });
-            if (!ss || !value || value->role != BufferValue::Role::State || !name_ok ||
-                !value->state_name.empty()) {
-                *err = "line " + std::to_string(line_no) + ": malformed STATE";
-                return false;
-            }
-            value->state_name = name;
-            std::string init;
-            if (ss >> init) {
-                try {
-                    size_t consumed = 0;
-                    value->init = std::stod(init, &consumed);
-                    if (consumed != init.size() || !value->shape.empty()) throw std::invalid_argument("init");
-                    value->has_init = true;
-                } catch (...) {
-                    *err = "line " + std::to_string(line_no) + ": STATE initial value must be a number, on a scalar";
-                    return false;
-                }
-                std::string trailing;
-                if (ss >> trailing) {
-                    *err = "line " + std::to_string(line_no) + ": trailing STATE fields";
-                    return false;
-                }
-            }
         } else {
             *err = "line " + std::to_string(line_no) + ": unknown record '" + tag + "'";
             return false;
@@ -457,22 +417,6 @@ bool parse_buffer_abi(const fs::path& path, BufferAbiDoc* out, std::string* err)
                        extent.axis >= value->shape.size())) {
             *err = "EXTENT references unknown value or invalid selector for '" +
                    extent.ssa_id + "'";
-            return false;
-        }
-    }
-    for (const auto& value : doc.values) {
-        if (value.role != BufferValue::Role::State) continue;
-        if (value.state_name.empty()) {
-            *err = "STATE value '" + value.ssa_id + "' has no STATE record naming its port";
-            return false;
-        }
-        if (std::find(value.dynamic_shape.begin(), value.dynamic_shape.end(), true) != value.dynamic_shape.end()) {
-            *err = "STATE value '" + value.ssa_id + "' must have a fixed shape";
-            return false;
-        }
-        if (value.has_init && value.nodus_dtype != 1 && value.nodus_dtype != 2 && value.nodus_dtype != 5 &&
-            value.nodus_dtype != 6) {
-            *err = "STATE value '" + value.ssa_id + "' initial value needs an f32, f64, i32 or i64 scalar";
             return false;
         }
     }
@@ -1082,14 +1026,11 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     std::vector<size_t> input_indices;
     std::vector<size_t> output_indices;
     std::vector<size_t> workspace_indices;
-    std::vector<size_t> state_indices;
     for (size_t i = 0; i < doc.values.size(); ++i) {
         if (doc.values[i].role == BufferValue::Role::Input) input_indices.push_back(i);
         else if (doc.values[i].role == BufferValue::Role::Output) output_indices.push_back(i);
-        else if (doc.values[i].role == BufferValue::Role::State) state_indices.push_back(i);
         else workspace_indices.push_back(i);
     }
-    const size_t row_ports = output_indices.size() + state_indices.size();
     std::vector<size_t> buffer_indices;
     for (const auto& id : doc.buffer_order) {
         for (size_t i = 0; i < doc.values.size(); ++i) {
@@ -1156,82 +1097,15 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     // mint once no stack entry names them; each output is taken from the row's own port "blank" (blank1, ... for
     // further outputs) when the mint has lent one of the right size, and created here otherwise.
     ss << "    ToolTensorRole tensor_role() const override { return ToolTensorRole::Borrower; }\n";
-    // Row ports: one blank per output, then one load port per state (named by its STATE record), all into the row.
-    ss << "    int32_t row_port_count() const override { return " << row_ports << "; }\n";
+    ss << "    int32_t row_port_count() const override { return " << output_indices.size() << "; }\n";
     ss << "    ToolRowPort row_port(int32_t idx) const override {\n";
-    for (size_t k = 0; k < row_ports; ++k) {
-        const std::string name = k < output_indices.size()
-            ? (k == 0 ? "blank" : "blank" + std::to_string(k))
-            : doc.values[state_indices[k - output_indices.size()]].state_name;
-        const float y = row_ports == 1 ? 0.5f : (static_cast<float>(k) + 0.5f) / static_cast<float>(row_ports);
-        ss << "        if (idx == " << k << ") return ToolRowPort{ToolPortKind::Argument, 0.0f, " << y << "f, \""
-           << escape_cpp_string(name) << "\", 8};\n";
+    for (size_t k = 0; k < output_indices.size(); ++k) {
+        const std::string name = k == 0 ? "blank" : "blank" + std::to_string(k);
+        const float y = output_indices.size() == 1 ? 0.5f : (static_cast<float>(k) + 0.5f) / static_cast<float>(output_indices.size());
+        ss << "        if (idx == " << k << ") return ToolRowPort{ToolPortKind::Argument, 0.0f, " << y << "f, \"" << name
+           << "\", 8};\n";
     }
     ss << "        return ToolRowPort{};\n    }\n";
-    if (!state_indices.empty()) {
-        // The states are saved with the canvas: a header, then each state's byte count and bytes (0 = not created).
-        ss << "    ~ImportedBufferTool_" << sym << "() noexcept override {\n"
-              "        for (uint64_t& id : state_ids_) if (id) { nodus_tensor_destroy(id); id = 0; }\n    }\n";
-        // A state's byte count is its declared element count times its element size. A mapped tensor may report a
-        // larger, padded allocation: the (1, 4) hidden bias mapped as 64 bytes, not 32 (2026-11-25).
-        auto element_bytes = [](int32_t dtype) -> uint64_t {
-            switch (dtype) {
-                case 2: case 6: case 14: return 8;
-                case 1: case 5: case 13: return 4;
-                case 4: case 12: return 2;
-                default: return 1;
-            }
-        };
-        ss << "    static constexpr std::array<uint64_t, " << state_indices.size() << "> kStateBytes = {";
-        for (size_t k = 0; k < state_indices.size(); ++k) {
-            const auto& value = doc.values[state_indices[k]];
-            uint64_t count = 1;
-            for (uint64_t extent : value.shape) count *= extent;
-            ss << (k ? ", " : "") << count * element_bytes(value.nodus_dtype) << "ull";
-        }
-        ss << "};\n";
-        ss << "    bool serialize(OutputArchive& out) const override {\n"
-              "        const uint32_t header[2] = {0x31545353u, " << state_indices.size() << "u};\n"
-              "        if (!out.write(header, sizeof(header))) return false;\n"
-              "        for (size_t k = 0; k < state_ids_.size(); ++k) {\n"
-              "            const uint64_t id = state_ids_[k];\n"
-              "            void* bytes_at = nullptr; uint64_t have = 0;\n"
-              "            if (id && (nodus_tensor_map(id, &bytes_at, &have) != NODUS_OK || have < kStateBytes[k])) {\n"
-              "                if (bytes_at) nodus_tensor_unmap(id);\n"
-              "                return false;\n"
-              "            }\n"
-              "            const uint64_t bytes = id ? kStateBytes[k] : 0;\n"
-              "            const bool ok = out.write(&bytes, sizeof(bytes)) && (bytes == 0 || out.write(bytes_at, static_cast<size_t>(bytes)));\n"
-              "            if (id) nodus_tensor_unmap(id);\n"
-              "            if (!ok) return false;\n"
-              "        }\n"
-              "        return true;\n    }\n";
-        ss << "    bool deserialize(InputArchive& in) override {\n"
-              "        uint32_t header[2] = {};\n"
-              "        if (!in.read(header, sizeof(header)) || header[0] != 0x31545353u || header[1] != "
-           << state_indices.size() << "u) return false;\n";
-        for (size_t k = 0; k < state_indices.size(); ++k) {
-            const auto& value = doc.values[state_indices[k]];
-            const size_t rank = value.shape.size();
-            ss << "        { uint64_t bytes = 0; if (!in.read(&bytes, sizeof(bytes))) return false;\n"
-                  "          if (bytes) {\n"
-                  "            const std::array<uint64_t, " << std::max<size_t>(rank, 1) << "> shape = {";
-            if (rank == 0) ss << "0ull";
-            for (size_t axis = 0; axis < rank; ++axis) ss << (axis ? ", " : "") << value.shape[axis] << "ull";
-            ss << "};\n"
-                  "            const uint64_t id = nodus_tensor_create(" << value.nodus_dtype << ", " << rank << ", "
-               << (rank == 0 ? "nullptr" : "shape.data()") << ");\n"
-                  "            void* bytes_at = nullptr; uint64_t have = 0;\n"
-                  "            if (!id || nodus_tensor_map(id, &bytes_at, &have) != NODUS_OK) { if (id) nodus_tensor_destroy(id); return false; }\n"
-                  "            const bool ok = bytes == kStateBytes[" << k << "] && have >= bytes && in.read(bytes_at, static_cast<size_t>(bytes));\n"
-                  "            nodus_tensor_unmap(id);\n"
-                  "            if (!ok) { nodus_tensor_destroy(id); return false; }\n"
-                  "            if (state_ids_[" << k << "]) nodus_tensor_destroy(state_ids_[" << k << "]);\n"
-                  "            state_ids_[" << k << "] = id;\n"
-                  "          } }\n";
-        }
-        ss << "        return true;\n    }\n";
-    }
     ss << "    void execute_stack(ToolStackContext& ctx) override {\n";
     // A compiled row succeeds only after every output is published. Missing
     // entry/input previously inherited success=true and advanced an idle row.
@@ -1279,48 +1153,6 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
           "            restore_inputs();\n"
           "        };\n";
 
-    // The states: created on the first call (zeroed, or set to the declared initial value), replaced by a tensor of
-    // the same dtype and shape that waits on the state's load port, then handed to the entry in place. They are never
-    // pushed and never destroyed by a failed call.
-    for (size_t k = 0; k < state_indices.size(); ++k) {
-        const size_t i = state_indices[k];
-        const auto& value = doc.values[i];
-        const size_t rank = value.shape.size();
-        const size_t port = output_indices.size() + k;
-        ss << "        if (!state_ids_[" << k << "]) {\n"
-              "            const std::array<uint64_t, " << std::max<size_t>(rank, 1) << "> shape = {";
-        if (rank == 0) ss << "0ull";
-        for (size_t axis = 0; axis < rank; ++axis) ss << (axis ? ", " : "") << value.shape[axis] << "ull";
-        ss << "};\n"
-              "            state_ids_[" << k << "] = nodus_tensor_create(" << value.nodus_dtype << ", " << rank << ", "
-           << (rank == 0 ? "nullptr" : "shape.data()") << ");\n"
-              "            if (!state_ids_[" << k << "] || nodus_tensor_zero(state_ids_[" << k << "], 0, 0) != NODUS_OK) { fail(); return; }\n";
-        if (value.has_init) {
-            const char* type = value.nodus_dtype == 1 ? "float" : value.nodus_dtype == 2 ? "double"
-                             : value.nodus_dtype == 5 ? "int32_t" : "int64_t";
-            ss << "            { void* at = nullptr; uint64_t bytes = 0;\n"
-                  "              if (nodus_tensor_map(state_ids_[" << k << "], &at, &bytes) != NODUS_OK) { fail(); return; }\n"
-                  "              *static_cast<" << type << "*>(at) = static_cast<" << type << ">(" << std::setprecision(17)
-               << value.init << ");\n"
-                  "              nodus_tensor_unmap(state_ids_[" << k << "]); }\n";
-        }
-        ss << "        }\n"
-              "        if (ctx.row_ports && ctx.row_ports->consume) { uint64_t offered = 0; size_t got = 0;\n"
-              "          if (ctx.row_ports->consume(ctx.row_ports->host, " << port
-           << ", &offered, sizeof(offered), &got) && got == sizeof(offered) && offered) {\n"
-              "            NodusTensorDesc od{}; bool fits = nodus_tensor_describe(offered, &od) == NODUS_OK && od.dtype == "
-           << value.nodus_dtype << " && od.rank == " << rank << "u;\n";
-        for (size_t axis = 0; axis < rank; ++axis) {
-            ss << "            fits = fits && od.shape[" << axis << "] == " << value.shape[axis] << "ull;\n";
-        }
-        ss << "            if (fits) { nodus_tensor_destroy(state_ids_[" << k << "]); state_ids_[" << k << "] = offered; }\n"
-              "            else { fprintf(stderr, \"[imported-buffer:" << sym << "] tensor on load port "
-           << escape_cpp_string(value.state_name) << " does not fit; destroyed\\n\"); nodus_tensor_destroy(offered); }\n"
-              "          } }\n"
-              "        handles[" << i << "].id = state_ids_[" << k << "];\n"
-              "        if (nodus_tensor_describe(handles[" << i << "].id, &descs[" << i << "]) != NODUS_OK) { fail(); return; }\n";
-    }
-
     // Describe every input before allocating outputs. Dynamic result shapes
     // may cite any input regardless of buffer order.
     for (size_t i = 0; i < doc.values.size(); ++i) {
@@ -1353,7 +1185,7 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
     }
     for (size_t i = 0; i < doc.values.size(); ++i) {
         const auto& value = doc.values[i];
-        if (value.role != BufferValue::Role::Input && value.role != BufferValue::Role::State) {
+        if (value.role != BufferValue::Role::Input) {
             const auto out_pos = std::find(output_indices.begin(), output_indices.end(), i);
             const bool lent = out_pos != output_indices.end();
             const size_t rank = value.shape.size();
@@ -1441,11 +1273,7 @@ std::string generate_buffer_wrapper_source(const BufferAbiDoc& doc,
           "    }\n";
     ss << "private:\n    void* module_ = nullptr;\n    EntryFn entry_ = nullptr;\n"
           "    ValidationResetFn validation_reset_ = nullptr;\n"
-          "    ValidationTakeFn validation_take_ = nullptr;\n";
-    if (!state_indices.empty()) {
-        ss << "    std::array<uint64_t, " << state_indices.size() << "> state_ids_{};\n";
-    }
-    ss << "};\n} // namespace\n\n";
+          "    ValidationTakeFn validation_take_ = nullptr;\n};\n} // namespace\n\n";
     ss << "extern \"C\" NODUS_PLUGIN_EXPORT ITool* NODUS_PLUGIN_FACTORY_NAME() { return new ImportedBufferTool_"
        << sym << "(); }\n";
     ss << "extern \"C\" NODUS_PLUGIN_EXPORT void NODUS_PLUGIN_DESTROY_NAME(ITool* t) { delete t; }\n";
